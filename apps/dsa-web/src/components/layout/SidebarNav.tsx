@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Award, Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, Compass, FileText, Gauge, Home, LogOut, MessageSquareQuote, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, Compass, FileText, Gauge, Home, LogOut, MessageSquareQuote, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
@@ -35,7 +35,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'knowledge-base', labelKey: 'layout.nav.knowledgeBase', to: '/knowledge-base', icon: BookOpen },
   { key: 'chat', labelKey: 'layout.nav.chat', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
   { key: 'chanlun', labelKey: 'layout.nav.chanlun', to: '/chanlun', icon: TrendingUp },
-  { key: 'zhengxi', labelKey: 'layout.nav.zhengxi', to: '/zhengxi', icon: Award },
+  // { key: 'zhengxi', labelKey: 'layout.nav.zhengxi', to: '/zhengxi', icon: Award }, // TEMP: hidden
   { key: 'supply-chain', labelKey: 'layout.nav.supplyChain', to: '/supply-chain', icon: Network },
   { key: 'screening', labelKey: 'layout.nav.screening', to: '/screening', icon: Search },
   { key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
