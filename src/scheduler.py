@@ -494,7 +494,12 @@ class Scheduler:
         """获取下次执行时间"""
         jobs = self.schedule.get_jobs()
         if jobs:
-            next_run = min(job.next_run for job in jobs if job.next_run is not None)
+            # schedule lib has no type stubs; next_run is Any. Coerce to
+            # datetime defensively before strftime to avoid AttributeError
+            # on schedule version bumps.
+            from datetime import datetime as _dt
+            candidate = min(j.next_run for j in jobs if j.next_run is not None)
+            next_run = _dt.fromtimestamp(float(candidate)) if not isinstance(candidate, _dt) else candidate
             return next_run.strftime("%Y-%m-%d %H:%M:%S")
         return "未设置"
 

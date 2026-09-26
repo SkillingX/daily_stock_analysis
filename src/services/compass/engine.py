@@ -22,6 +22,8 @@ import pandas as pd
 
 import icontract
 
+from typing import cast
+
 from src.schemas.compass import (
     ActionReasonCode,
     BarStatus,
@@ -81,10 +83,12 @@ def _wilder_ema(closes: pd.Series, period: int) -> pd.Series:
     if body.empty:
         return seeded
     smoothed = body.ewm(alpha=alpha, adjust=False).mean()
-    out = pd.concat([seeded, smoothed])
-    out.index = closes.index
-    out.name = closes.name
-    return out
+    # pd.concat can technically return DataFrame if columns misalign; cast
+    # back to Series to satisfy pyright (mypy sees the cast as redundant).
+    out_series: pd.Series = pd.concat([seeded, smoothed])
+    out_series.index = closes.index
+    out_series.name = closes.name
+    return out_series
 
 
 @icontract.require(
@@ -104,10 +108,12 @@ def compute_rsi_wilder(closes: pd.Series, period: int = 14) -> pd.Series:
     delta = closes.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
-    avg_gain = _wilder_ema(gain, period)
-    avg_loss = _wilder_ema(loss, period)
-    rs = avg_gain / avg_loss.replace(0.0, pd.NA)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
+    avg_gain = cast(pd.Series, _wilder_ema(gain, period))  # type: ignore[redundant-cast]
+    avg_loss = cast(pd.Series, _wilder_ema(loss, period))  # type: ignore[redundant-cast]
+    # Use float("nan") (not pd.NA) so .replace() returns Series, not DataFrame.
+    rs = avg_gain / avg_loss.replace(0.0, float("nan"))
+    one_plus_rs = cast(pd.Series, 1.0 + rs)  # type: ignore[redundant-cast]
+    rsi = cast(pd.Series, 100.0 - 100.0 / one_plus_rs)  # type: ignore[redundant-cast]
     # When avg_loss == 0, force RSI = 100 (pure up-move).
     rsi = rsi.where(avg_loss != 0, 100.0)
     return rsi
@@ -123,7 +129,10 @@ def compute_rsi_wilder(closes: pd.Series, period: int = 14) -> pd.Series:
 )
 def compute_ema(closes: pd.Series, period: int) -> pd.Series:
     """Standard EMA (alpha = 2/(period+1)), seeded via the first non-Na value."""
-    return closes.ewm(span=period, adjust=False).mean()
+    # pyright sees ewm().mean() as DataFrame | Series (pandas-stubs is loose);
+    # cast narrows to the declared Series return. mypy flags the cast as
+    # redundant, so the ignore is required to keep mypy --strict quiet.
+    return cast(pd.Series, closes.ewm(span=period, adjust=False).mean())  # type: ignore[redundant-cast]
 
 
 @icontract.require(
@@ -145,7 +154,7 @@ def _slope(series: pd.Series, window: int) -> pd.Series:
             return float("nan")
         return float((arr.iloc[-1] - arr.iloc[0]) / (len(arr) - 1))
 
-    return series.rolling(window=window, min_periods=window).apply(_delta, raw=False)
+    return cast(pd.Series, series.rolling(window=window, min_periods=window).apply(_delta, raw=False))  # type: ignore[redundant-cast]
 
 
 # ---------------------------------------------------------------------------

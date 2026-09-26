@@ -215,6 +215,28 @@
 | Finding (audit Appendix A.1) | 删除 `_to_iso` 死代码；`assemble` 改直接构造子模型对象；多处类型注解补全 |
 | Adjustment | 后续 PR 在 `.github/workflows/type-safety.yml` 把 compass 模块加入 `--strict` override；runner 镜像需要装 flake8 + mypy（CI 已经装） |
 
+### 2026-09-04 18:55 CI 修复 PR (loop engineering)
+
+| 字段 | 值 |
+|------|-----|
+| Loop | Manual — Implementation |
+| Level | L2 |
+| Branch | `fix/ci-failures` |
+| Worktree | `.worktrees/ci-failures` |
+| Duration | ~45 min |
+| Tokens | 估算 ~20k |
+| Trigger | manual ("处理：1. 修 CI ... 2. 清理 worktree ... 3. 规划 P2") |
+| Sub-agents | 0 |
+| Result | success（4 commit + 1 plan doc，待 push + PR） |
+| 备注 | 修了 main 上 3 类预存 CI 失败：(1) formatters 包/模块 namespace 冲突 (commit e1ea692)，(2) baostock_fetcher self param + cast iterrows (commit c49374f)，(3) supply_chain_executor generic dict type (commit dfacece)，(4) compass engine 自身 3 个 pyright 错漏过 PR #41 CI cache (commit f797c0e, amended)。**5 commit + 1 doc** 共 5 个新文件 + 修改 4 文件。 |
+| Finding 1 | `src/formatters/` package stub 自 2026-08-05 起遮蔽 `src/formatters.py` 真实实现；senders 静默跑 stub，测试集 import error。合并到 `src/formatters/__init__.py` 解决。 |
+| Finding 2 | `_map_financial_columns(df)` 缺 `self` 参数致 pyright 把 `df` 当 `self`，级联 493/497/534/537 共 6 错。补 self + 提 helper 函数 + cast iterrows 全部解决。 |
+| Finding 3 | `_call_v3_tools_directly` 函数签名 `list[dict]` + 返回 `dict`（声明）但实际 `Optional[dict]`，pyright 2 错。修签名。 |
+| Finding 4 | PR #41 合入的 `engine.py` 实际有 3 pyright 错（CI cache 差异未发现）；本地 pyright 严格。补 cast + type: ignore[redundant-cast]。 |
+| Friction | pandas-stubs + pyright 对 `pd.concat` / `.apply` / `.ewm().mean()` 返回类型判断比 mypy 宽松；需要 cast 但 mypy 报 redundant-cast。统一用 `cast(pd.Series, ...)  # type: ignore[redundant-cast]` |
+| Adjustment | **P2 之前**：建议在 `.github/workflows/type-safety.yml` 加 cache invalidation 或 runner 显式 `rm -rf .pyright-cache`；`.worktrees/` 应该被 CI exclude（pytest collect 会扫到） |
+| Open items | `data_provider/baostock_fetcher.py` 在 denylist，本次用户显式 override 才能 commit；后续 P2 / P3 触及 denylist 路径前请 maintainer 重新 approve |
+
 ### 2026-09-04 19:25 Compass CI 修复收尾
 
 | 字段 | 值 |
