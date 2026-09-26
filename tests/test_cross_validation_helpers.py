@@ -134,6 +134,36 @@ class TestGetValidatorConfigGate(unittest.TestCase):
             ifind_mcp_timeout_seconds = 5.0
         self.assertEqual(len(h._build_sources(_Cfg())), 2)
 
+    def test_build_sources_with_mx_mcp_disabled_without_key(self):
+        """MX_MCP 装配 opt-in：开关 false 或缺 key 均不挂入（默认零回归）。"""
+        class _Cfg:
+            ifind_mcp_endpoint = None
+            ifind_mcp_token = None
+            ifind_mcp_timeout_seconds = 8.0
+            enable_mx_mcp = False
+            mx_mcp_api_key = "redacted"
+            mx_mcp_endpoint = "https://x"
+            mx_mcp_timeout_seconds = 30.0
+        names = [s.name for s in h._build_sources(_Cfg())]
+        self.assertNotIn("mx_mcp", names)
+
+    def test_build_sources_with_mx_mcp_enabled(self):
+        """MX_MCP 装配：开关 true 且 key 存在时挂入，name 标识明确。"""
+        class _Cfg:
+            ifind_mcp_endpoint = None
+            ifind_mcp_token = None
+            ifind_mcp_timeout_seconds = 8.0
+            enable_mx_mcp = True
+            mx_mcp_api_key = "redacted"
+            mx_mcp_endpoint = "https://x"
+            mx_mcp_timeout_seconds = 30.0
+        sources = h._build_sources(_Cfg())
+        names = [s.name for s in sources]
+        self.assertIn("mx_mcp", names)
+        # 第三源与第一/第二同列
+        self.assertEqual(names[0], "mx")
+        self.assertEqual(len(sources), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

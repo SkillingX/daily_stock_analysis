@@ -750,6 +750,14 @@ class Config:
     deep_research_cross_validate: bool = False  # 深度投研锚点双源验证开关
     mx_call_budget: int = 50  # 单次报告 MX 调用上限（控配额）
 
+    # === 东财 Choice MCP（妙想 MCP；opt-in，默认关；https://mxapi.eastmoney.com/mxds/mcp）===
+    # 作为 fundamental 数据第三 cross-validation 源（与 MX + iFinD 并列）；
+    # 默认关 → 零回归；启用需同时配 MX_MCP_API_KEY。
+    enable_mx_mcp: bool = False  # ENABLE_MX_MCP（总开关，默认关）
+    mx_mcp_endpoint: Optional[str] = None  # MX_MCP_ENDPOINT（默认官方 streamable-http）
+    mx_mcp_api_key: Optional[str] = None  # MX_MCP_API_KEY（运行时注入，禁止入库）
+    mx_mcp_timeout_seconds: float = 30.0  # MX_MCP_TIMEOUT_SECONDS
+
     # === AlphaSift optional stock screening integration ===
     alphasift_enabled: bool = False
     alphasift_install_spec: str = DEFAULT_ALPHASIFT_INSTALL_SPEC
@@ -1705,6 +1713,14 @@ class Config:
                 os.getenv("DEEP_RESEARCH_CROSS_VALIDATE"), default=False
             ),
             mx_call_budget=int(os.getenv("MX_CALL_BUDGET") or "50"),
+            enable_mx_mcp=parse_env_bool(
+                os.getenv("ENABLE_MX_MCP"), default=False
+            ),
+            mx_mcp_endpoint=os.getenv("MX_MCP_ENDPOINT") or "https://mxapi.eastmoney.com/mxds/mcp",
+            mx_mcp_api_key=os.getenv("MX_MCP_API_KEY") or None,
+            mx_mcp_timeout_seconds=float(
+                os.getenv("MX_MCP_TIMEOUT_SECONDS") or "30.0"
+            ),
             stock_index_remote_update_enabled=parse_env_bool(
                 os.getenv("STOCK_INDEX_REMOTE_UPDATE_ENABLED"),
                 default=True,

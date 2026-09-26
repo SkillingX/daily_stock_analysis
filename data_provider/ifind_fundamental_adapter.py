@@ -230,7 +230,7 @@ def _safe_float(value: Any) -> Optional[float]:
         if f != f:  # NaN
             return None
         return f
-    s = str(value).strip().replace(",", "").replace("%", "")
+    s = str(value).strip().replace(",", "").replace("%", "").replace("倍", "")
     if not s or s in ("-", "--", "nan", "None", "null"):
         return None
     s = s.replace("元", "")  # 移除单位词「元」（保留量级单位「亿/万」）

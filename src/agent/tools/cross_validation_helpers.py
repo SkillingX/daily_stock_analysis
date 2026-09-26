@@ -38,7 +38,7 @@ def reset_validator() -> None:
 
 
 def _build_sources(config: Any) -> List[SourceAdapter]:
-    """构建数据源列表：MX 主源 + iFinD 验证源（配置 endpoint+token 时）。"""
+    """构建数据源列表：MX 主源 + iFinD 验证源 + Choice MCP 验证源（按需启用）。"""
     from data_provider.mx_data_adapter import MXSource
 
     sources: List[SourceAdapter] = [
@@ -55,6 +55,18 @@ def _build_sources(config: Any) -> List[SourceAdapter]:
             timeout_seconds=float(getattr(config, "ifind_mcp_timeout_seconds", 8.0)),
         )
         sources.append(IfindSource(fetcher=fetcher))
+    # 第三验证源：东财 Choice MCP（妙想 MCP），opt-in，默认关 → 零回归
+    if getattr(config, "enable_mx_mcp", False) and getattr(
+        config, "mx_mcp_api_key", None
+    ):
+        from data_provider.mx_mcp_adapter import MxMcpFetcher, MxMcpSource
+
+        fetcher = MxMcpFetcher(
+            endpoint=getattr(config, "mx_mcp_endpoint", None),
+            api_key=getattr(config, "mx_mcp_api_key", None),
+            timeout_seconds=float(getattr(config, "mx_mcp_timeout_seconds", 30.0)),
+        )
+        sources.append(MxMcpSource(fetcher=fetcher))
     return sources
 
 
