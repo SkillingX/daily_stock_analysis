@@ -151,6 +151,13 @@ class TestSafeFloat(unittest.TestCase):
         self.assertAlmostEqual(_safe_float("1709亿元"), 1.709e11)
         self.assertAlmostEqual(_safe_float("199.0亿元"), 1.99e10)
 
+    def test_bei_suffix_for_pe_pb(self):
+        # PE/PB 倍数后缀（mx_mcp 实测返回「18.99倍」「6.155倍」）
+        self.assertAlmostEqual(_safe_float("18.99倍"), 18.99)
+        self.assertAlmostEqual(_safe_float("6.155倍"), 6.155)
+        # 元 + 倍复合罕见但兼容
+        self.assertAlmostEqual(_safe_float("18.99元倍"), 18.99)
+
     def test_invalid(self):
         self.assertIsNone(_safe_float(None))
         self.assertIsNone(_safe_float("abc"))

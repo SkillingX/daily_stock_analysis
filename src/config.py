@@ -1716,10 +1716,21 @@ class Config:
             enable_mx_mcp=parse_env_bool(
                 os.getenv("ENABLE_MX_MCP"), default=False
             ),
-            mx_mcp_endpoint=os.getenv("MX_MCP_ENDPOINT") or "https://mxapi.eastmoney.com/mxds/mcp",
-            mx_mcp_api_key=os.getenv("MX_MCP_API_KEY") or None,
-            mx_mcp_timeout_seconds=float(
-                os.getenv("MX_MCP_TIMEOUT_SECONDS") or "30.0"
+            # 区分 None（未设置 → 默认）与 ""（显式空串 → 透传，由 MxMcpFetcher 判定 available=False）。
+            # 与 MxMcpFetcher.__init__ 的 None/"" 契约对齐，避免「空串回落默认」的隐式耦合。
+            mx_mcp_endpoint=(
+                os.getenv("MX_MCP_ENDPOINT")
+                if os.getenv("MX_MCP_ENDPOINT") is not None
+                else "https://mxapi.eastmoney.com/mxds/mcp"
+            ),
+            mx_mcp_api_key=os.getenv("MX_MCP_API_KEY"),
+            # 用 parse_env_float 而非裸 float()：非法输入（"foo"）会 warn + fallback，不阻塞进程启动
+            mx_mcp_timeout_seconds=parse_env_float(
+                os.getenv("MX_MCP_TIMEOUT_SECONDS"),
+                default=30.0,
+                field_name="MX_MCP_TIMEOUT_SECONDS",
+                minimum=1.0,
+                maximum=300.0,
             ),
             stock_index_remote_update_enabled=parse_env_bool(
                 os.getenv("STOCK_INDEX_REMOTE_UPDATE_ENABLED"),

@@ -191,8 +191,15 @@ def _judge_numeric(
     primary: AnchorReading,
     secondary: AnchorReading,
     spec: AnchorSpec,
+    tertiary: Optional[AnchorReading] = None,
 ) -> AnchorVerification:
-    """数值模式判定：口径 → 报告期 → 容差。"""
+    """数值模式判定：口径 → 报告期 → 容差。
+
+    三源 majority vote（``tertiary`` 提供时）：
+      - (primary, secondary) 一致 → high（tertiary 仅记录一致性，不提升 confidence）
+      - (primary, secondary) 不一致 + tertiary 与任一方一致 → medium（少数派标记为 outlier）
+      - 三源两两都不一致 → low（3-way 真冲突）
+    """
     diff = _discrepancy_pct(primary.value, secondary.value)
 
     # 口径检查（仅 caliber_aware 且两源都带口径时启用）
@@ -229,20 +236,75 @@ def _judge_numeric(
             note=f"报告期不一致（{primary.period}/{secondary.period}），未做数值比对",
         )
 
-    # 容差比对
-    agreed = _within_tolerance(primary.value, secondary.value, spec.tolerance_pct)
-    if agreed:
+    # 容差比对（primary vs secondary）
+    agreed_ps = _within_tolerance(primary.value, secondary.value, spec.tolerance_pct)
+    if agreed_ps:
         return AnchorVerification(
             field=spec.field,
             value=primary.value,
             confidence="high",
-            sources=(primary.source, secondary.source),
+            sources=(
+                (primary.source, secondary.source, tertiary.source)
+                if tertiary is not None
+                else (primary.source, secondary.source)
+            ),
             agreed=True,
             discrepancy_pct=diff,
             caliber=primary.caliber,
             period=primary.period,
-            note="",
+            note="" if tertiary is None else f"3源一致（含{tertiary.source}）",
         )
+
+    # primary vs secondary 不一致：tertiary 提供时做 3-way majority
+    if tertiary is not None:
+        # tertiary 必带口径/期一致（来源同一查询）；不再做 caliber/period 二次判定
+        pt_ok = _within_tolerance(
+            primary.value, tertiary.value, spec.tolerance_pct
+        )
+        st_ok = _within_tolerance(
+            secondary.value, tertiary.value, spec.tolerance_pct
+        )
+        # majority vote：(primary, tertiary) 赢 / (secondary, tertiary) 赢 / 全不一致
+        if pt_ok and not st_ok:
+            outlier = secondary
+            agreed_value = primary.value
+        elif st_ok and not pt_ok:
+            outlier = primary
+            agreed_value = primary.value  # primary 仍是 primary，但 verdict 反映 tertiary 校正
+        else:
+            # 两两都不一致 → 3-way 真冲突
+            return AnchorVerification(
+                field=spec.field,
+                value=primary.value,
+                confidence="low",
+                sources=(primary.source, secondary.source, tertiary.source),
+                agreed=False,
+                discrepancy_pct=diff,
+                caliber=primary.caliber,
+                period=primary.period,
+                note=(
+                    f"3源不一致：{primary.source}={_round(primary.value)}/"
+                    f"{secondary.source}={_round(secondary.value)}/"
+                    f"{tertiary.source}={_round(tertiary.value)}，"
+                    f"差异{diff:.1f}%"
+                ),
+            )
+        return AnchorVerification(
+            field=spec.field,
+            value=agreed_value,
+            confidence="medium",
+            sources=(primary.source, secondary.source, tertiary.source),
+            agreed=False,
+            discrepancy_pct=diff,
+            caliber=primary.caliber,
+            period=primary.period,
+            note=(
+                f"{primary.source}+{tertiary.source} 一致，"
+                f"{outlier.source}={_round(outlier.value)} 为 outlier"
+            ),
+        )
+
+    # 2-source 不一致 → 旧行为不变
     return AnchorVerification(
         field=spec.field,
         value=primary.value,
@@ -258,17 +320,28 @@ def _judge_numeric(
 
 
 def _judge_direction(
-    primary: AnchorReading, secondary: AnchorReading, field: str
+    primary: AnchorReading,
+    secondary: AnchorReading,
+    field: str,
+    tertiary: Optional[AnchorReading] = None,
 ) -> AnchorVerification:
-    """方向+量级判定（主力净流入；两源算法口径不同）。"""
+    """方向+量级判定（主力净流入；两源算法口径不同）。
+
+    3-source 时（``tertiary`` 提供）：majority vote —— 同方向 ≥2 → high；否则 medium。
+    """
     diff = _discrepancy_pct(primary.value, secondary.value)
+    sources_pair = (
+        (primary.source, secondary.source, tertiary.source)
+        if tertiary is not None
+        else (primary.source, secondary.source)
+    )
     # 零值视为「无数据/收盘」，方向不可靠 → medium（避免双零误判 high）
     if primary.value == 0 or secondary.value == 0:
         return AnchorVerification(
             field=field,
             value=primary.value,
             confidence="medium",
-            sources=(primary.source, secondary.source),
+            sources=sources_pair,
             agreed=False,
             discrepancy_pct=diff,
             caliber="方向比对",
@@ -282,11 +355,43 @@ def _judge_direction(
 
     # 方向相反 = 真冲突
     if d_primary != d_secondary:
+        # 3-source 时：tertiary 偏向任一方 → medium；否则 → low（保持旧行为）
+        if tertiary is not None:
+            tertiary_word = "净流入" if tertiary.value > 0 else "净流出"
+            d_tertiary = tertiary.value > 0
+            if d_tertiary == d_primary:
+                return AnchorVerification(
+                    field=field,
+                    value=primary.value,
+                    confidence="medium",
+                    sources=sources_pair,
+                    agreed=False,
+                    discrepancy_pct=diff,
+                    caliber="方向比对",
+                    note=(
+                        f"方向冲突：{primary.source}+{tertiary.source}={primary_word}/"
+                        f"{secondary.source}={secondary_word}，secondary 为 outlier"
+                    ),
+                )
+            if d_tertiary == d_secondary:
+                return AnchorVerification(
+                    field=field,
+                    value=primary.value,
+                    confidence="medium",
+                    sources=sources_pair,
+                    agreed=False,
+                    discrepancy_pct=diff,
+                    caliber="方向比对",
+                    note=(
+                        f"方向冲突：{primary.source}={primary_word}/"
+                        f"{secondary.source}+{tertiary.source}={secondary_word}，primary 为 outlier"
+                    ),
+                )
         return AnchorVerification(
             field=field,
             value=primary.value,
             confidence="low",
-            sources=(primary.source, secondary.source),
+            sources=sources_pair,
             agreed=False,
             discrepancy_pct=diff,
             caliber="方向比对",
@@ -414,11 +519,13 @@ class CrossSourceValidator:
         if len(readings) == 1:
             return _judge_single(readings[0], spec.field)
 
-        # 双源及以上：primary = 第一个源，secondary = 第二个源
+        # 双源及以上：primary = readings[0]，secondary = readings[1]；
+        # tertiary = readings[2]（当存在时进入 3-way majority vote，否则 2-source 行为不变）。
         primary, secondary = readings[0], readings[1]
+        tertiary = readings[2] if len(readings) >= 3 else None
         if spec.mode == MODE_DIRECTION:
-            return _judge_direction(primary, secondary, spec.field)
-        return _judge_numeric(primary, secondary, spec)
+            return _judge_direction(primary, secondary, spec.field, tertiary=tertiary)
+        return _judge_numeric(primary, secondary, spec, tertiary=tertiary)
 
     def _collect(
         self, code: str, field: str, period: Optional[str]
