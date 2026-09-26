@@ -6,7 +6,7 @@ import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -31,12 +31,6 @@ router = APIRouter()
 _VALID_TASKS = {"watchlist", "market_review"}
 
 
-class ScheduleStatusResponse(BaseModel):
-    recent_logs: list[Dict[str, Any]]
-    next_runs: Dict[str, Optional[str]]
-    health: Dict[str, Any]
-
-
 @router.get(
     "/status",
     response_model=ScheduleStatusResponse,
@@ -52,7 +46,7 @@ def get_schedule_status(
     for entry in repo.get_recent(limit=10):
         recent_logs.append(entry.to_dict())
 
-    next_runs: Dict[str, Optional[str]] = {
+    next_runs: dict[str, Optional[str]] = {
         "watchlist": None,
         "market_review": None,
     }

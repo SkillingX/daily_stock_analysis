@@ -341,10 +341,22 @@ class MxMcpFetcher:
         self, code: str, field: str, period: Optional[str]
     ) -> Optional[AnchorReading]:
         """执行一次 Choice MCP 调用。"""
+        import inspect
         from mcp import ClientSession  # type: ignore
-        from mcp.client.streamable_http import (  # type: ignore
-            streamablehttp_client,
-        )
+        # mcp 2.x renamed ``streamablehttp_client`` → ``streamable_http_client`` AND changed
+        # the signature from ``(url, headers=..., timeout=...)`` to ``(url, *, http_client=...)``.
+        # Detect at runtime; pass headers + timeout via ``httpx.AsyncClient`` for 2.x, pass
+        # kwargs directly for 1.x legacy.
+        try:  # pragma: no cover — real MCP call path, CI not covered
+            from mcp.client.streamable_http import streamable_http_client  # type: ignore
+        except ImportError:  # pragma: no cover — 1.x legacy
+            from mcp.client.streamable_http import (  # type: ignore
+                streamablehttp_client,  # type: ignore[attr-defined]
+            )
+            streamable_http_client = streamablehttp_client  # type: ignore[assignment]
+
+        sig_params = inspect.signature(streamable_http_client).parameters
+        uses_http_client_kwarg = "http_client" in sig_params
 
         tool, query_tpl, keywords = _MX_MCP_ANCHOR_QUERIES[field]
         query = query_tpl.format(code=code, period=period or "")
@@ -352,12 +364,36 @@ class MxMcpFetcher:
         last_error: Optional[str] = None
         for attempt in range(2):
             try:
-                async with streamablehttp_client(
-                    self._endpoint, headers=headers, timeout=self._timeout
-                ) as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        result = await session.call_tool(tool, {"query": query})
+                if uses_http_client_kwarg:  # mcp >= 2.0
+                    import httpx as _httpx  # type: ignore
+
+                    async with streamable_http_client(
+                        self._endpoint,
+                        http_client=_httpx.AsyncClient(
+                            headers=headers, timeout=self._timeout
+                        ),  # type: ignore[arg-type] — httpx vs httpx2 namespace mismatch
+                    ) as streams:
+                        # mcp 2.x yields 2-tuple; 1.x legacy yielded 3-tuple.
+                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
+                            read, write, _ = streams  # type: ignore[misc]
+                        else:
+                            read, write = streams  # type: ignore[misc]
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            result = await session.call_tool(tool, {"query": query})
+                else:  # mcp < 2.0 (legacy)
+                    async with streamable_http_client(
+                        self._endpoint,
+                        headers=headers,  # type: ignore[call-arg] — 1.x legacy kwarg
+                        timeout=self._timeout,  # type: ignore[call-arg]
+                    ) as streams:
+                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
+                            read, write, _ = streams  # type: ignore[misc]
+                        else:
+                            read, write = streams  # type: ignore[misc]
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            result = await session.call_tool(tool, {"query": query})
                 # 解析在上下文管理器关闭后做，避免持连接做正则
                 content = getattr(result, "content", None) or []
                 raw_text = next(

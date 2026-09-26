@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, TypeAlias
 
 import icontract
 from pydantic import (
@@ -610,8 +610,8 @@ VALID_CAPACITY_CHANGE_FACTORS: frozenset[str] = frozenset({
     "外协加工",
 })
 
-DemandSignal = Literal[tuple(VALID_DEMAND_SIGNALS)]
-CapacityChangeFactor = Literal[tuple(VALID_CAPACITY_CHANGE_FACTORS)]
+DemandSignal: TypeAlias = Literal[tuple(VALID_DEMAND_SIGNALS)]  # type: ignore[valid-type]
+CapacityChangeFactor: TypeAlias = Literal[tuple(VALID_CAPACITY_CHANGE_FACTORS)]  # type: ignore[valid-type]
 
 
 class IndustryOutlookV3(BaseModel):
