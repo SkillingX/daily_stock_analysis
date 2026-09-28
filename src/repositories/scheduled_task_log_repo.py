@@ -6,8 +6,6 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import desc
-
 from src.storage import DatabaseManager, ScheduledTaskLog
 
 logger = logging.getLogger(__name__)
@@ -66,7 +64,7 @@ class ScheduledTaskLogRepository:
         session = self.db.get_session()
         try:
             query = session.query(ScheduledTaskLog).order_by(
-                desc(ScheduledTaskLog.scheduled_at)
+                ScheduledTaskLog.scheduled_at.desc()
             )
             if task_name:
                 query = query.filter(ScheduledTaskLog.task_name == task_name)
@@ -83,7 +81,7 @@ class ScheduledTaskLogRepository:
             return (
                 session.query(ScheduledTaskLog)
                 .filter(ScheduledTaskLog.task_name == task_name)
-                .order_by(desc(ScheduledTaskLog.scheduled_at))
+                .order_by(ScheduledTaskLog.scheduled_at.desc())
                 .first()
             )
         finally:

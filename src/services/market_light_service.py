@@ -7,8 +7,6 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from sqlalchemy import desc
-
 from src.core.market_review import MARKET_REVIEW_HISTORY_CODE, MARKET_REVIEW_REPORT_TYPE
 from src.market_analyzer import MarketAnalyzer
 from src.schemas.market_light import MarketLightSnapshot
@@ -67,7 +65,7 @@ def load_previous_snapshot(
                 AnalysisHistory.code == MARKET_REVIEW_HISTORY_CODE,
                 AnalysisHistory.report_type == MARKET_REVIEW_REPORT_TYPE,
             )
-            .order_by(desc(AnalysisHistory.created_at), desc(AnalysisHistory.id))
+            .order_by(AnalysisHistory.created_at.desc(), AnalysisHistory.id.desc())
         )
         if limit is not None:
             query = query.limit(limit)

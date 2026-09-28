@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
 import pandas as pd
-
 import icontract
 
 from data_provider import DataFetcherManager
@@ -114,11 +113,8 @@ def fetch_daily_ohlcv(
     if df is None or df.empty or not required.issubset(df.columns):
         raise ValueError(f"daily OHLCV data for {code} missing required columns (source={source})")
 
-    ohlcv = (
-        df.set_index(pd.to_datetime(df["date"]))
-        .sort_index()
-        .loc[lambda frame: ~frame.index.duplicated(keep="last")]
-    )
+    df_indexed = df.set_index(pd.to_datetime(df["date"])).sort_index()
+    ohlcv = df_indexed.loc[~df_indexed.index.duplicated(keep="last")]
     for col in ("open", "high", "low", "close", "volume"):
         if col in ohlcv.columns:
             ohlcv[col] = ohlcv[col].astype(float)
