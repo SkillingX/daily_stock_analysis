@@ -113,7 +113,7 @@ def build_six_dim(ctx: SharedContext, data_dim_payload: Optional[Dict[str, Any]]
         scoring_version=framework_score.version,
         warnings=list(framework_score.warnings),
         narrative=(
-            f"六维总分 {framework.dimension_total:.1f}/100（v{framework.scoring_version}），"
+            f"六维总分 {framework.dimension_total:.1f}/100（{framework.scoring_version}），"
             f"产业链与基本面合计权重 50%，技术面 10%（刻意降权）。"
         ),
     )

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   deepResearchApi,
+  type DeepResearchGuardrailEvent,
   type DeepResearchReportDetail,
 } from '../api/deepResearch';
 
@@ -13,7 +14,41 @@ export interface DeepResearchProgressStep {
   tool?: string;
   display_name?: string;
   success?: boolean;
+  /** 双轨引擎维度事件（dim_start/dim_done）携带 */
+  dim?: string;
+  status?: string;
 }
+
+/** 双轨引擎 11 维度（与后端 DIM_IDS 严格对齐，徽章展示用） */
+export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
+  { id: 'data', label: '数据' },
+  { id: 'intel', label: '情报' },
+  { id: 'supply_chain', label: '产业链' },
+  { id: 'six_dim', label: '六维' },
+  { id: 'bayesian', label: '贝叶斯' },
+  { id: 'scenarios', label: '情景' },
+  { id: 'conclusion', label: '结论' },
+  { id: 'plan', label: '计划' },
+  { id: 'signal', label: '信号' },
+  { id: 'phase', label: '阶段' },
+  { id: 'history', label: '历史' },
+];
+
+export type DimRunStatus = 'pending' | 'running' | 'ok' | 'degraded';
+
+export type DimStatusMap = Record<string, DimRunStatus>;
+
+/** 双轨 done 事件的增量字段（legacy 引擎为空） */
+export interface DualTrackExtras {
+  engine?: 'legacy' | 'dual_track';
+  dimensions?: Record<string, { status?: string; degraded_reason?: string }>;
+  guardrailEvents: DeepResearchGuardrailEvent[];
+  dimsDegraded: string[];
+}
+
+const INITIAL_DIM_STATUSES: DimStatusMap = Object.fromEntries(
+  DUAL_TRACK_DIMS.map((d) => [d.id, 'pending' as const]),
+);
 
 /**
  * 深度投研报告生成 hook（表单流：一次性 SSE 生成）。
@@ -22,6 +57,7 @@ export interface DeepResearchProgressStep {
  * 增强点：
  * - AbortController：用户可取消（cancel）。
  * - 心跳 watchdog：90s 内无任何事件（含 heartbeat）视为断线 → error。
+ * - 双轨引擎维度徽章：dim_start/dim_done 事件维护 dimStatuses。
  * - 状态机：idle → generating → done | error。
  *
  * 注意：断线不做自动重连（一次性生成，重连=重复生成浪费）。断线提示用户
@@ -33,6 +69,11 @@ export function useDeepResearch() {
   const [report, setReport] = useState<DeepResearchReportDetail | null>(null);
   const [reportId, setReportId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dimStatuses, setDimStatuses] = useState<DimStatusMap>(INITIAL_DIM_STATUSES);
+  const [dualTrack, setDualTrack] = useState<DualTrackExtras>({
+    guardrailEvents: [],
+    dimsDegraded: [],
+  });
 
   const abortRef = useRef<AbortController | null>(null);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -66,6 +107,8 @@ export function useDeepResearch() {
       setReport(null);
       setReportId(null);
       setError(null);
+      setDimStatuses(INITIAL_DIM_STATUSES);
+      setDualTrack({ guardrailEvents: [], dimsDegraded: [] });
 
       const ac = new AbortController();
       abortRef.current = ac;
@@ -105,6 +148,11 @@ export function useDeepResearch() {
               message?: string;
               error?: string;
               success?: boolean;
+              dim?: string;
+              engine?: 'legacy' | 'dual_track';
+              dimensions?: Record<string, { status?: string; degraded_reason?: string }>;
+              guardrail_events?: DeepResearchGuardrailEvent[];
+              dims_degraded?: string[];
             };
             try {
               event = JSON.parse(line.slice(6));
@@ -124,7 +172,26 @@ export function useDeepResearch() {
                 status: event.status,
                 quality_score: event.quality_score,
                 missing_layers: event.missing_layers || [],
+                engine: event.engine,
               });
+              if (event.engine === 'dual_track') {
+                setDualTrack({
+                  engine: event.engine,
+                  dimensions: event.dimensions,
+                  guardrailEvents: event.guardrail_events || [],
+                  dimsDegraded: event.dims_degraded || [],
+                });
+                // done 后把仍在 running/pending 的维度收敛为最终状态
+                if (event.dimensions) {
+                  setDimStatuses((prev) => {
+                    const next = { ...prev };
+                    for (const [dimId, payload] of Object.entries(event.dimensions!)) {
+                      next[dimId] = payload?.status === 'degraded' ? 'degraded' : 'ok';
+                    }
+                    return next;
+                  });
+                }
+              }
               if (rid) {
                 setStatus('done');
               } else {
@@ -145,7 +212,25 @@ export function useDeepResearch() {
               continue; // 心跳仅用于重置 watchdog，不入 steps
             }
 
-            // thinking / tool_start / tool_done / generating → 进度步骤
+            // 双轨维度徽章事件（dim_start/dim_done）
+            if ((event.type === 'dim_start' || event.type === 'dim_done') && event.dim) {
+              const dimId = event.dim;
+              setDimStatuses((prev) =>
+                prev[dimId] === undefined
+                  ? prev
+                  : {
+                      ...prev,
+                      [dimId]:
+                        event.type === 'dim_start'
+                          ? 'running'
+                          : event.status === 'degraded'
+                            ? 'degraded'
+                            : 'ok',
+                    },
+              );
+            }
+
+            // thinking / tool_start / tool_done / generating / dim_* → 进度步骤
             setProgressSteps((prev) => [...prev, event]);
           }
 
@@ -191,6 +276,8 @@ export function useDeepResearch() {
     setReport(null);
     setReportId(null);
     setError(null);
+    setDimStatuses(INITIAL_DIM_STATUSES);
+    setDualTrack({ guardrailEvents: [], dimsDegraded: [] });
   }, [clearWatchdog]);
 
   // 卸载时清理
@@ -203,5 +290,16 @@ export function useDeepResearch() {
     };
   }, [clearWatchdog]);
 
-  return { status, progressSteps, report, reportId, error, generate, cancel, reset };
+  return {
+    status,
+    progressSteps,
+    report,
+    reportId,
+    error,
+    dimStatuses,
+    dualTrack,
+    generate,
+    cancel,
+    reset,
+  };
 }

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from src.core.trading_calendar import (
+    MarketPhase,
     get_effective_trading_date,
     infer_market_phase,
     is_market_open,
@@ -38,8 +39,8 @@ def build_phase_dim(ctx: SharedContext) -> PhaseDim:
     limitations: list[str] = []
     try:
         market_open = is_market_open("cn", today)
-        phase_ctx = infer_market_phase("cn", ctx.stock_code, datetime.now())
-        phase_label = getattr(phase_ctx, "phase", None) or "unknown"
+        phase = infer_market_phase("cn", datetime.now())
+        phase_label = phase.value if isinstance(phase, MarketPhase) else str(phase)
         next_trading = get_effective_trading_date("cn", today)
     except Exception as exc:  # noqa: BLE001 - 日历异常回退本地兜底
         market_open, phase_label = _fallback_session(today)
@@ -49,7 +50,12 @@ def build_phase_dim(ctx: SharedContext) -> PhaseDim:
         while next_trading.weekday() >= 5:
             next_trading += timedelta(days=1)
         limitations.append(f"交易日历数据源不可用，已按本地日期兜底（{exc}）")
-    in_session = market_open and phase_label in ("continuous", "open", "auction")
+    # 盘中 = 连续竞价/午间休市/收盘集合竞价（均可下单，口径保守）
+    in_session = market_open and phase_label in (
+        MarketPhase.INTRADAY.value,
+        MarketPhase.LUNCH_BREAK.value,
+        MarketPhase.CLOSING_AUCTION.value,
+    )
 
     if in_session:
         window = "盘中（交易时段，观点仅供收盘后复核）"

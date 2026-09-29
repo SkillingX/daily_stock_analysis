@@ -3192,21 +3192,21 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "DEEP_RESEARCH_ENGINE": {
         "title": "Deep Research Engine",
-        "description": "深度投研报告引擎：legacy=单循环（默认，稳定）；dual_track=双轨多维度（短线六件套×长线五段式+护栏+六维评分锚，见 docs/deep-research-dual-track-agent-requirements.md）。",
+        "description": "深度投研报告引擎：dual_track=双轨多维度（默认：短线六件套×长线五段式+护栏+六维评分锚，见 docs/deep-research-dual-track-agent-requirements.md）；legacy=单循环（回滚用）。",
         "category": "system",
         "data_type": "string",
         "ui_control": "select",
         "is_sensitive": False,
         "is_required": False,
         "is_editable": True,
-        "default_value": "legacy",
+        "default_value": "dual_track",
         "options": ["legacy", "dual_track"],
         "validation": {"enum": ["legacy", "dual_track"]},
         "display_order": 48,
         "help_key": "settings.system.market_review",
         "examples": [
-            "DEEP_RESEARCH_ENGINE=legacy",
             "DEEP_RESEARCH_ENGINE=dual_track",
+            "DEEP_RESEARCH_ENGINE=legacy",
         ],
         "docs": [
             {

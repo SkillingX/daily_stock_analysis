@@ -231,7 +231,7 @@ v1 只说了"复用 scoring"，但投研上缺三个机器定义，LLM 手填会
 | 改造 `deep_research_executor.py` | legacy 引擎保留于 `DEEP_RESEARCH_ENGINE=legacy` 分支内，作为回滚路径 |
 | 改造 `deep_research_validator.py` | 改为两层：逐维度契约校验（各维度独立）+ 成文后结构校验（十一章骨架） |
 | system_prompt.md | 拆分为维度 prompt 目录；旧文件仅 legacy 引擎使用 |
-| 配置项 | `DEEP_RESEARCH_ENGINE`（`dual_track`/`legacy`，P1 默认 `legacy`，P2 验证后翻转为 `dual_track`）；`DEEP_RESEARCH_DIM_MAX_STEPS`（探索型，默认 8）。已决策（§10）：LLM 润色层不实现，`DEEP_RESEARCH_SYNTH_NARRATIVE` 取消 |
+| 配置项 | `DEEP_RESEARCH_ENGINE`（`dual_track`/`legacy`，**默认 `dual_track`（P2 已翻转）**，`legacy` 保留回滚）；`DEEP_RESEARCH_DIM_MAX_STEPS`（探索型，默认 8）。已决策（§10）：LLM 润色层不实现，`DEEP_RESEARCH_SYNTH_NARRATIVE` 取消 |
 
 ### 7.2 前端（DeepResearchPage）
 

@@ -150,11 +150,15 @@ def run_dual_track(
     def emit_dim(dim_id: str, status: str) -> None:
         _emit(progress_callback, {"type": "dim_done", "dim": dim_id, "status": status})
 
+    def start_dim(dim_id: str) -> None:
+        _emit(progress_callback, {"type": "dim_start", "dim": dim_id})
+
     # ---- 阶段 0 + 前置 S2 ----
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
     ctx = build_shared_context(stock_code, stock_name)
 
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力/筹码）..."})
+    start_dim("data")
     data_dim = build_data_dim(ctx)
     dims["data"] = data_dim
     emit_dim("data", data_dim.status)
@@ -176,15 +180,20 @@ def run_dual_track(
 
     steps_total = 0
     with ThreadPoolExecutor(max_workers=2) as pool:
+        start_dim("intel")
         fut_intel = pool.submit(intel_worker)
+        start_dim("supply_chain")
         fut_sc = pool.submit(supply_chain_worker)
 
+        start_dim("phase")
         phase_dim = build_phase_dim(ctx)
         dims["phase"] = phase_dim
         emit_dim("phase", phase_dim.status)
+        start_dim("history")
         history_dim = build_history_dim(ctx)
         dims["history"] = history_dim
         emit_dim("history", history_dim.status)
+        start_dim("six_dim")
         six_dim = build_six_dim(ctx, data_dim.model_dump())
         dims["six_dim"] = six_dim
         emit_dim("six_dim", six_dim.status)
@@ -218,6 +227,7 @@ def run_dual_track(
     evidence_dicts = [
         e.model_dump() for e in getattr(dims["intel"], "evidence_items", [])
     ]
+    start_dim("bayesian")
     bayesian_dim = build_bayesian_dim(
         dims["six_dim"].model_dump(), evidence_dicts
     )
@@ -227,6 +237,7 @@ def run_dual_track(
     # ---- 波次 3：L5 → L3 → S4 → S1 ----
     _emit(progress_callback, {"type": "thinking", "step": 3, "message": "合成情景/结论/计划/信号（规则 + 护栏）..."})
     current_price = ctx.quote.get("price")
+    start_dim("scenarios")
     scenarios_dim = build_scenarios_dim(ctx, float(current_price) if isinstance(current_price, (int, float)) else None)
     facts_scen = scenarios_dim.model_dump()
     scenarios_dim = scenarios_dim.model_copy(
@@ -239,6 +250,7 @@ def run_dual_track(
     dims["scenarios"] = scenarios_dim
     emit_dim("scenarios", scenarios_dim.status)
 
+    start_dim("conclusion")
     conclusion_dim = build_conclusion_dim(
         ctx, dims["six_dim"].model_dump(), dims["bayesian"].model_dump(), dims["scenarios"].model_dump()
     )
@@ -254,6 +266,7 @@ def run_dual_track(
     position_suggestion = (
         getattr(dims["bayesian"].bayesian, "position_suggestion", None) or "观察"
     )
+    start_dim("plan")
     plan_dim = build_plan_dim(ctx, dims["data"].model_dump(), position_suggestion)
     facts_plan = plan_dim.model_dump()
     plan_dim = plan_dim.model_copy(
@@ -262,6 +275,7 @@ def run_dual_track(
     dims["plan"] = plan_dim
     emit_dim("plan", plan_dim.status)
 
+    start_dim("signal")
     signal_dim = build_signal_dim(
         ctx,
         dims["conclusion"].model_dump(),

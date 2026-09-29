@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   FileText,
+  FileJson,
   Download,
   Copy,
   RefreshCw,
@@ -13,9 +14,10 @@ import {
 } from 'lucide-react';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
-import { useDeepResearch } from '../hooks/useDeepResearch';
+import { useDeepResearch, DUAL_TRACK_DIMS } from '../hooks/useDeepResearch';
 import {
   deepResearchApi,
+  type DeepResearchGuardrailEvent,
   type DeepResearchReportItem,
   type DeepResearchReportDetail,
 } from '../api/deepResearch';
@@ -24,6 +26,24 @@ import { cn } from '../utils/cn';
 interface SelectedStock {
   code: string;
   name?: string;
+}
+
+/** 双轨引擎维度产物的本地视图（新生成报告来自 done 事件，历史报告来自 /dims 端点） */
+interface DimsInfo {
+  guardrailEvents: DeepResearchGuardrailEvent[];
+  dimsDegraded: string[];
+}
+
+const DIM_ID_SET = new Set(DUAL_TRACK_DIMS.map((d) => d.id));
+
+function isDualTrackDetail(detail: DeepResearchReportDetail | null): boolean {
+  return detail?.engine === 'dual_track';
+}
+
+/** 历史列表项是否双轨报告（missing_layers 全部为空或维度 id；列表无 engine 字段，此为启发式） */
+function isDualTrackItem(item: DeepResearchReportItem): boolean {
+  const ml = item.missing_layers;
+  return Array.isArray(ml) && ml.every((x) => DIM_ID_SET.has(x));
 }
 
 /**
@@ -45,10 +65,24 @@ export function DeepResearchPage() {
   const [pdfLoading, setPdfLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const { status, progressSteps, report, reportId, error, generate, cancel, reset } =
+  const { status, progressSteps, report, reportId, error, dimStatuses, dualTrack, generate, cancel, reset } =
     useDeepResearch();
 
+  const [dimsInfo, setDimsInfo] = useState<DimsInfo | null>(null);
+
   const isGenerating = status === 'generating';
+
+  // 当前展示的维度信息：新生成报告用 done 事件字段，历史报告用 dimsInfo
+  const effectiveDims: DimsInfo | null = isDualTrackDetail(report)
+    ? {
+        guardrailEvents: dualTrack.guardrailEvents,
+        dimsDegraded: dualTrack.dimsDegraded,
+      }
+    : dimsInfo;
+
+  const dimsOkCount = effectiveDims
+    ? DUAL_TRACK_DIMS.length - effectiveDims.dimsDegraded.length
+    : 0;
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -80,6 +114,7 @@ export function DeepResearchPage() {
     }
     setInputError(null);
     setCurrentDetail(null);
+    setDimsInfo(null);
     reset();
     void generate(selectedStock.code, selectedStock.name);
   }, [selectedStock, generate, reset]);
@@ -87,8 +122,21 @@ export function DeepResearchPage() {
   const handleSelectHistory = useCallback(
     async (id: string) => {
       try {
-        const detail = await deepResearchApi.getReport(id);
+        const [detail, dims] = await Promise.all([
+          deepResearchApi.getReport(id),
+          deepResearchApi.getDims(id),
+        ]);
         setCurrentDetail(detail);
+        setDimsInfo(
+          dims
+            ? {
+                guardrailEvents: dims.guardrail_events || [],
+                dimsDegraded: Object.entries(dims.dimensions || {})
+                  .filter(([, v]) => (v as { status?: string })?.status === 'degraded')
+                  .map(([k]) => k),
+              }
+            : null,
+        );
         reset();
         setSidebarOpen(false);
       } catch {
@@ -98,6 +146,23 @@ export function DeepResearchPage() {
     [reset],
   );
 
+  const handleDownloadDimsJson = useCallback(async (id: string) => {
+    const dims = await deepResearchApi.getDims(id);
+    if (!dims) {
+      window.alert('该报告无维度产物（legacy 引擎报告）');
+      return;
+    }
+    const blob = new Blob([JSON.stringify(dims, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${id}_dims.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, []);
+
   const handleDelete = useCallback(
     async (id: string) => {
       try {
@@ -105,6 +170,7 @@ export function DeepResearchPage() {
         await loadHistory();
         if (currentDetail?.id === id) {
           setCurrentDetail(null);
+          setDimsInfo(null);
         }
       } catch {
         // ignore
@@ -173,10 +239,17 @@ export function DeepResearchPage() {
               <div className="mt-0.5 truncate text-xs text-muted-text">
                 {item.stock_code} · {item.created_at?.slice(0, 16).replace('T', ' ')}
               </div>
-              {item.status === 'partial' && (
-                <span className="mt-1 inline-block rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">
-                  不完整
+              {isDualTrackItem(item) ? (
+                <span className="mt-1 inline-block rounded bg-cyan/15 px-1.5 py-0.5 text-[10px] text-cyan">
+                  维度 {DUAL_TRACK_DIMS.length - (item.missing_layers?.length ?? 0)}/
+                  {DUAL_TRACK_DIMS.length}
                 </span>
+              ) : (
+                item.status === 'partial' && (
+                  <span className="mt-1 inline-block rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">
+                    不完整
+                  </span>
+                )
               )}
             </div>
             <span
@@ -282,7 +355,31 @@ export function DeepResearchPage() {
             <div className="space-y-4">
               <div className="flex items-center gap-3 text-secondary-text">
                 <Loader2 className="h-5 w-5 animate-spin text-cyan" />
-                <span>正在执行五层穿透深度分析，预计 2-5 分钟，请勿关闭页面...</span>
+                <span>正在执行双轨多维深度分析（短线六件套 × 长线五段式），请勿关闭页面...</span>
+              </div>
+              {/* 双轨维度徽章进度 */}
+              <div className="flex flex-wrap gap-1.5">
+                {DUAL_TRACK_DIMS.map((d) => {
+                  const st = dimStatuses[d.id] ?? 'pending';
+                  return (
+                    <span
+                      key={d.id}
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px]',
+                        st === 'ok' && 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400',
+                        st === 'degraded' &&
+                          'border-amber-500/30 bg-amber-500/10 text-amber-400',
+                        st === 'running' && 'border-cyan/30 bg-cyan/10 text-cyan',
+                        st === 'pending' && 'border-white/10 bg-white/2 text-muted-text',
+                      )}
+                    >
+                      {st === 'running' && <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />}
+                      {st === 'ok' && <span aria-hidden="true">✓</span>}
+                      {st === 'degraded' && <AlertTriangle className="h-3 w-3" aria-hidden="true" />}
+                      {d.label}
+                    </span>
+                  );
+                })}
               </div>
               <details className="rounded-lg border border-white/8 bg-white/2 p-3" open>
                 <summary className="cursor-pointer text-sm font-medium text-muted-text">
@@ -297,6 +394,9 @@ export function DeepResearchPage() {
                         {s.type === 'tool_start' && `调用工具：${s.display_name || s.tool}`}
                         {s.type === 'tool_done' && `完成：${s.display_name || s.tool}`}
                         {s.type === 'generating' && s.message}
+                        {s.type === 'dim_start' && `维度启动：${s.dim}`}
+                        {s.type === 'dim_done' &&
+                          `维度完成：${s.dim}${s.status === 'degraded' ? '（降级）' : ''}`}
                       </span>
                     </div>
                   ))}
@@ -324,7 +424,7 @@ export function DeepResearchPage() {
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-center text-muted-text">
               <FileText className="h-10 w-10 opacity-40" />
               <p>输入 A 股代码或名称，生成机构级深度投研报告</p>
-              <p className="text-xs">五层穿透：宏观 → 产业 → 财务 → 估值 → 博弈</p>
+              <p className="text-xs">双轨结构：短线六件套 × 长线五段式，六维评分锚 + 规则决策护栏</p>
             </div>
           )}
 
@@ -337,6 +437,56 @@ export function DeepResearchPage() {
                   <span>
                     以下层次分析不充分：{displayReport.missing_layers.join('、')}
                   </span>
+                </div>
+              )}
+              {/* 双轨报告：维度完成度 + 护栏事件折叠区 */}
+              {effectiveDims && (
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="rounded bg-cyan/15 px-2 py-0.5 text-cyan">
+                      双轨引擎 · 维度 {dimsOkCount}/{DUAL_TRACK_DIMS.length}
+                    </span>
+                    {effectiveDims.dimsDegraded.length > 0 && (
+                      <span className="rounded bg-amber-500/15 px-2 py-0.5 text-amber-400">
+                        降级：{effectiveDims.dimsDegraded.join('、')}
+                      </span>
+                    )}
+                    <span className="rounded bg-white/8 px-2 py-0.5 text-muted-text">
+                      护栏触发 {effectiveDims.guardrailEvents.length} 条
+                    </span>
+                    <span className="text-muted-text">
+                      数据截至：{displayReport.created_at?.slice(0, 16).replace('T', ' ') ?? '见报告头部'}
+                    </span>
+                  </div>
+                  {effectiveDims.guardrailEvents.length > 0 && (
+                    <details className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
+                      <summary className="cursor-pointer text-sm font-medium text-amber-300">
+                        决策护栏事件表（{effectiveDims.guardrailEvents.length}）
+                      </summary>
+                      <div className="mt-2 overflow-x-auto text-xs">
+                        <table className="w-full text-left">
+                          <thead>
+                            <tr className="text-muted-text">
+                              <th className="py-1 pr-3">规则</th>
+                              <th className="py-1 pr-3">维度</th>
+                              <th className="py-1 pr-3">处置</th>
+                              <th className="py-1">理由</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {effectiveDims.guardrailEvents.map((e, i) => (
+                              <tr key={i} className="border-t border-white/5 text-secondary-text">
+                                <td className="py-1 pr-3 font-mono">{e.rule_id}</td>
+                                <td className="py-1 pr-3">{e.dim}</td>
+                                <td className="py-1 pr-3">{e.action}</td>
+                                <td className="py-1">{e.reason}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
               <div className="flex flex-wrap items-center gap-2">
@@ -353,6 +503,22 @@ export function DeepResearchPage() {
                     )}
                     {pdfLoading ? '生成 PDF...' : '下载 PDF'}
                   </button>
+                )}
+                {displayId && effectiveDims && (
+                  <>
+                    <button
+                      onClick={() => deepResearchApi.downloadMarkdown(displayId)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-sm text-secondary-text hover:bg-white/5"
+                    >
+                      <Download className="h-4 w-4" /> 下载 Markdown
+                    </button>
+                    <button
+                      onClick={() => handleDownloadDimsJson(displayId)}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-sm text-secondary-text hover:bg-white/5"
+                    >
+                      <FileJson className="h-4 w-4" /> 维度 JSON
+                    </button>
+                  </>
                 )}
                 <button
                   onClick={() => handleCopy(displayReport.markdown)}
