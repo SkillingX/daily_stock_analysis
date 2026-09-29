@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.config import get_config
@@ -35,6 +36,25 @@ _REPORT_ID_PATTERN = "{code}_{ts:%Y%m%d%H%M}"
 
 # executor 单例缓存（config 不常变；LLMToolAdapter/ToolRegistry 较重，避免每次重建）
 _executor_instance: Optional[Any] = None
+
+# 双轨引擎 LLM adapter 单例（同样较重）
+_dual_track_adapter: Optional[Any] = None
+
+
+def _get_dual_track_adapter() -> Any:
+    """获取（缓存的）双轨引擎 LLM adapter。"""
+    global _dual_track_adapter
+    if _dual_track_adapter is None:
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        _dual_track_adapter = LLMToolAdapter(get_config())
+    return _dual_track_adapter
+
+
+def get_deep_research_engine() -> str:
+    """当前深度投研引擎：legacy | dual_track（默认 legacy，见 config_registry）。"""
+    engine = str(getattr(get_config(), "deep_research_engine", "legacy") or "legacy")
+    return engine if engine in ("legacy", "dual_track") else "legacy"
 
 
 class DeepResearchInputError(ValueError):
@@ -144,13 +164,46 @@ class DeepResearchService:
         report_dir = get_deep_research_dir()
         md_path = report_dir / f"{report_id}.md"
 
-        executor = _get_executor()
-        result = executor.generate(
-            stock_code=code,
-            stock_name=name,
-            report_type=report_type,
-            progress_callback=progress_callback,
-        )
+        # 引擎分发：dual_track=双轨多维度；legacy=单循环（默认）
+        dims_payload: Optional[Dict[str, Any]] = None
+        guardrail_events: List[Any] = []
+        if get_deep_research_engine() == "dual_track":
+            _emit = progress_callback or (lambda _e: None)
+            _emit({"type": "thinking", "step": 0, "message": "使用双轨多维度引擎生成..."})
+            from src.agent.deep_research.orchestrator import run_dual_track
+
+            dt_result = run_dual_track(
+                stock_code=code,
+                stock_name=name,
+                llm_adapter=_get_dual_track_adapter(),
+                progress_callback=progress_callback,
+                explore_max_steps=int(
+                    getattr(get_config(), "deep_research_dim_max_steps", 8) or 8
+                ),
+            )
+            result = SimpleNamespace(
+                success=dt_result.success,
+                status=dt_result.status,
+                markdown=dt_result.markdown,
+                quality_score=dt_result.quality_score,
+                missing_layers=dt_result.degraded_dims,
+                total_steps=dt_result.total_steps,
+                total_tokens=dt_result.total_tokens,
+                provider=dt_result.provider,
+                error=dt_result.error,
+            )
+            dims_payload = dt_result.dims_payload
+            guardrail_events = [
+                e.model_dump() for e in dt_result.guardrail_events
+            ]
+        else:
+            executor = _get_executor()
+            result = executor.generate(
+                stock_code=code,
+                stock_name=name,
+                report_type=report_type,
+                progress_callback=progress_callback,
+            )
 
         # 写 Markdown 文件（即使 partial 也写，保证有产物）
         markdown = result.markdown or ""
@@ -161,6 +214,29 @@ class DeepResearchService:
                 write_ok = True
             except OSError as exc:
                 logger.error("[DeepResearch] 写报告文件失败 %s: %s", md_path, exc)
+
+        # 双轨引擎：维度 JSON 产物落盘（复算/钻取用）
+        if write_ok and dims_payload is not None:
+            dims_path = report_dir / f"{report_id}_dims.json"
+            try:
+                import json
+
+                dims_path.write_text(
+                    json.dumps(
+                        {
+                            "report_id": report_id,
+                            "engine": "dual_track",
+                            "guardrail_events": guardrail_events,
+                            "dimensions": dims_payload,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("[DeepResearch] 写维度产物失败 %s: %s", dims_path, exc)
 
         # 写元数据到 SQLite（md_path 用绝对路径字符串）
         if write_ok:
@@ -179,20 +255,25 @@ class DeepResearchService:
             # 清理超额（事务内删元数据，事务外删文件）
             self._prune_and_clean_files(_max_reports())
 
+        done_event: Dict[str, Any] = {
+            "type": "done",
+            "report_id": report_id if write_ok else None,
+            "status": result.status,
+            "quality_score": result.quality_score,
+            "missing_layers": result.missing_layers,
+            "markdown": markdown,
+            "error": result.error if not result.success else None,
+        }
+        if dims_payload is not None:
+            # 增量字段：旧前端可忽略（兼容 §7.3）
+            done_event["engine"] = "dual_track"
+            done_event["dimensions"] = dims_payload
+            done_event["guardrail_events"] = guardrail_events
+            done_event["dims_degraded"] = list(result.missing_layers)
         if progress_callback:
-            progress_callback(
-                {
-                    "type": "done",
-                    "report_id": report_id if write_ok else None,
-                    "status": result.status,
-                    "quality_score": result.quality_score,
-                    "missing_layers": result.missing_layers,
-                    "markdown": markdown,
-                    "error": result.error if not result.success else None,
-                }
-            )
+            progress_callback(done_event)
 
-        return {
+        return_dict: Dict[str, Any] = {
             "report_id": report_id if write_ok else None,
             "stock_code": code,
             "stock_name": name,
@@ -206,6 +287,11 @@ class DeepResearchService:
             "provider": result.provider,
             "error": result.error if not result.success else None,
         }
+        if dims_payload is not None:
+            return_dict["engine"] = "dual_track"
+            return_dict["dimensions"] = dims_payload
+            return_dict["guardrail_events"] = guardrail_events
+        return return_dict
 
     # ------------------------------------------------------------------
     # 查询
@@ -237,16 +323,32 @@ class DeepResearchService:
         data["markdown"] = markdown
         return data
 
+    def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:
+        """双轨维度 JSON 产物（legacy 报告无产物返回 None）。"""
+        record = get_db().get_deep_research_report(report_id)
+        if record is None:
+            return None
+        dims_path = get_deep_research_dir() / f"{report_id}_dims.json"
+        try:
+            if dims_path.exists():
+                import json
+
+                return json.loads(dims_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("[DeepResearch] 读取维度产物失败 %s: %s", dims_path, exc)
+        return None
+
     # ------------------------------------------------------------------
     # 删除
     # ------------------------------------------------------------------
 
     def delete_report(self, report_id: str) -> bool:
-        """删除报告（元数据 + .md + .pdf 文件）。返回是否删除成功。"""
+        """删除报告（元数据 + .md + .pdf + 维度产物文件）。返回是否删除成功。"""
         paths = get_db().delete_deep_research_report(report_id)
         if paths is None:
             return False
         # 删文件（事务外，失败只记日志不影响元数据删除）
+        extra = str(get_deep_research_dir() / f"{report_id}_dims.json")
         for key in ("md_path", "pdf_path"):
             p = paths.get(key)
             if p:
@@ -254,6 +356,10 @@ class DeepResearchService:
                     Path(p).unlink(missing_ok=True)
                 except OSError as exc:
                     logger.warning("[DeepResearch] 删除文件失败 %s: %s", p, exc)
+        try:
+            Path(extra).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("[DeepResearch] 删除维度产物失败 %s: %s", extra, exc)
         logger.info("[DeepResearch] 已删除报告 %s", report_id)
         return True
 

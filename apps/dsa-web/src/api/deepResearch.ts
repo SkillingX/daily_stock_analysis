@@ -31,6 +31,15 @@ export interface DeepResearchReportDetail extends DeepResearchReportItem {
   total_tokens?: number;
   provider?: string;
   error?: string;
+  engine?: 'legacy' | 'dual_track';
+}
+
+/** 双轨引擎 done 事件的护栏事件（规则 id / 维度 / 处置 / 理由） */
+export interface DeepResearchGuardrailEvent {
+  rule_id: string;
+  dim: string;
+  action: string;
+  reason: string;
 }
 
 /**
@@ -129,5 +138,29 @@ export const deepResearchApi = {
     const base = API_BASE_URL || '';
     const url = `${base}/api/v1/deep-research/reports/${reportId}/pdf`;
     await downloadPdfFromUrl(url, 'deep_research', reportId);
+  },
+
+  /**
+   * 下载报告 Markdown 原文件（双轨/legacy 通用）。
+   */
+  async downloadMarkdown(reportId: string): Promise<void> {
+    const base = API_BASE_URL || '';
+    const url = `${base}/api/v1/deep-research/reports/${reportId}/markdown`;
+    await downloadPdfFromUrl(url, 'deep_research', reportId);
+  },
+
+  /**
+   * 双轨引擎维度 JSON 产物（11 维度结构化数据 + 护栏事件表）。
+   * legacy 报告无产物，返回 null。
+   */
+  async getDims(reportId: string): Promise<{ guardrail_events: DeepResearchGuardrailEvent[]; dimensions: Record<string, unknown> } | null> {
+    try {
+      const response = await apiClient.get<{ success: boolean; data: { guardrail_events: DeepResearchGuardrailEvent[]; dimensions: Record<string, unknown> } }>(
+        `/api/v1/deep-research/reports/${reportId}/dims`,
+      );
+      return response.data.data;
+    } catch {
+      return null;
+    }
   },
 };

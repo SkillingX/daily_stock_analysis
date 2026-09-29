@@ -1160,6 +1160,11 @@ class Config:
     supply_chain_analysis_enabled: bool = True
     # 深度投研报告：保留报告数量上限（超出删最旧，含 .md/.pdf 文件）
     deep_research_max_reports: int = 200
+    # 深度投研引擎：legacy（单循环，默认）| dual_track（双轨多维度，见
+    # docs/deep-research-dual-track-agent-requirements.md）
+    deep_research_engine: str = "legacy"
+    # 双轨引擎：探索型维度（S3/L4）的 ReAct 步数上限
+    deep_research_dim_max_steps: int = 8
     # 政策与公告排雷报告：保留报告数量上限（超出删最旧，含 .md/.pdf 文件，0=不清理）
     policy_minesweeper_max_reports: int = 200
     # 启用价值情景分析
@@ -2344,6 +2349,15 @@ class Config:
                 200,
                 field_name="deep_research_max_reports",
                 minimum=0,
+            ),
+            deep_research_engine=(
+                os.getenv("DEEP_RESEARCH_ENGINE", "legacy").strip() or "legacy"
+            ),
+            deep_research_dim_max_steps=parse_env_int(
+                os.getenv("DEEP_RESEARCH_DIM_MAX_STEPS", "8"),
+                8,
+                field_name="deep_research_dim_max_steps",
+                minimum=1,
             ),
             policy_minesweeper_max_reports=parse_env_int(
                 os.getenv("POLICY_MINESWEEPER_MAX_REPORTS", "200"),

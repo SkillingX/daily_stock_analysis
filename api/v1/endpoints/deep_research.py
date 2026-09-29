@@ -4,12 +4,14 @@
 形态：表单输入股票 → SSE 流式生成 → 报告展示 + PDF 下载 + 历史列表。
 与问股/郑希/供应链的对话框模式不同（无多轮会话），但复用同一套 SSE 线程池包装。
 
-接口（5 个，挂 ``/api/v1/deep-research``，继承全局 AuthMiddleware）：
+接口（7 个，挂 ``/api/v1/deep-research``，继承全局 AuthMiddleware）：
 - ``POST /generate/stream``  SSE 流式生成（thinking/tool_start/tool_done/generating/done/error/heartbeat）
 - ``GET  /reports``          历史报告列表（分页）
 - ``GET  /reports/{id}``     报告详情（含 Markdown 正文）
-- ``DELETE /reports/{id}``   删除报告（元数据 + .md + .pdf）
-- ``GET  /reports/{id}/pdf`` PDF 下载（惰性生成，``asyncio.to_thread`` + Semaphore 限流）
+- ``DELETE /reports/{id}``   删除报告（元数据 + .md + .pdf + 维度产物）
+- ``GET  /reports/{id}/pdf`` PDF 下载（惰性生成，``asyncio.to_thread`` 限流）
+- ``GET  /reports/{id}/markdown`` Markdown 原文件下载（双轨/legacy 通用）
+- ``GET  /reports/{id}/dims``     双轨维度 JSON 产物（legacy 报告 404）
 
 安全：
 - ``report_id`` 白名单 ``^\\d{6}_\\d{12}$`` + ``_resolve_asset_path`` 双重防穿越。
@@ -51,6 +53,9 @@ HEARTBEAT_INTERVAL_S = 30.0
 # report_id 白名单：{6位A股代码}_{YYYYMMDDHHmm}，可选 _序号 后缀（同分钟冲突追加，如 _1）
 # 后缀仅允许 _\d+，路径穿越字符（../ 等）仍被拒绝
 _REPORT_ID_RE = re.compile(r"^\d{6}_\d{12}(_\d+)?$")
+
+# PDF 渲染并发限流（xhtml2pdf 内存密集，模块级 Semaphore(1) 串行化惰性生成）
+_PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
 
 
 # ============================================================
@@ -296,10 +301,11 @@ async def download_pdf(report_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="报告不存在")
 
-    # 惰性生成（线程池，防阻塞）
-    pdf_path_str = await asyncio.to_thread(
-        deep_research_service.get_pdf_path, report_id
-    )
+    # 惰性生成（线程池 + Semaphore(1) 串行化，防并发渲染打爆内存）
+    async with _PDF_RENDER_SEMAPHORE:
+        pdf_path_str = await asyncio.to_thread(
+            deep_research_service.get_pdf_path, report_id
+        )
     if not pdf_path_str:
         raise HTTPException(
             status_code=404,
@@ -341,3 +347,58 @@ async def download_pdf(report_id: str):
             "Expires": "0",
         },
     )
+
+
+# ============================================================
+# Markdown 原文件下载 + 双轨维度产物
+# ============================================================
+
+
+@router.get("/reports/{report_id}/markdown")
+async def download_markdown(report_id: str):
+    """下载报告 Markdown 原文件（双轨与 legacy 引擎通用）。"""
+    _validate_report_id(report_id)
+    record = await asyncio.to_thread(deep_research_service.get_report, report_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="报告不存在")
+
+    safe_path = _resolve_safe_path(record.get("md_path") or "")
+    if safe_path is None or not safe_path.exists():
+        raise HTTPException(status_code=404, detail="Markdown 文件不存在")
+
+    _created = record.get("created_at")
+    if not _created and "_" in report_id:
+        _d = report_id.split("_", 1)[1][:8]
+        if len(_d) == 8 and _d.isdigit():
+            _created = f"{_d[:4]}-{_d[4:6]}-{_d[6:8]}"
+    from src.services.report_filename import (
+        _clean_filename_part,
+        _format_date,
+        STOCK_REPORT_TYPE_LABELS,
+    )
+
+    label = STOCK_REPORT_TYPE_LABELS.get("deep_research", "报告")
+    name = _clean_filename_part(record.get("stock_name")) if record.get("stock_name") else ""
+    code = _clean_filename_part(record.get("stock_code") or report_id.split("_", 1)[0])
+    display = name or code or "未知"
+    filename = f"{display}（{code}）{label}{_format_date(_created)}.md"
+
+    return FileResponse(
+        str(safe_path),
+        media_type="text/markdown; charset=utf-8",
+        filename=filename,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.get("/reports/{report_id}/dims")
+async def get_dims(report_id: str):
+    """双轨引擎维度 JSON 产物（11 维度结构化数据 + 护栏事件表）。
+
+    legacy 引擎报告无产物 → 404。数据仅供复算/钻取，无缓存要求。
+    """
+    _validate_report_id(report_id)
+    payload = await asyncio.to_thread(deep_research_service.get_dims_payload, report_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="维度产物不存在（legacy 引擎报告无此产物）")
+    return {"success": True, "data": payload}
