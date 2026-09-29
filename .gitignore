@@ -66,6 +66,7 @@ env/
 **/.llm_usage_hmac_secret
 logs/
 reports/
+data/deep_research/.dim_cache/
 *.db
 *.sqlite
 *.sqlite3

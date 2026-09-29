@@ -38,6 +38,7 @@ from src.deep_research_dims.six_dim import build_six_dim
 from src.schemas.bayesian_framework import EvidenceItem
 from src.schemas.deep_research_dims import (
     DIM_IDS,
+    DataDim,
     DimEnvelope,
     GuardrailEvent,
     IntelDim,
@@ -49,6 +50,39 @@ from src.schemas.supply_chain import SupplyChain
 logger = logging.getLogger(__name__)
 
 ProgressCb = Optional[Callable[[Dict[str, Any]], None]]
+
+# 维度依赖图（省钱模式 dims 子集自动补依赖闭包，避免产出"无输入的派生维度"）
+_DIM_DEPENDENCIES: Dict[str, frozenset] = {
+    "data": frozenset(),
+    "phase": frozenset(),
+    "history": frozenset(),
+    "intel": frozenset(),
+    "supply_chain": frozenset(),
+    "six_dim": frozenset({"data"}),
+    "bayesian": frozenset({"six_dim"}),
+    "scenarios": frozenset(),
+    "conclusion": frozenset({"six_dim", "bayesian", "scenarios"}),
+    "plan": frozenset({"data", "bayesian"}),
+    "signal": frozenset({"conclusion", "scenarios"}),
+}
+
+
+def expand_dim_selection(dims: Optional[set]) -> set:
+    """把用户选择的维度扩展为依赖闭包；None/空 = 全部 11 维度。"""
+    from src.schemas.deep_research_dims import DIM_IDS
+
+    if not dims:
+        return set(DIM_IDS)
+    selected = set(dims)
+    changed = True
+    while changed:
+        changed = False
+        for dim in list(selected):
+            for dep in _DIM_DEPENDENCIES.get(dim, frozenset()):
+                if dep not in selected:
+                    selected.add(dep)
+                    changed = True
+    return selected
 
 
 @dataclass
@@ -72,8 +106,11 @@ class DualTrackResult:
 
     @property
     def quality_score(self) -> int:
-        ok = sum(1 for m in self.dims.values() if m.status == "ok")
-        return round(ok / max(len(DIM_IDS), 1) * 100)
+        executed = [m for m in self.dims.values() if m.status != "skipped"]
+        if not executed:
+            return 0
+        ok = sum(1 for m in executed if m.status == "ok")
+        return round(ok / len(executed) * 100)
 
 
 def _emit(cb: ProgressCb, event: Dict[str, Any]) -> None:
@@ -142,10 +179,18 @@ def run_dual_track(
     llm_adapter: Any,
     progress_callback: ProgressCb = None,
     explore_max_steps: int = 8,
+    force_refresh: bool = False,
+    dims_filter: Optional[set] = None,
 ) -> DualTrackResult:
     """执行一次双轨深度投研分析。"""
     result = DualTrackResult()
     dims: Dict[str, DimEnvelope] = {}
+
+    # 维度子集（省钱模式）：未选维度标 skipped，不执行、不入缓存
+    selected = expand_dim_selection(dims_filter)
+    skipped_ids = [d for d in DIM_IDS if d not in selected]
+    for _d in skipped_ids:
+        _emit(progress_callback, {"type": "dim_done", "dim": _d, "status": "skipped"})
 
     def emit_dim(dim_id: str, status: str) -> None:
         _emit(progress_callback, {"type": "dim_done", "dim": dim_id, "status": status})
@@ -153,15 +198,52 @@ def run_dual_track(
     def start_dim(dim_id: str) -> None:
         _emit(progress_callback, {"type": "dim_start", "dim": dim_id})
 
+    from src.deep_research_dims.dim_cache import (
+        CACHEABLE_DIMS,
+        load_cached_dim,
+        save_cached_dim,
+    )
+    from src.schemas.deep_research_dims import parse_dim as _parse_dim
+
+    def try_cache(dim_id: str) -> Optional[DimEnvelope]:
+        """命中未过期缓存则直接载入该维度（force_refresh 时跳过）。"""
+        if force_refresh or dim_id not in CACHEABLE_DIMS:
+            return None
+        payload = load_cached_dim(stock_code, dim_id)
+        if payload is None:
+            return None
+        try:
+            dim = _parse_dim(dim_id, payload)
+        except (ValidationError, ValueError, TypeError):
+            return None
+        _emit(
+            progress_callback,
+            {"type": "thinking", "step": 1, "message": f"维度「{dim_id}」命中缓存（未过期，跳过计算）"},
+        )
+        emit_dim(dim_id, dim.status)
+        return dim
+
+    def store_cache(dim_id: str, dim: DimEnvelope) -> None:
+        """成功（非降级）的缓存类维度落盘，供同票复用。"""
+        if dim.status == "ok" and dim_id in CACHEABLE_DIMS:
+            save_cached_dim(stock_code, dim_id, dim.model_dump())
+
     # ---- 阶段 0 + 前置 S2 ----
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
     ctx = build_shared_context(stock_code, stock_name)
 
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力/筹码）..."})
-    start_dim("data")
-    data_dim = build_data_dim(ctx)
-    dims["data"] = data_dim
-    emit_dim("data", data_dim.status)
+    data_dim: Optional[DataDim] = None
+    if "data" in selected:
+        data_dim = try_cache("data")
+        if data_dim is None:
+            start_dim("data")
+            data_dim = build_data_dim(ctx)
+            store_cache("data", data_dim)
+            dims["data"] = data_dim
+            emit_dim("data", data_dim.status)
+        else:
+            dims["data"] = data_dim
 
     # ---- 波次 1：探索 Agent 线程池 + 主线程纯规则 ----
     _emit(progress_callback, {"type": "thinking", "step": 1, "message": "并行执行情报/产业链探索与规则维度..."})
@@ -179,114 +261,195 @@ def run_dual_track(
         return "err", out.get("error") or "产业链探索失败", 0
 
     steps_total = 0
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        start_dim("intel")
-        fut_intel = pool.submit(intel_worker)
-        start_dim("supply_chain")
-        fut_sc = pool.submit(supply_chain_worker)
+    run_intel = "intel" in selected
+    run_sc = "supply_chain" in selected
 
-        start_dim("phase")
-        phase_dim = build_phase_dim(ctx)
-        dims["phase"] = phase_dim
-        emit_dim("phase", phase_dim.status)
-        start_dim("history")
-        history_dim = build_history_dim(ctx)
-        dims["history"] = history_dim
-        emit_dim("history", history_dim.status)
-        start_dim("six_dim")
-        six_dim = build_six_dim(ctx, data_dim.model_dump())
-        dims["six_dim"] = six_dim
-        emit_dim("six_dim", six_dim.status)
-
-        try:
-            sc_status, sc_data, sc_steps = fut_sc.result(timeout=600)
-            if sc_status == "ok":
-                sc_dim, used = _parse_supply_chain(sc_data, sc_steps)
-                dims["supply_chain"] = sc_dim
-                steps_total += used
+    def _run_rule_dims() -> None:
+        if "phase" in selected:
+            start_dim("phase")
+            phase_dim = build_phase_dim(ctx)
+            dims["phase"] = phase_dim
+            emit_dim("phase", phase_dim.status)
+        if "history" in selected:
+            start_dim("history")
+            history_dim = build_history_dim(ctx)
+            dims["history"] = history_dim
+            emit_dim("history", history_dim.status)
+        if "six_dim" in selected:
+            six_dim = try_cache("six_dim")
+            if six_dim is None:
+                start_dim("six_dim")
+                six_dim = build_six_dim(
+                    ctx, (data_dim.model_dump() if data_dim else {})
+                )
+                store_cache("six_dim", six_dim)
+                dims["six_dim"] = six_dim
+                emit_dim("six_dim", six_dim.status)
             else:
-                dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=str(sc_data))
-        except Exception as exc:  # noqa: BLE001
-            dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=f"产业链维度异常: {exc}")
-        emit_dim("supply_chain", dims["supply_chain"].status)
+                dims["six_dim"] = six_dim
 
-        try:
-            intel_status, intel_data, intel_steps = fut_intel.result(timeout=600)
-            if intel_status == "ok":
-                intel_dim, used = _parse_intel(intel_data, intel_steps)
-                dims["intel"] = intel_dim
-                steps_total += used
-            else:
-                dims["intel"] = IntelDim(status="degraded", degraded_reason=str(intel_data))
-        except Exception as exc:  # noqa: BLE001
-            dims["intel"] = IntelDim(status="degraded", degraded_reason=f"情报维度异常: {exc}")
-        emit_dim("intel", dims["intel"].status)
+    if run_intel or run_sc:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            sc_cached = try_cache("supply_chain") if run_sc else None
+            intel_cached = try_cache("intel") if run_intel else None
+            fut_intel = None
+            fut_sc = None
+            if run_intel and intel_cached is None:
+                start_dim("intel")
+                fut_intel = pool.submit(intel_worker)
+            if run_sc and sc_cached is None:
+                start_dim("supply_chain")
+                fut_sc = pool.submit(supply_chain_worker)
+
+            _run_rule_dims()
+
+            if run_sc:
+                if sc_cached is not None:
+                    dims["supply_chain"] = sc_cached
+                    sc_from_cache = True
+                else:
+                    sc_from_cache = False
+                    try:
+                        sc_status, sc_data, sc_steps = fut_sc.result(timeout=600)  # type: ignore[union-attr]
+                        if sc_status == "ok":
+                            sc_dim, used = _parse_supply_chain(sc_data, sc_steps)
+                            dims["supply_chain"] = sc_dim
+                            store_cache("supply_chain", sc_dim)
+                            steps_total += used
+                        else:
+                            dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=str(sc_data))
+                    except Exception as exc:  # noqa: BLE001
+                        dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=f"产业链维度异常: {exc}")
+                if not sc_from_cache:
+                    emit_dim("supply_chain", dims["supply_chain"].status)
+
+            if run_intel:
+                if intel_cached is not None:
+                    dims["intel"] = intel_cached
+                    intel_from_cache = True
+                else:
+                    intel_from_cache = False
+                    try:
+                        intel_status, intel_data, intel_steps = fut_intel.result(timeout=600)  # type: ignore[union-attr]
+                        if intel_status == "ok":
+                            intel_dim, used = _parse_intel(intel_data, intel_steps)
+                            dims["intel"] = intel_dim
+                            store_cache("intel", intel_dim)
+                            steps_total += used
+                        else:
+                            dims["intel"] = IntelDim(status="degraded", degraded_reason=str(intel_data))
+                    except Exception as exc:  # noqa: BLE001
+                        dims["intel"] = IntelDim(status="degraded", degraded_reason=f"情报维度异常: {exc}")
+                if not intel_from_cache:
+                    emit_dim("intel", dims["intel"].status)
+    else:
+        _run_rule_dims()
 
     # ---- 波次 2：L2 贝叶斯 ----
-    _emit(progress_callback, {"type": "thinking", "step": 2, "message": "贝叶斯证据链计算（LR 标定 + 后验更新）..."})
-    evidence_dicts = [
-        e.model_dump() for e in getattr(dims["intel"], "evidence_items", [])
-    ]
-    start_dim("bayesian")
-    bayesian_dim = build_bayesian_dim(
-        dims["six_dim"].model_dump(), evidence_dicts
-    )
-    dims["bayesian"] = bayesian_dim
-    emit_dim("bayesian", bayesian_dim.status)
+    if "bayesian" in selected:
+        _emit(progress_callback, {"type": "thinking", "step": 2, "message": "贝叶斯证据链计算（LR 标定 + 行业基率锚点 + 后验更新）..."})
+        from src.deep_research_dims.industry_base_rate import lookup_base_rate
+
+        sc_model = getattr(dims.get("supply_chain"), "supply_chain", None)
+        hint_text = " ".join(
+            part
+            for part in (
+                str(ctx.fundamental.get("industry_hint") or ""),
+                str(getattr(sc_model, "company_position", "") or ""),
+                stock_name,
+            )
+            if part
+        )
+        market_implied_p, market_implied_basis = lookup_base_rate(hint_text)
+        evidence_dicts = [
+            e.model_dump() for e in getattr(dims.get("intel"), "evidence_items", [])
+        ]
+        start_dim("bayesian")
+        bayesian_dim = build_bayesian_dim(
+            dims["six_dim"].model_dump(),
+            evidence_dicts,
+            market_implied_p=market_implied_p,
+            market_implied_basis=market_implied_basis,
+        )
+        dims["bayesian"] = bayesian_dim
+        emit_dim("bayesian", bayesian_dim.status)
 
     # ---- 波次 3：L5 → L3 → S4 → S1 ----
     _emit(progress_callback, {"type": "thinking", "step": 3, "message": "合成情景/结论/计划/信号（规则 + 护栏）..."})
     current_price = ctx.quote.get("price")
-    start_dim("scenarios")
-    scenarios_dim = build_scenarios_dim(ctx, float(current_price) if isinstance(current_price, (int, float)) else None)
-    facts_scen = scenarios_dim.model_dump()
-    scenarios_dim = scenarios_dim.model_copy(
-        update={
-            "narrative": narrate(
-                llm_adapter, "scenarios", facts_scen, scenarios_dim.narrative
+    if "scenarios" in selected:
+        scenarios_from_cache = False
+        scenarios_dim = try_cache("scenarios")
+        if scenarios_dim is None:
+            start_dim("scenarios")
+            scenarios_dim = build_scenarios_dim(ctx, float(current_price) if isinstance(current_price, (int, float)) else None)
+        else:
+            scenarios_from_cache = True
+        if not scenarios_from_cache:
+            facts_scen = scenarios_dim.model_dump()
+            scenarios_dim = scenarios_dim.model_copy(
+                update={
+                    "narrative": narrate(
+                        llm_adapter, "scenarios", facts_scen, scenarios_dim.narrative
+                    )
+                }
             )
-        }
-    )
-    dims["scenarios"] = scenarios_dim
-    emit_dim("scenarios", scenarios_dim.status)
+        store_cache("scenarios", scenarios_dim)
+        if not scenarios_from_cache:
+            dims["scenarios"] = scenarios_dim
+            emit_dim("scenarios", scenarios_dim.status)
+        else:
+            dims["scenarios"] = scenarios_dim
 
-    start_dim("conclusion")
-    conclusion_dim = build_conclusion_dim(
-        ctx, dims["six_dim"].model_dump(), dims["bayesian"].model_dump(), dims["scenarios"].model_dump()
-    )
-    facts_conc = conclusion_dim.model_dump()
-    conclusion_dim = conclusion_dim.model_copy(
-        update={
-            "rationale": narrate(llm_adapter, "conclusion", facts_conc, conclusion_dim.narrative)
-        }
-    )
-    dims["conclusion"] = conclusion_dim
-    emit_dim("conclusion", conclusion_dim.status)
+    if "conclusion" in selected:
+        start_dim("conclusion")
+        conclusion_dim = build_conclusion_dim(
+            ctx, dims["six_dim"].model_dump(), dims["bayesian"].model_dump(), dims["scenarios"].model_dump()
+        )
+        facts_conc = conclusion_dim.model_dump()
+        conclusion_dim = conclusion_dim.model_copy(
+            update={
+                "rationale": narrate(llm_adapter, "conclusion", facts_conc, conclusion_dim.narrative)
+            }
+        )
+        dims["conclusion"] = conclusion_dim
+        emit_dim("conclusion", conclusion_dim.status)
 
-    position_suggestion = (
-        getattr(dims["bayesian"].bayesian, "position_suggestion", None) or "观察"
-    )
-    start_dim("plan")
-    plan_dim = build_plan_dim(ctx, dims["data"].model_dump(), position_suggestion)
-    facts_plan = plan_dim.model_dump()
-    plan_dim = plan_dim.model_copy(
-        update={"narrative": narrate(llm_adapter, "plan", facts_plan, plan_dim.narrative)}
-    )
-    dims["plan"] = plan_dim
-    emit_dim("plan", plan_dim.status)
+    if "plan" in selected:
+        position_suggestion = (
+            getattr(dims["bayesian"].bayesian, "position_suggestion", None) or "观察"
+        )
+        start_dim("plan")
+        plan_dim = build_plan_dim(ctx, dims["data"].model_dump(), position_suggestion)
+        facts_plan = plan_dim.model_dump()
+        plan_dim = plan_dim.model_copy(
+            update={"narrative": narrate(llm_adapter, "plan", facts_plan, plan_dim.narrative)}
+        )
+        dims["plan"] = plan_dim
+        emit_dim("plan", plan_dim.status)
 
-    start_dim("signal")
-    signal_dim = build_signal_dim(
-        ctx,
-        dims["conclusion"].model_dump(),
-        dims["scenarios"].model_dump(),
-    )
-    facts_sig = signal_dim.model_dump()
-    signal_dim = signal_dim.model_copy(
-        update={"narrative": narrate(llm_adapter, "signal", facts_sig, signal_dim.narrative)}
-    )
-    dims["signal"] = signal_dim
-    emit_dim("signal", signal_dim.status)
+    if "signal" in selected:
+        start_dim("signal")
+        signal_dim = build_signal_dim(
+            ctx,
+            dims["conclusion"].model_dump(),
+            dims["scenarios"].model_dump(),
+        )
+        facts_sig = signal_dim.model_dump()
+        signal_dim = signal_dim.model_copy(
+            update={"narrative": narrate(llm_adapter, "signal", facts_sig, signal_dim.narrative)}
+        )
+        dims["signal"] = signal_dim
+        emit_dim("signal", signal_dim.status)
+
+    # 未选维度（省钱模式）补 skipped 占位，供成文与契约一致
+    from src.schemas.deep_research_dims import DIM_MODELS
+
+    for _dim_id in skipped_ids:
+        if _dim_id not in dims:
+            dims[_dim_id] = DIM_MODELS[_dim_id](
+                status="skipped", degraded_reason="省钱模式未选择该维度"
+            )
 
     # ---- 护栏层（override 后叙述修订 + 契约重解析）----
     payloads = {d: m.model_dump() for d, m in dims.items()}
@@ -332,9 +495,10 @@ def run_dual_track(
             f"> ⚠️ 报告结构不完整，缺失章节：{', '.join(missing)}\n\n" + markdown
         )
 
+    executed = [d for d, m in dims.items() if m.status != "skipped"]
     degraded = [d for d, m in dims.items() if m.status == "degraded"]
-    ok_count = len(dims) - len(degraded)
-    status = "success" if not degraded else "partial" if ok_count >= 6 else "failed"
+    ok_count = len(executed) - len(degraded)
+    status = "success" if not degraded else "partial" if ok_count >= max(2, len(executed) // 2) else "failed"
 
     result.success = status != "failed" and bool(markdown.strip())
     result.status = status

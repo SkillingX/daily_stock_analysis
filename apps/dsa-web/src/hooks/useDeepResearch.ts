@@ -34,7 +34,7 @@ export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
   { id: 'history', label: '历史' },
 ];
 
-export type DimRunStatus = 'pending' | 'running' | 'ok' | 'degraded';
+export type DimRunStatus = 'pending' | 'running' | 'ok' | 'degraded' | 'skipped';
 
 export type DimStatusMap = Record<string, DimRunStatus>;
 
@@ -100,7 +100,11 @@ export function useDeepResearch() {
   }, [clearWatchdog]);
 
   const generate = useCallback(
-    async (stockCode: string, stockName?: string) => {
+    async (
+      stockCode: string,
+      stockName?: string,
+      options?: { dims?: string[]; forceRefresh?: boolean },
+    ) => {
       // 重置状态
       setStatus('generating');
       setProgressSteps([]);
@@ -116,7 +120,13 @@ export function useDeepResearch() {
 
       try {
         const response = await deepResearchApi.generateStream(
-          { stock_code: stockCode, stock_name: stockName, report_type: 'deep' },
+          {
+            stock_code: stockCode,
+            stock_name: stockName,
+            report_type: 'deep',
+            dims: options?.dims,
+            force_refresh: options?.forceRefresh,
+          },
           { signal: ac.signal },
         );
         const reader = response.body?.getReader();
@@ -186,7 +196,12 @@ export function useDeepResearch() {
                   setDimStatuses((prev) => {
                     const next = { ...prev };
                     for (const [dimId, payload] of Object.entries(event.dimensions!)) {
-                      next[dimId] = payload?.status === 'degraded' ? 'degraded' : 'ok';
+                      next[dimId] =
+                        payload?.status === 'degraded'
+                          ? 'degraded'
+                          : payload?.status === 'skipped'
+                            ? 'skipped'
+                            : 'ok';
                     }
                     return next;
                   });
@@ -225,7 +240,9 @@ export function useDeepResearch() {
                           ? 'running'
                           : event.status === 'degraded'
                             ? 'degraded'
-                            : 'ok',
+                            : event.status === 'skipped'
+                              ? 'skipped'
+                              : 'ok',
                     },
               );
             }

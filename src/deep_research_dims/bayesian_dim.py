@@ -45,8 +45,14 @@ def _evidence_fresh_enough(evidence_date: str, today: Optional[date] = None) -> 
 def build_bayesian_dim(
     six_dim_payload: Dict[str, Any],
     evidence_items: List[Dict[str, Any]],
+    market_implied_p: float = 0.5,
+    market_implied_basis: str = "neutral_default",
 ) -> BayesianDim:
-    """L2：先验 ← 六维总分；后验 ← 合格证据依次连乘 LR（cap 0.02–0.98）。"""
+    """L2：先验 ← 六维总分；后验 ← 合格证据依次连乘 LR（cap 0.02–0.98）。
+
+    market_implied_p 由编排器经行业基率表（industry_base_rate.lookup_base_rate）
+    机器计算后注入；未命中时 0.5 中性，basis 如实标注。
+    """
     framework = (six_dim_payload or {}).get("framework") or {}
     dimension_total = float(framework.get("dimension_total") or 50.0)
 
@@ -84,7 +90,7 @@ def build_bayesian_dim(
     # 综合 LR = 后验 odds / 先验 odds，交给 calculate_bayesian 复算（保持单一计算源）
     result = calculate_bayesian(
         dimension_total=dimension_total,
-        market_implied_p=0.5,  # 行业基率暂回退中性，见模块 docstring
+        market_implied_p=market_implied_p,
         lr=lr_product,
         strong_negative_evidence=strong_negative,
     )
@@ -101,7 +107,7 @@ def build_bayesian_dim(
     return BayesianDim(
         bayesian=bayesian,
         evidence_rejected=rejected,
-        market_implied_basis="industry_baseline_unavailable_neutral_0.5",
+        market_implied_basis=market_implied_basis,
         narrative=(
             f"先验 {bayesian.prior_p:.2f}（六维 {dimension_total:.0f} 分映射）→ "
             f"后验 {bayesian.posterior_p:.2f}（{len(accepted)} 条证据，LR 乘积 {lr_product:.2f}）。"

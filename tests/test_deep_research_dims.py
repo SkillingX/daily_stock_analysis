@@ -11,7 +11,7 @@ from datetime import date, timedelta
 import pytest
 from icontract import ViolationError
 
-from src.deep_research_dims.bayesian_dim import calibrate_lr
+from src.deep_research_dims.bayesian_dim import build_bayesian_dim, calibrate_lr
 from src.deep_research_dims.context import SharedContext
 from src.deep_research_dims.data_dim import build_data_dim
 from src.deep_research_dims.guardrail import (
@@ -356,8 +356,141 @@ class TestGuardrailRules:
 
 
 # ---------------------------------------------------------------------------
+# 行业基率表（§5.4-3：market_implied_p 机器锚点）
+# ---------------------------------------------------------------------------
+
+
+class TestDimSubset:
+    def test_expand_closure_full_when_none(self):
+        from src.agent.deep_research.orchestrator import expand_dim_selection
+
+        assert expand_dim_selection(None) == set(DIM_IDS)
+        assert expand_dim_selection(set()) == set(DIM_IDS)
+
+    def test_expand_adds_dependencies(self):
+        from src.agent.deep_research.orchestrator import expand_dim_selection
+
+        # 只选信号 → 自动补 结论/情景/贝叶斯/六维（依赖闭包）
+        selected = expand_dim_selection({"signal"})
+        assert {"signal", "conclusion", "scenarios", "bayesian", "six_dim"} <= selected
+
+    def test_expand_plan_pulls_data_and_bayesian(self):
+        from src.agent.deep_research.orchestrator import expand_dim_selection
+
+        selected = expand_dim_selection({"plan"})
+        assert {"plan", "data", "bayesian", "six_dim"} <= selected
+
+    def test_run_dual_track_subset_offline(self, monkeypatch, tmp_path):
+        """离线冒烟：只选 2 个纯规则维度，其余 9 个 skipped。"""
+        from datetime import date as _date
+        import datetime as _dt
+        from src.agent.deep_research import orchestrator as orch
+        from src.deep_research_dims import dim_cache
+        from src.deep_research_dims.context import SharedContext
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        ctx = SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="2026-09-29T10:00:00")
+        ctx.quote = {"price": 13.0}
+        ctx.history = [
+            {"date": str(_date(2026, 8, 1) + _dt.timedelta(days=i)),
+             "open": 10 + i * 0.1, "high": 10.3 + i * 0.1, "low": 9.7 + i * 0.1,
+             "close": 10 + i * 0.1, "volume": 10000}
+            for i in range(40)
+        ]
+        monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
+
+        result = orch.run_dual_track(
+            "600519", "贵州茅台", llm_adapter=None, dims_filter={"phase", "history"}
+        )
+        assert result.status == "success"
+        assert result.dims["phase"].status == "ok"
+        assert result.dims["history"].status == "ok"
+        skipped = [d for d, m in result.dims.items() if m.status == "skipped"]
+        assert set(skipped) == set(DIM_IDS) - {"phase", "history"}
+        assert result.quality_score == 100  # 只统计执行维度
+        assert "未选择生成" in result.markdown
+
+
+class TestIndustryBaseRate:
+    def test_keyword_hit(self):
+        from src.deep_research_dims.industry_base_rate import lookup_base_rate
+
+        rate, basis = lookup_base_rate("中游酱香型白酒酿造商（核心环节）")
+        assert rate == 0.55 and basis == "industry_base_rate:白酒"
+
+    def test_miss_falls_back_neutral(self):
+        from src.deep_research_dims.industry_base_rate import lookup_base_rate
+
+        rate, basis = lookup_base_rate("完全未知的行业描述 xyz")
+        assert rate == 0.5 and basis == "neutral_default"
+
+    def test_empty_text_neutral(self):
+        from src.deep_research_dims.industry_base_rate import lookup_base_rate
+
+        rate, _ = lookup_base_rate("")
+        assert rate == 0.5
+
+    def test_l2_uses_injected_market_implied(self):
+        """L2 采用编排器注入的行业基率，edge 与 basis 如实反映。"""
+        six = SixDimDim(
+            framework={"dimension_total": 82.0, "dimensions": [], "scoring_version": "v1"}
+        ).model_dump()
+        dim = build_bayesian_dim(
+            six, [], market_implied_p=0.4, market_implied_basis="industry_base_rate:白酒"
+        )
+        assert dim.bayesian is not None
+        assert dim.bayesian.market_implied_p == 0.4
+        assert dim.bayesian.edge > 0  # 先验(82分→~0.73) > 0.4 → 正认知差
+        assert dim.market_implied_basis == "industry_base_rate:白酒"
+
+
+# ---------------------------------------------------------------------------
 # 契约解析 + 渲染结构
 # ---------------------------------------------------------------------------
+
+
+class TestDimCache:
+    def test_save_load_roundtrip(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        payload = {"dim": "data", "status": "ok", "perspective": None}
+        dim_cache.save_cached_dim("600519", "data", payload)
+        loaded = dim_cache.load_cached_dim("600519", "data")
+        assert loaded == payload
+
+    def test_ttl_expiry(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        dim_cache.save_cached_dim("600519", "data", {"dim": "data", "status": "ok"})
+        # 把 saved_at 拨到 25 小时前（data TTL=24h）
+        import json
+        import os
+        from datetime import datetime, timedelta
+
+        path = os.path.join(str(tmp_path), "600519_data.json")
+        record = json.loads(open(path, encoding="utf-8").read())
+        record["saved_at"] = (datetime.now() - timedelta(hours=25)).isoformat()
+        open(path, "w", encoding="utf-8").write(json.dumps(record))
+        assert dim_cache.load_cached_dim("600519", "data") is None
+
+    def test_non_cacheable_dim_always_miss(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        # 派生维度 bayesian 不可缓存：写了也读不到
+        dim_cache.save_cached_dim("600519", "bayesian", {"dim": "bayesian"})
+        assert dim_cache.load_cached_dim("600519", "bayesian") is None
+
+    def test_clear_cache_scoped(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        dim_cache.save_cached_dim("600519", "data", {"a": 1})
+        dim_cache.save_cached_dim("000001", "data", {"a": 2})
+        assert dim_cache.clear_cache("600519") == 1
+        assert dim_cache.load_cached_dim("000001", "data") == {"a": 2}
 
 
 class TestPhaseFallback:

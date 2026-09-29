@@ -7,6 +7,10 @@ export interface DeepResearchGenerateRequest {
   stock_code: string;
   stock_name?: string;
   report_type?: string;
+  /** 维度子集（省钱模式）：不传/空 = 全部 11 维度；传入选中维度 id（后端自动补依赖闭包） */
+  dims?: string[];
+  /** 跳过维度缓存强制重算 */
+  force_refresh?: boolean;
 }
 
 export interface DeepResearchStreamOptions {

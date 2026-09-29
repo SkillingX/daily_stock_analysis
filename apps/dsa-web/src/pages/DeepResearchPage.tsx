@@ -32,6 +32,16 @@ interface SelectedStock {
 interface DimsInfo {
   guardrailEvents: DeepResearchGuardrailEvent[];
   dimsDegraded: string[];
+  dimsSkipped: string[];
+}
+
+function skippedFromDimensions(
+  dimensions: Record<string, unknown> | undefined,
+): string[] {
+  if (!dimensions) return [];
+  return Object.entries(dimensions)
+    .filter(([, v]) => (v as { status?: string })?.status === 'skipped')
+    .map(([k]) => k);
 }
 
 const DIM_ID_SET = new Set(DUAL_TRACK_DIMS.map((d) => d.id));
@@ -69,6 +79,9 @@ export function DeepResearchPage() {
     useDeepResearch();
 
   const [dimsInfo, setDimsInfo] = useState<DimsInfo | null>(null);
+  // 省钱模式：维度子集（默认全选；非全选时传 dims，后端自动补依赖闭包）
+  const [selectedDims, setSelectedDims] = useState<string[]>(DUAL_TRACK_DIMS.map((d) => d.id));
+  const [forceRefresh, setForceRefresh] = useState(false);
 
   const isGenerating = status === 'generating';
 
@@ -77,6 +90,7 @@ export function DeepResearchPage() {
     ? {
         guardrailEvents: dualTrack.guardrailEvents,
         dimsDegraded: dualTrack.dimsDegraded,
+        dimsSkipped: skippedFromDimensions(dualTrack.dimensions),
       }
     : dimsInfo;
 
@@ -116,8 +130,12 @@ export function DeepResearchPage() {
     setCurrentDetail(null);
     setDimsInfo(null);
     reset();
-    void generate(selectedStock.code, selectedStock.name);
-  }, [selectedStock, generate, reset]);
+    const allSelected = selectedDims.length === DUAL_TRACK_DIMS.length;
+    void generate(selectedStock.code, selectedStock.name, {
+      dims: allSelected ? undefined : selectedDims,
+      forceRefresh: forceRefresh || undefined,
+    });
+  }, [selectedStock, generate, reset, selectedDims, forceRefresh]);
 
   const handleSelectHistory = useCallback(
     async (id: string) => {
@@ -134,6 +152,7 @@ export function DeepResearchPage() {
                 dimsDegraded: Object.entries(dims.dimensions || {})
                   .filter(([, v]) => (v as { status?: string })?.status === 'degraded')
                   .map(([k]) => k),
+                dimsSkipped: skippedFromDimensions(dims.dimensions),
               }
             : null,
         );
@@ -347,6 +366,67 @@ export function DeepResearchPage() {
             )}
           </div>
           {inputError && <p className="text-sm text-red-400">{inputError}</p>}
+          <details className="rounded-lg border border-white/8 bg-white/2 px-3 py-2">
+            <summary className="cursor-pointer text-xs text-muted-text hover:text-secondary-text">
+              省钱模式：自选维度生成（默认全选；未选维度跳过计算，依赖维度自动补齐）
+            </summary>
+            <div className="mt-2 space-y-2">
+              <div className="flex flex-wrap gap-1.5">
+                {(
+                  [
+                    { label: '全部（11 维）', dims: DUAL_TRACK_DIMS.map((d) => d.id) },
+                    {
+                      label: '快速版（无情报/产业链探索）',
+                      dims: DUAL_TRACK_DIMS.map((d) => d.id).filter((x) => x !== 'intel' && x !== 'supply_chain'),
+                    },
+                    {
+                      label: '长线投研（五段式+探索）',
+                      dims: ['supply_chain', 'intel', 'six_dim', 'bayesian', 'scenarios', 'conclusion'],
+                    },
+                    {
+                      label: '仅规则（零探索）',
+                      dims: ['data', 'phase', 'history', 'six_dim', 'bayesian', 'scenarios'],
+                    },
+                  ] as { label: string; dims: string[] }[]
+                ).map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => setSelectedDims(preset.dims)}
+                    className="rounded border border-white/10 px-2 py-0.5 text-[11px] text-muted-text hover:border-cyan/40 hover:text-cyan"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-x-3 gap-y-1">
+                {DUAL_TRACK_DIMS.map((d) => (
+                  <label key={d.id} className="inline-flex items-center gap-1 text-xs text-secondary-text">
+                    <input
+                      type="checkbox"
+                      checked={selectedDims.includes(d.id)}
+                      onChange={(e) =>
+                        setSelectedDims((prev) =>
+                          e.target.checked ? [...prev, d.id] : prev.filter((x) => x !== d.id),
+                        )
+                      }
+                      className="accent-cyan"
+                    />
+                    {d.label}
+                  </label>
+                ))}
+              </div>
+              <label className="inline-flex items-center gap-1.5 text-xs text-muted-text">
+                <input
+                  type="checkbox"
+                  checked={forceRefresh}
+                  onChange={(e) => setForceRefresh(e.target.checked)}
+                  className="accent-cyan"
+                />
+                强制刷新（跳过维度缓存，全额重算）
+              </label>
+            </div>
+          </details>
         </header>
 
         <div className="rounded-[1.25rem] border border-white/8 bg-card/82 p-5 shadow-soft-card">
@@ -371,6 +451,7 @@ export function DeepResearchPage() {
                           'border-amber-500/30 bg-amber-500/10 text-amber-400',
                         st === 'running' && 'border-cyan/30 bg-cyan/10 text-cyan',
                         st === 'pending' && 'border-white/10 bg-white/2 text-muted-text',
+                        st === 'skipped' && 'border-dashed border-white/15 bg-white/2 text-muted-text/60 line-through',
                       )}
                     >
                       {st === 'running' && <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />}
@@ -449,6 +530,11 @@ export function DeepResearchPage() {
                     {effectiveDims.dimsDegraded.length > 0 && (
                       <span className="rounded bg-amber-500/15 px-2 py-0.5 text-amber-400">
                         降级：{effectiveDims.dimsDegraded.join('、')}
+                      </span>
+                    )}
+                    {effectiveDims.dimsSkipped.length > 0 && (
+                      <span className="rounded bg-white/8 px-2 py-0.5 text-muted-text">
+                        未选：{effectiveDims.dimsSkipped.length} 维
                       </span>
                     )}
                     <span className="rounded bg-white/8 px-2 py-0.5 text-muted-text">

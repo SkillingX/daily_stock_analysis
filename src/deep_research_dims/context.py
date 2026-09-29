@@ -83,6 +83,14 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("financial") or {}).get("data") or {}
+        boards = (compact.get("boards") or {}).get("data") or {}
+        industry_hint = ""
+        if isinstance(boards, dict):
+            for key in ("industry", "industry_name", "sw_industry", "sector"):
+                value = boards.get(key)
+                if isinstance(value, str) and value.strip():
+                    industry_hint = value.strip()
+                    break
         return {
             "pe_ttm": valuation.get("pe_ratio") or valuation.get("pe_ttm"),
             "pb": valuation.get("pb_ratio"),
@@ -92,6 +100,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "revenue_growth": financial.get("revenue_growth")
             or financial.get("revenue_yoy"),
             "gross_margin": financial.get("gross_margin"),
+            "industry_hint": industry_hint,
             "source": "fundamental_context",
         }
     except Exception as exc:  # noqa: BLE001

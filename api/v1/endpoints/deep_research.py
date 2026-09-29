@@ -67,6 +67,10 @@ class DeepResearchRequest(BaseModel):
     stock_code: str
     stock_name: Optional[str] = None
     report_type: str = "deep"
+    # 维度子集（省钱模式）：None/空 = 全部 11 维度；传入时自动补依赖闭包
+    dims: Optional[List[str]] = None
+    # 跳过维度缓存强制重算（默认复用未过期缓存）
+    force_refresh: bool = False
 
 
 class ReportListItem(BaseModel):
@@ -141,11 +145,20 @@ async def generate_stream(request: DeepResearchRequest):
     config = get_config()
     _require_agent(config)
 
-    # 入口预校验（非 A 股直接 400）
+    # 入口预校验（非 A 股 / 非法维度直接 400，不浪费 SSE 连接）
     try:
         normalize_a_share(request.stock_code)
     except DeepResearchInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if request.dims:
+        from src.schemas.deep_research_dims import DIM_IDS
+
+        unknown = [d for d in request.dims if d not in DIM_IDS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知维度: {', '.join(unknown)}（可选: {', '.join(DIM_IDS)}）",
+            )
 
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
@@ -164,6 +177,8 @@ async def generate_stream(request: DeepResearchRequest):
                 raw_name=request.stock_name,
                 report_type=request.report_type,
                 progress_callback=progress_callback,
+                dims=request.dims,
+                force_refresh=request.force_refresh,
             )
             # done 事件由 service.generate_report 内部推
         except DeepResearchInputError as exc:

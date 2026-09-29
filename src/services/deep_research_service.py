@@ -150,8 +150,13 @@ class DeepResearchService:
         raw_name: Optional[str] = None,
         report_type: str = "deep",
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        dims: Optional[List[str]] = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
-        """生成一份深度投研报告并落盘。返回 {report_id, status, markdown, ...}。"""
+        """生成一份深度投研报告并落盘。返回 {report_id, status, markdown, ...}。
+
+        dims：维度子集（省钱模式），None/空 = 全部；force_refresh：跳过维度缓存。
+        """
         code = normalize_a_share(raw_code)
         name = (raw_name or "").strip()
         if not name:
@@ -180,6 +185,8 @@ class DeepResearchService:
                 explore_max_steps=int(
                     getattr(get_config(), "deep_research_dim_max_steps", 8) or 8
                 ),
+                dims_filter=set(dims) if dims else None,
+                force_refresh=force_refresh,
             )
             result = SimpleNamespace(
                 success=dt_result.success,

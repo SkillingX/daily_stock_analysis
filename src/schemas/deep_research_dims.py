@@ -59,7 +59,7 @@ DIM_IDS: tuple[str, ...] = (
     "scenarios",
 )
 
-DimStatus = Literal["ok", "degraded"]
+DimStatus = Literal["ok", "degraded", "skipped"]
 
 Rating = Literal["买入", "增持", "中性", "减持"]
 Confidence = Literal["高", "中", "低"]
@@ -82,6 +82,10 @@ class DimEnvelope(BaseModel):
     @property
     def ok(self) -> bool:
         return self.status == "ok"
+
+    @property
+    def skipped(self) -> bool:
+        return self.status == "skipped"
 
 
 class GuardrailEvent(BaseModel):

@@ -51,8 +51,11 @@ REQUIRED_HEADINGS = [
 
 
 def _degraded_note(dim: Any) -> str:
-    if getattr(dim, "status", "ok") == "degraded":
+    status = getattr(dim, "status", "ok")
+    if status == "degraded":
         return f"⚠️ 本维度生成不充分：{getattr(dim, 'degraded_reason', '未知原因')}，以下内容为降级占位。"
+    if status == "skipped":
+        return "— 本维度未选择生成（省钱模式），以下内容为默认占位，不代表分析结论。"
     return ""
 
 
