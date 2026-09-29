@@ -57,6 +57,10 @@ _REPORT_ID_RE = re.compile(r"^\d{6}_\d{12}(_\d+)?$")
 # PDF 渲染并发限流（xhtml2pdf 内存密集，模块级 Semaphore(1) 串行化惰性生成）
 _PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
 
+# 深度投研 in-flight 请求去重（防止用户快速点击导致重复生成）
+# key: stock_code, value: asyncio.Event（生成完成时置位）
+_IN_FLIGHT_REQUESTS: Dict[str, asyncio.Event] = {}
+
 
 # ============================================================
 # Schemas
@@ -160,6 +164,23 @@ async def generate_stream(request: DeepResearchRequest):
                 detail=f"未知维度: {', '.join(unknown)}（可选: {', '.join(DIM_IDS)}）",
             )
 
+    # ── In-flight 请求去重 ──
+    # 同一股票如果已有进行中的生成请求，直接返回冲突错误，避免重复生成
+    dedupe_key = request.stock_code.strip()
+    if dedupe_key in _IN_FLIGHT_REQUESTS:
+        logger.warning(
+            "[DeepResearch] 股票 %s 已有进行中的生成请求，拒绝重复提交",
+            dedupe_key,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"股票 {dedupe_key} 已有生成任务正在进行中，请等待完成后重试",
+        )
+
+    # 标记为进行中（函数返回时清除）
+    in_flight_event = asyncio.Event()
+    _IN_FLIGHT_REQUESTS[dedupe_key] = in_flight_event
+
     loop = asyncio.get_running_loop()
     queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
@@ -196,6 +217,8 @@ async def generate_stream(request: DeepResearchRequest):
 
         fut_sync = try_submit_long_task(run_sync)
         if fut_sync is None:
+            # 线程池满：清理 in-flight 标记后返回错误
+            _IN_FLIGHT_REQUESTS.pop(dedupe_key, None)
             yield (
                 "data: "
                 + json.dumps(
@@ -227,6 +250,8 @@ async def generate_stream(request: DeepResearchRequest):
                 if event.get("type") in ("done", "error"):
                     break
         finally:
+            # 清理 in-flight 标记（无论正常/异常结束都必须清理）
+            _IN_FLIGHT_REQUESTS.pop(dedupe_key, None)
             try:
                 await asyncio.wait_for(fut, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
