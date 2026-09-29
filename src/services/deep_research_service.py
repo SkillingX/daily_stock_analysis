@@ -28,11 +28,15 @@ from src.storage import get_db
 
 logger = logging.getLogger(__name__)
 
-# ── 报告级缓存（30min TTL，同一股票重复查询直接返回缓存，报告完全一致）────────────────
-_REPORT_CACHE_TTL_SECONDS = 1800  # 30分钟
-_ReportCacheEntry = Tuple[str, float]  # (report_id, timestamp)
+# ── 报告级日缓存（同一天内同一股票不重复生成报告，内容完全一致）────────────────
+# key格式：{code}:{date}，date = YYYYMMDD，按自然日缓存，次日自动失效
 _report_cache: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}  # key→(report_id, ts, full_result)
 _cache_lock = threading.Lock()
+
+
+def _date_key(code: str) -> str:
+    """返回今日缓存 key（按自然日，同一天内复用同一报告）。"""
+    return f"{code}:{datetime.now().strftime('%Y%m%d')}"
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）
@@ -172,35 +176,30 @@ class DeepResearchService:
             # 前端未传名称时反查真实中文名，避免元数据 stock_name 退化成代码
             name = _lookup_stock_name(code) or code
 
-        # ── 报告级缓存查找（force_refresh 时跳过）──────────────────────────────
+        # ── 报告级日缓存查找（同一天内不重复生成，force_refresh 时跳过）──────────
         if not force_refresh:
-            cache_key = f"{code}:{report_type}"
+            cache_key = _date_key(code)
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
             if cached:
                 cached_id, cached_ts, cached_result = cached
-                if now - cached_ts < _REPORT_CACHE_TTL_SECONDS:
-                    logger.info(
-                        "[DeepResearch] 缓存命中 %s（%.0fs前生成），直接返回缓存报告",
-                        code,
-                        now - cached_ts,
-                    )
-                    # 通知前端这是缓存命中
-                    if progress_callback:
-                        progress_callback({
-                            "type": "thinking",
-                            "step": 0,
-                            "message": f"📦 缓存命中（{int(now - cached_ts)}s前），直接返回历史报告",
-                        })
-                    # 追加 cache_hit 标记，前端据此显示"来自缓存"
-                    cached_result = dict(cached_result)
-                    cached_result["cache_hit"] = True
-                    return cached_result
-                else:
-                    # TTL 过期，清理
-                    with _cache_lock:
-                        _report_cache.pop(cache_key, None)
+                logger.info(
+                    "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
+                    code,
+                    now - cached_ts,
+                )
+                # 通知前端这是缓存命中
+                if progress_callback:
+                    progress_callback({
+                        "type": "thinking",
+                        "step": 0,
+                        "message": f"📦 日缓存命中（{int((now - cached_ts) / 60)}min前），直接返回今日报告",
+                    })
+                # 追加 cache_hit 标记，前端据此显示"来自缓存"
+                cached_result = dict(cached_result)
+                cached_result["cache_hit"] = True
+                return cached_result
 
         report_id = _REPORT_ID_PATTERN.format(code=code, ts=datetime.now())
         # 防同分钟同股票 id 冲突（save 用 merge 会覆盖旧记录导致文件孤儿）
@@ -338,13 +337,13 @@ class DeepResearchService:
             return_dict["dimensions"] = dims_payload
             return_dict["guardrail_events"] = guardrail_events
 
-        # ── 写入报告缓存（成功时）──────────────────────────────────────────────
+        # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
         if write_ok and return_dict.get("markdown"):
-            cache_key = f"{code}:{report_type}"
+            cache_key = _date_key(code)
             now = time.time()
             with _cache_lock:
                 _report_cache[cache_key] = (report_id, now, return_dict)
-            logger.info("[DeepResearch] 报告缓存已写入 key=%s report_id=%s", cache_key, report_id)
+            logger.info("[DeepResearch] 日缓存已写入 %s → %s", cache_key, report_id)
 
         return return_dict
 
