@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,12 @@ from src.services.stock_code_utils import normalize_code
 from src.storage import get_db
 
 logger = logging.getLogger(__name__)
+
+# ── 报告级缓存（30min TTL，同一股票重复查询直接返回缓存，报告完全一致）────────────────
+_REPORT_CACHE_TTL_SECONDS = 1800  # 30分钟
+_ReportCacheEntry = Tuple[str, float]  # (report_id, timestamp)
+_report_cache: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}  # key→(report_id, ts, full_result)
+_cache_lock = threading.Lock()
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）
@@ -156,12 +164,43 @@ class DeepResearchService:
         """生成一份深度投研报告并落盘。返回 {report_id, status, markdown, ...}。
 
         dims：维度子集（省钱模式），None/空 = 全部；force_refresh：跳过维度缓存。
+        30min 内同一股票重复查询直接返回缓存（报告完全一致）。
         """
         code = normalize_a_share(raw_code)
         name = (raw_name or "").strip()
         if not name:
             # 前端未传名称时反查真实中文名，避免元数据 stock_name 退化成代码
             name = _lookup_stock_name(code) or code
+
+        # ── 报告级缓存查找（force_refresh 时跳过）──────────────────────────────
+        if not force_refresh:
+            cache_key = f"{code}:{report_type}"
+            now = time.time()
+            with _cache_lock:
+                cached = _report_cache.get(cache_key)
+            if cached:
+                cached_id, cached_ts, cached_result = cached
+                if now - cached_ts < _REPORT_CACHE_TTL_SECONDS:
+                    logger.info(
+                        "[DeepResearch] 缓存命中 %s（%.0fs前生成），直接返回缓存报告",
+                        code,
+                        now - cached_ts,
+                    )
+                    # 通知前端这是缓存命中
+                    if progress_callback:
+                        progress_callback({
+                            "type": "thinking",
+                            "step": 0,
+                            "message": f"📦 缓存命中（{int(now - cached_ts)}s前），直接返回历史报告",
+                        })
+                    # 追加 cache_hit 标记，前端据此显示"来自缓存"
+                    cached_result = dict(cached_result)
+                    cached_result["cache_hit"] = True
+                    return cached_result
+                else:
+                    # TTL 过期，清理
+                    with _cache_lock:
+                        _report_cache.pop(cache_key, None)
 
         report_id = _REPORT_ID_PATTERN.format(code=code, ts=datetime.now())
         # 防同分钟同股票 id 冲突（save 用 merge 会覆盖旧记录导致文件孤儿）
@@ -298,6 +337,15 @@ class DeepResearchService:
             return_dict["engine"] = "dual_track"
             return_dict["dimensions"] = dims_payload
             return_dict["guardrail_events"] = guardrail_events
+
+        # ── 写入报告缓存（成功时）──────────────────────────────────────────────
+        if write_ok and return_dict.get("markdown"):
+            cache_key = f"{code}:{report_type}"
+            now = time.time()
+            with _cache_lock:
+                _report_cache[cache_key] = (report_id, now, return_dict)
+            logger.info("[DeepResearch] 报告缓存已写入 key=%s report_id=%s", cache_key, report_id)
+
         return return_dict
 
     # ------------------------------------------------------------------
