@@ -182,6 +182,9 @@ def run_dual_track(
     explore_max_steps: int = 8,
     force_refresh: bool = False,
     dims_filter: Optional[set] = None,
+    skip_narrations: bool = False,
+    write_cache: bool = True,
+    cache_exclude: Optional[frozenset] = None,
 ) -> DualTrackResult:
     """执行一次双轨深度投研分析。"""
     result = DualTrackResult()
@@ -230,7 +233,17 @@ def run_dual_track(
         return dim
 
     def store_cache(dim_id: str, dim: DimEnvelope) -> None:
-        """成功（非降级）的缓存类维度落盘，供同票复用。"""
+        """成功（非降级）的缓存类维度落盘，供同票复用。
+
+        write_cache=False（批量桥接场景）：只读缓存不写。
+        cache_exclude：按维度排除——如批量场景跳过情景维度（其叙述为空，固化后
+        web 端缓存命中会拿到无叙述 payload）；探索/评分类维度 payload 与叙述无关，
+        批量写入仍能让次日命中省下探索 Agent。
+        """
+        if not write_cache:
+            return
+        if cache_exclude and dim_id in cache_exclude:
+            return
         if dim.status == "ok" and dim_id in CACHEABLE_DIMS:
             save_cached_dim(stock_code, dim_id, dim.model_dump())
 
@@ -263,7 +276,7 @@ def run_dual_track(
         if "phase" in selected:
             start_dim("phase")
             phase_dim = build_phase_dim(ctx)
-            if phase_dim.status == "ok":
+            if phase_dim.status == "ok" and not skip_narrations:
                 phase_dim = phase_dim.model_copy(
                     update={
                         "narrative": narrate(
@@ -276,7 +289,7 @@ def run_dual_track(
         if "history" in selected:
             start_dim("history")
             history_dim = build_history_dim(ctx)
-            if history_dim.status == "ok":
+            if history_dim.status == "ok" and not skip_narrations:
                 history_dim = history_dim.model_copy(
                     update={
                         "narrative": narrate(
@@ -307,7 +320,7 @@ def run_dual_track(
         if dim is None:
             start_dim("data")
             dim = build_data_dim(ctx)
-            if dim.status == "ok":
+            if dim.status == "ok" and not skip_narrations:
                 dim = dim.model_copy(
                     update={
                         "narrative": narrate(
@@ -467,7 +480,7 @@ def run_dual_track(
 
     # 四个维度的 LLM 叙述并行化：串行实测 ~89s（4 个独立 roundtrip），并行 ≈ 最慢一个
     narrate_jobs: List[Tuple[str, Any]] = []
-    if scenarios_dim is not None and not scenarios_from_cache:
+    if not skip_narrations and scenarios_dim is not None and not scenarios_from_cache:
         narrate_jobs.append(("scenarios", scenarios_dim))
     if conclusion_dim is not None:
         narrate_jobs.append(("conclusion", conclusion_dim))
@@ -475,7 +488,7 @@ def run_dual_track(
         narrate_jobs.append(("plan", plan_dim))
     if signal_dim is not None:
         narrate_jobs.append(("signal", signal_dim))
-    if narrate_jobs:
+    if narrate_jobs and not skip_narrations:
         with ThreadPoolExecutor(max_workers=4) as pool:
             fut_map = {
                 pool.submit(
@@ -499,7 +512,7 @@ def run_dual_track(
                 else:
                     signal_dim = updated
 
-    if scenarios_dim is not None:
+    if scenarios_dim is not None and not scenarios_from_cache:
         store_cache("scenarios", scenarios_dim)
         emit_dim("scenarios", scenarios_dim.status)
     if conclusion_dim is not None:

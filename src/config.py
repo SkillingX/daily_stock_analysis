@@ -1165,6 +1165,9 @@ class Config:
     deep_research_engine: str = "dual_track"
     # 双轨引擎：探索型维度（S3/L4）的 ReAct 步数上限
     deep_research_dim_max_steps: int = 8
+    # 每日分析长线段接入双轨引擎（A 股收敛单实现，见 src/services/longtrack_bridge.py；
+    # 默认关，开启后 A 股自选股长线五段式由双轨长线子集产出，失败自动回退内嵌路径）
+    enable_longtrack_dual_track: bool = False
     # 政策与公告排雷报告：保留报告数量上限（超出删最旧，含 .md/.pdf 文件，0=不清理）
     policy_minesweeper_max_reports: int = 200
     # 启用价值情景分析
@@ -2359,6 +2362,10 @@ class Config:
                 field_name="deep_research_dim_max_steps",
                 minimum=1,
             ),
+            enable_longtrack_dual_track=os.getenv(
+                "ENABLE_LONGTRACK_DUAL_TRACK", "false"
+            ).lower()
+            == "true",
             policy_minesweeper_max_reports=parse_env_int(
                 os.getenv("POLICY_MINESWEEPER_MAX_REPORTS", "200"),
                 200,

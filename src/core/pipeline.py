@@ -1980,6 +1980,23 @@ class StockAnalysisPipeline:
             logger.debug("[ResearchFramework] 已禁用，跳过")
             return result
 
+        # 双轨长线桥接（A 股收敛单实现；开关默认关，内含内嵌回退）
+        if getattr(self.config, "enable_longtrack_dual_track", False):
+            try:
+                from src.services.longtrack_bridge import integrate_longtrack_dual
+
+                result = integrate_longtrack_dual(result, context or {})
+                logger.info(
+                    "[LongTrackBridge] %s 长线段接入完成（source=%s）",
+                    result.code,
+                    getattr(result, "longtrack_source", "unknown"),
+                )
+                return result
+            except Exception as e:  # noqa: BLE001 - 桥接失败回退原路径
+                logger.warning(
+                    "[LongTrackBridge] 接入异常，回退内嵌五段式: %s", e
+                )
+
         try:
             from src.services.research_framework_integration import (
                 integrate_research_framework as rf_integrate,

@@ -445,11 +445,12 @@ async def get_dims(report_id: str):
 
 
 @router.get("/reports/{report_id}/dims/{dim_id}")
-async def get_dim_report(report_id: str, dim_id: str):
+async def get_dim_report(report_id: str, dim_id: str, download: int = 0):
     """单维度子报告（Markdown）：报告区对应章节的独立详版。
 
-    浏览器直接打开即可查看（text/markdown），加 ?download=1 触发附件下载。
-    双轨报告经 ``_write_dim_reports`` 落盘；legacy 报告无子报告 → 404。
+    浏览器直接打开即可内联查看（text/markdown）；``?download=1`` 带文件名
+    触发附件下载（前端 <a download> 亦生效）。双轨报告经 ``_write_dim_reports``
+    落盘；legacy 报告无子报告 → 404。
     """
     _validate_report_id(report_id)
     from src.schemas.deep_research_dims import DIM_IDS
@@ -469,8 +470,10 @@ async def get_dim_report(report_id: str, dim_id: str):
     safe_path = _resolve_safe_path(data["path"])
     if safe_path is None or not safe_path.exists():
         raise HTTPException(status_code=404, detail="维度子报告文件不存在")
-    return FileResponse(
-        str(safe_path),
-        media_type="text/markdown; charset=utf-8",
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
-    )
+    response_kwargs: Dict[str, Any] = {
+        "media_type": "text/markdown; charset=utf-8",
+        "headers": {"Cache-Control": "no-store, no-cache, must-revalidate"},
+    }
+    if download:
+        response_kwargs["filename"] = f"{report_id}_dim_{dim_id}.md"
+    return FileResponse(str(safe_path), **response_kwargs)
