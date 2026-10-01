@@ -82,6 +82,7 @@
 - {{ item }}
 {% endfor %}
 {% endif %}
+{% if plan.narrative %}{{ plan.narrative }}{% endif %}
 
 ### 五、阶段决策
 
@@ -97,6 +98,7 @@
 {% endfor %}
 {% endif %}
 {% endif %}
+{% if phase.narrative %}{{ phase.narrative }}{% endif %}
 
 ### 六、历史对比
 
@@ -113,6 +115,7 @@
 {% if history.drift_flags %}
 **观点漂移**：{% for f in history.drift_flags %}{{ f }}；{% endfor %}
 {% endif %}
+{% if history.narrative %}{{ history.narrative }}{% endif %}
 
 ---
 

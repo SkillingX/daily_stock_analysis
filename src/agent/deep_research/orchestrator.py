@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
@@ -185,6 +186,11 @@ def run_dual_track(
     """执行一次双轨深度投研分析。"""
     result = DualTrackResult()
     dims: Dict[str, DimEnvelope] = {}
+    _perf_t0 = time.time()
+    _perf_marks: List[Tuple[str, float]] = []
+
+    def _perf_mark(label: str) -> None:
+        _perf_marks.append((label, time.time() - _perf_t0))
 
     # 维度子集（省钱模式）：未选维度标 skipped，不执行、不入缓存
     selected = expand_dim_selection(dims_filter)
@@ -231,20 +237,9 @@ def run_dual_track(
     # ---- 阶段 0 + 前置 S2 ----
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
     ctx = build_shared_context(stock_code, stock_name)
+    _perf_mark("stage0_context")
 
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力/筹码）..."})
-    data_dim: Optional[DataDim] = None
-    if "data" in selected:
-        data_dim = try_cache("data")
-        if data_dim is None:
-            start_dim("data")
-            data_dim = build_data_dim(ctx)
-            store_cache("data", data_dim)
-            dims["data"] = data_dim
-            emit_dim("data", data_dim.status)
-        else:
-            dims["data"] = data_dim
-
     # ---- 波次 1：探索 Agent 线程池 + 主线程纯规则 ----
     _emit(progress_callback, {"type": "thinking", "step": 1, "message": "并行执行情报/产业链探索与规则维度..."})
 
@@ -268,11 +263,27 @@ def run_dual_track(
         if "phase" in selected:
             start_dim("phase")
             phase_dim = build_phase_dim(ctx)
+            if phase_dim.status == "ok":
+                phase_dim = phase_dim.model_copy(
+                    update={
+                        "narrative": narrate(
+                            llm_adapter, "phase", phase_dim.model_dump(), phase_dim.narrative
+                        )
+                    }
+                )
             dims["phase"] = phase_dim
             emit_dim("phase", phase_dim.status)
         if "history" in selected:
             start_dim("history")
             history_dim = build_history_dim(ctx)
+            if history_dim.status == "ok":
+                history_dim = history_dim.model_copy(
+                    update={
+                        "narrative": narrate(
+                            llm_adapter, "history", history_dim.model_dump(), history_dim.narrative
+                        )
+                    }
+                )
             dims["history"] = history_dim
             emit_dim("history", history_dim.status)
         if "six_dim" in selected:
@@ -288,6 +299,29 @@ def run_dual_track(
             else:
                 dims["six_dim"] = six_dim
 
+    def _build_data_dim() -> Optional[DataDim]:
+        """S2 数据透视：缓存优先；fresh 时 LLM 叙述（与探索 Agent 并行，叙述耗时隐藏）。"""
+        if "data" not in selected:
+            return None
+        dim = try_cache("data")
+        if dim is None:
+            start_dim("data")
+            dim = build_data_dim(ctx)
+            if dim.status == "ok":
+                dim = dim.model_copy(
+                    update={
+                        "narrative": narrate(
+                            llm_adapter, "data", dim.model_dump(), dim.narrative
+                        )
+                    }
+                )
+            store_cache("data", dim)
+            dims["data"] = dim
+            emit_dim("data", dim.status)
+        else:
+            dims["data"] = dim
+        return dim
+
     if run_intel or run_sc:
         with ThreadPoolExecutor(max_workers=2) as pool:
             sc_cached = try_cache("supply_chain") if run_sc else None
@@ -301,6 +335,7 @@ def run_dual_track(
                 start_dim("supply_chain")
                 fut_sc = pool.submit(supply_chain_worker)
 
+            data_dim = _build_data_dim()
             _run_rule_dims()
 
             if run_sc:
@@ -343,7 +378,10 @@ def run_dual_track(
                 if not intel_from_cache:
                     emit_dim("intel", dims["intel"].status)
     else:
+        data_dim = _build_data_dim()
         _run_rule_dims()
+
+    _perf_mark("wave1_done")
 
     # ---- 波次 2：L2 贝叶斯 ----
     if "bayesian" in selected:
@@ -374,60 +412,49 @@ def run_dual_track(
         dims["bayesian"] = bayesian_dim
         emit_dim("bayesian", bayesian_dim.status)
 
+    _perf_mark("wave2_done")
+
     # ---- 波次 3：L5 → L3 → S4 → S1 ----
     _emit(progress_callback, {"type": "thinking", "step": 3, "message": "合成情景/结论/计划/信号（规则 + 护栏）..."})
     current_price = ctx.quote.get("price")
+
+    scenarios_from_cache = False
+    scenarios_dim = None
     if "scenarios" in selected:
-        scenarios_from_cache = False
         scenarios_dim = try_cache("scenarios")
         if scenarios_dim is None:
             start_dim("scenarios")
-            scenarios_dim = build_scenarios_dim(ctx, float(current_price) if isinstance(current_price, (int, float)) else None)
+            scenarios_dim = build_scenarios_dim(
+                ctx,
+                float(current_price) if isinstance(current_price, (int, float)) else None,
+            )
         else:
             scenarios_from_cache = True
-        if not scenarios_from_cache:
-            facts_scen = scenarios_dim.model_dump()
-            scenarios_dim = scenarios_dim.model_copy(
-                update={
-                    "narrative": narrate(
-                        llm_adapter, "scenarios", facts_scen, scenarios_dim.narrative
-                    )
-                }
-            )
-        store_cache("scenarios", scenarios_dim)
-        if not scenarios_from_cache:
-            dims["scenarios"] = scenarios_dim
-            emit_dim("scenarios", scenarios_dim.status)
-        else:
-            dims["scenarios"] = scenarios_dim
+        dims["scenarios"] = scenarios_dim  # 先行入册，供 plan/signal 构建读取
 
+    conclusion_dim = None
     if "conclusion" in selected:
         start_dim("conclusion")
         conclusion_dim = build_conclusion_dim(
-            ctx, dims["six_dim"].model_dump(), dims["bayesian"].model_dump(), dims["scenarios"].model_dump()
-        )
-        facts_conc = conclusion_dim.model_dump()
-        conclusion_dim = conclusion_dim.model_copy(
-            update={
-                "rationale": narrate(llm_adapter, "conclusion", facts_conc, conclusion_dim.narrative)
-            }
+            ctx,
+            dims["six_dim"].model_dump(),
+            dims["bayesian"].model_dump(),
+            scenarios_dim.model_dump() if scenarios_dim else {},
         )
         dims["conclusion"] = conclusion_dim
         emit_dim("conclusion", conclusion_dim.status)
 
+    plan_dim = None
     if "plan" in selected:
         position_suggestion = (
             getattr(dims["bayesian"].bayesian, "position_suggestion", None) or "观察"
         )
         start_dim("plan")
         plan_dim = build_plan_dim(ctx, dims["data"].model_dump(), position_suggestion)
-        facts_plan = plan_dim.model_dump()
-        plan_dim = plan_dim.model_copy(
-            update={"narrative": narrate(llm_adapter, "plan", facts_plan, plan_dim.narrative)}
-        )
         dims["plan"] = plan_dim
         emit_dim("plan", plan_dim.status)
 
+    signal_dim = None
     if "signal" in selected:
         start_dim("signal")
         signal_dim = build_signal_dim(
@@ -435,12 +462,52 @@ def run_dual_track(
             dims["conclusion"].model_dump(),
             dims["scenarios"].model_dump(),
         )
-        facts_sig = signal_dim.model_dump()
-        signal_dim = signal_dim.model_copy(
-            update={"narrative": narrate(llm_adapter, "signal", facts_sig, signal_dim.narrative)}
-        )
         dims["signal"] = signal_dim
         emit_dim("signal", signal_dim.status)
+
+    # 四个维度的 LLM 叙述并行化：串行实测 ~89s（4 个独立 roundtrip），并行 ≈ 最慢一个
+    narrate_jobs: List[Tuple[str, Any]] = []
+    if scenarios_dim is not None and not scenarios_from_cache:
+        narrate_jobs.append(("scenarios", scenarios_dim))
+    if conclusion_dim is not None:
+        narrate_jobs.append(("conclusion", conclusion_dim))
+    if plan_dim is not None:
+        narrate_jobs.append(("plan", plan_dim))
+    if signal_dim is not None:
+        narrate_jobs.append(("signal", signal_dim))
+    if narrate_jobs:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fut_map = {
+                pool.submit(
+                    narrate, llm_adapter, dim_id, dim.model_dump(), dim.narrative
+                ): (dim_id, dim)
+                for dim_id, dim in narrate_jobs
+            }
+            for fut, (dim_id, dim) in fut_map.items():
+                try:
+                    narrated = fut.result(timeout=180)
+                    updated = dim.model_copy(update={"narrative": narrated})
+                except Exception as exc:  # noqa: BLE001 - 单维度叙述失败只降级
+                    logger.warning("[DualTrack] 叙述并行任务失败 %s: %s", dim_id, exc)
+                    updated = dim
+                if dim_id == "scenarios":
+                    scenarios_dim = updated
+                elif dim_id == "conclusion":
+                    conclusion_dim = updated
+                elif dim_id == "plan":
+                    plan_dim = updated
+                else:
+                    signal_dim = updated
+
+    if scenarios_dim is not None:
+        store_cache("scenarios", scenarios_dim)
+        emit_dim("scenarios", scenarios_dim.status)
+    if conclusion_dim is not None:
+        dims["conclusion"] = conclusion_dim
+    if plan_dim is not None:
+        dims["plan"] = plan_dim
+    if signal_dim is not None:
+        dims["signal"] = signal_dim
 
     # 未选维度（省钱模式）补 skipped 占位，供成文与契约一致
     from src.schemas.deep_research_dims import DIM_MODELS
@@ -450,6 +517,8 @@ def run_dual_track(
             dims[_dim_id] = DIM_MODELS[_dim_id](
                 status="skipped", degraded_reason="省钱模式未选择该维度"
             )
+
+    _perf_mark("wave3_done")
 
     # ---- 护栏层（override 后叙述修订 + 契约重解析）----
     payloads = {d: m.model_dump() for d, m in dims.items()}
@@ -485,6 +554,8 @@ def run_dual_track(
             final_dims[dim_id] = dims[dim_id]
     dims = final_dims
 
+    _perf_mark("guardrail_done")
+
     # ---- 成文 ----
     _emit(progress_callback, {"type": "thinking", "step": 4, "message": "生成双轨投研报告（模板直灌）..."})
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events)
@@ -508,4 +579,11 @@ def run_dual_track(
     result.total_steps = steps_total
     result.provider = ""
     result.error = None if result.success else "维度降级过多，报告不可用"
+    _perf_mark("render_done")
+    _perf_summary = " ".join(
+        f"{name}={t:.1f}s" for name, t in _perf_marks
+    )
+    logger.info(
+        "[DualTrack][perf] total=%.1fs stages: %s", time.time() - _perf_t0, _perf_summary
+    )
     return result

@@ -116,3 +116,70 @@ def render_markdown(view: Dict[str, Any]) -> str:
 def validate_structure(markdown: str) -> List[str]:
     """成文后结构校验：返回缺失章节列表（空=通过）。"""
     return [h for h in REQUIRED_HEADINGS if h not in markdown]
+
+
+# ---------------------------------------------------------------------------
+# 按维度切分子报告（方向 A：每维度独立 .md，内容即合并报告对应章节，天然满足
+# 「子报告 ≥ 合并报告章节」验收；skipped 维度章节含"未选择生成"注记）
+# ---------------------------------------------------------------------------
+
+# 维度 id → 合并报告章节锚点（### 标题，与模板严格对齐）
+DIM_SECTION_ANCHORS: Dict[str, str] = {
+    "signal": "### 一、信号",
+    "data": "### 二、数据透视",
+    "intel": "### 三、情报",
+    "plan": "### 四、作战计划",
+    "phase": "### 五、阶段决策",
+    "history": "### 六、历史对比",
+    "conclusion": "### 七、投资结论",
+    "supply_chain": "### 八、产业链解读",
+    "scenarios": "### 九、长期价值与情景",
+    "bayesian": "### 十、贝叶斯证据链",
+    "six_dim": "### 十一、六维评分明细",
+}
+
+
+def split_dim_sections(markdown: str) -> Dict[str, str]:
+    """把整份报告切成 {dim_id: 章节 markdown}。
+
+    章节范围 = 锚点行（### 开头）到下一个 ###/## 标题前。锚点缺失的维度不出现在
+    结果里（调用方按缺失处理）。切分基于模板章节锚点，与成文结构同源，不复制
+    模板代码。
+    """
+    lines = markdown.split("\n")
+    # 锚点行号（按出现顺序）
+    anchors: List[tuple[str, int]] = []
+    for dim_id, anchor in DIM_SECTION_ANCHORS.items():
+        for i, line in enumerate(lines):
+            if line.strip() == anchor:
+                anchors.append((dim_id, i))
+                break
+    anchors.sort(key=lambda x: x[1])
+
+    sections: Dict[str, str] = {}
+    for idx, (dim_id, start) in enumerate(anchors):
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            stripped = lines[j].strip()
+            if stripped.startswith("### ") or stripped.startswith("## "):
+                end = j
+                break
+        sections[dim_id] = "\n".join(lines[start:end]).strip() + "\n"
+    return sections
+
+
+def build_dim_report(
+    dim_id: str,
+    section_markdown: str,
+    stock_name: str,
+    stock_code: str,
+    as_of: str,
+) -> str:
+    """单维度子报告：小头（标题/数据截至/免责）+ 章节正文。"""
+    label = DIM_SECTION_ANCHORS[dim_id].lstrip("# ").strip()
+    header = (
+        f"# {stock_name}（{stock_code}）· {label}（子报告）\n\n"
+        f"> 数据截至：{as_of}｜摘自双轨深度投研报告，单维度详版\n\n"
+    )
+    footer = "\n---\n\n*本报告由 AI 生成，不构成投资建议。*\n"
+    return header + section_markdown.rstrip() + "\n" + footer

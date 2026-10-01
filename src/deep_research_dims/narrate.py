@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,9 @@ def narrate(
     if not prompt or llm_adapter is None:
         return default_sentence
     import json
+    import time as _time
+
+    _t0 = _time.time()
 
     system = (
         load_constitution()
@@ -67,8 +71,16 @@ def narrate(
             timeout=timeout,
         )
         text = (response.content or "").strip()
+        # 推理模型可能泄漏 <think>/<thinking> 思考块（实测 8.9KB 污染），先剥除再用
+        text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        # 只取首段（prompt 要求 200 字内一段；模型偶发多段/编号列表）
+        text = text.split("\n\n")[0].strip()
         if len(text) < 20:
             return default_sentence
+        logger.info(
+            "[DualTrack][perf] narrate dim=%s elapsed=%.1fs out=%dB",
+            dim_id, _time.time() - _t0, len(text),
+        )
         return text
     except Exception as exc:  # noqa: BLE001 - 叙述失败只降级
         logger.warning("[DualTrack] 叙述生成失败 %s: %s", dim_id, exc)

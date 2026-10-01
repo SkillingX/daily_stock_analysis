@@ -153,6 +153,12 @@ export const deepResearchApi = {
     await downloadPdfFromUrl(url, 'deep_research', reportId);
   },
 
+  /** 单维度子报告 URL（浏览器直接查看；加 ?download=1 触发下载） */
+  dimReportUrl(reportId: string, dimId: string): string {
+    const base = API_BASE_URL || '';
+    return `${base}/api/v1/deep-research/reports/${reportId}/dims/${dimId}`;
+  },
+
   /**
    * 双轨引擎维度 JSON 产物（11 维度结构化数据 + 护栏事件表）。
    * legacy 报告无产物，返回 null。

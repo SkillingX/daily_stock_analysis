@@ -449,6 +449,57 @@ class TestIndustryBaseRate:
 # ---------------------------------------------------------------------------
 
 
+class TestReportDayCache:
+    def test_date_key_dims_fingerprint(self):
+        from src.services.deep_research_service import _date_key
+
+        full = _date_key("600519")
+        subset = _date_key("600519", ["conclusion", "six_dim", "bayesian"])
+        subset_reordered = _date_key("600519", ["bayesian", "conclusion", "six_dim"])
+        assert full != subset
+        assert subset == subset_reordered  # 顺序无关
+
+    def test_cache_hit_emits_done_event(self, monkeypatch):
+        """远程日缓存命中路径必须推送 done 事件，否则 SSE 端挂起等 90s 看门狗。"""
+        from src.services import deep_research_service as svc
+
+        fake_result = {
+            "report_id": "600519_202609290900",
+            "stock_code": "600519",
+            "stock_name": "贵州茅台",
+            "status": "success",
+            "quality_score": 100,
+            "missing_layers": [],
+            "markdown": "# 缓存报告",
+            "engine": "dual_track",
+            "dimensions": {"signal": {"status": "ok"}},
+            "guardrail_events": [],
+            "error": None,
+        }
+        monkeypatch.setattr(
+            svc, "_report_cache", {_date_key_of("600519"): ("600519_202609290900", 0.0, fake_result)}
+        )
+        events: list = []
+        out = svc.deep_research_service.generate_report(
+            raw_code="600519",
+            raw_name="贵州茅台",
+            progress_callback=lambda e: events.append(e),
+        )
+        assert out.get("cache_hit") is True
+        done = [e for e in events if e.get("type") == "done"]
+        assert len(done) == 1, f"缓存命中必须恰好推送 1 个 done，实际: {[e.get('type') for e in events]}"
+        assert done[0]["cache_hit"] is True
+        assert done[0]["markdown"] == "# 缓存报告"
+        assert done[0]["engine"] == "dual_track"
+        assert done[0]["report_id"] == "600519_202609290900"
+
+
+def _date_key_of(code: str) -> str:
+    from src.services.deep_research_service import _date_key
+
+    return _date_key(code)
+
+
 class TestDimCache:
     def test_save_load_roundtrip(self, tmp_path, monkeypatch):
         from src.deep_research_dims import dim_cache
@@ -491,6 +542,93 @@ class TestDimCache:
         dim_cache.save_cached_dim("000001", "data", {"a": 2})
         assert dim_cache.clear_cache("600519") == 1
         assert dim_cache.load_cached_dim("000001", "data") == {"a": 2}
+
+
+class TestNarrateHardening:
+    def test_think_block_stripped(self):
+        """实测缺陷回归：推理模型的 <think> 思考块不得泄漏进报告叙述。"""
+        from src.deep_research_dims.narrate import narrate
+
+        class _ThinkAdapter:
+            def call_text(self, messages, **kwargs):
+                class _R:
+                    content = (
+                        "<think>Let me analyze the data and think about the "
+                        "ma alignment carefully step by step...</think>\n"
+                        "均线空头排列显示短期承压，量能平稳暗示观望情绪，"
+                        "当前位置宜等待回踩支撑再考虑介入。"
+                    )
+
+                return _R()
+
+        out = narrate(
+            _ThinkAdapter(), "data", {"a": 1}, "默认句", timeout=1
+        )
+        assert "<think>" not in out
+        assert out.startswith("均线空头排列")
+
+    def test_thinking_variant_stripped(self):
+        from src.deep_research_dims.narrate import narrate
+
+        class _T2:
+            def call_text(self, messages, **kwargs):
+                class _R:
+                    content = "<thinking>长思考过程</thinking>结论句：当前阶段处于盘后时段，建议按报告计划挂单等待触发价，不要追高。"
+
+                return _R()
+
+        out = narrate(_T2(), "phase", {}, "默认句", timeout=1)
+        assert "thinking" not in out.lower()
+        assert out.startswith("结论句")
+
+    def test_empty_after_strip_falls_back(self):
+        from src.deep_research_dims.narrate import narrate
+
+        class _Empty:
+            def call_text(self, messages, **kwargs):
+                class _R:
+                    content = "<think>只有思考没有结论</think>"
+
+                return _R()
+
+        assert narrate(_Empty(), "history", {}, "默认句", timeout=1) == "默认句"
+
+
+class TestDimSubReports:
+    def test_split_all_11_sections(self):
+        from src.deep_research_dims.render import (
+            DIM_SECTION_ANCHORS,
+            split_dim_sections,
+        )
+
+        dims = _all_default_dims()
+        view = build_view("贵州茅台", "600519", "2026-09-29T10:00:00", [], dims, [])
+        markdown = render_markdown(view)
+        sections = split_dim_sections(markdown)
+        assert set(sections) == set(DIM_SECTION_ANCHORS)
+        # 每个章节非空且以锚点标题开头
+        for dim_id, anchor in DIM_SECTION_ANCHORS.items():
+            assert sections[dim_id].startswith(anchor), dim_id
+
+    def test_skipped_section_carries_note(self):
+        from src.deep_research_dims.render import split_dim_sections
+
+        dims = _all_default_dims()
+        dims["phase"] = dims["phase"].model_copy(
+            update={"status": "skipped", "degraded_reason": "省钱模式未选择该维度"}
+        )
+        view = build_view("贵州茅台", "600519", "2026-09-29T10:00:00", [], dims, [])
+        sections = split_dim_sections(render_markdown(view))
+        assert "未选择生成" in sections["phase"]
+
+    def test_build_dim_report_header_footer(self):
+        from src.deep_research_dims.render import build_dim_report
+
+        md = build_dim_report("intel", "### 三、情报\n\n内容", "贵州茅台", "600519", "2026-09-29T10:00:00")
+        assert md.startswith("# 贵州茅台（600519）· 三、情报（子报告）")
+        assert "数据截至：2026-09-29T10:00:00" in md
+        assert "不构成投资建议" in md
+        assert "内容" in md
 
 
 class TestPhaseFallback:

@@ -527,6 +527,11 @@ export function DeepResearchPage() {
                     <span className="rounded bg-cyan/15 px-2 py-0.5 text-cyan">
                       双轨引擎 · 维度 {dimsOkCount}/{DUAL_TRACK_DIMS.length}
                     </span>
+                    {dualTrack.cacheHit && (
+                      <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-400">
+                        📦 今日缓存命中
+                      </span>
+                    )}
                     {effectiveDims.dimsDegraded.length > 0 && (
                       <span className="rounded bg-amber-500/15 px-2 py-0.5 text-amber-400">
                         降级：{effectiveDims.dimsDegraded.join('、')}
@@ -544,6 +549,32 @@ export function DeepResearchPage() {
                       数据截至：{displayReport.created_at?.slice(0, 16).replace('T', ' ') ?? '见报告头部'}
                     </span>
                   </div>
+                  {/* 逐维度子报告：直接查看（新标签页）/ 下载 */}
+                  {displayId && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-[11px] text-muted-text">子报告：</span>
+                      {DUAL_TRACK_DIMS.map((d) => (
+                        <span key={d.id} className="inline-flex items-center gap-0.5">
+                          <a
+                            href={deepResearchApi.dimReportUrl(displayId, d.id)}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="rounded border border-white/10 px-1.5 py-0.5 text-[11px] text-muted-text transition-colors hover:border-cyan/40 hover:text-cyan"
+                          >
+                            {d.label}
+                          </a>
+                          <a
+                            href={`${deepResearchApi.dimReportUrl(displayId, d.id)}?download=1`}
+                            download
+                            aria-label={`下载${d.label}子报告`}
+                            className="rounded px-0.5 text-[11px] text-muted-text/50 transition-colors hover:text-cyan"
+                          >
+                            ⬇
+                          </a>
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   {effectiveDims.guardrailEvents.length > 0 && (
                     <details className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                       <summary className="cursor-pointer text-sm font-medium text-amber-300">

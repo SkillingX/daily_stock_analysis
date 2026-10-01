@@ -442,3 +442,35 @@ async def get_dims(report_id: str):
     if payload is None:
         raise HTTPException(status_code=404, detail="维度产物不存在（legacy 引擎报告无此产物）")
     return {"success": True, "data": payload}
+
+
+@router.get("/reports/{report_id}/dims/{dim_id}")
+async def get_dim_report(report_id: str, dim_id: str):
+    """单维度子报告（Markdown）：报告区对应章节的独立详版。
+
+    浏览器直接打开即可查看（text/markdown），加 ?download=1 触发附件下载。
+    双轨报告经 ``_write_dim_reports`` 落盘；legacy 报告无子报告 → 404。
+    """
+    _validate_report_id(report_id)
+    from src.schemas.deep_research_dims import DIM_IDS
+
+    if dim_id not in DIM_IDS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"未知维度: {dim_id}（可选: {', '.join(DIM_IDS)}）",
+        )
+    data = await asyncio.to_thread(
+        deep_research_service.get_dim_report, report_id, dim_id
+    )
+    if data is None:
+        raise HTTPException(
+            status_code=404, detail="维度子报告不存在（legacy 引擎报告无子报告）"
+        )
+    safe_path = _resolve_safe_path(data["path"])
+    if safe_path is None or not safe_path.exists():
+        raise HTTPException(status_code=404, detail="维度子报告文件不存在")
+    return FileResponse(
+        str(safe_path),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )

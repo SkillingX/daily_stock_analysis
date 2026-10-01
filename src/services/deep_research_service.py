@@ -34,9 +34,13 @@ _report_cache: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}  # key→(repor
 _cache_lock = threading.Lock()
 
 
-def _date_key(code: str) -> str:
-    """返回今日缓存 key（按自然日，同一天内复用同一报告）。"""
-    return f"{code}:{datetime.now().strftime('%Y%m%d')}"
+def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
+    """返回今日缓存 key（按自然日 + 维度子集指纹，同一天同子集复用同一报告）。
+
+    dims 指纹：省钱模式下不同维度子集各自独立缓存，避免全量/子集报告互相串包。
+    """
+    dims_fp = ",".join(sorted(d for d in (dims or []) if d)) or "full"
+    return f"{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）
@@ -178,7 +182,7 @@ class DeepResearchService:
 
         # ── 报告级日缓存查找（同一天内不重复生成，force_refresh 时跳过）──────────
         if not force_refresh:
-            cache_key = _date_key(code)
+            cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
@@ -189,13 +193,28 @@ class DeepResearchService:
                     code,
                     now - cached_ts,
                 )
-                # 通知前端这是缓存命中
+                # 通知前端这是缓存命中（thinking + done 都必须推，否则 SSE 端等不到 done 挂起）
                 if progress_callback:
                     progress_callback({
                         "type": "thinking",
                         "step": 0,
                         "message": f"📦 日缓存命中（{int((now - cached_ts) / 60)}min前），直接返回今日报告",
                     })
+                    done_event: Dict[str, Any] = {
+                        "type": "done",
+                        "report_id": cached_result.get("report_id"),
+                        "status": cached_result.get("status"),
+                        "quality_score": cached_result.get("quality_score"),
+                        "missing_layers": cached_result.get("missing_layers") or [],
+                        "markdown": cached_result.get("markdown") or "",
+                        "error": None,
+                        "cache_hit": True,
+                    }
+                    # 透传双轨增量字段（engine/dimensions/guardrail_events/dims_degraded）
+                    for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded"):
+                        if _k in cached_result:
+                            done_event[_k] = cached_result[_k]
+                    progress_callback(done_event)
                 # 追加 cache_hit 标记，前端据此显示"来自缓存"
                 cached_result = dict(cached_result)
                 cached_result["cache_hit"] = True
@@ -259,6 +278,10 @@ class DeepResearchService:
                 write_ok = True
             except OSError as exc:
                 logger.error("[DeepResearch] 写报告文件失败 %s: %s", md_path, exc)
+
+        # 双轨引擎：按维度切分子报告落盘（dim_<id>.md，单维度查看/下载用）
+        if write_ok and dims_payload is not None:
+            self._write_dim_reports(report_id, markdown, name, code)
 
         # 双轨引擎：维度 JSON 产物落盘（复算/钻取用）
         if write_ok and dims_payload is not None:
@@ -339,7 +362,7 @@ class DeepResearchService:
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
         if write_ok and return_dict.get("markdown"):
-            cache_key = _date_key(code)
+            cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:
                 _report_cache[cache_key] = (report_id, now, return_dict)
@@ -393,6 +416,66 @@ class DeepResearchService:
         return None
 
     # ------------------------------------------------------------------
+    # 按维度子报告（方向 A：dim_<id>.md 落盘/清理）
+    # ------------------------------------------------------------------
+
+    def _write_dim_reports(
+        self, report_id: str, markdown: str, stock_name: str, stock_code: str
+    ) -> None:
+        """把整份报告按章节锚点切成 11 个维度子报告落盘。"""
+        from src.deep_research_dims.render import build_dim_report, split_dim_sections
+
+        sections = split_dim_sections(markdown)
+        report_dir = get_deep_research_dir()
+        for dim_id, section_md in sections.items():
+            try:
+                content = build_dim_report(
+                    dim_id, section_md, stock_name, stock_code,
+                    datetime.now().isoformat(timespec="seconds"),
+                )
+                (report_dir / f"{report_id}_dim_{dim_id}.md").write_text(
+                    content, encoding="utf-8"
+                )
+            except (OSError, KeyError) as exc:
+                logger.warning(
+                    "[DeepResearch] 写维度子报告失败 %s/%s: %s", report_id, dim_id, exc
+                )
+
+    def _dim_report_path(self, report_id: str, dim_id: str) -> Optional[Path]:
+        """返回维度子报告路径（文件必须存在）。"""
+        path = get_deep_research_dir() / f"{report_id}_dim_{dim_id}.md"
+        return path if path.exists() else None
+
+    def get_dim_report(
+        self, report_id: str, dim_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """维度子报告（含正文），供端点直接返回。"""
+        path = self._dim_report_path(report_id, dim_id)
+        if path is None:
+            return None
+        try:
+            return {
+                "dim": dim_id,
+                "path": str(path),
+                "markdown": path.read_text(encoding="utf-8"),
+            }
+        except OSError as exc:
+            logger.warning("[DeepResearch] 读维度子报告失败 %s: %s", path, exc)
+            return None
+
+    @staticmethod
+    def _remove_dim_artifacts(report_id: str) -> None:
+        """删除维度产物（_dims.json + 全部 _dim_<id>.md）。"""
+        report_dir = get_deep_research_dir()
+        targets = [report_dir / f"{report_id}_dims.json"]
+        targets.extend(report_dir.glob(f"{report_id}_dim_*.md"))
+        for p in targets:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("[DeepResearch] 删除维度产物失败 %s: %s", p, exc)
+
+    # ------------------------------------------------------------------
     # 删除
     # ------------------------------------------------------------------
 
@@ -402,7 +485,6 @@ class DeepResearchService:
         if paths is None:
             return False
         # 删文件（事务外，失败只记日志不影响元数据删除）
-        extra = str(get_deep_research_dir() / f"{report_id}_dims.json")
         for key in ("md_path", "pdf_path"):
             p = paths.get(key)
             if p:
@@ -410,10 +492,7 @@ class DeepResearchService:
                     Path(p).unlink(missing_ok=True)
                 except OSError as exc:
                     logger.warning("[DeepResearch] 删除文件失败 %s: %s", p, exc)
-        try:
-            Path(extra).unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("[DeepResearch] 删除维度产物失败 %s: %s", extra, exc)
+        self._remove_dim_artifacts(report_id)
         logger.info("[DeepResearch] 已删除报告 %s", report_id)
         return True
 
@@ -458,7 +537,7 @@ class DeepResearchService:
     # ------------------------------------------------------------------
 
     def _prune_and_clean_files(self, max_reports: int) -> None:
-        """清理超额报告：删元数据（事务内）+ 删文件（事务外）。"""
+        """清理超额报告：删元数据（事务内）+ 删文件（事务外，含维度产物）。"""
         if max_reports <= 0:
             return
         pruned = get_db().prune_deep_research_reports(max_reports)
@@ -470,6 +549,9 @@ class DeepResearchService:
                         Path(p).unlink(missing_ok=True)
                     except OSError as exc:
                         logger.warning("[DeepResearch] 清理删除文件失败 %s: %s", p, exc)
+            md = paths.get("md_path")
+            if md:
+                self._remove_dim_artifacts(Path(str(md)).stem)
         if pruned:
             logger.info("[DeepResearch] 清理超额报告 %d 份", len(pruned))
 

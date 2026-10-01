@@ -44,6 +44,8 @@ export interface DualTrackExtras {
   dimensions?: Record<string, { status?: string; degraded_reason?: string }>;
   guardrailEvents: DeepResearchGuardrailEvent[];
   dimsDegraded: string[];
+  /** 服务端日缓存命中（同一天同股票/同子集直接返回既有报告） */
+  cacheHit?: boolean;
 }
 
 const INITIAL_DIM_STATUSES: DimStatusMap = Object.fromEntries(
@@ -73,6 +75,7 @@ export function useDeepResearch() {
   const [dualTrack, setDualTrack] = useState<DualTrackExtras>({
     guardrailEvents: [],
     dimsDegraded: [],
+    cacheHit: false,
   });
 
   const abortRef = useRef<AbortController | null>(null);
@@ -112,7 +115,7 @@ export function useDeepResearch() {
       setReportId(null);
       setError(null);
       setDimStatuses(INITIAL_DIM_STATUSES);
-      setDualTrack({ guardrailEvents: [], dimsDegraded: [] });
+      setDualTrack({ guardrailEvents: [], dimsDegraded: [], cacheHit: false });
 
       const ac = new AbortController();
       abortRef.current = ac;
@@ -163,6 +166,7 @@ export function useDeepResearch() {
               dimensions?: Record<string, { status?: string; degraded_reason?: string }>;
               guardrail_events?: DeepResearchGuardrailEvent[];
               dims_degraded?: string[];
+              cache_hit?: boolean;
             };
             try {
               event = JSON.parse(line.slice(6));
@@ -184,9 +188,11 @@ export function useDeepResearch() {
                 missing_layers: event.missing_layers || [],
                 engine: event.engine,
               });
+              setDualTrack((prev) => ({ ...prev, cacheHit: Boolean(event.cache_hit) }));
               if (event.engine === 'dual_track') {
                 setDualTrack({
                   engine: event.engine,
+                  cacheHit: Boolean(event.cache_hit),
                   dimensions: event.dimensions,
                   guardrailEvents: event.guardrail_events || [],
                   dimsDegraded: event.dims_degraded || [],
@@ -294,7 +300,7 @@ export function useDeepResearch() {
     setReportId(null);
     setError(null);
     setDimStatuses(INITIAL_DIM_STATUSES);
-    setDualTrack({ guardrailEvents: [], dimsDegraded: [] });
+    setDualTrack({ guardrailEvents: [], dimsDegraded: [], cacheHit: false });
   }, [clearWatchdog]);
 
   // 卸载时清理
