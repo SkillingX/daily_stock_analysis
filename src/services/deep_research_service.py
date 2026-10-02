@@ -211,7 +211,7 @@ class DeepResearchService:
                         "cache_hit": True,
                     }
                     # 透传双轨增量字段（engine/dimensions/guardrail_events/dims_degraded）
-                    for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded"):
+                    for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded", "final_conclusion"):
                         if _k in cached_result:
                             done_event[_k] = cached_result[_k]
                     progress_callback(done_event)
@@ -362,6 +362,10 @@ class DeepResearchService:
             return_dict["engine"] = "dual_track"
             return_dict["dimensions"] = dims_payload
             return_dict["guardrail_events"] = guardrail_events
+            # 终读结论必须进缓存 payload，否则日缓存命中路径的 done 事件会丢字段
+            return_dict["final_conclusion"] = (
+                getattr(result, "final_conclusion", "") or ""
+            )
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
         if write_ok and return_dict.get("markdown"):
