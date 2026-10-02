@@ -12,6 +12,7 @@ import { DashboardStateBlock, WatchlistPanel } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { StockHistoryTrendDrawer, StockBar } from '../components/history';
 import { ReportMarkdownDrawer } from '../components/report/ReportMarkdownDrawer';
+import { LongtrackSummaryCard } from '../components/report/LongtrackSummaryCard';
 import { MarketReviewReportView } from '../components/report/MarketReviewReportView';
 import { ReportSummary } from '../components/report/ReportSummary';
 import { RunFlowPanel } from '../components/run-flow';
@@ -1056,17 +1057,20 @@ const HomePage: React.FC = () => {
                     onRetry={() => void openHistoryTrend()}
                   />
                 ) : (
-                  <ReportSummary
-                    data={selectedReport}
-                    isHistory
+                  <>
+                    <LongtrackSummaryCard report={selectedReport} />
+                    <ReportSummary
+                      data={selectedReport}
+                      isHistory
                     onOpenRunFlow={openHistoryRunFlow}
-                    watchlist={{
-                      isInWatchlist: watchlistState.isInWatchlist,
-                      onToggle: watchlistState.toggleWatchlist,
-                      isActioning: watchlistState.isActioning,
-                      actionMessage: watchlistState.actionMessage,
-                    }}
-                  />
+                      watchlist={{
+                        isInWatchlist: watchlistState.isInWatchlist,
+                        onToggle: watchlistState.toggleWatchlist,
+                        isActioning: watchlistState.isActioning,
+                        actionMessage: watchlistState.actionMessage,
+                      }}
+                    />
+                  </>
                 )}
               </div>
             ) : !marketReviewReport ? (
