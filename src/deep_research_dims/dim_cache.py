@@ -102,3 +102,46 @@ def clear_cache(stock_code: Optional[str] = None) -> int:
         except OSError:
             pass
     return removed
+
+
+# ---------------------------------------------------------------------------
+# 阶段 0 快照缓存（基本面等日内不变的数据源，TTL 由调用方指定）
+# ---------------------------------------------------------------------------
+
+
+def load_snapshot(key: str, ttl_hours: float) -> Optional[Dict[str, Any]]:
+    """通用快照缓存：命中且未过期返回 payload；key 自带命名空间。"""
+    path = os.path.join(_CACHE_DIR, f"snap_{key}.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    saved_at = str(record.get("saved_at") or "")
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        saved_time = datetime.fromisoformat(saved_at)
+    except ValueError:
+        return None
+    if datetime.now() - saved_time > timedelta(hours=ttl_hours):
+        return None
+    return payload
+
+
+def save_snapshot(key: str, payload: Dict[str, Any]) -> None:
+    """写快照缓存（失败只记日志）。空 payload 不缓存（保留重试机会）。"""
+    if not payload:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        record = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "key": key,
+            "payload": payload,
+        }
+        with open(os.path.join(_CACHE_DIR, f"snap_{key}.json"), "w", encoding="utf-8") as fh:
+            json.dump(record, fh, ensure_ascii=False, default=str)
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("[DimCache] 写快照缓存失败 %s: %s", key, exc)

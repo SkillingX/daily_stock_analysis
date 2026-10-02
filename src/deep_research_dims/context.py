@@ -72,6 +72,17 @@ def _safe_quote(code: str, ctx: SharedContext) -> Dict[str, Any]:
 
 
 def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
+    """基本面快照：日内不变，走 24h 快照缓存（实测抓取 25s，为阶段 0 最慢一路）。
+
+    行情/日线/筹码刻意不缓存（价格数据必须新鲜）；基本面缓存失败不缓存，
+    保留下次重试机会。
+    """
+    from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
+
+    cache_key = f"stage0_fund_{code}"
+    cached = load_snapshot(cache_key, ttl_hours=24.0)
+    if cached is not None:
+        return cached
     try:
         from src.agent.tools.data_tools import (
             _compact_fundamental_context,
@@ -91,7 +102,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                 if isinstance(value, str) and value.strip():
                     industry_hint = value.strip()
                     break
-        return {
+        result = {
             "pe_ttm": valuation.get("pe_ratio") or valuation.get("pe_ttm"),
             "pb": valuation.get("pb_ratio"),
             "market_cap": valuation.get("market_cap")
@@ -103,6 +114,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "industry_hint": industry_hint,
             "source": "fundamental_context",
         }
+        save_snapshot(cache_key, result)
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 基本面装配失败 %s: %s", code, exc)
         ctx.limitation(f"基本面数据装配失败: {exc}")

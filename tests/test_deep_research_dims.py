@@ -544,6 +544,45 @@ class TestDimCache:
         assert dim_cache.load_cached_dim("000001", "data") == {"a": 2}
 
 
+class TestSnapshotCache:
+    """阶段 0 快照缓存（基本面 24h）：命中不重抓，TTL 过期失效，空不缓存。"""
+
+    def test_roundtrip_and_ttl(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        payload = {"pe_ttm": 19.09, "roe": 16.75}
+        dim_cache.save_snapshot("stage0_fund_600519", payload)
+        assert dim_cache.load_snapshot("stage0_fund_600519", ttl_hours=24) == payload
+        assert dim_cache.load_snapshot("stage0_fund_600519", ttl_hours=0) is None
+
+    def test_empty_payload_not_cached(self, tmp_path, monkeypatch):
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        dim_cache.save_snapshot("stage0_fund_600519", {})
+        assert dim_cache.load_snapshot("stage0_fund_600519", ttl_hours=24) is None
+
+    def test_fundamental_cache_hit_skips_fetch(self, monkeypatch, tmp_path):
+        """命中快照时不得触碰 fetcher（monkeypatch 成抛异常即证）。"""
+        from src.agent.tools import data_tools
+        from src.deep_research_dims import context as ctx_mod
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        dim_cache.save_snapshot("stage0_fund_600519", {"pe_ttm": 19.09})
+
+        def _boom(*a, **k):
+            raise AssertionError("命中快照不应调用 fetcher")
+
+        # _safe_fundamental 在函数内 from-import，需 patch 源模块属性
+        monkeypatch.setattr(data_tools, "_get_fetcher_manager", _boom)
+        ctx = ctx_mod.SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="x")
+        result = ctx_mod._safe_fundamental("600519", ctx)
+        assert result["pe_ttm"] == 19.09
+        assert not ctx.limitations
+
+
 class TestNarrateHardening:
     def test_think_block_stripped(self):
         """实测缺陷回归：推理模型的 <think> 思考块不得泄漏进报告叙述。"""
