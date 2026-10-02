@@ -244,6 +244,7 @@ class DeepResearchService:
                 ),
                 dims_filter=set(dims) if dims else None,
                 force_refresh=force_refresh,
+                report_id=report_id,
             )
             result = SimpleNamespace(
                 success=dt_result.success,
@@ -255,6 +256,7 @@ class DeepResearchService:
                 total_tokens=dt_result.total_tokens,
                 provider=dt_result.provider,
                 error=dt_result.error,
+                final_conclusion=dt_result.final_conclusion,
             )
             dims_payload = dt_result.dims_payload
             guardrail_events = [
@@ -338,6 +340,7 @@ class DeepResearchService:
             done_event["dimensions"] = dims_payload
             done_event["guardrail_events"] = guardrail_events
             done_event["dims_degraded"] = list(result.missing_layers)
+            done_event["final_conclusion"] = getattr(result, "final_conclusion", "") or ""
         if progress_callback:
             progress_callback(done_event)
 

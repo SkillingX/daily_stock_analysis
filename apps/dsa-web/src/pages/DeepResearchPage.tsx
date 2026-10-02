@@ -112,7 +112,18 @@ export function DeepResearchPage() {
 
   useEffect(() => {
     loadHistory();
-  }, [loadHistory]);
+    // 每日分析摘要卡跳页携带 ?code=&name=：预填并自动生成一次
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    if (code) {
+      const name = params.get('name') || '';
+      setSelectedStock({ code, name });
+      setQuery(name ? `${name} ${code}` : code);
+      window.history.replaceState({}, '', window.location.pathname);
+      void generate(code, name || undefined);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 生成完成后刷新历史列表
   useEffect(() => {
@@ -374,7 +385,7 @@ export function DeepResearchPage() {
               <div className="flex flex-wrap gap-1.5">
                 {(
                   [
-                    { label: '全部（11 维）', dims: DUAL_TRACK_DIMS.map((d) => d.id) },
+                    { label: `全部（${DUAL_TRACK_DIMS.length} 维）`, dims: DUAL_TRACK_DIMS.map((d) => d.id) },
                     {
                       label: '快速版（无情报/产业链探索）',
                       dims: DUAL_TRACK_DIMS.map((d) => d.id).filter((x) => x !== 'intel' && x !== 'supply_chain'),

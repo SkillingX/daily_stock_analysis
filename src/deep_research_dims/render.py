@@ -33,19 +33,12 @@ _TEMPLATE_DIR = os.path.join(
 _TEMPLATE_NAME = "deep_research_dual_track.j2"
 
 REQUIRED_HEADINGS = [
-    "## 短线六件套",
-    "### 一、信号",
-    "### 二、数据透视",
-    "### 三、情报",
-    "### 四、作战计划",
-    "### 五、阶段决策",
-    "### 六、历史对比",
-    "## 长线五段式",
-    "### 七、投资结论",
-    "### 八、产业链解读",
-    "### 九、长期价值与情景",
-    "### 十、贝叶斯证据链",
-    "### 十一、六维评分明细",
+    "## 一、结论",
+    "## 二、盘面解读",
+    "## 三、走势预测",
+    "## 四、六维评分总表",
+    "## 五、详情分析",
+    "## 六、交易参考",
     "## 附录",
 ]
 
@@ -66,6 +59,8 @@ def build_view(
     ctx_limitations: List[str],
     dims: Dict[str, Any],
     guardrail_events: List[GuardrailEvent],
+    report_id: str = "",
+    final_conclusion: str = "",
 ) -> Dict[str, Any]:
     """把契约模型装配成模板视图（纯数据搬运，不做计算）。"""
     signal: SignalDim = dims["signal"]
@@ -79,11 +74,19 @@ def build_view(
     conclusion: ConclusionDim = dims["conclusion"]
     supply_chain: SupplyChainDim = dims["supply_chain"]
     scenarios: ScenariosDim = dims["scenarios"]
+    fundamental: Any = dims["fundamental"]
+    sector: Any = dims["sector"]
 
     return {
         "stock_name": stock_name,
         "stock_code": stock_code,
         "as_of": as_of,
+        "report_id": report_id,
+        "final_conclusion": final_conclusion,
+        "dim_anchor_items": [
+            {"id": dim_id, "anchor": anchor}
+            for dim_id, anchor in DIM_SECTION_ANCHORS.items()
+        ],
         "signal": signal,
         "data": data,
         "intel": intel,
@@ -95,6 +98,8 @@ def build_view(
         "conclusion": conclusion,
         "supply_chain": supply_chain,
         "scenarios": scenarios,
+        "fundamental": fundamental,
+        "sector": sector,
         "guardrail_events": guardrail_events,
         "limitations": ctx_limitations,
         "degraded_note": _degraded_note,
@@ -123,19 +128,21 @@ def validate_structure(markdown: str) -> List[str]:
 # 「子报告 ≥ 合并报告章节」验收；skipped 维度章节含"未选择生成"注记）
 # ---------------------------------------------------------------------------
 
-# 维度 id → 合并报告章节锚点（### 标题，与模板严格对齐）
+# 维度 id → 报告章节锚点（#### 级，与五段模板严格对齐；切分子报告用）
 DIM_SECTION_ANCHORS: Dict[str, str] = {
-    "signal": "### 一、信号",
-    "data": "### 二、数据透视",
-    "intel": "### 三、情报",
-    "plan": "### 四、作战计划",
-    "phase": "### 五、阶段决策",
-    "history": "### 六、历史对比",
-    "conclusion": "### 七、投资结论",
-    "supply_chain": "### 八、产业链解读",
-    "scenarios": "### 九、长期价值与情景",
-    "bayesian": "### 十、贝叶斯证据链",
-    "six_dim": "### 十一、六维评分明细",
+    "fundamental": "#### 财务与基本面（F1）",
+    "sector": "#### 板块分析（F2）",
+    "supply_chain": "#### 产业链解读",
+    "intel": "#### 消息面详析",
+    "six_dim": "#### 六维指标明细",
+    "scenarios": "#### 情景与时间层级",
+    "bayesian": "#### 贝叶斯证据链",
+    "conclusion": "#### 投资结论",
+    "signal": "#### 信号",
+    "data": "#### 数据透视",
+    "plan": "#### 作战计划",
+    "phase": "#### 阶段决策",
+    "history": "#### 历史对比",
 }
 
 
@@ -161,7 +168,11 @@ def split_dim_sections(markdown: str) -> Dict[str, str]:
         end = len(lines)
         for j in range(start + 1, len(lines)):
             stripped = lines[j].strip()
-            if stripped.startswith("### ") or stripped.startswith("## "):
+            if (
+                stripped.startswith("#### ")
+                or stripped.startswith("### ")
+                or stripped.startswith("## ")
+            ):
                 end = j
                 break
         sections[dim_id] = "\n".join(lines[start:end]).strip() + "\n"

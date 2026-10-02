@@ -94,6 +94,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("financial") or {}).get("data") or {}
+        institution = (compact.get("institution") or {}).get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
         industry_hint = ""
         if isinstance(boards, dict):
@@ -111,10 +112,15 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "revenue_growth": financial.get("revenue_growth")
             or financial.get("revenue_yoy"),
             "gross_margin": financial.get("gross_margin"),
+            "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
             "source": "fundamental_context",
         }
-        save_snapshot(cache_key, result)
+        # 全 None 的占位结果不缓存（缓存污染 bug：失败抓取会被固化 24h）
+        if result.get("pe_ttm") is not None or result.get("roe") is not None:
+            save_snapshot(cache_key, result)
+        else:
+            ctx.limitation("基本面数据全缺（快照不缓存，下次重试）")
         return result
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 基本面装配失败 %s: %s", code, exc)

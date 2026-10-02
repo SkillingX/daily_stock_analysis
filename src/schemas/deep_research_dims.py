@@ -43,6 +43,8 @@ DimId = Literal[
     "conclusion",
     "supply_chain",
     "scenarios",
+    "fundamental",
+    "sector",
 ]
 
 DIM_IDS: tuple[str, ...] = (
@@ -57,6 +59,8 @@ DIM_IDS: tuple[str, ...] = (
     "conclusion",
     "supply_chain",
     "scenarios",
+    "fundamental",
+    "sector",
 )
 
 DimStatus = Literal["ok", "degraded", "skipped"]
@@ -127,13 +131,40 @@ class DataDim(DimEnvelope):
     narrative: str = ""
 
 
+class RootCause(BaseModel):
+    """盘面根因四要素（段二数据源）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    event: str = ""
+    mechanism: str = ""
+    magnitude: str = ""
+    persistence: str = ""
+
+
+class EventPlan(BaseModel):
+    """未来事件 + 各结果交易预案（段三/段五消息面数据源）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    event: str = ""
+    date: str = ""
+    outcomes: List[str] = Field(default_factory=list)
+    plans: List[str] = Field(default_factory=list)
+
+
 class IntelDim(DimEnvelope):
-    """S3 情报：探索型 Agent 产出，含证据候选（供 L2 消费）。"""
+    """S3 消息面（方案 v2.1 重定义）：探索型 Agent 三分区产出。
+
+    三分区：情报摘要（含证据候选，供 L2 消费）/ 盘面根因四要素 / 未来事件日历+预案。
+    """
 
     dim: Literal["intel"] = "intel"
     intelligence: Optional[Intelligence] = None
     evidence_items: List[EvidenceItem] = Field(default_factory=list)
     unverified_count: int = Field(0, ge=0)
+    root_cause: Optional[RootCause] = None
+    event_calendar: List[EventPlan] = Field(default_factory=list)
     narrative: str = ""
 
 
@@ -228,6 +259,39 @@ class ScenariosDim(DimEnvelope):
     expected_value: Optional[float] = Field(None, gt=0)
     valuation_basis: Literal["PE_TTM", "PB", "PS", "none"] = "none"
     current_pe_ttm: Optional[float] = None
+    # 时间层级路径（段三）：每周期一句"条件→目标位"，由 LLM 生成机器不背书数字
+    time_paths: Dict[str, str] = Field(default_factory=dict)
+    narrative: str = ""
+
+
+class FundamentalDim(DimEnvelope):
+    """F1 财务与基本面（方案 v2.1 新增）：盈利/成长/安全/估值四框架详表。
+
+    数据消费 fundamental_context 的 valuation/growth/institution 块；
+    缺数据项按打分纪律记缺口，不编分。
+    """
+
+    dim: Literal["fundamental"] = "fundamental"
+    profitability: Dict[str, Any] = Field(default_factory=dict)
+    growth_quality: Dict[str, Any] = Field(default_factory=dict)
+    financial_safety: Dict[str, Any] = Field(default_factory=dict)
+    valuation_detail: Dict[str, Any] = Field(default_factory=dict)
+    data_gaps: List[str] = Field(default_factory=list)
+    health_score: Optional[float] = Field(None, ge=0, le=100)
+    narrative: str = ""
+
+
+class SectorDim(DimEnvelope):
+    """F2 板块分析（方案 v2.1 新增）：政策倾向/行业基率/板块地位/景气。"""
+
+    dim: Literal["sector"] = "sector"
+    sector_hint: str = ""
+    policy_lean: Optional[str] = None  # supportive / neutral / restrictive
+    base_rate: Optional[float] = Field(None, ge=0, le=1)
+    base_rate_basis: str = ""
+    rankings: Dict[str, Any] = Field(default_factory=dict)
+    data_gaps: List[str] = Field(default_factory=list)
+    sector_score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""
 
 
@@ -243,6 +307,8 @@ DIM_MODELS: Dict[str, type[DimEnvelope]] = {
     "conclusion": ConclusionDim,
     "supply_chain": SupplyChainDim,
     "scenarios": ScenariosDim,
+    "fundamental": FundamentalDim,
+    "sector": SectorDim,
 }
 
 

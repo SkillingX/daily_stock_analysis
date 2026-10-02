@@ -130,6 +130,8 @@ def integrate_longtrack_dual(result: Any, context: Dict[str, Any]) -> Any:
     for field, value in mapped.items():
         setattr(result, field, value)
     result.longtrack_source = "dual_track"
+    # 终读结论供通知/摘要卡消费（需求 3 + 决策 2）
+    result.longtrack_conclusion = dt_result.final_conclusion or ""
     logger.info(
         "[LongTrackBridge] %s 长线段已由双轨产出（status=%s quality=%d）",
         a_code,

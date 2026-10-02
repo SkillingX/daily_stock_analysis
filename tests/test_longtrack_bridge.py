@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from src.schemas.deep_research_dims import DIM_IDS
 from typing import Any, Dict, List
 
 
@@ -114,6 +116,8 @@ class _FakeDualTrackResult:
         self.status = status
         self.dims_payload = payload
         self.quality_score = quality
+        self.final_conclusion = ""
+        self.success = status != "failed"
 
 
 class TestLongtrackBridge:
@@ -346,6 +350,73 @@ class TestCacheHygieneRegressions:
         assert sc["payload"]["supply_chain"]["company_position"] == "白酒"
 
 
+class TestFinalConclusion:
+    def test_conclusion_generated_with_fake_adapter(self, monkeypatch, tmp_path):
+        """终读结论：fake adapter 产出文本进报告段一与 result 字段。"""
+        from datetime import date, timedelta
+
+        from src.agent.deep_research import orchestrator as orch
+        from src.deep_research_dims import dim_cache
+        from src.deep_research_dims.context import SharedContext
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        ctx = SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="2026-10-02T15:00:00")
+        ctx.quote = {"price": 13.0}
+        ctx.fundamental = {"pe_ttm": 25.0}
+        ctx.history = [
+            {"date": str(date(2026, 8, 1) + timedelta(days=i)), "open": 10 + i * 0.1,
+             "high": 10.3 + i * 0.1, "low": 9.7 + i * 0.1, "close": 10 + i * 0.1, "volume": 10000}
+            for i in range(40)
+        ]
+        monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
+        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
+        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+
+        captured: dict = {}
+
+        class _Adapter:
+            def call_text(self, messages, **kwargs):
+                import json as _json
+
+                facts = _json.loads(messages[1]["content"])
+                captured.update(facts)
+
+                class _R:
+                    content = "总评分 50 分，建议观望。论据：估值合理。风险：需求疲弱。关注三季报。"
+                return _R()
+
+        result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=_Adapter(), force_refresh=True)
+        assert "总评分 50 分" in result.final_conclusion
+        assert "报告结论" in result.markdown and "总评分 50 分" in result.markdown
+        # 数字注入式：事实面含评分与行动
+        assert captured.get("total_score") is not None
+        assert captured.get("action") in ("建仓", "加仓", "持有", "减仓", "止损", "观察")
+
+    def test_conclusion_skipped_when_no_adapter(self, monkeypatch, tmp_path):
+        from datetime import date, timedelta
+
+        from src.agent.deep_research import orchestrator as orch
+        from src.deep_research_dims import dim_cache
+        from src.deep_research_dims.context import SharedContext
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        ctx = SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="x")
+        ctx.quote = {"price": 13.0}
+        ctx.fundamental = {"pe_ttm": 25.0}
+        ctx.history = [
+            {"date": str(date(2026, 8, 1) + timedelta(days=i)), "open": 10, "high": 11,
+             "low": 9, "close": 10, "volume": 100}
+            for i in range(40)
+        ]
+        monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
+        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
+        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=None, force_refresh=True)
+        assert result.final_conclusion == ""
+        # 模板回退：报告结论区仍有信号一句话
+        assert "报告结论" in result.markdown
+
+
 class TestSkipNarrationsPropagation:
     def test_orchestrator_skip_narrations_offline(self, monkeypatch, tmp_path):
         """skip_narrations=True 时全部 7 个叙述点静默（输出=规则默认句）。"""
@@ -379,4 +450,4 @@ class TestSkipNarrationsPropagation:
             force_refresh=True, skip_narrations=True,
         )
         assert result.status == "success"
-        assert len(result.dims) == 11
+        assert len(result.dims) == len(DIM_IDS) == 13

@@ -27,6 +27,8 @@ from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import build_shared_context
 from src.deep_research_dims.data_dim import build_data_dim
+from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
 from src.deep_research_dims.history_dim import build_history_dim
 from src.deep_research_dims.narrate import narrate
@@ -100,6 +102,8 @@ class DualTrackResult:
     total_tokens: int = 0
     provider: str = ""
     error: Optional[str] = None
+    # 终读结论（需求 3）：LLM 通读结构化事实写报告级总结；空 = 回退信号一句话
+    final_conclusion: str = ""
 
     @property
     def degraded_dims(self) -> List[str]:
@@ -144,10 +148,33 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
         earnings_outlook=parsed.get("earnings_outlook"),
         sentiment_summary=parsed.get("sentiment_summary"),
     )
+    rc_raw = parsed.get("root_cause") or {}
+    root_cause = None
+    if any(rc_raw.get(k) for k in ("event", "mechanism", "magnitude")):
+        root_cause = {
+            "event": str(rc_raw.get("event") or "")[:200],
+            "mechanism": str(rc_raw.get("mechanism") or "")[:200],
+            "magnitude": str(rc_raw.get("magnitude") or "")[:100],
+            "persistence": str(rc_raw.get("persistence") or "")[:100],
+        }
+    calendar = []
+    for item in parsed.get("event_calendar") or []:
+        if not isinstance(item, dict):
+            continue
+        calendar.append(
+            {
+                "event": str(item.get("event") or "")[:120],
+                "date": str(item.get("date") or "")[:20],
+                "outcomes": [str(x)[:80] for x in (item.get("outcomes") or [])][:4],
+                "plans": [str(x)[:120] for x in (item.get("plans") or [])][:4],
+            }
+        )
     dim = IntelDim(
         intelligence=intelligence,
         evidence_items=evidence,
         unverified_count=int(parsed.get("unverified_count") or 0),
+        root_cause=root_cause,
+        event_calendar=calendar[:6],
     )
     return dim, steps
 
@@ -174,6 +201,148 @@ def _parse_supply_chain(
     return dim, steps
 
 
+def _generate_final_conclusion(
+    llm_adapter: Any,
+    stock_name: str,
+    stock_code: str,
+    dims: Dict[str, DimEnvelope],
+    guardrail_events: List[GuardrailEvent],
+) -> str:
+    """终读结论（需求 3）：输入五段结构化事实，LLM 写 3-5 句投资人向总结。
+
+    数字全部以 JSON 事实注入，LLM 禁止修改或新增数字；输出直接进报告段一与
+    done 事件（每日通知消费同一字段）。失败回退空串（模板用信号一句话）。
+    """
+    import json
+    import re
+
+    signal = dims.get("signal")
+    conclusion = dims.get("conclusion")
+    plan = dims.get("plan")
+    six_dim = dims.get("six_dim")
+    intel = dims.get("intel")
+    framework = getattr(six_dim, "framework", None)
+    sniper = getattr(plan, "sniper_points", None)
+    facts: Dict[str, Any] = {
+        "stock": f"{stock_name}（{stock_code}）",
+        "total_score": getattr(framework, "dimension_total", None),
+        "rating": getattr(signal, "rating", None),
+        "action": getattr(getattr(conclusion, "conclusion", None), "action", None),
+        "ideal_buy": getattr(sniper, "ideal_buy", None),
+        "stop_loss": getattr(sniper, "stop_loss", None),
+        "take_profit": getattr(sniper, "take_profit", None),
+        "dimension_summaries": {
+            d.dimension: (d.indicators[0].summary if d.indicators else "")
+            for d in (framework.dimensions if framework else [])
+        },
+        "root_cause_event": (getattr(intel, "root_cause", None).event if getattr(intel, "root_cause", None) else None),
+        "guardrail_count": len(guardrail_events),
+    }
+    system = (
+        "你是投研报告的主笔。基于输入的结构化事实，为该股票写一段 3-5 句的中文投资结论，"
+        "面向普通投资人，要求：第一句给总评分与建议行动（用给定的行动词）；接着两个最关键论据"
+        "（从维度总结中选）；然后一个最大风险；最后一句下一步关注点。只允许使用输入中的数字，"
+        "禁止新增或修改任何数字；禁止 markdown 格式与项目符号。"
+    )
+    try:
+        resp = llm_adapter.call_text(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
+            ],
+            temperature=0.3,
+            timeout=120.0,
+        )
+        text = (resp.content or "").strip()
+        text = re.sub(
+            r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+        if len(text) < 30:
+            return ""
+        return text
+    except Exception as exc:  # noqa: BLE001 - 结论失败只回退
+        logger.warning("[DualTrack] 终读结论生成失败: %s", exc)
+        return ""
+
+
+def _write_reflection_journals(
+    stock_code: str,
+    stock_name: str,
+    dims: Dict[str, DimEnvelope],
+    report_id: Optional[str],
+    write_cache: bool,
+) -> None:
+    """自反思日志（方案 v2.1 P2）：操作指令 + 评分快照落库。
+
+    仅 web 全量路径落库（write_cache=True 且 report_id 非空）；批量桥接
+    （write_cache=False / report_id=None）不写，避免日报噪音淹没回放样本。
+    失败只记日志，绝不影响报告生成。
+    """
+    if not write_cache or not report_id:
+        return
+    try:
+        import json as _json
+
+        from src.storage import get_db
+
+        signal = dims.get("signal")
+        plan = dims.get("plan")
+        six_dim = dims.get("six_dim")
+        conclusion = dims.get("conclusion")
+        sniper = getattr(plan, "sniper_points", None)
+        framework = getattr(six_dim, "framework", None)
+        get_db().save_recommendation_journal(
+            {
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+                "action": str(getattr(getattr(conclusion, "conclusion", None), "action", None) or "观察"),
+                "rating": str(getattr(signal, "rating", None) or "中性"),
+                "score": float(getattr(framework, "dimension_total", 0.0) or 0.0) or None,
+                "ideal_buy": getattr(sniper, "ideal_buy", None),
+                "sell_price": getattr(sniper, "take_profit", None),
+                "stop_loss": getattr(sniper, "stop_loss", None),
+                "take_profit": getattr(sniper, "take_profit", None),
+                "report_id": report_id,
+                "scoring_version": getattr(six_dim, "scoring_version", None),
+            }
+        )
+        if framework is not None:
+            get_db().save_score_journal(
+                {
+                    "stock_code": stock_code,
+                    "total_score": float(framework.dimension_total),
+                    "dimensions_json": _json.dumps(
+                        {
+                            "dimension_total": framework.dimension_total,
+                            "dimensions": [
+                                {
+                                    "dimension": d.dimension,
+                                    "score": d.score,
+                                    "weight": d.weight,
+                                    "indicators": [
+                                        {
+                                            "name": i.name,
+                                            "score": i.score,
+                                            "weight": i.weight,
+                                            "basis": i.basis,
+                                        }
+                                        for i in d.indicators
+                                    ],
+                                }
+                                for d in framework.dimensions
+                            ],
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                    "scoring_version": framework.scoring_version,
+                    "report_id": report_id,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 - 日志失败绝不影响主流程
+        logger.warning("[DualTrack] 自反思日志写入失败: %s", exc)
+
+
 def run_dual_track(
     stock_code: str,
     stock_name: str,
@@ -185,6 +354,7 @@ def run_dual_track(
     skip_narrations: bool = False,
     write_cache: bool = True,
     cache_exclude: Optional[frozenset] = None,
+    report_id: Optional[str] = None,
 ) -> DualTrackResult:
     """执行一次双轨深度投研分析。"""
     result = DualTrackResult()
@@ -299,18 +469,16 @@ def run_dual_track(
                 )
             dims["history"] = history_dim
             emit_dim("history", history_dim.status)
-        if "six_dim" in selected:
-            six_dim = try_cache("six_dim")
-            if six_dim is None:
-                start_dim("six_dim")
-                six_dim = build_six_dim(
-                    ctx, (data_dim.model_dump() if data_dim else {})
-                )
-                store_cache("six_dim", six_dim)
-                dims["six_dim"] = six_dim
-                emit_dim("six_dim", six_dim.status)
+        if "fundamental" in selected:
+            f1_dim = try_cache("fundamental")
+            if f1_dim is None:
+                start_dim("fundamental")
+                f1_dim = build_fundamental_dim(ctx)
+                store_cache("fundamental", f1_dim)
+                dims["fundamental"] = f1_dim
+                emit_dim("fundamental", f1_dim.status)
             else:
-                dims["six_dim"] = six_dim
+                dims["fundamental"] = f1_dim
 
     def _build_data_dim() -> Optional[DataDim]:
         """S2 数据透视：缓存优先；fresh 时 LLM 叙述（与探索 Agent 并行，叙述耗时隐藏）。"""
@@ -396,7 +564,39 @@ def run_dual_track(
 
     _perf_mark("wave1_done")
 
-    # ---- 波次 2：L2 贝叶斯 ----
+    # ---- 波次 2：F2 板块（带产业链定位文本）→ L1 六维 v2 → L2 贝叶斯 ----
+    if "sector" in selected:
+        f2_dim = try_cache("sector")
+        if f2_dim is None:
+            start_dim("sector")
+            sc_model = getattr(dims.get("supply_chain"), "supply_chain", None)
+            f2_dim = build_sector_dim(
+                ctx, str(getattr(sc_model, "company_position", "") or "") or None
+            )
+            store_cache("sector", f2_dim)
+            dims["sector"] = f2_dim
+            emit_dim("sector", f2_dim.status)
+        else:
+            dims["sector"] = f2_dim
+
+    if "six_dim" in selected:
+        six_dim = try_cache("six_dim")
+        if six_dim is None:
+            start_dim("six_dim")
+            six_dim = build_six_dim(
+                ctx,
+                (data_dim.model_dump() if data_dim else {}),
+                llm_adapter,
+                (dims.get("fundamental").model_dump() if "fundamental" in dims else None),
+                (dims.get("sector").model_dump() if "sector" in dims else None),
+                (dims.get("intel").model_dump() if "intel" in dims else None),
+            )
+            store_cache("six_dim", six_dim)
+            dims["six_dim"] = six_dim
+            emit_dim("six_dim", six_dim.status)
+        else:
+            dims["six_dim"] = six_dim
+
     if "bayesian" in selected:
         _emit(progress_callback, {"type": "thinking", "step": 2, "message": "贝叶斯证据链计算（LR 标定 + 行业基率锚点 + 后验更新）..."})
         from src.deep_research_dims.industry_base_rate import lookup_base_rate
@@ -440,6 +640,8 @@ def run_dual_track(
             scenarios_dim = build_scenarios_dim(
                 ctx,
                 float(current_price) if isinstance(current_price, (int, float)) else None,
+                None,
+                llm_adapter,
             )
         else:
             scenarios_from_cache = True
@@ -569,9 +771,21 @@ def run_dual_track(
 
     _perf_mark("guardrail_done")
 
+    # ---- 终读结论（需求 3：通读报告级总结；数字注入式，批量/无 LLM 时回退空串）----
+    final_conclusion = ""
+    if not skip_narrations and llm_adapter is not None:
+        final_conclusion = _generate_final_conclusion(
+            llm_adapter, stock_name, stock_code, dims, events
+        )
+    result.final_conclusion = final_conclusion
+
     # ---- 成文 ----
     _emit(progress_callback, {"type": "thinking", "step": 4, "message": "生成双轨投研报告（模板直灌）..."})
-    view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events)
+    view = build_view(
+        stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events,
+        report_id=report_id or "",
+        final_conclusion=final_conclusion,
+    )
     markdown = render_markdown(view)
     missing = validate_structure(markdown)
     if missing:
@@ -592,6 +806,9 @@ def run_dual_track(
     result.total_steps = steps_total
     result.provider = ""
     result.error = None if result.success else "维度降级过多，报告不可用"
+    _write_reflection_journals(
+        stock_code, stock_name, dims, report_id, write_cache
+    )
     _perf_mark("render_done")
     _perf_summary = " ".join(
         f"{name}={t:.1f}s" for name, t in _perf_marks

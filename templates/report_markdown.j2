@@ -17,6 +17,9 @@
 {% for e in enriched %}
 {% set result = e.result %}
 {% set dashboard = result.dashboard if result.dashboard else {} %}
+{% if result.longtrack_conclusion %}
+> 📋 投研结论：{{ result.longtrack_conclusion }}（[查看完整深度报告](/deep-research?code={{ result.code }})）
+{% endif %}
 {% set intel = dashboard.get('intelligence') or {} %}
 {% set core = dashboard.get('core_conclusion') or {} %}
 {% set battle = dashboard.get('battle_plan') or {} %}

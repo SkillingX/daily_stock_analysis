@@ -21,15 +21,17 @@ export interface DeepResearchProgressStep {
 
 /** 双轨引擎 11 维度（与后端 DIM_IDS 严格对齐，徽章展示用） */
 export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
-  { id: 'data', label: '数据' },
-  { id: 'intel', label: '情报' },
+  { id: 'fundamental', label: '财务' },
+  { id: 'sector', label: '板块' },
   { id: 'supply_chain', label: '产业链' },
+  { id: 'intel', label: '消息' },
   { id: 'six_dim', label: '六维' },
   { id: 'bayesian', label: '贝叶斯' },
   { id: 'scenarios', label: '情景' },
   { id: 'conclusion', label: '结论' },
-  { id: 'plan', label: '计划' },
+  { id: 'data', label: '数据' },
   { id: 'signal', label: '信号' },
+  { id: 'plan', label: '计划' },
   { id: 'phase', label: '阶段' },
   { id: 'history', label: '历史' },
 ];

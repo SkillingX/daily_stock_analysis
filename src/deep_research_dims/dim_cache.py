@@ -30,10 +30,17 @@ _CACHE_DIR = os.path.join(
 DIM_TTL_HOURS: Dict[str, float] = {
     "intel": 4.0,
     "data": 24.0,
-    "six_dim": 120.0,
+    # six_dim 依赖 data/F1/F2(24h) 与 intel(4h)：TTL 不得超过最小依赖的日级上限，
+    # 否则会出现"旧评分快照 + 新情报正文"的一致性问题（审计 C8）
+    "six_dim": 24.0,
     "scenarios": 120.0,
     "supply_chain": 120.0,
+    "fundamental": 24.0,  # F1 基本面快照驱动（日内不变）
+    "sector": 24.0,  # F2 政策倾向/基率日内稳定
 }
+
+# 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
+SCHEMA_VERSION = 3
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 
@@ -53,6 +60,8 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
             record = json.load(fh)
     except (OSError, ValueError):
         return None
+    if record.get("schema_version") != SCHEMA_VERSION:
+        return None  # 旧契约 payload 不兼容（C4）：视为 miss，重算并覆盖
     saved_at = str(record.get("saved_at") or "")
     payload = record.get("payload")
     if not isinstance(payload, dict):
@@ -73,6 +82,7 @@ def save_cached_dim(stock_code: str, dim: str, payload: Dict[str, Any]) -> None:
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
         record = {
+            "schema_version": SCHEMA_VERSION,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "stock_code": stock_code,
             "dim": dim,

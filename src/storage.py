@@ -361,6 +361,48 @@ class AnalysisHistory(Base):
         }
 
 
+class RecommendationJournal(Base):
+    """操作指令日志（方案 v2.1 自反思雏形）：每次报告的买卖指令结构化留痕。
+
+    模拟盘回放（scripts/replay_journals.py）据此撮合成交并统计兑现率/盈亏。
+    """
+
+    __tablename__ = "recommendation_journal"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[Optional[str]] = mapped_column(String(50))
+    action: Mapped[str] = mapped_column(String(16), nullable=False)  # 建仓/加仓/持有/减仓/止损/观察
+    rating: Mapped[Optional[str]] = mapped_column(String(8))  # 买入/增持/中性/减持
+    score: Mapped[Optional[float]] = mapped_column(Float)  # v2 总评分
+    ideal_buy: Mapped[Optional[float]] = mapped_column(Float)
+    sell_price: Mapped[Optional[float]] = mapped_column(Float)
+    stop_loss: Mapped[Optional[float]] = mapped_column(Float)
+    take_profit: Mapped[Optional[float]] = mapped_column(Float)
+    report_id: Mapped[Optional[str]] = mapped_column(String(64))
+    scoring_version: Mapped[Optional[str]] = mapped_column(String(16))
+
+
+class ScoreJournal(Base):
+    """评分快照日志（自反思雏形）：每次报告的六维评分明细留痕。
+
+    回放脚本据此计算评分与未来收益相关性（样本 <30 不出结论）。
+    """
+
+    __tablename__ = "score_journal"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    total_score: Mapped[float] = mapped_column(Float, nullable=False)
+    dimensions_json: Mapped[str] = mapped_column(Text, nullable=False)  # 六维+指标明细
+    scoring_version: Mapped[Optional[str]] = mapped_column(String(16))
+    report_id: Mapped[Optional[str]] = mapped_column(String(64))
+
+# === journal 模型结束（勿在此后追加字段，需走 schema 迁移） ===
+
+
 class DeepResearchReport(Base):
     """深度投研报告记录模型（A股深度投研报告功能）。
 
@@ -2938,6 +2980,143 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         try:
             return self._run_write_transaction("prune_deep_research_reports", _write)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] prune deep_research_reports failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # 自反思日志（方案 v2.1）：操作指令 + 评分快照
+    # ------------------------------------------------------------------
+
+    def save_recommendation_journal(self, record: Dict[str, Any]) -> Optional[int]:
+        """写入操作指令日志。返回自增 id；失败只记日志返回 None。"""
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                row = RecommendationJournal(
+                    stock_code=str(record.get("stock_code") or ""),
+                    stock_name=record.get("stock_name"),
+                    action=str(record.get("action") or "观察"),
+                    rating=record.get("rating"),
+                    score=record.get("score"),
+                    ideal_buy=record.get("ideal_buy"),
+                    sell_price=record.get("sell_price"),
+                    stop_loss=record.get("stop_loss"),
+                    take_profit=record.get("take_profit"),
+                    report_id=record.get("report_id"),
+                    scoring_version=record.get("scoring_version"),
+                )
+                db.add(row)
+                db.commit()
+                return int(row.id)
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] save_recommendation_journal failed: %s", exc)
+            return None
+
+    def save_score_journal(self, record: Dict[str, Any]) -> Optional[int]:
+        """写入评分快照日志。返回自增 id；失败只记日志返回 None。"""
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                row = ScoreJournal(
+                    stock_code=str(record.get("stock_code") or ""),
+                    total_score=float(record.get("total_score") or 50.0),
+                    dimensions_json=str(record.get("dimensions_json") or "{}"),
+                    scoring_version=record.get("scoring_version"),
+                    report_id=record.get("report_id"),
+                )
+                db.add(row)
+                db.commit()
+                return int(row.id)
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] save_score_journal failed: %s", exc)
+            return None
+
+    def list_recommendation_journal(
+        self, stock_code: Optional[str] = None, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """操作指令日志列表（时间倒序）。"""
+        session_local = self._SessionLocal
+        if session_local is None:
+            return []
+        try:
+            db = session_local()
+            try:
+                query = db.query(RecommendationJournal)
+                if stock_code:
+                    query = query.filter(RecommendationJournal.stock_code == stock_code)
+                rows = (
+                    query.order_by(RecommendationJournal.created_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+                return [
+                    {
+                        "id": r.id,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "stock_code": r.stock_code,
+                        "stock_name": r.stock_name,
+                        "action": r.action,
+                        "rating": r.rating,
+                        "score": r.score,
+                        "ideal_buy": r.ideal_buy,
+                        "sell_price": r.sell_price,
+                        "stop_loss": r.stop_loss,
+                        "take_profit": r.take_profit,
+                        "report_id": r.report_id,
+                        "scoring_version": r.scoring_version,
+                    }
+                    for r in rows
+                ]
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] list_recommendation_journal failed: %s", exc)
+            return []
+
+    def list_score_journal(
+        self, stock_code: Optional[str] = None, limit: int = 500
+    ) -> List[Dict[str, Any]]:
+        """评分快照列表（时间倒序）。"""
+        session_local = self._SessionLocal
+        if session_local is None:
+            return []
+        try:
+            db = session_local()
+            try:
+                query = db.query(ScoreJournal)
+                if stock_code:
+                    query = query.filter(ScoreJournal.stock_code == stock_code)
+                rows = (
+                    query.order_by(ScoreJournal.created_at.desc()).limit(limit).all()
+                )
+                return [
+                    {
+                        "id": r.id,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "stock_code": r.stock_code,
+                        "total_score": r.total_score,
+                        "dimensions_json": r.dimensions_json,
+                        "scoring_version": r.scoring_version,
+                        "report_id": r.report_id,
+                    }
+                    for r in rows
+                ]
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] list_score_journal failed: %s", exc)
+            return []
         except Exception as exc:
             logger.error("prune_deep_research_reports failed: %s", exc)
             return []

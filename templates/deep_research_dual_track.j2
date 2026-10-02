@@ -1,55 +1,197 @@
 # {{ stock_name }}（{{ stock_code }}）深度投研报告（双轨版）
 
-> 数据截至：{{ as_of }}（阶段 0 快照时点）｜ 报告生成：双轨多维度引擎 v1
-> 评级：**{{ signal.rating }}** ｜ 目标价（EV）：{{ signal.expected_value or "N/A" }} ｜ 期望上行：见信号区
+> 数据截至：{{ as_of }}（阶段 0 快照时点）｜ 报告生成：双轨多维度引擎 v1 · 评分框架 {{ six_dim.scoring_version }}
+> 总评分：**{{ six_dim.framework.dimension_total }}/100** ｜ 评级：**{{ signal.rating }}** ｜ 行动：**{{ conclusion.conclusion.action if conclusion.conclusion else '观察' }}**
 > 核心逻辑：{{ signal.one_sentence }}
-> 护栏说明：本报告触发 {{ guardrail_events|length }} 条决策护栏（详见附录事件表）
+> 护栏说明：本报告触发 {{ guardrail_events|length }} 条决策护栏（详见附录）｜ 本报告为模拟盘研究记录，不构成投资建议
 
 ---
 
-## 短线六件套
+## 一、结论
 
-### 一、信号
+**总评分 {{ six_dim.framework.dimension_total }}/100**（六维加权，详见第四段论据表）
 
-{{ degraded_note(signal) }}
-- 信号类型：{{ signal.signal_type }}
-- 置信度：{{ signal.confidence }}
-- 目标价 / 期望值：{{ signal.target_price or "N/A" }} / {{ signal.expected_value or "N/A" }}
-- 一句话：{{ signal.one_sentence }}
+**报告结论**：{% if final_conclusion %}{{ final_conclusion }}{% else %}{{ signal.one_sentence }}{% endif %}
 
-{% if signal.narrative %}{{ signal.narrative }}{% endif %}
+**报告结论**：{% if final_conclusion %}{{ final_conclusion }}{% else %}{{ signal.one_sentence }}{% endif %}
 
-### 二、数据透视
+**怎么在这只票上赚到钱**：{{ signal.one_sentence }}
+
+<details>
+<summary>术语速查（点击展开）：评分=六维加权总分(0-100，越高越好)；先验=六维映射的初始胜率估计；Edge=我们与市场定价的认知差；EV=三情景概率加权目标价；LR=证据强度（似然比）</summary>
+
+</details>
+
+**操作指令（模拟盘记录，非实盘建议）**：
+{% if conclusion.conclusion %}
+- 行动：**{{ conclusion.conclusion.action }}**（{{ {"建仓":"建议开始分批买入","加仓":"建议增加持仓","持有":"建议维持现有持仓","减仓":"建议降低持仓","止损":"建议止损离场","观察":"建议观望等待"}[conclusion.conclusion.action] }}） ｜ 评级：{{ signal.rating }} ｜ 置信度：{{ signal.confidence }}
+{% endif %}
+{% if plan.sniper_points %}
+- 理想买价：{{ plan.sniper_points.ideal_buy or 'N/A' }} ｜ 止损：{{ plan.sniper_points.stop_loss or 'N/A' }} ｜ 止盈/卖价：{{ plan.sniper_points.take_profit or 'N/A' }}
+{% endif %}
+- 本指令已写入操作日志（recommendation_journal），未来价格走出后将回放统计兑现率——自反思系统雏形。
+
+---
+
+## 二、盘面解读
 
 {{ degraded_note(data) }}
-{% if data.perspective %}
-{% set t = data.perspective.trend_status %}
-- 均线排列：{{ t.ma_alignment if t else "N/A" }}（{% if t and t.is_bullish %}多头{% else %}非多头{% endif %}），趋势分 {{ t.trend_score if t else "N/A" }}/100
-{% set p = data.perspective.price_position %}
-- 现价 {{ p.current_price if p else "N/A" }}｜MA5 {{ p.ma5 if p else "N/A" }}｜MA10 {{ p.ma10 if p else "N/A" }}｜MA20 {{ p.ma20 if p else "N/A" }}｜乖离 {{ p.bias_ma5 if p else "N/A" }}%
-- 支撑 {{ p.support_level if p else "N/A" }}｜阻力 {{ p.resistance_level if p else "N/A" }}
-{% set v = data.perspective.volume_analysis %}
-- 量比 {{ v.volume_ratio if v else "N/A" }}（{{ v.volume_status if v else "N/A" }}）｜换手 {{ v.turnover_rate if v else "N/A" }}%
-{% set c = data.perspective.chip_structure %}
-- 筹码：获利 {{ c.profit_ratio if c else "N/A" }}｜平均成本 {{ c.avg_cost if c else "N/A" }}｜集中度 {{ c.concentration if c else "N/A" }}
+- 当前结构：**{{ data.perspective.trend_status.ma_alignment if data.perspective and data.perspective.trend_status else '数据不足' }}**
+{% if data.ma250_deviation_pct is not none %}
+- 价格相对年线（MA250）偏离：{{ data.ma250_deviation_pct }}% ｜ 距 52 周高点：{{ data.distance_from_52w_high_pct }}%
 {% endif %}
 {% if data.narrative %}{{ data.narrative }}{% endif %}
 
-### 三、情报
+**根因四要素**（消息面 Agent 产出）：
+{% if intel.root_cause %}
+- 事件：{{ intel.root_cause.event or '未提取' }}
+- 机制：{{ intel.root_cause.mechanism or '未提取' }}
+- 量级：{{ intel.root_cause.magnitude or '未评估' }}
+- 持续性：{{ intel.root_cause.persistence or '未评估' }}
+{% else %}
+- 根因未提取（情报维度降级或搜索源不可用）。
+{% endif %}
+
+---
+
+## 三、走势预测
+
+{{ degraded_note(scenarios) }}
+{% if scenarios.scenarios and scenarios.scenarios.scenarios %}
+**情景与概率**（机器归一化，概率和 {{ (scenarios.probability_sum * 100)|round(0) }}%）：
+
+| 情景 | 概率 | 价值锚 | 说明 |
+|------|------|--------|------|
+{% for s in scenarios.scenarios.scenarios %}
+| {{ s.type }} | {{ (s.probability * 100)|round(0) }}% | {{ s.value_anchor or 'N/A' }} | {{ s.description or '' }} |
+{% endfor %}
+
+**时间层级路径**（条件→目标位，每条须以实际触发条件为准）：
+{% if scenarios.time_paths %}
+{% for horizon, text in scenarios.time_paths.items() %}
+- {{ horizon }}：{{ text }}
+{% endfor %}
+{% else %}
+- （时间层级未生成）
+{% endif %}
+期望价值 EV：{{ scenarios.expected_value or 'N/A' }}（{{ scenarios.valuation_basis }} 口径）
+
+{% if intel.event_calendar %}
+**未来事件与预案**：
+{% for ev in intel.event_calendar %}
+- **{{ ev.event }}**（{{ ev.date or '日期待定' }}）
+{% for o in ev.outcomes %}  - 可能结果：{{ o }}
+{% endfor %}
+{% for pl in ev.plans %}  - 预案：{{ pl }}
+{% endfor %}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if scenarios.narrative %}{{ scenarios.narrative }}{% endif %}
+
+#### 情景与时间层级
+{{ degraded_note(scenarios) }}
+（见本节上方情景表与时间层级路径；概率和 {{ (scenarios.probability_sum * 100)|round(0) }}%，期望价值 {{ scenarios.expected_value or 'N/A' }}）
+
+#### 投资结论
+{{ degraded_note(conclusion) }}
+{% if conclusion.conclusion %}
+- 先验 {{ conclusion.conclusion.prior_p }} / 后验见贝叶斯链 ｜ 行动：**{{ conclusion.conclusion.action }}** ｜ 1/3/5 年价值区间：{{ conclusion.conclusion.value_range_1y or 'N/A' }} / {{ conclusion.conclusion.value_range_3y or 'N/A' }} / {{ conclusion.conclusion.value_range_5y or 'N/A' }}
+{% endif %}
+{% if conclusion.narrative %}{{ conclusion.narrative }}{% endif %}
+
+#### 贝叶斯证据链
+{{ degraded_note(bayesian) }}
+{% if bayesian.bayesian %}
+- 先验 {{ bayesian.bayesian.prior_p }} → 后验 {{ bayesian.bayesian.posterior_p }} ｜ Edge {{ bayesian.bayesian.edge }} ｜ 仓位建议：{{ bayesian.bayesian.position_suggestion }}
+{% if bayesian.bayesian.evidence_log %}
+{% for e in bayesian.bayesian.evidence_log %}
+- [{{ e.date }}] {{ e.evidence }}（{{ e.strength }}，LR {{ e.lr }}）
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if bayesian.narrative %}{{ bayesian.narrative }}{% endif %}
+
+---
+
+## 四、六维评分总表
+
+{{ degraded_note(six_dim) }}
+**加权总分：{{ six_dim.framework.dimension_total }}/100**（{{ six_dim.scoring_version }}，单一评分源：本表 = 第一段总评分 = 贝叶斯先验输入）
+
+| 维度 | 权重 | 得分 | 一句话 |
+|------|------|------|--------|
+{% for d in six_dim.framework.dimensions %}
+| {{ d.dimension }} | {{ (d.weight * 100)|round(0) }}% | {{ d.score }} | {% if d.indicators %}{{ d.indicators[0].summary[:60] }}{% if d.indicators|length > 1 %} 等{{ d.indicators|length }}项{% endif %}{% endif %} |
+{% endfor %}
+
+#### 六维指标明细
+{{ degraded_note(six_dim) }}
+{% for d in six_dim.framework.dimensions %}
+- **{{ d.dimension }}**（{{ (d.weight * 100)|round(0) }}%）{{ d.score }} 分{% if d.indicators %}：{% for i in d.indicators %}{{ i.name }} {{ i.score }}（{{ i.summary[:30] }}）{% if not loop.last %}；{% endif %}{% endfor %}{% endif %}
+{% endfor %}
+
+{% if six_dim.warnings %}
+**评分声明**：{{ six_dim.warnings|join('；') }}。本评分已写入 score_journal，将持续回放验证"评分与未来涨跌的正相关性"，偏离即迭代权重——投研自反思系统。
+{% endif %}
+
+---
+
+## 五、详情分析
+
+### 5.1 基本面（权重 30%）
+
+{{ degraded_note(fundamental) }}
+#### 财务与基本面（F1）
+{% if fundamental.health_score is not none %}
+- 财务健康分：**{{ fundamental.health_score }}/100**
+{% endif %}
+{% if fundamental.profitability %}
+- 盈利质量：ROE {{ fundamental.profitability.roe.value or '缺失' }}（{{ fundamental.profitability.roe.label }}）｜ 毛利率 {{ fundamental.profitability.gross_margin.value or '缺失' }}（{{ fundamental.profitability.gross_margin.label }}）
+{% endif %}
+{% if fundamental.growth_quality %}
+- 成长质量：营收同比 {{ fundamental.growth_quality.revenue_yoy.value or '缺失' }} ｜ 净利同比 {{ fundamental.growth_quality.net_profit_yoy.value or '缺失' }}{% if fundamental.growth_quality.scissors is not none %}（剪刀差 {{ fundamental.growth_quality.scissors }}）{% endif %}
+{% endif %}
+- 估值：{{ fundamental.valuation_detail.assessment }}
+{% if fundamental.data_gaps %}
+- 数据缺口：{{ fundamental.data_gaps|join('、') }}（按纪律记中性分）
+{% endif %}
+{% if fundamental.narrative %}{{ fundamental.narrative }}{% endif %}
+
+#### 板块分析（F2）
+{{ degraded_note(sector) }}
+- 板块：{{ sector.sector_hint or '未识别' }} ｜ 政策倾向：{{ sector.policy_lean or '未知' }} ｜ 行业基率：{{ sector.base_rate }}（{{ sector.base_rate_basis }}）
+{% if sector.sector_score is not none %}- 板块得分：{{ sector.sector_score }}/100{% endif %}
+{% if sector.narrative %}{{ sector.narrative }}{% endif %}
+
+#### 产业链解读
+{{ degraded_note(supply_chain) }}
+- 双源校验状态：{{ supply_chain.verification_status }}
+{% if supply_chain.supply_chain %}
+- 公司定位：{{ supply_chain.supply_chain.company_position }}
+{% if supply_chain.supply_chain.chokepoints %}
+{% for cp in supply_chain.supply_chain.chokepoints %}
+- 卡点 [{{ cp.type }}/{{ cp.confidence }}]：{{ cp.description }}
+{% endfor %}
+{% endif %}
+{% endif %}
+{% if supply_chain.narrative %}{{ supply_chain.narrative }}{% endif %}
+
+### 5.2 消息面（权重 15%）
 
 {{ degraded_note(intel) }}
+#### 消息面详析
 {% if intel.intelligence %}
-- 情绪总结：{{ intel.intelligence.sentiment_summary or "N/A" }}
-- 业绩展望：{{ intel.intelligence.earnings_outlook or "N/A" }}
-- 最新要闻：{{ intel.intelligence.latest_news or "N/A" }}
+- 情绪总结：{{ intel.intelligence.sentiment_summary or 'N/A' }}
+- 最新要闻：{{ intel.intelligence.latest_news or 'N/A' }}
 {% if intel.intelligence.risk_alerts %}
-**🚨 风险警报**：
+**风险警报**：
 {% for a in intel.intelligence.risk_alerts %}
 - {{ a }}
 {% endfor %}
 {% endif %}
 {% if intel.intelligence.positive_catalysts %}
-**✨ 正向催化剂**：
+**正向催化剂**：
 {% for c in intel.intelligence.positive_catalysts %}
 - {{ c }}
 {% endfor %}
@@ -58,160 +200,111 @@
 - unverified 情报条数：{{ intel.unverified_count }}
 {% if intel.narrative %}{{ intel.narrative }}{% endif %}
 
-### 四、作战计划
+### 5.3 资金面（权重 15%）
+{% if six_dim.framework %}
+{% for d in six_dim.framework.dimensions %}
+{% if d.dimension == '资金面' %}
+{% for i in d.indicators %}
+- {{ i.name }}（权重 {{ (i.weight * 100)|round(0) }}%）：{{ i.score }} 分 —— {{ i.summary }}{% if i.data_gap %}（缺口）{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
 
+### 5.4 技术面（权重 15%）
+{% if six_dim.framework %}
+{% for d in six_dim.framework.dimensions %}
+{% if d.dimension == '技术面' %}
+{% for i in d.indicators %}
+- {{ i.name }}（权重 {{ (i.weight * 100)|round(0) }}%）：{{ i.score }} 分 —— {{ i.summary }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if data.perspective and data.perspective.price_position %}
+- 支撑 {{ data.perspective.price_position.support_level or 'N/A' }} ｜ 阻力 {{ data.perspective.price_position.resistance_level or 'N/A' }}
+{% endif %}
+
+### 5.5 情绪面（权重 15%）
+{% if six_dim.framework %}
+{% for d in six_dim.framework.dimensions %}
+{% if d.dimension == '情绪面' %}
+{% for i in d.indicators %}
+- {{ i.name }}（权重 {{ (i.weight * 100)|round(0) }}%）：{{ i.score }} 分 —— {{ i.summary }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+### 5.6 宏观（权重 10%）
+{% if six_dim.framework %}
+{% for d in six_dim.framework.dimensions %}
+{% if d.dimension == '宏观' %}
+{% for i in d.indicators %}
+- {{ i.name }}（权重 {{ (i.weight * 100)|round(0) }}%）：{{ i.score }} 分 —— {{ i.summary }}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endif %}
+
+---
+
+## 六、交易参考（择时类内容，非本报告重点）
+
+#### 信号
+{{ degraded_note(signal) }}
+- 评级：{{ signal.rating }} ｜ 置信度：{{ signal.confidence }} ｜ 期望值：{{ signal.expected_value or 'N/A' }}
+{% if signal.narrative %}{{ signal.narrative }}{% endif %}
+
+#### 数据透视
+{{ degraded_note(data) }}
+{% if data.perspective and data.perspective.volume_analysis %}
+- 量比 {{ data.perspective.volume_analysis.volume_ratio or 'N/A' }}（{{ data.perspective.volume_analysis.volume_status or 'N/A' }}）
+{% endif %}
+
+#### 作战计划
 {{ degraded_note(plan) }}
 {% if plan.sniper_points %}
 | 点位 | 价格 |
 |------|------|
-| 🎯 理想买 | {{ plan.sniper_points.ideal_buy or "N/A" }} |
-| 🔵 次买 | {{ plan.sniper_points.secondary_buy or "N/A" }} |
-| 🛑 止损 | {{ plan.sniper_points.stop_loss or "N/A" }} |
-| 🎊 止盈 | {{ plan.sniper_points.take_profit or "N/A" }} |
-
-计算依据：{{ plan.basis }}
+| 理想买 | {{ plan.sniper_points.ideal_buy or 'N/A' }} |
+| 止损 | {{ plan.sniper_points.stop_loss or 'N/A' }} |
+| 止盈 | {{ plan.sniper_points.take_profit or 'N/A' }} |
 {% endif %}
 {% if plan.position_strategy %}
-- 建议仓位：{{ plan.position_strategy.suggested_position }}
-- 入场：{{ plan.position_strategy.entry_plan }}
-- 风控：{{ plan.position_strategy.risk_control }}
+- 仓位：{{ plan.position_strategy.suggested_position }} ｜ 入场：{{ plan.position_strategy.entry_plan }}
 {% endif %}
-{% if plan.action_checklist %}
-**✅ 行动清单**：
-{% for item in plan.action_checklist %}
-- {{ item }}
-{% endfor %}
-{% endif %}
-{% if plan.narrative %}{{ plan.narrative }}{% endif %}
 
-### 五、阶段决策
-
+#### 阶段决策
 {{ degraded_note(phase) }}
 {% if phase.phase %}
-- 行动窗口：{{ phase.phase.action_window }}
-- 立即行动：{{ phase.phase.immediate_action }}
-- 下次检查：{{ phase.phase.next_check_time }}
-{% if phase.phase.watch_conditions %}
-**观察条件**：
-{% for w in phase.phase.watch_conditions %}
-- {{ w }}
-{% endfor %}
+- 窗口：{{ phase.phase.action_window }} ｜ 下次检查：{{ phase.phase.next_check_time }}
 {% endif %}
-{% endif %}
-{% if phase.narrative %}{{ phase.narrative }}{% endif %}
 
-### 六、历史对比
-
+#### 历史对比
 {{ degraded_note(history) }}
 {% if history.rows %}
-| 时间 | 评级/目标价 | 当时结论 |
-|------|------------|---------|
 {% for r in history.rows %}
-| {{ r.created_at }} | {{ r.rating_hint or "—" }} | {{ r.one_sentence or "—" }} |
+- {{ r.created_at }}：{{ r.rating_hint or '—' }} {{ r.one_sentence or '' }}
 {% endfor %}
 {% else %}
 （无历史报告）
 {% endif %}
-{% if history.drift_flags %}
-**观点漂移**：{% for f in history.drift_flags %}{{ f }}；{% endfor %}
-{% endif %}
-{% if history.narrative %}{{ history.narrative }}{% endif %}
-
----
-
-## 长线五段式
-
-### 七、投资结论
-
-{{ degraded_note(conclusion) }}
-{% if conclusion.conclusion %}
-- 先验 P(H)：{{ conclusion.conclusion.prior_p }}｜市场隐含：{{ conclusion.conclusion.market_implied_p }}｜Edge：{{ conclusion.conclusion.edge }}
-- 行动：**{{ conclusion.conclusion.action }}**（后验 {{ (bayesian.bayesian.posterior_p if bayesian.bayesian else "N/A") }}）
-- 1/3/5 年价值区间：{{ conclusion.conclusion.value_range_1y or "N/A" }} / {{ conclusion.conclusion.value_range_3y or "N/A" }} / {{ conclusion.conclusion.value_range_5y or "N/A" }}
-{% endif %}
-{% if conclusion.narrative %}{{ conclusion.narrative }}{% endif %}
-
-### 八、产业链解读
-
-{{ degraded_note(supply_chain) }}
-- 双源校验状态：{{ supply_chain.verification_status }}
-{% if supply_chain.supply_chain %}
-- 公司定位：{{ supply_chain.supply_chain.company_position }}
-{% if supply_chain.supply_chain.chokepoints %}
-**瓶颈/卡点**：
-{% for cp in supply_chain.supply_chain.chokepoints %}
-- [{{ cp.type }}/{{ cp.confidence }}] {{ cp.description }}
-{% endfor %}
-{% endif %}
-{% if supply_chain.supply_chain.us_china_chain %}
-- 中美双链角色：{{ supply_chain.supply_chain.us_china_chain.role }}｜替代进度：{{ supply_chain.supply_chain.us_china_chain.substitution_progress or "N/A" }}｜制裁风险：{{ supply_chain.supply_chain.us_china_chain.sanction_risk or "N/A" }}
-{% endif %}
-{% endif %}
-{% if supply_chain.narrative %}{{ supply_chain.narrative }}{% endif %}
-
-### 九、长期价值与情景
-
-{{ degraded_note(scenarios) }}
-{% if scenarios.scenarios and scenarios.scenarios.scenarios %}
-| 情景 | 概率 | 价值锚 | 说明 |
-|------|------|--------|------|
-{% for s in scenarios.scenarios.scenarios %}
-| {{ s.type }} | {{ (s.probability * 100)|round(0) }}% | {{ s.value_anchor or "N/A" }} | {{ s.description or "" }} |
-{% endfor %}
-
-概率和：{{ (scenarios.probability_sum * 100)|round(0) }}%（机器归一化）｜期望价值 EV：{{ scenarios.expected_value or "N/A" }}｜估值口径：{{ scenarios.valuation_basis }}（当前 PE(TTM)={{ scenarios.current_pe_ttm or "N/A" }}）
-{% endif %}
-{% if scenarios.narrative %}{{ scenarios.narrative }}{% endif %}
-
-### 十、贝叶斯证据链
-
-{{ degraded_note(bayesian) }}
-{% if bayesian.bayesian %}
-- 先验 {{ bayesian.bayesian.prior_p }} → 后验 {{ bayesian.bayesian.posterior_p }}｜Edge {{ bayesian.bayesian.edge }}｜仓位建议：{{ bayesian.bayesian.position_suggestion }}｜置信度：{{ bayesian.bayesian.confidence }}
-- 市场隐含概率来源：{{ bayesian.market_implied_basis }}
-{% if bayesian.bayesian.evidence_log %}
-| 日期 | 证据 | 强度 | LR | 步骤后验 |
-|------|------|------|----|---------|
-{% for e in bayesian.bayesian.evidence_log %}
-| {{ e.date }} | {{ e.evidence }} | {{ e.strength }} | {{ e.lr }} | {{ e.posterior_p }} |
-{% endfor %}
-{% endif %}
-{% if bayesian.bayesian.stop_conditions %}
-- 止损条件：{{ bayesian.bayesian.stop_conditions }}
-{% endif %}
-{% if bayesian.evidence_rejected %}
-**被驳回证据**：
-{% for r in bayesian.evidence_rejected %}
-- {{ r }}
-{% endfor %}
-{% endif %}
-{% endif %}
-{% if bayesian.narrative %}{{ bayesian.narrative }}{% endif %}
-
-### 十一、六维评分明细
-
-{{ degraded_note(six_dim) }}
-{% if six_dim.framework %}
-**六维总分：{{ six_dim.framework.dimension_total }}/100（{{ six_dim.scoring_version }}）**
-{% for d in six_dim.framework.dimensions %}
-#### {{ d.dimension }}（权重 {{ (d.weight * 100)|round(0) }}%）：{{ d.score }} 分
-{% if d.indicators %}
-| 指标 | 得分 | 权重 | 依据 | 说明 |
-|------|------|------|------|------|
-{% for i in d.indicators %}
-| {{ i.name }} | {{ i.score }} | {{ (i.weight * 100)|round(0) }}% | {{ i.basis }} | {{ i.summary or "" }} |
-{% endfor %}
-{% endif %}
-{% endfor %}
-{% if six_dim.warnings %}
-**评分警告**：{% for w in six_dim.warnings %}{{ w }}；{% endfor %}
-{% endif %}
-{% endif %}
-{% if six_dim.narrative %}{{ six_dim.narrative }}{% endif %}
 
 ---
 
 ## 附录
+
+### 子报告下载索引（每维度独立详版）
+{% if report_id %}
+| 维度 | 查看 | 下载 |
+|------|------|------|
+{% for item in dim_anchor_items %}
+| {{ item.id }} | [/查看](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}) | [/下载](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}?download=1) |
+{% endfor %}
+{% else %}
+（报告 id 缺失，索引不可用）
+{% endif %}
 
 ### 护栏事件表
 {% if guardrail_events %}
@@ -229,4 +322,4 @@
 - {{ l }}
 {% endfor %}
 
-*本报告由 AI 生成，所引数据以「数据截至」时点为准，不构成投资建议。*
+*本报告由 AI 生成，所引数据以「数据截至」时点为准；操作指令为模拟盘研究记录，不构成投资建议。*

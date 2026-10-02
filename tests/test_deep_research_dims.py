@@ -34,6 +34,8 @@ from src.schemas.deep_research_dims import (
     BayesianDim,
     ConclusionDim,
     DataDim,
+    FundamentalDim,
+    SectorDim,
     DIM_IDS,
     HistoryDim,
     IntelDim,
@@ -563,6 +565,29 @@ class TestSnapshotCache:
         dim_cache.save_snapshot("stage0_fund_600519", {})
         assert dim_cache.load_snapshot("stage0_fund_600519", ttl_hours=24) is None
 
+    def test_all_none_fundamental_not_cached(self, monkeypatch, tmp_path):
+        """E2E 抓的缓存污染 bug：失败抓取返回全 None dict，曾被固化 24h。"""
+        from src.agent.tools import data_tools
+        from src.deep_research_dims import context as ctx_mod
+        from src.deep_research_dims import dim_cache
+
+        monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+
+        class _Fund:
+            def get_fundamental_context(self, code):
+                return {"valuation": {"data": {}}, "financial": {"data": {}}}
+
+        monkeypatch.setattr(
+            data_tools, "_get_fetcher_manager", lambda: _Fund()
+        )
+        ctx = ctx_mod.SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="x")
+        result = ctx_mod._safe_fundamental("600519", ctx)
+        assert result["pe_ttm"] is None
+        # 全 None 不得写缓存
+        import os
+
+        assert not os.listdir(str(tmp_path)), "全 None 结果不应产生缓存文件"
+
     def test_fundamental_cache_hit_skips_fetch(self, monkeypatch, tmp_path):
         """命中快照时不得触碰 fetcher（monkeypatch 成抛异常即证）。"""
         from src.agent.tools import data_tools
@@ -634,7 +659,7 @@ class TestNarrateHardening:
 
 
 class TestDimSubReports:
-    def test_split_all_11_sections(self):
+    def test_split_all_dim_sections(self):
         from src.deep_research_dims.render import (
             DIM_SECTION_ANCHORS,
             split_dim_sections,
@@ -663,11 +688,19 @@ class TestDimSubReports:
     def test_build_dim_report_header_footer(self):
         from src.deep_research_dims.render import build_dim_report
 
-        md = build_dim_report("intel", "### 三、情报\n\n内容", "贵州茅台", "600519", "2026-09-29T10:00:00")
-        assert md.startswith("# 贵州茅台（600519）· 三、情报（子报告）")
+        md = build_dim_report("intel", "#### 消息面详析\n\n内容", "贵州茅台", "600519", "2026-09-29T10:00:00")
+        assert md.startswith("# 贵州茅台（600519）· 消息面详析（子报告）")
         assert "数据截至：2026-09-29T10:00:00" in md
         assert "不构成投资建议" in md
         assert "内容" in md
+
+    def test_six_dim_ttl_not_exceeds_dependencies(self):
+        """审计 C8：six_dim 缓存 TTL 不得超过其数据依赖（data/F1/F2=24h）。"""
+        from src.deep_research_dims.dim_cache import DIM_TTL_HOURS
+
+        assert DIM_TTL_HOURS["six_dim"] <= DIM_TTL_HOURS["data"]
+        assert DIM_TTL_HOURS["six_dim"] <= DIM_TTL_HOURS["fundamental"]
+        assert DIM_TTL_HOURS["six_dim"] <= DIM_TTL_HOURS["sector"]
 
 
 class TestPhaseFallback:
@@ -699,6 +732,8 @@ def _all_default_dims() -> dict:
         "conclusion": ConclusionDim(),
         "supply_chain": SupplyChainDim(),
         "scenarios": ScenariosDim(probability_sum=1.0),
+        "fundamental": FundamentalDim(),
+        "sector": SectorDim(),
     }
     assert set(dims) == set(DIM_IDS)
     return dims
