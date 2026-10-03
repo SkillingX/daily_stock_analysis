@@ -361,6 +361,20 @@ class AnalysisHistory(Base):
         }
 
 
+class FundamentalsReport(Base):
+    """基本面分析报告（专项模块）：复用 business/sector/financial 研究员产出。"""
+
+    __tablename__ = "fundamentals_reports"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # fd_{YYYYMMDDHHmm}(_seq)?
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    md_path: Mapped[str] = mapped_column(Text, nullable=False)
+    pdf_path: Mapped[Optional[str]] = mapped_column(Text)
+    dims_json: Mapped[Optional[str]] = mapped_column(Text)  # 三维度 payload 快照
+
+
 class RecommendationJournal(Base):
     """操作指令日志（方案 v2.1 自反思雏形）：每次报告的买卖指令结构化留痕。
 
@@ -3042,6 +3056,101 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             logger.warning("[Storage] save_score_journal failed: %s", exc)
             return None
 
+    def save_fundamentals_report(self, record: Dict[str, Any]) -> bool:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return False
+        try:
+            db = session_local()
+            try:
+                db.add(
+                    FundamentalsReport(
+                        id=str(record.get("id") or ""),
+                        stock_code=str(record.get("stock_code") or ""),
+                        stock_name=record.get("stock_name"),
+                        md_path=str(record.get("md_path") or ""),
+                        dims_json=record.get("dims_json"),
+                    )
+                )
+                db.commit()
+                return True
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] save_fundamentals_report failed: %s", exc)
+            return False
+
+    def get_fundamentals_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                r = db.get(FundamentalsReport, report_id)
+                if r is None:
+                    return None
+                return {
+                    "id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                    "md_path": r.md_path, "pdf_path": r.pdf_path, "dims_json": r.dims_json,
+                }
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] get_fundamentals_report failed: %s", exc)
+            return None
+
+    def list_fundamentals_reports(
+        self, stock_code: Optional[str] = None, limit: int = 50, offset: int = 0
+    ) -> tuple[list, int]:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return [], 0
+        try:
+            db = session_local()
+            try:
+                query = db.query(FundamentalsReport)
+                if stock_code:
+                    query = query.filter(FundamentalsReport.stock_code == stock_code)
+                total = query.count()
+                rows = (
+                    query.order_by(FundamentalsReport.created_at.desc())
+                    .offset(offset).limit(limit).all()
+                )
+                return [
+                    {
+                        "id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                    }
+                    for r in rows
+                ], int(total)
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] list_fundamentals_reports failed: %s", exc)
+            return [], 0
+
+    def delete_fundamentals_report(self, report_id: str) -> Optional[Dict[str, Optional[str]]]:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                r = db.get(FundamentalsReport, report_id)
+                if r is None:
+                    return None
+                paths = {"md_path": r.md_path, "pdf_path": r.pdf_path}
+                db.delete(r)
+                db.commit()
+                return paths
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] delete_fundamentals_report failed: %s", exc)
+            return None
+
     def list_recommendation_journal(
         self, stock_code: Optional[str] = None, limit: int = 500
     ) -> List[Dict[str, Any]]:
@@ -3445,6 +3554,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 .all()
             )
             return list(rows), int(total)
+
+    def get_latest_supply_chain_report_by_stock(
+        self, stock_code: str,
+    ) -> Optional[SupplyChainReport]:
+        """按股票取最新供应链专项报告（产业链研究员复用：有则直取）。"""
+        with self.get_session() as session:
+            row = session.execute(
+                select(SupplyChainReport)
+                .where(SupplyChainReport.stock_code == stock_code)
+                .order_by(desc(SupplyChainReport.created_at))
+                .limit(1)
+            ).scalars().first()
+            return row
 
     def get_supply_chain_report(self, report_id: str) -> Optional[SupplyChainReport]:
         """按主键查询单条报告。"""

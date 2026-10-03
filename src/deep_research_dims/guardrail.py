@@ -254,6 +254,27 @@ def rule10_subjective_divergence(six_dim: Dict[str, Any]) -> List[GuardrailEvent
     return events
 
 
+def rule11_event_plan_completeness(intel: Dict[str, Any]) -> List[GuardrailEvent]:
+    """消息面②：每个未来事件的预案数必须覆盖结果数（预案缺失即披露）。"""
+    events = []
+    for item in (intel.get("event_calendar") or []):
+        if not isinstance(item, dict):
+            continue
+        outcomes = item.get("outcomes") or []
+        plans = item.get("plans") or []
+        if outcomes and len(plans) < len(outcomes):
+            events.append(
+                _event(
+                    "GR11_event_plan_completeness",
+                    "intel",
+                    "rewrite",
+                    f"事件「{str(item.get('event') or '未知')[:30]}」有 {len(outcomes)} 种结果但只有 "
+                    f"{len(plans)} 条预案，预案覆盖不全",
+                )
+            )
+    return events
+
+
 def apply_guardrails(payloads: Dict[str, Dict[str, Any]]) -> tuple[List[GuardrailEvent], Dict[str, Any]]:
     """按波次执行全部规则（波次 3 合成后统一执行一遍）。
 
@@ -277,6 +298,7 @@ def apply_guardrails(payloads: Dict[str, Dict[str, Any]]) -> tuple[List[Guardrai
     events += rule8_unverified_intel(payloads.get("intel", {}))
     events += rule9_evidence_freshness(payloads.get("bayesian", {}))
     events += rule10_subjective_divergence(payloads.get("six_dim", {}))
+    events += rule11_event_plan_completeness(payloads.get("intel", {}))
 
     adjusted = {k: dict(v) for k, v in payloads.items()}
     _apply_overrides(events, adjusted)

@@ -15,6 +15,22 @@ from src.deep_research_dims.narrate import load_constitution, load_dim_prompt
 
 logger = logging.getLogger(__name__)
 
+import threading
+
+from src.config import get_config
+
+_LLM_SEMAPHORE: "threading.Semaphore | None" = None
+
+
+def _llm_semaphore() -> "threading.Semaphore":
+    """全局 LLM 并发上限（MiniMax code plan 有限流）：所有研究员探索循环共用。"""
+    global _LLM_SEMAPHORE
+    if _LLM_SEMAPHORE is None:
+        limit = int(getattr(get_config(), "deep_research_llm_concurrency", 3) or 3)
+        _LLM_SEMAPHORE = threading.Semaphore(max(1, limit))
+    return _LLM_SEMAPHORE
+
+
 _INTEL_TOOLS = {
     "search_stock_news",
     "search_comprehensive_intel",
@@ -70,15 +86,16 @@ def _run_explore(
 
     last_error = ""
     for attempt in range(retry + 1):
-        loop = run_agent_loop(
-            messages=messages,
-            tool_registry=registry,
-            llm_adapter=llm_adapter,
-            max_steps=max_steps,
-            progress_callback=progress_callback,
-            max_wall_clock_seconds=480.0,
-            stock_scope=None,
-        )
+        with _llm_semaphore():
+            loop = run_agent_loop(
+                messages=messages,
+                tool_registry=registry,
+                llm_adapter=llm_adapter,
+                max_steps=max_steps,
+                progress_callback=progress_callback,
+                max_wall_clock_seconds=480.0,
+                stock_scope=None,
+            )
         parsed = _extract_json(loop.content)
         if parsed is not None:
             return {"ok": True, "data": parsed, "steps": loop.total_steps}
@@ -176,3 +193,129 @@ def run_supply_chain_agent(
         progress_callback,
         max_steps,
     )
+
+
+# ---------------------------------------------------------------------------
+# 八大研究员 · 新增 5 员（方案 v3：基金经理-研究员架构）
+# ---------------------------------------------------------------------------
+
+_TECHNICAL_TOOLS = {"get_daily_history", "analyze_trend"}
+_CAPITAL_TOOLS = {"get_capital_flow", "get_chip_distribution", "get_stock_info"}
+_SENTIMENT_TOOLS = {"search_stock_news", "search_market_discussion"}
+_OWNERSHIP_TOOLS = {
+    "search_comprehensive_intel",
+    "search_stock_news",
+    "search_knowledge_base",
+}
+_US_CHINA_TOOLS = {"search_comprehensive_intel", "verify_supply_chain_evidence"}
+
+
+def _chanlun_engine_facts(stock_code: str) -> str:
+    """P0-1：缠论引擎真实结构（优先数据源）。引擎不可用时返回空串，LLM 退回工具取数。"""
+    try:
+        import pandas as pd
+
+        from chanlun.chanlun_engine import ChanLunEngine
+        from src.services.history_loader import load_history_df
+
+        df, _src = load_history_df(stock_code, days=250)
+        if df is None or df.empty or len(df) < 60:
+            return ""
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        out = ChanLunEngine(df).analyze()
+        return (
+            f"【缠论引擎结构（权威，禁止矛盾）】趋势={out.get('current_trend')}"
+            f"，中枢位置={out.get('position')}，背驰={out.get('divergence') or '无'}；"
+            f"笔数={len(out.get('strokes') or [])}，中枢数={len(out.get('zhongshus') or [])}。"
+        )
+    except Exception:  # noqa: BLE001 - 引擎失败不阻断研究员
+        return ""
+
+
+def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """技术研究员：缠论引擎结构注入（LLM 只解读），+ 支撑压力 + MACD/RSI/波浪。"""
+    engine_facts = _chanlun_engine_facts(stock_code)
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做技术面深度分析并直接输出 JSON：\n"
+        f"0) 缠论结构事实（引擎已算好，你的解读必须与之一致，禁止矛盾）：{engine_facts or '引擎不可用，用工具取数后自行判定'}\n"
+        "1) 用 get_daily_history 取 250 天日线，analyze_trend 取综合指标；\n"
+        "2) 输出 JSON：chanlun_summary(字符串：基于引擎结构的解读——为什么是这个趋势/位置/背驰)、"
+        "support(数值)、resistance(数值)、indicator_summary(字符串：MACD/RSI/均线状态)、"
+        "wave_note(字符串：波浪理论视角的一句判断，不适用则写不适用)、"
+        "score(0-100 综合技术分，须与引擎结构方向一致)、basis(打分依据一句话，含具体数字)。"
+    )
+    return _run_explore("technical", _TECHNICAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
+
+
+def run_capital_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """资金研究员：资金流向 + 机构/大户持仓变动 + 筹码成本结构。"""
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON：\n"
+        "1) get_capital_flow 取主力资金流（当日/5日/10日），get_chip_distribution 取筹码结构，"
+        "get_stock_info 取机构持仓与基本面佐证；\n"
+        "2) 输出 JSON：flow_summary、flow_score(0-100)、institution_summary"
+        "（机构/大户持仓变动解读）、institution_score(0-100)、chip_summary"
+        "（筹码成本结构：获利盘/集中度/平均成本解读）、chip_score(0-100)、"
+        "score(三项加权总分)、每项说明含具体数字；取不到的项 score 填 null。"
+    )
+    return _run_explore("capital", _CAPITAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
+
+
+def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """情绪研究员：机构评价 + 社区评价（雪球/微博/股吧，强制来源等级）。"""
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做情绪面深度分析并直接输出 JSON：\n"
+        "1) search_stock_news 查机构研报/评级观点，search_market_discussion 查雪球/微博/股吧讨论；\n"
+        "2) 输出 JSON：institute_view(机构评价分层：评级/目标价/分歧点)、institute_score(0-100)、"
+        "community_view(社区情绪：看多/看空比例与典型观点，带来源等级标签)、"
+        "community_score(0-100)、unverified_count(社区传闻条数)、"
+        "score(加权总分)；社区信息只作分歧线索，不得写成确认。"
+    )
+    return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
+
+
+def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """股权高管研究员：实控人/十大股东/高管背景与变动（审计 A2：评分只作参考，不硬塞六维）。"""
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做股权架构与高管背景调查并直接输出 JSON：\n"
+        "1) search_knowledge_base 查已有资料，search_comprehensive_intel / search_stock_news "
+        "查实控人/股东/高管的公开信息（同花顺数据源为本，搜索为补）；\n"
+        "2) 输出 JSON：controller(实际控制人/控股股东，一句话)、top_holders(前十大股东要点数组)、"
+        "executives(核心高管：姓名/职务/背景一句，数组)、recent_changes(近一年增减持/任免/股权变动数组)、"
+        "data_gaps(取不到的数据项数组，禁止编造)、score(治理结构健康度参考分 0-100，可 null)、"
+        "narrative(调查结论一段)。所有事实带来源等级标签。"
+    )
+    return _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps)
+
+
+def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """中美竞争研究员：从供应链 Agent 拆出（方案决策 1）。"""
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做中美产业链竞争分析并直接输出 JSON：\n"
+        "1) search_comprehensive_intel 调研出口管制/制裁/平行链影响，"
+        "verify_supply_chain_evidence 校验板块归属；\n"
+        "2) 输出 JSON：applicability(强相关/低相关/不适用+一句理由)、role_cn(中国链位置)、"
+        "role_us(美国/全球链位置)、export_control(出口管制影响)、sanction_risk(制裁风险)、"
+        "substitution(国产替代/平行替换进度与阶段标签)、"
+        "score(中美链维度参考分 0-100，可 null)、narrative(一段结论)；"
+        "低相关行业 applicability 写低相关，其余字段留空。"
+    )
+    return _run_explore("us_china", _US_CHINA_TOOLS, task, llm_adapter, progress_callback, max_steps)
+
+
+_BUSINESS_TOOLS = {"search_comprehensive_intel", "search_stock_news", "get_market_indices"}
+
+
+def run_business_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与龙头对比。"""
+    task = (
+        f"请对 A 股 {stock_name}（{stock_code}）做业务画像与竞争地位分析并直接输出 JSON：\n"
+        "1) search_comprehensive_intel 调研主营业务/经营模式/行业地位，search_stock_news 查业务动态，"
+        "get_market_indices 取大盘环境作对比基准；\n"
+        "2) 输出 JSON：business_model(一句话经营模式)、main_products(主营产品与收入结构)、"
+        "competitive_position(行业地位与护城河)、vs_market_leader(与板块龙头/大盘的对比，标注 inferred 或来源等级)、"
+        "score(0-100 业务画像分，可 null)、data_gaps(取不到的数据项数组，禁止编造)、narrative(一段结论)。"
+    )
+    return _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps)

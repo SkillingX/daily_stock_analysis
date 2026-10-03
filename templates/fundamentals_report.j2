@@ -1,0 +1,110 @@
+{%- macro red(t) -%}
+<font color="#e03131">**{{ t }}**</font>
+{%- endmacro -%}
+{%- macro kv_list(d) -%}
+{% if d %}
+{% for k, v in d.items() %}
+- 🔴 **{{ k }}**：{% if v is string %}{{ v }}{% else %}{{ v }}{% endif %}
+{% endfor %}
+{% endif %}
+{%- endmacro -%}
+
+# 【{{ stock_name }}】（{{ stock_code }}）基本面分析报告
+
+> 报告日期：{{ as_of }} ｜ AI 生成，不构成投资建议
+> 本报告链接：查看 /api/v1/fundamentals/reports/{{ report_id }} ｜ 下载加 ?download=1
+
+---
+
+## 一、公司是做什么的
+
+{{ degraded_note(business) }}
+{% if business.narrative %}{{ business.narrative }}
+
+{% endif %}
+{% if business.business_model is mapping %}
+**要点**
+{% for k, v in business.business_model.items() %}
+{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v if v is string else v | tojson }}
+{% endfor %}
+{% endif %}
+{% if business.main_products %}
+**主营产品与收入结构**
+{% set mp = business['main_products'] if business['main_products'] is defined else {} %}
+{% if mp.业务板块 is defined and mp.业务板块 is sequence %}
+{% for item in mp.业务板块 %}
+- 🔴 **{{ item.name }}**：{{ item.desc }}（{{ item.level or 'inferred' }}）
+{% endfor %}
+{% if mp.收入结构 %}*收入结构：{{ mp.收入结构 if mp.收入结构 is string else mp.收入结构 | tojson }}*
+{% endif %}
+{% elif mp is mapping %}
+{% for k, v in mp.items() %}
+- **{{ k }}**：{{ v if v is string else v | tojson }}
+{% endfor %}
+{% else %}
+- {{ mp }}
+{% endif %}
+{% endif %}
+
+## 二、行业地位与竞争格局
+
+{{ degraded_note(business) }}
+{% if business.competitive_position is mapping %}
+{{ kv_list(business.competitive_position) }}
+{% endif %}
+{% if sector.narrative %}{{ sector.narrative }}
+
+{% endif %}
+{% if sector.data_gaps %}- 板块数据缺口：{{ sector.data_gaps|join('、') }}
+{% endif %}
+
+## 三、与龙头和大盘对比
+
+{{ degraded_note(business) }}
+{% set vs = business['vs_market_leader'] if business['vs_market_leader'] is defined else {} %}
+{% if vs.comparison is defined and vs.comparison is sequence %}
+**与龙头对比表**
+{% if vs.对比基准 %}*对比基准：{{ vs.对比基准 }}*
+{% endif %}
+| 对比维度 | 本公司 | 板块龙头 | 评价 |
+|---------|--------|---------|------|
+{% for row in vs.comparison %}
+| {{ row.metric }} | {{ row[stock_name] if row[stock_name] is defined else row.get('本公司', '数据缺失') }} | {{ row['板块龙头'] if row['板块龙头'] is defined else row.get('leader', '') }} | {{ row.level or '' }} |
+{% endfor %}
+{% elif vs is mapping %}
+{% for k, v in vs.items() %}
+{{ loop.index }}. 🔴 **{{ k }}**：{{ v if v is string else v | tojson }}
+{% endfor %}
+{% elif vs %}
+{{ vs }}
+{% else %}
+（对比数据缺口：iFinD 成分股接口配额恢复后自动补全，当前不编造）
+{% endif %}
+
+## 四、财务体检
+
+{{ degraded_note(financial) }}
+{% if financial.profitability %}
+**要点**
+1. 🔴 **盈利质量**：ROE {{ financial.profitability.roe.value or '缺失' }}（{{ financial.profitability.roe.label }}）｜ 毛利率 {{ financial.profitability.gross_margin.value or '缺失' }}（{{ financial.profitability.gross_margin.label }}）
+2. **成长质量**：营收同比 {{ financial.growth_quality.revenue_yoy.value or '缺失' }}（{{ financial.growth_quality.revenue_yoy.label }}）｜ 净利同比 {{ financial.growth_quality.net_profit_yoy.value or '缺失' }}（{{ financial.growth_quality.net_profit_yoy.label }}）
+3. **估值**：{{ financial.valuation_detail.assessment }}
+{% if financial.data_gaps %}
+- 数据缺口：{{ financial.data_gaps|join('、') }}
+{% endif %}
+{% if financial.narrative %}{{ financial.narrative }}{% endif %}
+{% endif %}
+
+## 五、结论与关注点
+
+{% if business.narrative and financial.narrative %}
+1. 🔴 **盯住基本面**：季报营收/净利增速剪刀差是否收窄
+2. **盯住板块**：政策与龙头对比位次变化
+3. **数据恢复后**：补全年报分产品收入与可比公司估值表，再出方向性评级
+{% else %}
+- （研究员产出不足，本节待数据恢复后补全。）
+{% endif %}
+
+---
+
+*数据来源：同花顺 / 东方财富数据接口 + AI 研究员分析；数据缺口已如实标注。*

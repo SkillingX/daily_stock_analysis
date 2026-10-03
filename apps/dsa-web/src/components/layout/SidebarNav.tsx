@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, Compass, FileText, Gauge, Home, LogOut, MessageSquareQuote, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
+import { Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, Compass, FileText, Gauge, Home, LogOut, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
@@ -31,9 +31,10 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'home', labelKey: 'layout.nav.home', to: '/', icon: Home, exact: true },
   { key: 'trend-compass', labelKey: 'layout.nav.trendCompass', to: '/trend-compass', icon: Compass },
   { key: 'deep-research', labelKey: 'layout.nav.deepResearch', to: '/deep-research', icon: FileText },
+  { key: 'fundamentals', labelKey: 'layout.nav.fundamentals', to: '/fundamentals', icon: FileText },
   { key: 'policy-minesweeper', labelKey: 'layout.nav.policyMinesweeper', to: '/policy-minesweeper', icon: ShieldAlert },
   { key: 'knowledge-base', labelKey: 'layout.nav.knowledgeBase', to: '/knowledge-base', icon: BookOpen },
-  { key: 'chat', labelKey: 'layout.nav.chat', to: '/chat', icon: MessageSquareQuote, badge: 'completion' },
+  // A股分析（/chat）按需求仅菜单隐藏，路由保留
   { key: 'chanlun', labelKey: 'layout.nav.chanlun', to: '/chanlun', icon: TrendingUp },
   // { key: 'zhengxi', labelKey: 'layout.nav.zhengxi', to: '/zhengxi', icon: Award }, // TEMP: hidden
   { key: 'supply-chain', labelKey: 'layout.nav.supplyChain', to: '/supply-chain', icon: Network },

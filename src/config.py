@@ -1165,6 +1165,8 @@ class Config:
     deep_research_engine: str = "dual_track"
     # 双轨引擎：探索型维度（S3/L4）的 ReAct 步数上限
     deep_research_dim_max_steps: int = 8
+    # 双轨引擎：全局 LLM 并发上限（MiniMax code plan 有限流；所有研究员探索循环共用信号量）
+    deep_research_llm_concurrency: int = 3
     # 每日分析长线段接入双轨引擎（A 股收敛单实现，见 src/services/longtrack_bridge.py；
     # 默认关，开启后 A 股自选股长线五段式由双轨长线子集产出，失败自动回退内嵌路径）
     enable_longtrack_dual_track: bool = False
@@ -2355,6 +2357,12 @@ class Config:
             ),
             deep_research_engine=(
                 os.getenv("DEEP_RESEARCH_ENGINE", "dual_track").strip() or "dual_track"
+            ),
+            deep_research_llm_concurrency=parse_env_int(
+                os.getenv("DEEP_RESEARCH_LLM_CONCURRENCY", "3"),
+                3,
+                field_name="deep_research_llm_concurrency",
+                minimum=1,
             ),
             deep_research_dim_max_steps=parse_env_int(
                 os.getenv("DEEP_RESEARCH_DIM_MAX_STEPS", "8"),

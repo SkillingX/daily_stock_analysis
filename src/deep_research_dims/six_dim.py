@@ -20,8 +20,6 @@ from src.scoring.indicators_v2 import (
     aggregate_v2_dimensions,
     framework_total_v2,
     gap_indicator,
-    score_chip_cost,
-    score_institution_change,
     score_support_indicator,
     score_valuation,
 )
@@ -324,6 +322,24 @@ def _score_from_intel(intel_payload: Optional[Dict[str, Any]]) -> Dict[str, Opti
     return {"real_news": real_news, "event_plan": event_plan}
 
 
+def _researcher_score(payload: Optional[Dict[str, Any]], key: str = "score") -> Optional[Dict[str, Any]]:
+    """研究员打分 → 指标分（basis=llm，summary=narrative）；研究员缺失/降級 → None 走规则回退。"""
+    p = payload or {}
+    if p.get("status") != "ok":
+        return None
+    score = p.get(key)
+    if not isinstance(score, (int, float)):
+        return None
+    return {
+        "id": key,
+        "score": float(score),
+        "confidence": "medium",
+        "basis": "llm",
+        "data_gap": False,
+        "summary": str(p.get("narrative") or "")[:200] or f"研究员评分 {score}",
+    }
+
+
 def build_six_dim(
     ctx: SharedContext,
     data_dim_payload: Optional[Dict[str, Any]] = None,
@@ -331,6 +347,10 @@ def build_six_dim(
     f1_payload: Optional[Dict[str, Any]] = None,
     f2_payload: Optional[Dict[str, Any]] = None,
     intel_payload: Optional[Dict[str, Any]] = None,
+    technical_payload: Optional[Dict[str, Any]] = None,
+    capital_payload: Optional[Dict[str, Any]] = None,
+    sentiment_payload: Optional[Dict[str, Any]] = None,
+    ownership_payload: Optional[Dict[str, Any]] = None,
 ) -> SixDimDim:
     """L1 v2：规则 + 缠论 + 罗盘 + LLM 混合打分，单一评分源。"""
     validate_v2_weights()
@@ -338,32 +358,29 @@ def build_six_dim(
     price_pos = data.get("price_position") or {}
     current = price_pos.get("current_price") or ctx.quote.get("price")
     fund = ctx.fundamental
-    chip = ctx.chip or {}
 
     intel_scores = _score_from_intel(intel_payload)
     indicator_results: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {
         "基本面": {
             "sector_vs_leader": _score_from_f2(f2_payload),
             "business_financial": _score_from_f1(f1_payload),
+            "equity_mgmt": _researcher_score(ownership_payload),
         },
         "消息面": {
             "real_news": intel_scores["real_news"],
             "event_plan": intel_scores["event_plan"],
         },
         "资金面": {
-            "capital_flow": None,  # 资金流向数据当前不可得（capital_flow 块常为空）
-            "institution_change": score_institution_change(
-                fund.get("institution_holding_change")
-            ),
-            "chip_cost": score_chip_cost(
-                float(current) if isinstance(current, (int, float)) else None,
-                chip.get("avg_cost") or chip.get("average_cost"),
-                chip.get("profit_ratio") or chip.get("winner_percent"),
-            ),
+            "capital_flow": _researcher_score(capital_payload, "flow_score"),
+            "institution_change": _researcher_score(capital_payload, "institution_change_score"),
+            "chip_cost": _researcher_score(capital_payload, "chip_score"),
         },
-        "情绪面": {},
+        "情绪面": {
+            "institute_view": _researcher_score(sentiment_payload, "institute_score"),
+            "community_view": _researcher_score(sentiment_payload, "community_score"),
+        },
         "技术面": {
-            "chanlun_struct": _score_chanlun(ctx),
+            "chanlun_struct": _researcher_score(technical_payload) or _score_chanlun(ctx),
             "compass_weekly": _score_compass_weekly(ctx),
             "support_indicator": score_support_indicator(
                 float(current) if isinstance(current, (int, float)) else None,

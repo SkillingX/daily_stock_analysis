@@ -36,6 +36,12 @@ from src.schemas.deep_research_dims import (
     DataDim,
     FundamentalDim,
     SectorDim,
+    TechnicalDim,
+    CapitalDim,
+    SentimentDim,
+    OwnershipDim,
+    UsChinaDim,
+    BusinessDim,
     DIM_IDS,
     HistoryDim,
     IntelDim,
@@ -703,6 +709,60 @@ class TestDimSubReports:
         assert DIM_TTL_HOURS["six_dim"] <= DIM_TTL_HOURS["sector"]
 
 
+class TestGuardrailEventPlans:
+    def test_gr11_flags_incomplete_plans(self):
+        from src.deep_research_dims.guardrail import rule11_event_plan_completeness
+
+        intel = {
+            "event_calendar": [
+                {"event": "三季报", "outcomes": ["超预期", "平", "低于预期"], "plans": ["持有"]},
+                {"event": "解禁", "outcomes": ["平稳"], "plans": ["观望", "减仓"]},
+            ]
+        }
+        events = rule11_event_plan_completeness(intel)
+        assert len(events) == 1 and events[0].rule_id == "GR11_event_plan_completeness"
+
+    def test_gr11_passes_full_coverage(self):
+        from src.deep_research_dims.guardrail import rule11_event_plan_completeness
+
+        intel = {"event_calendar": [{"event": "e", "outcomes": ["a"], "plans": ["p1"]}]}
+        assert rule11_event_plan_completeness(intel) == []
+
+
+class TestChanlunFactsInjection:
+    def test_engine_facts_empty_on_failure(self, monkeypatch):
+        """引擎/数据失败时返回空串，研究员退回工具取数（不阻断）。"""
+        from src.agent.deep_research import explore_agents
+        from src.services import history_loader
+
+        monkeypatch.setattr(history_loader, "load_history_df", lambda *a, **k: (None, "none"))
+        assert explore_agents._chanlun_engine_facts("000000") == ""  # 无数据 → 空串兜底
+
+
+class TestSupplyChainReuse:
+    def test_existing_report_maps_to_dim(self):
+        """供应链专项报告复用：载荷 → SupplyChainDim（链接/日期/深潜结构）。"""
+        from src.deep_research.researchers.supply_chain import parse
+
+        dim, steps = parse(
+            {
+                "existing_report": {
+                    "report_id": "sc_202610011200",
+                    "topic": "白酒产业链",
+                    "created_at": "2026-10-01",
+                    "link": "/api/v1/supply-chain/reports/sc_202610011200",
+                    "deep_dive": {"chokepoints": [{"type": "geo", "description": "产区稀缺"}]},
+                }
+            },
+            0,
+        )
+        assert dim.status == "ok"
+        assert "白酒产业链" in dim.supply_chain.company_position
+        assert dim.verification_status == "existing_report:sc_202610011200"
+        assert "supply-chain/reports/sc_202610011200" in dim.narrative
+        assert dim.supply_chain.chokepoints[0].type == "geo"
+
+
 class TestPhaseFallback:
     def test_phase_never_degrades_on_calendar_failure(self, monkeypatch):
         """日历数据源抛异常时回退本地兜底，维度不降级（E2E 抓到的真实问题）。"""
@@ -734,6 +794,12 @@ def _all_default_dims() -> dict:
         "scenarios": ScenariosDim(probability_sum=1.0),
         "fundamental": FundamentalDim(),
         "sector": SectorDim(),
+        "technical": TechnicalDim(),
+        "capital": CapitalDim(),
+        "sentiment": SentimentDim(),
+        "ownership": OwnershipDim(),
+        "us_china": UsChinaDim(),
+        "business": BusinessDim(),
     }
     assert set(dims) == set(DIM_IDS)
     return dims

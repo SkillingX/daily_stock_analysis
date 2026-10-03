@@ -34,6 +34,12 @@ export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
   { id: 'plan', label: '计划' },
   { id: 'phase', label: '阶段' },
   { id: 'history', label: '历史' },
+  { id: 'technical', label: '技术' },
+  { id: 'capital', label: '资金' },
+  { id: 'sentiment', label: '情绪' },
+  { id: 'ownership', label: '股权' },
+  { id: 'us_china', label: '中美' },
+  { id: 'business', label: '业务' },
 ];
 
 export type DimRunStatus = 'pending' | 'running' | 'ok' | 'degraded' | 'skipped';

@@ -45,6 +45,12 @@ DimId = Literal[
     "scenarios",
     "fundamental",
     "sector",
+    "technical",
+    "capital",
+    "sentiment",
+    "ownership",
+    "us_china",
+    "business",
 ]
 
 DIM_IDS: tuple[str, ...] = (
@@ -61,6 +67,12 @@ DIM_IDS: tuple[str, ...] = (
     "scenarios",
     "fundamental",
     "sector",
+    "technical",
+    "capital",
+    "sentiment",
+    "ownership",
+    "us_china",
+    "business",
 )
 
 DimStatus = Literal["ok", "degraded", "skipped"]
@@ -295,6 +307,87 @@ class SectorDim(DimEnvelope):
     narrative: str = ""
 
 
+class TechnicalDim(DimEnvelope):
+    """技术研究员：缠论结构 + 支撑压力 + MACD/RSI/波浪。"""
+
+    dim: Literal["technical"] = "technical"
+    chanlun_summary: str = ""
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    indicator_summary: str = ""
+    wave_note: str = ""
+    score: Optional[float] = Field(None, ge=0, le=100)
+    basis: str = ""
+    narrative: str = ""
+
+
+class CapitalDim(DimEnvelope):
+    """资金研究员：资金流向 + 机构/大户持仓变动 + 筹码成本结构。"""
+
+    dim: Literal["capital"] = "capital"
+    flow_summary: str = ""
+    flow_score: Optional[float] = Field(None, ge=0, le=100)
+    institution_summary: str = ""
+    institution_score: Optional[float] = Field(None, ge=0, le=100)
+    chip_summary: str = ""
+    chip_score: Optional[float] = Field(None, ge=0, le=100)
+    score: Optional[float] = Field(None, ge=0, le=100)
+    narrative: str = ""
+
+
+class SentimentDim(DimEnvelope):
+    """情绪研究员：机构评价 + 社区评价（来源等级强制）。"""
+
+    dim: Literal["sentiment"] = "sentiment"
+    institute_view: str = ""
+    institute_score: Optional[float] = Field(None, ge=0, le=100)
+    community_view: str = ""
+    community_score: Optional[float] = Field(None, ge=0, le=100)
+    unverified_count: int = Field(0, ge=0)
+    score: Optional[float] = Field(None, ge=0, le=100)
+    narrative: str = ""
+
+
+class OwnershipDim(DimEnvelope):
+    """股权高管研究员：实控人/十大股东/高管背景与变动（同花顺数据源）。"""
+
+    dim: Literal["ownership"] = "ownership"
+    controller: str = ""
+    top_holders: List[str] = Field(default_factory=list)
+    executives: List[str] = Field(default_factory=list)
+    recent_changes: List[str] = Field(default_factory=list)
+    data_gaps: List[str] = Field(default_factory=list)
+    score: Optional[float] = Field(None, ge=0, le=100)
+    narrative: str = ""
+
+
+class BusinessDim(DimEnvelope):
+    """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与大盘和龙头对比。"""
+
+    dim: Literal["business"] = "business"
+    business_model: str = ""
+    main_products: str = ""
+    competitive_position: str = ""
+    vs_market_leader: str = ""
+    score: Optional[float] = Field(None, ge=0, le=100)
+    data_gaps: List[str] = Field(default_factory=list)
+    narrative: str = ""
+
+
+class UsChinaDim(DimEnvelope):
+    """中美竞争研究员：适用性/双链位置/出口管制/制裁风险/替代进度。"""
+
+    dim: Literal["us_china"] = "us_china"
+    applicability: str = ""
+    role_cn: str = ""
+    role_us: str = ""
+    export_control: str = ""
+    sanction_risk: str = ""
+    substitution: str = ""
+    score: Optional[float] = Field(None, ge=0, le=100)
+    narrative: str = ""
+
+
 DIM_MODELS: Dict[str, type[DimEnvelope]] = {
     "signal": SignalDim,
     "data": DataDim,
@@ -309,6 +402,12 @@ DIM_MODELS: Dict[str, type[DimEnvelope]] = {
     "scenarios": ScenariosDim,
     "fundamental": FundamentalDim,
     "sector": SectorDim,
+    "technical": TechnicalDim,
+    "capital": CapitalDim,
+    "sentiment": SentimentDim,
+    "ownership": OwnershipDim,
+    "us_china": UsChinaDim,
+    "business": BusinessDim,
 }
 
 

@@ -37,10 +37,18 @@ DIM_TTL_HOURS: Dict[str, float] = {
     "supply_chain": 120.0,
     "fundamental": 24.0,  # F1 基本面快照驱动（日内不变）
     "sector": 24.0,  # F2 政策倾向/基率日内稳定
+    "technical": 24.0,
+    "capital": 24.0,
+    "sentiment": 24.0,
+    "ownership": 24.0,  # 高管动态时效：审计 A4，不设 5d
+    "us_china": 120.0,
+    "business": 24.0,
 }
 
+# 契约结构变更（18 维研究员 payload）→ bump
+
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6  # BusinessDim 四字段 str→Dict
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 

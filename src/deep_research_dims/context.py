@@ -116,6 +116,61 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "industry_hint": industry_hint,
             "source": "fundamental_context",
         }
+        # fuyao 兜底（按官方文档契约：GET /api/a-share/... + X-api-key）：
+        # 主链（tushare/efinance 等）拿不到的关键字段用同花顺 fuyao 补，
+        # 估值快照 + 利润表/资产负债表推算 ROE/毛利率/增速。
+        def _fuyao_get(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            import os as _os
+            import requests as _rq
+
+            key = (_os.getenv("FUYAO_API_KEY") or "").strip()
+            if not key:
+                return None
+            try:
+                resp = _rq.get(
+                    f"https://fuyao.aicubes.cn{path}",
+                    params=params,
+                    headers={"X-api-key": key},
+                    timeout=20,
+                )
+                body = resp.json()
+            except Exception:  # noqa: BLE001
+                return None
+            if resp.status_code == 429 or (isinstance(body, dict) and body.get("code") not in (0, None)):
+                return None
+            data = body.get("data") or {}
+            items = data.get("item") or []
+            return items[0] if items else None
+
+        try:
+            thscode = f"{code}.SH" if code.startswith(("60", "68", "9")) else f"{code}.SZ"
+            snap = _fuyao_get("/api/a-share/valuations/snapshot", {"thscodes": thscode})
+            if snap:
+                if result.get("pe_ttm") is None:
+                    result["pe_ttm"] = snap.get("pe_ttm")
+                if result.get("pb") is None:
+                    result["pb"] = snap.get("pb_mrq")
+                result["source"] = "fundamental_context+fuyao"
+            income = _fuyao_get(
+                "/api/a-share/financials/income-statements",
+                {"thscode": thscode, "period": "annual", "limit": 2},
+            )
+            balance = _fuyao_get(
+                "/api/a-share/financials/balance-sheets",
+                {"thscode": thscode, "period": "annual", "limit": 1},
+            )
+            if income:
+                rev = income.get("operating_income")
+                cost = income.get("operating_costs")
+                np_ = income.get("parent_holder_net_profit")
+                if result.get("gross_margin") is None and rev and cost is not None:
+                    result["gross_margin"] = round((rev - cost) / rev * 100, 2)
+                if result.get("roe") is None and np_ and balance:
+                    equity = balance.get("holder_equity_total")
+                    if equity:
+                        result["roe"] = round(np_ / equity * 100, 2)
+        except Exception as exc:  # noqa: BLE001 - 兜底失败不阻断
+            logger.debug("[DualTrack] fuyao 兜底失败 %s: %s", code, exc)
         # 全 None 的占位结果不缓存（缓存污染 bug：失败抓取会被固化 24h）
         if result.get("pe_ttm") is not None or result.get("roe") is not None:
             save_snapshot(cache_key, result)

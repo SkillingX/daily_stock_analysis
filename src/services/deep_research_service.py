@@ -439,6 +439,7 @@ class DeepResearchService:
                 content = build_dim_report(
                     dim_id, section_md, stock_name, stock_code,
                     datetime.now().isoformat(timespec="seconds"),
+                    report_id=report_id,
                 )
                 (report_dir / f"{report_id}_dim_{dim_id}.md").write_text(
                     content, encoding="utf-8"

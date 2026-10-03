@@ -1,3 +1,7 @@
+{%- macro dim_links(dim_id) -%}
+{% if report_id %}📄 本维度详细报告：[查看](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ dim_id }}) ｜ [下载](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ dim_id }}?download=1){% endif %}
+{%- endmacro -%}
+
 # {{ stock_name }}（{{ stock_code }}）深度投研报告（双轨版）
 
 > 数据截至：{{ as_of }}（阶段 0 快照时点）｜ 报告生成：双轨多维度引擎 v1 · 评分框架 {{ six_dim.scoring_version }}
@@ -90,10 +94,14 @@
 {% if scenarios.narrative %}{{ scenarios.narrative }}{% endif %}
 
 #### 情景与时间层级
+
+{{ dim_links('scenarios') }}
 {{ degraded_note(scenarios) }}
 （见本节上方情景表与时间层级路径；概率和 {{ (scenarios.probability_sum * 100)|round(0) }}%，期望价值 {{ scenarios.expected_value or 'N/A' }}）
 
 #### 投资结论
+
+{{ dim_links('conclusion') }}
 {{ degraded_note(conclusion) }}
 {% if conclusion.conclusion %}
 - 先验 {{ conclusion.conclusion.prior_p }} / 后验见贝叶斯链 ｜ 行动：**{{ conclusion.conclusion.action }}** ｜ 1/3/5 年价值区间：{{ conclusion.conclusion.value_range_1y or 'N/A' }} / {{ conclusion.conclusion.value_range_3y or 'N/A' }} / {{ conclusion.conclusion.value_range_5y or 'N/A' }}
@@ -101,6 +109,8 @@
 {% if conclusion.narrative %}{{ conclusion.narrative }}{% endif %}
 
 #### 贝叶斯证据链
+
+{{ dim_links('bayesian') }}
 {{ degraded_note(bayesian) }}
 {% if bayesian.bayesian %}
 - 先验 {{ bayesian.bayesian.prior_p }} → 后验 {{ bayesian.bayesian.posterior_p }} ｜ Edge {{ bayesian.bayesian.edge }} ｜ 仓位建议：{{ bayesian.bayesian.position_suggestion }}
@@ -126,6 +136,8 @@
 {% endfor %}
 
 #### 六维指标明细
+
+{{ dim_links('six_dim') }}
 {{ degraded_note(six_dim) }}
 {% for d in six_dim.framework.dimensions %}
 - **{{ d.dimension }}**（{{ (d.weight * 100)|round(0) }}%）{{ d.score }} 分{% if d.indicators %}：{% for i in d.indicators %}{{ i.name }} {{ i.score }}（{{ i.summary[:30] }}）{% if not loop.last %}；{% endif %}{% endfor %}{% endif %}
@@ -141,8 +153,20 @@
 
 ### 5.1 基本面（权重 30%）
 
+{{ degraded_note(business) }}
+#### 业务画像与竞争地位
+
+{{ dim_links('business') }}
+{% if business.narrative %}{{ business.narrative }}{% else %}（基本面研究员未产出）{% endif %}
+{% if business.business_model %}- 经营模式：{{ business.business_model }}{% endif %}
+{% if business.main_products %}- 主营产品：{{ business.main_products }}{% endif %}
+{% if business.competitive_position %}- 行业地位：{{ business.competitive_position }}{% endif %}
+{% if business.vs_market_leader %}- 与龙头/大盘对比：{{ business.vs_market_leader }}{% endif %}
+
 {{ degraded_note(fundamental) }}
 #### 财务与基本面（F1）
+
+{{ dim_links('fundamental') }}
 {% if fundamental.health_score is not none %}
 - 财务健康分：**{{ fundamental.health_score }}/100**
 {% endif %}
@@ -159,12 +183,16 @@
 {% if fundamental.narrative %}{{ fundamental.narrative }}{% endif %}
 
 #### 板块分析（F2）
+
+{{ dim_links('sector') }}
 {{ degraded_note(sector) }}
 - 板块：{{ sector.sector_hint or '未识别' }} ｜ 政策倾向：{{ sector.policy_lean or '未知' }} ｜ 行业基率：{{ sector.base_rate }}（{{ sector.base_rate_basis }}）
 {% if sector.sector_score is not none %}- 板块得分：{{ sector.sector_score }}/100{% endif %}
 {% if sector.narrative %}{{ sector.narrative }}{% endif %}
 
 #### 产业链解读
+
+{{ dim_links('supply_chain') }}
 {{ degraded_note(supply_chain) }}
 - 双源校验状态：{{ supply_chain.verification_status }}
 {% if supply_chain.supply_chain %}
@@ -181,6 +209,8 @@
 
 {{ degraded_note(intel) }}
 #### 消息面详析
+
+{{ dim_links('intel') }}
 {% if intel.intelligence %}
 - 情绪总结：{{ intel.intelligence.sentiment_summary or 'N/A' }}
 - 最新要闻：{{ intel.intelligence.latest_news or 'N/A' }}
@@ -201,6 +231,11 @@
 {% if intel.narrative %}{{ intel.narrative }}{% endif %}
 
 ### 5.3 资金面（权重 15%）
+{{ degraded_note(capital) }}
+#### 资金面分析
+
+{{ dim_links('capital') }}
+{% if capital.narrative %}{{ capital.narrative }}{% else %}（资金研究员未产出）{% endif %}
 {% if six_dim.framework %}
 {% for d in six_dim.framework.dimensions %}
 {% if d.dimension == '资金面' %}
@@ -212,6 +247,11 @@
 {% endif %}
 
 ### 5.4 技术面（权重 15%）
+{{ degraded_note(technical) }}
+#### 技术面分析
+
+{{ dim_links('technical') }}
+{% if technical.narrative %}{{ technical.narrative }}{% else %}（技术研究员未产出）{% endif %}
 {% if six_dim.framework %}
 {% for d in six_dim.framework.dimensions %}
 {% if d.dimension == '技术面' %}
@@ -226,6 +266,11 @@
 {% endif %}
 
 ### 5.5 情绪面（权重 15%）
+{{ degraded_note(sentiment) }}
+#### 情绪面分析
+
+{{ dim_links('sentiment') }}
+{% if sentiment.narrative %}{{ sentiment.narrative }}{% else %}（情绪研究员未产出）{% endif %}
 {% if six_dim.framework %}
 {% for d in six_dim.framework.dimensions %}
 {% if d.dimension == '情绪面' %}
@@ -247,22 +292,74 @@
 {% endfor %}
 {% endif %}
 
+### 5.7 中美竞争分析
+
+{{ degraded_note(us_china) }}
+#### 中美竞争分析
+
+{{ dim_links('us_china') }}
+{% if us_china.applicability %}
+- 适用性：{{ us_china.applicability }}
+{% if us_china.role_cn %}- 中国链位置：{{ us_china.role_cn }}{% endif %}
+{% if us_china.role_us %}- 美国/全球链位置：{{ us_china.role_us }}{% endif %}
+{% if us_china.export_control %}- 出口管制：{{ us_china.export_control }}{% endif %}
+{% if us_china.sanction_risk %}- 制裁风险：{{ us_china.sanction_risk }}{% endif %}
+{% if us_china.substitution %}- 替代进度：{{ us_china.substitution }}{% endif %}
+{% endif %}
+{% if us_china.narrative %}{{ us_china.narrative }}{% endif %}
+
+### 5.8 股权架构与高管
+
+{{ degraded_note(ownership) }}
+#### 股权架构与高管
+
+{{ dim_links('ownership') }}
+{% if ownership.controller %}- 实际控制人：{{ ownership.controller }}{% endif %}
+{% if ownership.top_holders %}
+**前十大股东**：
+{% for h in ownership.top_holders %}
+- {{ h }}
+{% endfor %}
+{% endif %}
+{% if ownership.executives %}
+**核心高管**：
+{% for e in ownership.executives %}
+- {{ e }}
+{% endfor %}
+{% endif %}
+{% if ownership.recent_changes %}
+**近一年变动**：
+{% for c in ownership.recent_changes %}
+- {{ c }}
+{% endfor %}
+{% endif %}
+{% if ownership.data_gaps %}
+- 数据缺口：{{ ownership.data_gaps|join('、') }}（不编造）
+{% endif %}
+{% if ownership.narrative %}{{ ownership.narrative }}{% endif %}
+
 ---
 
 ## 六、交易参考（择时类内容，非本报告重点）
 
 #### 信号
+
+{{ dim_links('signal') }}
 {{ degraded_note(signal) }}
 - 评级：{{ signal.rating }} ｜ 置信度：{{ signal.confidence }} ｜ 期望值：{{ signal.expected_value or 'N/A' }}
 {% if signal.narrative %}{{ signal.narrative }}{% endif %}
 
 #### 数据透视
+
+{{ dim_links('data') }}
 {{ degraded_note(data) }}
 {% if data.perspective and data.perspective.volume_analysis %}
 - 量比 {{ data.perspective.volume_analysis.volume_ratio or 'N/A' }}（{{ data.perspective.volume_analysis.volume_status or 'N/A' }}）
 {% endif %}
 
 #### 作战计划
+
+{{ dim_links('plan') }}
 {{ degraded_note(plan) }}
 {% if plan.sniper_points %}
 | 点位 | 价格 |
@@ -276,12 +373,16 @@
 {% endif %}
 
 #### 阶段决策
+
+{{ dim_links('phase') }}
 {{ degraded_note(phase) }}
 {% if phase.phase %}
 - 窗口：{{ phase.phase.action_window }} ｜ 下次检查：{{ phase.phase.next_check_time }}
 {% endif %}
 
 #### 历史对比
+
+{{ dim_links('history') }}
 {{ degraded_note(history) }}
 {% if history.rows %}
 {% for r in history.rows %}
@@ -305,6 +406,10 @@
 {% else %}
 （报告 id 缺失，索引不可用）
 {% endif %}
+
+### 运行元信息（可复现审计）
+- 引擎：dual_track ｜ 评分框架：{{ six_dim.scoring_version }} ｜ 生成时间：{{ as_of }}
+- 维度：{{ dims_count | default(19) }} 个 ｜ 护栏触发：{{ guardrail_events|length }} 条 ｜ 报告 id：{{ report_id or 'N/A' }}
 
 ### 护栏事件表
 {% if guardrail_events %}

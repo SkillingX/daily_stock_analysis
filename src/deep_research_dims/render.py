@@ -75,7 +75,13 @@ def build_view(
     supply_chain: SupplyChainDim = dims["supply_chain"]
     scenarios: ScenariosDim = dims["scenarios"]
     fundamental: Any = dims["fundamental"]
+    business: Any = dims["business"]
     sector: Any = dims["sector"]
+    technical: Any = dims["technical"]
+    capital: Any = dims["capital"]
+    sentiment: Any = dims["sentiment"]
+    ownership: Any = dims["ownership"]
+    us_china: Any = dims["us_china"]
 
     return {
         "stock_name": stock_name,
@@ -99,7 +105,13 @@ def build_view(
         "supply_chain": supply_chain,
         "scenarios": scenarios,
         "fundamental": fundamental,
+        "business": business,
         "sector": sector,
+        "technical": technical,
+        "capital": capital,
+        "sentiment": sentiment,
+        "ownership": ownership,
+        "us_china": us_china,
         "guardrail_events": guardrail_events,
         "limitations": ctx_limitations,
         "degraded_note": _degraded_note,
@@ -143,6 +155,12 @@ DIM_SECTION_ANCHORS: Dict[str, str] = {
     "plan": "#### 作战计划",
     "phase": "#### 阶段决策",
     "history": "#### 历史对比",
+    "technical": "#### 技术面分析",
+    "capital": "#### 资金面分析",
+    "sentiment": "#### 情绪面分析",
+    "ownership": "#### 股权架构与高管",
+    "us_china": "#### 中美竞争分析",
+    "business": "#### 业务画像与竞争地位",
 }
 
 
@@ -185,12 +203,15 @@ def build_dim_report(
     stock_name: str,
     stock_code: str,
     as_of: str,
+    report_id: str = "",
 ) -> str:
     """单维度子报告：小头（标题/数据截至/免责）+ 章节正文。"""
     label = DIM_SECTION_ANCHORS[dim_id].lstrip("# ").strip()
     header = (
         f"# {stock_name}（{stock_code}）· {label}（子报告）\n\n"
-        f"> 数据截至：{as_of}｜摘自双轨深度投研报告，单维度详版\n\n"
+        f"> 数据截至：{as_of}｜摘自双轨深度投研报告，单维度详版\n"
+        f"> 本报告链接：查看 /api/v1/deep-research/reports/{report_id}/dims/{dim_id}"
+        f" ｜ 下载加 ?download=1\n\n"
     )
     footer = "\n---\n\n*本报告由 AI 生成，不构成投资建议。*\n"
     return header + section_markdown.rstrip() + "\n" + footer

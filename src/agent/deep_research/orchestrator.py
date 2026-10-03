@@ -19,9 +19,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-from src.agent.deep_research.explore_agents import (
+from src.agent.deep_research.explore_agents import (  # noqa: F401
+    run_business_agent,
+    run_capital_agent,
     run_intel_agent,
+    run_ownership_agent,
+    run_sentiment_agent,
     run_supply_chain_agent,
+    run_technical_agent,
+    run_us_china_agent,
 )
 from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
@@ -41,6 +47,7 @@ from src.deep_research_dims.six_dim import build_six_dim
 from src.schemas.bayesian_framework import EvidenceItem
 from src.schemas.deep_research_dims import (
     DIM_IDS,
+    DIM_MODELS,
     DataDim,
     DimEnvelope,
     GuardrailEvent,
@@ -343,6 +350,41 @@ def _write_reflection_journals(
         logger.warning("[DualTrack] 自反思日志写入失败: %s", exc)
 
 
+def _coerce_researcher_value(key: str, value: Any) -> Any:
+    """LLM 输出类型矫正：dict → 提取 summary/note 子字段或紧凑 JSON；score 类字段取数值。"""
+    if value is None or isinstance(value, (str, int, float, bool, list)):
+        return value
+    if isinstance(value, dict):
+        if key.endswith("score") or key == "score":
+            for sub in ("score", "value", "data"):
+                if isinstance(value.get(sub), (int, float)):
+                    return value[sub]
+            return None
+        for sub in ("summary", "note", "text", "reason"):
+            if isinstance(value.get(sub), str):
+                return value[sub]
+        import json as _json
+
+        return _json.dumps(value, ensure_ascii=False)[:300]
+    return str(value)
+
+
+def _parse_researcher(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[DimEnvelope, int]:
+    """5 新研究员通用解析：字段过滤 + 类型矫正进契约（LLM 多余键丢弃）。"""
+    model = DIM_MODELS[dim_id]
+    payload = {
+        k: _coerce_researcher_value(k, v)
+        for k, v in (parsed or {}).items()
+        if k in set(model.model_fields)
+    }
+    payload["status"] = "ok"
+    return model(**payload), steps
+
+
+# 研究员注册表驱动（src/deep_research/researchers/）：新增研究员 = 新模块 + registry 记录。
+# 注意：注册表在 run_dual_track 内延迟导入（防循环：researchers → explore_agents → 本包 → researchers）
+
+
 def run_dual_track(
     stock_code: str,
     stock_name: str,
@@ -426,21 +468,7 @@ def run_dual_track(
     # ---- 波次 1：探索 Agent 线程池 + 主线程纯规则 ----
     _emit(progress_callback, {"type": "thinking", "step": 1, "message": "并行执行情报/产业链探索与规则维度..."})
 
-    def intel_worker() -> tuple[str, Any, int]:
-        out = run_intel_agent(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
-        if out.get("ok"):
-            return "ok", out["data"], int(out.get("steps") or 0)
-        return "err", out.get("error") or "情报探索失败", 0
-
-    def supply_chain_worker() -> tuple[str, Any, int]:
-        out = run_supply_chain_agent(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
-        if out.get("ok"):
-            return "ok", out["data"], int(out.get("steps") or 0)
-        return "err", out.get("error") or "产业链探索失败", 0
-
     steps_total = 0
-    run_intel = "intel" in selected
-    run_sc = "supply_chain" in selected
 
     def _run_rule_dims() -> None:
         if "phase" in selected:
@@ -503,61 +531,53 @@ def run_dual_track(
             dims["data"] = dim
         return dim
 
-    if run_intel or run_sc:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            sc_cached = try_cache("supply_chain") if run_sc else None
-            intel_cached = try_cache("intel") if run_intel else None
-            fut_intel = None
-            fut_sc = None
-            if run_intel and intel_cached is None:
-                start_dim("intel")
-                fut_intel = pool.submit(intel_worker)
-            if run_sc and sc_cached is None:
-                start_dim("supply_chain")
-                fut_sc = pool.submit(supply_chain_worker)
+    # ---- 波次 1：八大研究员并行（5 线程，全局 LLM 信号量限流）+ 主线程规则维度 ----
+    from src.deep_research.researchers import REGISTRY, RUNNER_NAMES, researcher_dim_ids
+
+    active_researchers = [
+        (d, globals()[RUNNER_NAMES[d]]) for d in researcher_dim_ids if d in selected
+    ]
+    if active_researchers:
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures: Dict[Any, str] = {}
+            for dim_id, runner in active_researchers:
+                cached = try_cache(dim_id)
+                if cached is not None:
+                    dims[dim_id] = cached
+                    continue
+                start_dim(dim_id)
+                futures[
+                    pool.submit(
+                        runner, stock_code, stock_name, llm_adapter,
+                        progress_callback, explore_max_steps,
+                    )
+                ] = dim_id
 
             data_dim = _build_data_dim()
             _run_rule_dims()
 
-            if run_sc:
-                if sc_cached is not None:
-                    dims["supply_chain"] = sc_cached
-                    sc_from_cache = True
-                else:
-                    sc_from_cache = False
-                    try:
-                        sc_status, sc_data, sc_steps = fut_sc.result(timeout=600)  # type: ignore[union-attr]
-                        if sc_status == "ok":
-                            sc_dim, used = _parse_supply_chain(sc_data, sc_steps)
-                            dims["supply_chain"] = sc_dim
-                            store_cache("supply_chain", sc_dim)
-                            steps_total += used
+            for fut, dim_id in futures.items():
+                try:
+                    out = fut.result(timeout=600)
+                    if out.get("ok"):
+                        if dim_id == "intel":
+                            dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
+                        elif dim_id == "supply_chain":
+                            dim, used = _parse_supply_chain(out["data"], int(out.get("steps") or 0))
                         else:
-                            dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=str(sc_data))
-                    except Exception as exc:  # noqa: BLE001
-                        dims["supply_chain"] = SupplyChainDim(status="degraded", degraded_reason=f"产业链维度异常: {exc}")
-                if not sc_from_cache:
-                    emit_dim("supply_chain", dims["supply_chain"].status)
-
-            if run_intel:
-                if intel_cached is not None:
-                    dims["intel"] = intel_cached
-                    intel_from_cache = True
-                else:
-                    intel_from_cache = False
-                    try:
-                        intel_status, intel_data, intel_steps = fut_intel.result(timeout=600)  # type: ignore[union-attr]
-                        if intel_status == "ok":
-                            intel_dim, used = _parse_intel(intel_data, intel_steps)
-                            dims["intel"] = intel_dim
-                            store_cache("intel", intel_dim)
-                            steps_total += used
-                        else:
-                            dims["intel"] = IntelDim(status="degraded", degraded_reason=str(intel_data))
-                    except Exception as exc:  # noqa: BLE001
-                        dims["intel"] = IntelDim(status="degraded", degraded_reason=f"情报维度异常: {exc}")
-                if not intel_from_cache:
-                    emit_dim("intel", dims["intel"].status)
+                            dim, used = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
+                        dims[dim_id] = dim
+                        store_cache(dim_id, dim)
+                        steps_total += used
+                    else:
+                        dims[dim_id] = DIM_MODELS[dim_id](
+                            status="degraded", degraded_reason=str(out.get("error"))
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    dims[dim_id] = DIM_MODELS[dim_id](
+                        status="degraded", degraded_reason=f"研究员异常: {exc}"
+                    )
+                emit_dim(dim_id, dims[dim_id].status)
     else:
         data_dim = _build_data_dim()
         _run_rule_dims()
@@ -590,6 +610,10 @@ def run_dual_track(
                 (dims.get("fundamental").model_dump() if "fundamental" in dims else None),
                 (dims.get("sector").model_dump() if "sector" in dims else None),
                 (dims.get("intel").model_dump() if "intel" in dims else None),
+                (dims.get("technical").model_dump() if "technical" in dims else None),
+                (dims.get("capital").model_dump() if "capital" in dims else None),
+                (dims.get("sentiment").model_dump() if "sentiment" in dims else None),
+                (dims.get("ownership").model_dump() if "ownership" in dims else None),
             )
             store_cache("six_dim", six_dim)
             dims["six_dim"] = six_dim
@@ -725,8 +749,6 @@ def run_dual_track(
         dims["signal"] = signal_dim
 
     # 未选维度（省钱模式）补 skipped 占位，供成文与契约一致
-    from src.schemas.deep_research_dims import DIM_MODELS
-
     for _dim_id in skipped_ids:
         if _dim_id not in dims:
             dims[_dim_id] = DIM_MODELS[_dim_id](
