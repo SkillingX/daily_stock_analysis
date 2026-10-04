@@ -13,6 +13,7 @@ from fastapi import APIRouter
 
 from api.v1.endpoints import (
     fundamentals,
+    financial_analysis,
     agent,
     alerts,
     alphasift,
@@ -98,6 +99,7 @@ router.include_router(
 
 router.include_router(schedule.router, prefix="/schedule", tags=["Schedule"])
 router.include_router(fundamentals.router, prefix="/fundamentals", tags=["Fundamentals"])
+router.include_router(financial_analysis.router, prefix="/financial-analysis", tags=["Financial Analysis"])
 
 router.include_router(
     knowledge.router, prefix="/knowledge-base", tags=["KnowledgeBase"]

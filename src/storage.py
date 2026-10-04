@@ -375,6 +375,20 @@ class FundamentalsReport(Base):
     dims_json: Mapped[Optional[str]] = mapped_column(Text)  # 三维度 payload 快照
 
 
+class FinancialAnalysisReport(Base):
+    """个股财务分析专项报告。"""
+
+    __tablename__ = "financial_analysis_reports"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # fa_{YYYYMMDDHHmm}
+    stock_code: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
+    stock_name: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    md_path: Mapped[str] = mapped_column(Text, nullable=False)
+    health_score: Mapped[Optional[float]] = mapped_column(Float)
+    analysis_json: Mapped[Optional[str]] = mapped_column(Text)
+
+
 class RecommendationJournal(Base):
     """操作指令日志（方案 v2.1 自反思雏形）：每次报告的买卖指令结构化留痕。
 
@@ -3149,6 +3163,90 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 db.close()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Storage] delete_fundamentals_report failed: %s", exc)
+            return None
+
+    def save_financial_analysis_report(self, record: Dict[str, Any]) -> bool:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return False
+        try:
+            db = session_local()
+            try:
+                db.add(FinancialAnalysisReport(
+                    id=str(record.get("id") or ""),
+                    stock_code=str(record.get("stock_code") or ""),
+                    stock_name=record.get("stock_name"),
+                    md_path=str(record.get("md_path") or ""),
+                    health_score=record.get("health_score"),
+                    analysis_json=record.get("analysis_json"),
+                ))
+                db.commit()
+                return True
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] save_financial_analysis_report failed: %s", exc)
+            return False
+
+    def get_financial_analysis_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                r = db.get(FinancialAnalysisReport, report_id)
+                if r is None:
+                    return None
+                return {"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "md_path": r.md_path, "health_score": r.health_score,
+                        "analysis_json": r.analysis_json}
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] get_financial_analysis_report failed: %s", exc)
+            return None
+
+    def list_financial_analysis_reports(self, stock_code=None, limit=50, offset=0):
+        session_local = self._SessionLocal
+        if session_local is None:
+            return [], 0
+        try:
+            db = session_local()
+            try:
+                query = db.query(FinancialAnalysisReport)
+                if stock_code:
+                    query = query.filter(FinancialAnalysisReport.stock_code == stock_code)
+                total = query.count()
+                rows = query.order_by(FinancialAnalysisReport.created_at.desc()).offset(offset).limit(limit).all()
+                return [{"id": r.id, "stock_code": r.stock_code, "stock_name": r.stock_name,
+                         "created_at": r.created_at.isoformat() if r.created_at else None,
+                         "health_score": r.health_score} for r in rows], int(total)
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] list failed: %s", exc)
+            return [], 0
+
+    def delete_financial_analysis_report(self, report_id: str):
+        session_local = self._SessionLocal
+        if session_local is None:
+            return None
+        try:
+            db = session_local()
+            try:
+                r = db.get(FinancialAnalysisReport, report_id)
+                if r is None:
+                    return None
+                paths = {"md_path": r.md_path, "pdf_path": None}
+                db.delete(r)
+                db.commit()
+                return paths
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Storage] delete failed: %s", exc)
             return None
 
     def list_recommendation_journal(

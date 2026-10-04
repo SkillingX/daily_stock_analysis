@@ -1,0 +1,72 @@
+{%- macro red(t) -%}
+<font color="#e03131">**{{ t }}**</font>
+{%- endmacro -%}
+
+# 【{{ stock_name }}】（{{ stock_code }}）个股财务分析报告
+
+> 报告日期：{{ as_of }} ｜ 🔴 **财务健康分：{{ a.health_score if a.health_score is not none else '数据不足' }}**/100 ｜ AI 生成，不构成投资建议
+> 本报告链接：查看 /api/v1/financial-analysis/reports/{{ report_id }} ｜ 下载加 ?download=1
+
+---
+
+## 一、体检总览
+
+{% for key, label in [("profitability", "盈利质量"), ("growth", "成长质量"), ("safety", "财务安全"), ("valuation", "估值")] %}
+{{ loop.index }}. {{ red(label) }}：{{ a.dims[key].score if a.dims[key].score is not none else '—' }} 分 —— {{ a.dims[key].label }}
+{% endfor %}
+
+## 二、盈利质量（ROE / 毛利率）
+
+{% if a.years %}
+| 年度 | 营收（亿元） | 归母净利（亿元） | 毛利率 | ROE |
+|------|------------|----------------|--------|-----|
+{% for y in a.years %}
+| {{ y.year }} | {{ '%.1f'|format(y.revenue/1e8) if y.revenue else '—' }} | {{ '%.1f'|format(y.net_profit/1e8) if y.net_profit is not none else '—' }} | {{ y.gross_margin if y.gross_margin is not none else '—' }}% | {{ y.roe if y.roe is not none else '—' }}% |
+{% endfor %}
+{% else %}
+（多年序列缺失）
+{% endif %}
+
+**要点**
+1. 🔴 **ROE**：{{ a.dims.profitability.label }}
+2. **毛利率**：见上表趋势，{{ "逐年改善" if a.years|length > 1 and a.years[0].gross_margin and a.years[-1].gross_margin and a.years[0].gross_margin > a.years[-1].gross_margin else "详见上表" }}
+3. 评价：{{ "盈利质量优秀" if a.dims.profitability.score and a.dims.profitability.score >= 75 else "盈利质量一般" if a.dims.profitability.score and a.dims.profitability.score >= 50 else "盈利质量偏弱" }}
+
+## 三、成长质量（营收 / 净利增速剪刀差）
+
+**要点**
+1. 🔴 **营收同比**：{{ a.rev_yoy if a.rev_yoy is not none else '数据不足' }}%
+2. **净利同比**：{{ a.np_yoy if a.np_yoy is not none else '数据不足' }}%
+3. 🔴 **剪刀差**：{{ a.scissors if a.scissors is not none else '—' }}%（{{ "增收不增利，警惕" if a.scissors is not none and a.scissors < -10 else "利润增速跟得上收入" if a.scissors is not none and a.scissors >= 0 else "数据不足" }}）
+
+## 四、财务安全
+
+**要点**
+1. 🔴 **资产负债率**：{{ a.dims.safety.label }}
+2. **利润含金量**：经营现金流 / 净利润 = {{ a.years[0].op_cash_flow / a.years[0].net_profit | round(2) if a.years and a.years[0].op_cash_flow is not none and a.years[0].net_profit else '数据不足' }}
+3. 评价：{{ "杠杆安全垫充足" if a.dims.safety.score and a.dims.safety.score >= 70 else "关注杠杆" if a.dims.safety.score and a.dims.safety.score < 50 else "中性" }}
+
+## 五、估值
+
+**要点**
+1. 🔴 **结论**：{{ a.valuation.summary }}
+2. PE(TTM)：{{ a.valuation.pe_ttm if a.valuation.pe_ttm is not none else '—' }} ｜ PB：{{ a.valuation.pb if a.valuation.pb is not none else '—' }}
+3. {% if a.valuation.pe_ttm is not none and a.valuation.pe_ttm <= 0 %}亏损股已自动切换 PB 口径（PE 为负无意义）{% else %}PE 分档打分见下{% endif %}
+
+## 六、综合评分与数据缺口
+
+| 维度 | 权重 | 得分 | 说明 |
+|------|------|------|------|
+| 盈利质量 | 30% | {{ a.dims.profitability.score or '—' }} | {{ a.dims.profitability.label }} |
+| 成长质量 | 30% | {{ a.dims.growth.score or '—' }} | {{ a.dims.growth.label }} |
+| 财务安全 | 20% | {{ a.dims.safety.score or '—' }} | {{ a.dims.safety.label }} |
+| 估值 | 20% | {{ a.dims.valuation.score or '—' }} | {{ a.dims.valuation.label }} |
+
+{{ red('财务健康分') }}：**{{ a.health_score if a.health_score is not none else '数据不足' }}**/100（50=减持或止损，65=关注等待抄底，75=持有或加仓）
+{% if a.gaps %}
+- 数据缺口：{{ a.gaps|join('、') }}（不编造，待数据源恢复后自动补全）
+{% endif %}
+
+---
+
+*数据来源：同花顺 fuyao 报表接口 + 基本面快照；多年序列为年报口径。*

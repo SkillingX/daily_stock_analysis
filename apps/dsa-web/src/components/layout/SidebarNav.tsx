@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, BarChart3, Bell, BookOpen, BriefcaseBusiness, Compass, FileText, Gauge, Home, LogOut, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
+import { BarChart3, BookOpen, Compass, FileText, Gauge, Home, LogOut, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
@@ -32,6 +32,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'trend-compass', labelKey: 'layout.nav.trendCompass', to: '/trend-compass', icon: Compass },
   { key: 'deep-research', labelKey: 'layout.nav.deepResearch', to: '/deep-research', icon: FileText },
   { key: 'fundamentals', labelKey: 'layout.nav.fundamentals', to: '/fundamentals', icon: FileText },
+  { key: 'financial-analysis', labelKey: 'layout.nav.financialAnalysis', to: '/financial-analysis', icon: Gauge },
   { key: 'policy-minesweeper', labelKey: 'layout.nav.policyMinesweeper', to: '/policy-minesweeper', icon: ShieldAlert },
   { key: 'knowledge-base', labelKey: 'layout.nav.knowledgeBase', to: '/knowledge-base', icon: BookOpen },
   // A股分析（/chat）按需求仅菜单隐藏，路由保留
@@ -39,10 +40,10 @@ const NAV_ITEMS: NavItem[] = [
   // { key: 'zhengxi', labelKey: 'layout.nav.zhengxi', to: '/zhengxi', icon: Award }, // TEMP: hidden
   { key: 'supply-chain', labelKey: 'layout.nav.supplyChain', to: '/supply-chain', icon: Network },
   { key: 'screening', labelKey: 'layout.nav.screening', to: '/screening', icon: Search },
-  { key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
-  { key: 'decision-signals', labelKey: 'layout.nav.decisionSignals', to: '/decision-signals', icon: Activity },
-  { key: 'backtest', labelKey: 'layout.nav.backtest', to: '/backtest', icon: BarChart3 },
-  { key: 'alerts', labelKey: 'layout.nav.alerts', to: '/alerts', icon: Bell },
+  // 按需求屏蔽（路由保留）：{ key: 'portfolio', labelKey: 'layout.nav.portfolio', to: '/portfolio', icon: BriefcaseBusiness },
+  // 按需求屏蔽（路由保留）：{ key: 'decision-signals', labelKey: 'layout.nav.decisionSignals', to: '/decision-signals', icon: Activity },
+  // 按需求屏蔽（路由保留）：{ key: 'backtest', labelKey: 'layout.nav.backtest', to: '/backtest', icon: BarChart3 },
+  // 按需求屏蔽（路由保留）：{ key: 'alerts', labelKey: 'layout.nav.alerts', to: '/alerts', icon: Bell },
   { key: 'usage', labelKey: 'layout.nav.usage', to: '/usage', icon: Gauge },
   { key: 'settings', labelKey: 'layout.nav.settings', to: '/settings', icon: Settings2 },
 ];
