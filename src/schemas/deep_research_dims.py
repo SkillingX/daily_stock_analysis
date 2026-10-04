@@ -362,13 +362,17 @@ class OwnershipDim(DimEnvelope):
 
 
 class BusinessDim(DimEnvelope):
-    """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与大盘和龙头对比。"""
+    """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与大盘和龙头对比。
+
+    四字段为结构化 Dict（SCHEMA_VERSION 6 定稿）：研究员 LLM 输出 dict 经
+    generic_parse 原样放行；渲染层 cn 过滤器递归中文化，杜绝 JSON 裸奔。
+    """
 
     dim: Literal["business"] = "business"
-    business_model: str = ""
-    main_products: str = ""
-    competitive_position: str = ""
-    vs_market_leader: str = ""
+    business_model: Dict[str, Any] = Field(default_factory=dict)
+    main_products: Dict[str, Any] = Field(default_factory=dict)
+    competitive_position: Dict[str, Any] = Field(default_factory=dict)
+    vs_market_leader: Dict[str, Any] = Field(default_factory=dict)
     score: Optional[float] = Field(None, ge=0, le=100)
     data_gaps: List[str] = Field(default_factory=list)
     narrative: str = ""

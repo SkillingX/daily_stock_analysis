@@ -111,6 +111,8 @@ class DualTrackResult:
     error: Optional[str] = None
     # 终读结论（需求 3）：LLM 通读结构化事实写报告级总结；空 = 回退信号一句话
     final_conclusion: str = ""
+    # 经理终稿（研报体 v2）：观点式标题/内容概括/分节叙事；空 dict = 模板全降级
+    manager_writeup: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def degraded_dims(self) -> List[str]:
@@ -365,7 +367,9 @@ def _coerce_researcher_value(key: str, value: Any) -> Any:
                 return value[sub]
         import json as _json
 
-        return _json.dumps(value, ensure_ascii=False)[:300]
+        # 结构化字段（如业务画像 products/position）整存 JSON；截断会制造无效
+        # JSON（cn 过滤器无法解析、投资人看到裸 JSON），上限给足常规研报粒度。
+        return _json.dumps(value, ensure_ascii=False)[:2000]
     return str(value)
 
 
@@ -801,12 +805,26 @@ def run_dual_track(
         )
     result.final_conclusion = final_conclusion
 
+    # ---- 经理终稿（研报体 v2：观点式标题 + 内容概括 + 分节叙事；3 波独立容错）----
+    manager_writeup: Dict[str, Any] = {}
+    if not skip_narrations and llm_adapter is not None:
+        try:
+            from src.deep_research_dims.manager_writeup import generate_manager_writeup
+
+            manager_writeup = generate_manager_writeup(
+                llm_adapter, stock_name, stock_code, dims, events
+            )
+        except Exception as exc:  # noqa: BLE001 - 终稿失败只降级
+            logger.warning("[DualTrack] 经理终稿生成失败: %s", exc)
+    result.manager_writeup = manager_writeup
+
     # ---- 成文 ----
     _emit(progress_callback, {"type": "thinking", "step": 4, "message": "生成双轨投研报告（模板直灌）..."})
     view = build_view(
         stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events,
         report_id=report_id or "",
         final_conclusion=final_conclusion,
+        manager=manager_writeup,
     )
     markdown = render_markdown(view)
     missing = validate_structure(markdown)

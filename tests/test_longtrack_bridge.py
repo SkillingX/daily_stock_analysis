@@ -387,7 +387,9 @@ class TestFinalConclusion:
 
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=_Adapter(), force_refresh=True)
         assert "总评分 50 分" in result.final_conclusion
-        assert "报告结论" in result.markdown and "总评分 50 分" in result.markdown
+        # v2：终读结论文本进「二、怎么在这只票上赚到钱」
+        assert "总评分 50 分" in result.markdown
+        assert "## 二、怎么在这只票上赚到钱" in result.markdown
         # 数字注入式：事实面含评分与行动
         assert captured.get("total_score") is not None
         assert captured.get("action") in ("建仓", "加仓", "持有", "减仓", "止损", "观察")
@@ -413,8 +415,46 @@ class TestFinalConclusion:
         orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=None, force_refresh=True)
         assert result.final_conclusion == ""
-        # 模板回退：报告结论区仍有信号一句话
-        assert "报告结论" in result.markdown
+        # 模板回退：无 LLM 时第二节仍渲染（信号一句话兜底）
+        assert "## 二、怎么在这只票上赚到钱" in result.markdown
+
+
+class TestResearcherParseCoercion:
+    def test_nested_dict_fields_coerced(self):
+        """LLM 把 summary 字段返回成 dict 时必须矫正而非校验失败。"""
+        from src.agent.deep_research.orchestrator import _parse_researcher
+
+        dim, _ = _parse_researcher(
+            "capital",
+            {
+                "flow_summary": {"status": "data_unavailable", "summary": "流向数据不可用"},
+                "institution_summary": {"note": "机构持仓无变动"},
+                "chip_summary": {"text": "筹码集中度 12%"},
+                "flow_score": {"score": 40.0},
+                "institution_score": "45",
+                "chip_score": None,
+                "score": {"value": 42},
+            },
+            1,
+        )
+        assert dim.status == "ok"
+        assert dim.flow_summary == "流向数据不可用"
+        assert dim.institution_summary == "机构持仓无变动"
+        assert dim.chip_summary == "筹码集中度 12%"
+        assert dim.flow_score == 40.0
+        assert dim.institution_score == 45.0
+        assert dim.chip_score is None
+        assert dim.score == 42.0
+
+    def test_unknown_dict_becomes_compact_json(self):
+        from src.agent.deep_research.orchestrator import _parse_researcher
+
+        dim, _ = _parse_researcher(
+            "us_china",
+            {"export_control": {"list": [1, 2], "flag": True}},
+            1,
+        )
+        assert isinstance(dim.export_control, str) and "list" in dim.export_control
 
 
 class TestSkipNarrationsPropagation:
@@ -438,6 +478,14 @@ class TestSkipNarrationsPropagation:
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
         orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中性", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
         orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        for _name in (
+            "run_technical_agent", "run_capital_agent", "run_sentiment_agent",
+            "run_ownership_agent", "run_us_china_agent", "run_business_agent",
+        ):
+            setattr(
+                orch, _name,
+                lambda *a, **k: {"ok": True, "data": {"score": 55, "narrative": "测试"}, "steps": 1},
+            )
 
         # narrate 被调用即失败（证明 skip 生效）
         def _forbidden_narrate(*a, **k):
@@ -450,4 +498,4 @@ class TestSkipNarrationsPropagation:
             force_refresh=True, skip_narrations=True,
         )
         assert result.status == "success"
-        assert len(result.dims) == len(DIM_IDS) == 13
+        assert len(result.dims) == len(DIM_IDS) == 19

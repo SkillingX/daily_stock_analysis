@@ -155,8 +155,11 @@ def run_intel_agent(
         "当前盘面结构(涨/跌/震荡)的根因：发生了什么事件、通过什么机制影响股价、"
         "影响量级(正面利好/负面利空/有限)、预计持续性；基于你搜到的情报作答，搜不到就留空；\n"
         "4) event_calendar(数组，最多 6 项：{event, date, outcomes(2-4个可能结果), "
-        "plans(每个结果对应的一条交易预案)})——未来可能大幅影响股价的事件"
-        "(财报/解禁/政策/行业会议等)，每个事件给出可能结果和对应预案；不确定日期写\"未知\"。\n"
+        "plans(每个结果对应的一条交易预案)})——只收录当前时点之后尚未发生的事件"
+        "(财报/解禁/政策/行业会议等)，禁止列出已过去年份的事件；每个事件给出可能结果和对应预案；"
+        "不确定日期写\"未知\"。\n"
+        "事件预案编号联动：plans 每条预案开头引用操作编号——T1-L 左侧买入 ｜ T1-R 右侧确认买入 ｜ "
+        "T1-S1 减仓/止盈 ｜ T1-SL 止损。会导致无论价格无条件离场的事件，在预案末尾标注「一票否决」。\n"
         "来源等级标注（primary/news/industry/community_*/inferred/unverified）写在字符串内容里。"
     )
     return _run_explore(
@@ -244,7 +247,8 @@ def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         "2) 输出 JSON：chanlun_summary(字符串：基于引擎结构的解读——为什么是这个趋势/位置/背驰)、"
         "support(数值)、resistance(数值)、indicator_summary(字符串：MACD/RSI/均线状态)、"
         "wave_note(字符串：波浪理论视角的一句判断，不适用则写不适用)、"
-        "score(0-100 综合技术分，须与引擎结构方向一致)、basis(打分依据一句话，含具体数字)。"
+        "score(0-100 综合技术分，须与引擎结构方向一致)、basis(打分依据一句话，含具体数字)、"
+        "narrative(50-100 字结论：必须含至少 2 个硬数字——价位/百分比/指标值，禁止只给分无论据)。"
     )
     return _run_explore("technical", _TECHNICAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
@@ -258,7 +262,8 @@ def run_capital_agent(stock_code, stock_name, llm_adapter, progress_callback=Non
         "2) 输出 JSON：flow_summary、flow_score(0-100)、institution_summary"
         "（机构/大户持仓变动解读）、institution_score(0-100)、chip_summary"
         "（筹码成本结构：获利盘/集中度/平均成本解读）、chip_score(0-100)、"
-        "score(三项加权总分)、每项说明含具体数字；取不到的项 score 填 null。"
+        "score(三项加权总分)、每项说明含具体数字；取不到的项 score 填 null；"
+        "narrative(50-100 字结论：必须含至少 2 个硬数字——净流入金额/获利盘比例/成本价等，禁止只给分无论据)。"
     )
     return _run_explore("capital", _CAPITAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
@@ -271,7 +276,8 @@ def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         "2) 输出 JSON：institute_view(机构评价分层：评级/目标价/分歧点)、institute_score(0-100)、"
         "community_view(社区情绪：看多/看空比例与典型观点，带来源等级标签)、"
         "community_score(0-100)、unverified_count(社区传闻条数)、"
-        "score(加权总分)；社区信息只作分歧线索，不得写成确认。"
+        "score(加权总分)、narrative(50-100 字结论：必须含至少 1 个硬数字——机构数/目标价家数/多空比例，"
+        "取不到数字就如实写「缺 XX 数据」，禁止只给分无论据)；社区信息只作分歧线索，不得写成确认。"
     )
     return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
 

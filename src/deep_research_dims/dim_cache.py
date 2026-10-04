@@ -48,7 +48,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 6  # BusinessDim 四字段 str→Dict
+SCHEMA_VERSION = 7  # v7：BusinessDim 四字段真正落 Dict 注解（v6 仅注释漂移）；v6=18 维研究员 payload
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 

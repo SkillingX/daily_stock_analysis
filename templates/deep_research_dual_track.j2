@@ -401,7 +401,7 @@
 | 维度 | 查看 | 下载 |
 |------|------|------|
 {% for item in dim_anchor_items %}
-| {{ item.id }} | [/查看](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}) | [/下载](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}?download=1) |
+| {{ item.label }}（{{ item.id }}） | [/查看](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}) | [/下载](/api/v1/deep-research/reports/{{ report_id }}/dims/{{ item.id }}?download=1) |
 {% endfor %}
 {% else %}
 （报告 id 缺失，索引不可用）

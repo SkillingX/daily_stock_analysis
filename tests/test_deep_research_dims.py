@@ -578,6 +578,9 @@ class TestSnapshotCache:
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+        # 关掉 fuyao 兜底：本机 .env 有 key 时会真实 HTTP 请求并成功补值，
+        # 使"全 None"前提不成立（测试依赖网络状态的 flaky 根因）。
+        monkeypatch.delenv("FUYAO_API_KEY", raising=False)
 
         class _Fund:
             def get_fundamental_context(self, code):
@@ -667,7 +670,8 @@ class TestNarrateHardening:
 class TestDimSubReports:
     def test_split_all_dim_sections(self):
         from src.deep_research_dims.render import (
-            DIM_SECTION_ANCHORS,
+            DIM_LABELS,
+            VIEW_DIM_ORDER,
             split_dim_sections,
         )
 
@@ -675,8 +679,23 @@ class TestDimSubReports:
         view = build_view("贵州茅台", "600519", "2026-09-29T10:00:00", [], dims, [])
         markdown = render_markdown(view)
         sections = split_dim_sections(markdown)
+        assert set(sections) == set(VIEW_DIM_ORDER)
+        # 每个章节非空且以「### 中文节名」标题开头
+        for dim_id in VIEW_DIM_ORDER:
+            assert sections[dim_id].startswith(f"### {DIM_LABELS[dim_id]}"), dim_id
+
+    def test_split_legacy_anchor_markdown_still_works(self):
+        """v1 模板历史报告（无 dim 标记）回退锚点切分。"""
+        from src.deep_research_dims.render import (
+            DIM_SECTION_ANCHORS,
+            split_dim_sections,
+        )
+
+        dims = _all_default_dims()
+        view = build_view("贵州茅台", "600519", "2026-09-29T10:00:00", [], dims, [])
+        markdown = render_markdown(view, template_name="deep_research_dual_track.j2")
+        sections = split_dim_sections(markdown)
         assert set(sections) == set(DIM_SECTION_ANCHORS)
-        # 每个章节非空且以锚点标题开头
         for dim_id, anchor in DIM_SECTION_ANCHORS.items():
             assert sections[dim_id].startswith(anchor), dim_id
 
@@ -684,12 +703,12 @@ class TestDimSubReports:
         from src.deep_research_dims.render import split_dim_sections
 
         dims = _all_default_dims()
-        dims["phase"] = dims["phase"].model_copy(
+        dims["capital"] = dims["capital"].model_copy(
             update={"status": "skipped", "degraded_reason": "省钱模式未选择该维度"}
         )
         view = build_view("贵州茅台", "600519", "2026-09-29T10:00:00", [], dims, [])
         sections = split_dim_sections(render_markdown(view))
-        assert "未选择生成" in sections["phase"]
+        assert "未选择生成" in sections["capital"]
 
     def test_build_dim_report_header_footer(self):
         from src.deep_research_dims.render import build_dim_report

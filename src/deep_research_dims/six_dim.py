@@ -336,7 +336,7 @@ def _researcher_score(payload: Optional[Dict[str, Any]], key: str = "score") -> 
         "confidence": "medium",
         "basis": "llm",
         "data_gap": False,
-        "summary": str(p.get("narrative") or "")[:200] or f"研究员评分 {score}",
+        "summary": str(p.get("narrative") or "")[:200] or f"研究员给分 {score}（未附论据，低置信）",
     }
 
 

@@ -111,3 +111,10 @@ docs/specs/
 # 运行日志 / 临时备份（仓库根散落的 *.log 与 static.backup.* 时间戳目录不入仓）
 /*.log
 /static.backup.*/
+
+# 本地 agent 环境产物（不入仓：编辑器/agent 状态、截图证据、临时 venv 链接）
+.omc/
+.playwright-mcp/
+venv
+compass-*.png
+dr-dual-track-*.png

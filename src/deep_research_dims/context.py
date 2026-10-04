@@ -237,3 +237,84 @@ def build_shared_context(stock_code: str, stock_name: str) -> SharedContext:
         ctx.chip = fut_chip.result()
     ctx.history_reports = _safe_history_reports(stock_code, ctx)
     return ctx
+
+
+def fetch_fuyao_financial_series(code: str, limit: int = 4) -> Dict[str, Any]:
+    """fuyao 多年年报序列（估值快照 + 利润表/负债表/现金流），24h 快照缓存控频。
+
+    Returns:
+        {"years": [{year, revenue, net_profit, gross_margin, roe, debt_ratio,
+                    op_cash_flow, eps}...], "valuation": {...}, "as_of": str}
+        失败返回空结构，不抛异常。
+    """
+    import os as _os
+    import requests as _rq
+
+    from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
+
+    key = f"fin_series_{code}"
+    cached = load_snapshot(key, ttl_hours=24.0)
+    if cached is not None:
+        return cached
+
+    out: Dict[str, Any] = {"years": [], "valuation": {}, "as_of": ""}
+    api_key = (_os.getenv("FUYAO_API_KEY") or "").strip()
+    if not api_key:
+        return out
+    thscode = f"{code}.SH" if code.startswith(("60", "68", "9")) else f"{code}.SZ"
+
+    def _get(path: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        try:
+            resp = _rq.get(
+                f"https://fuyao.aicubes.cn{path}",
+                params=params,
+                headers={"X-api-key": api_key},
+                timeout=20,
+            )
+            if resp.status_code == 429:
+                return []
+            body = resp.json()
+            if body.get("code") not in (0, None):
+                return []
+            return (body.get("data") or {}).get("item") or []
+        except Exception:  # noqa: BLE001
+            return []
+
+    incomes = _get("/api/a-share/financials/income-statements",
+                   {"thscode": thscode, "period": "annual", "limit": limit})
+    balances = _get("/api/a-share/financials/balance-sheets",
+                    {"thscode": thscode, "period": "annual", "limit": limit})
+    cashflows = _get("/api/a-share/financials/cash-flow-statements",
+                     {"thscode": thscode, "period": "annual", "limit": limit})
+    snaps = _get("/api/a-share/valuations/snapshot", {"thscodes": thscode})
+
+    bal_by_year = {b.get("fiscal_year"): b for b in balances}
+    cf_by_year = {c.get("fiscal_year"): c for c in cashflows}
+    for item in incomes:
+        year = item.get("fiscal_year")
+        rev = item.get("operating_income")
+        cost = item.get("operating_costs")
+        np_ = item.get("parent_holder_net_profit")
+        bal = bal_by_year.get(year) or {}
+        cf = cf_by_year.get(year) or {}
+        equity = bal.get("holder_equity_total")
+        assets = bal.get("assets_total")
+        debt = bal.get("total_debt")
+        out["years"].append(
+            {
+                "year": year,
+                "revenue": rev,
+                "net_profit": np_,
+                "gross_margin": round((rev - cost) / rev * 100, 2) if rev and cost is not None else None,
+                "roe": round(np_ / equity * 100, 2) if np_ is not None and equity else None,
+                "debt_ratio": round(debt / assets * 100, 2) if debt is not None and assets else None,
+                "op_cash_flow": cf.get("act_cash_flow_net"),
+                "eps": item.get("basic_eps"),
+            }
+        )
+    if snaps:
+        out["valuation"] = snaps[0]
+    out["as_of"] = datetime.now().isoformat(timespec="seconds")
+    if out["years"]:
+        save_snapshot(key, out)
+    return out

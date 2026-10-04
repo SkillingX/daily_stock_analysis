@@ -20,11 +20,11 @@ class TestDateKey:
     """_date_key 按自然日生成缓存 key。"""
 
     def test_date_key_format(self):
-        """key 格式为 {code}:{YYYYMMDD}。"""
+        """key 格式为 {code}:{YYYYMMDD}:{dims指纹}，全量 dims 指纹为 full。"""
         key = _date_key("600519")
         today = datetime.now().strftime("%Y%m%d")
-        assert key == f"600519:{today}"
-        assert len(key) == 6 + 1 + 8  # code:date
+        assert key == f"600519:{today}:full"
+        assert len(key) == 6 + 1 + 8 + 1 + 4  # code:date:full
 
     def test_date_key_different_codes(self):
         """不同股票代码 key 不同。"""
@@ -217,4 +217,4 @@ class TestCacheServiceLevel:
         # 使用一个 mock 的方式验证缓存写入路径存在
         # （实际 LLM 调用由集成测试覆盖）
         cache_key = _date_key("600519")
-        assert cache_key == f"600519:{datetime.now().strftime('%Y%m%d')}"
+        assert cache_key == f"600519:{datetime.now().strftime('%Y%m%d')}:full"

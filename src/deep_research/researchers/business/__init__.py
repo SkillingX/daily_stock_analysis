@@ -19,5 +19,18 @@ SCORE_KEY = 'score'
 runner_fn = run_business_agent
 
 
+def _strip_noise_keys(value: Any) -> Any:
+    """递归剔除纯背景噪音键（大盘指数原始数据块，渲染无投资价值且喧宾夺主）。"""
+    if isinstance(value, dict):
+        return {
+            k: _strip_noise_keys(v)
+            for k, v in value.items()
+            if k != "index_environment_for_context_only"
+        }
+    if isinstance(value, list):
+        return [_strip_noise_keys(v) for v in value]
+    return value
+
+
 def parse(parsed, steps):
-    return generic_parse(DIM_ID, parsed, steps)
+    return generic_parse(DIM_ID, _strip_noise_keys(parsed or {}), steps)
