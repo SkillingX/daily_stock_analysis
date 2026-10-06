@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -13,6 +14,13 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from src.services import sector_analysis_service
+from src.schemas.sector_analysis import (
+    SectorAnalysisDeleteResponse,
+    SectorAnalysisDetailResponse,
+    SectorAnalysisGenerateResponse,
+    SectorAnalysisListResponse,
+    SectorAnalysisReportItem,
+)
 from src.storage import get_db
 
 logger = logging.getLogger(__name__)
@@ -26,10 +34,10 @@ def _validate_id(report_id: str) -> str:
     return report_id
 
 
-@router.post("/generate")
+@router.post("/generate", response_model=SectorAnalysisGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None):
     try:
-        return await asyncio.to_thread(
+        raw = await asyncio.to_thread(
             sector_analysis_service.generate_report, stock_code, stock_name
         )
     except ValueError as exc:
@@ -37,29 +45,50 @@ async def generate(stock_code: str, stock_name: Optional[str] = None):
     except Exception as exc:  # noqa: BLE001
         logger.error("[SectorAnalysis] 生成失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"生成失败：{exc}")
+    # FastAPI 的 response_model 会用 SectorAnalysisGenerateResponse 校验；
+    # 这里显式再过一次保证 schema 错误在 service 边界暴露，不污染 HTTP 层
+    return SectorAnalysisGenerateResponse.model_validate({
+        "report_id": raw["report_id"],
+        "stock_code": raw["stock_code"],
+        "stock_name": raw.get("stock_name"),
+        "markdown": raw["markdown"],
+        "analysis": raw["analysis"],
+    })
 
 
-@router.get("/reports")
+@router.get("/reports", response_model=SectorAnalysisListResponse)
 async def list_reports(stock_code: Optional[str] = None,
                        limit: int = Query(50, ge=1, le=200),
                        offset: int = Query(0, ge=0)):
-    rows, total = await asyncio.to_thread(
+    rows, _total = await asyncio.to_thread(
         get_db().list_sector_analysis_reports, stock_code, limit, offset
     )
-    return {"success": True, "data": rows, "total": total}
+    items = [SectorAnalysisReportItem.model_validate(r) for r in rows]
+    return {"success": True, "data": items, "total": _total}
 
 
-@router.get("/reports/{report_id}")
+@router.get("/reports/{report_id}", response_model=SectorAnalysisDetailResponse)
 async def get_report(report_id: str):
     _validate_id(report_id)
     record = await asyncio.to_thread(get_db().get_sector_analysis_report, report_id)
     if record is None:
         raise HTTPException(status_code=404, detail="报告不存在")
-    try:
-        record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
-    except OSError:
-        record["markdown"] = ""
-    return {"success": True, "data": record}
+    # storage 层 analysis_json 持久化为 JSON 字符串，schema 期望 dict — 显式反序列化
+    raw_analysis = record.get("analysis_json")
+    if isinstance(raw_analysis, str) and raw_analysis:
+        try:
+            record["analysis_json"] = json.loads(raw_analysis)
+        except json.JSONDecodeError:
+            record["analysis_json"] = None
+    elif raw_analysis is None:
+        record["analysis_json"] = None
+    if record.get("md_path"):
+        try:
+            record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
+        except OSError:
+            record["markdown"] = ""
+    item = SectorAnalysisReportItem.model_validate(record)
+    return {"success": True, "data": item}
 
 
 @router.get("/reports/{report_id}/markdown")
@@ -77,7 +106,7 @@ async def download_markdown(report_id: str, download: int = 0):
     return FileResponse(str(path), **kwargs)
 
 
-@router.delete("/reports/{report_id}")
+@router.delete("/reports/{report_id}", response_model=SectorAnalysisDeleteResponse)
 async def delete_report(report_id: str):
     _validate_id(report_id)
     paths = await asyncio.to_thread(get_db().delete_sector_analysis_report, report_id)
