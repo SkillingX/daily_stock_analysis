@@ -329,7 +329,7 @@ class CapitalDim(DimEnvelope):
     flow_score: Optional[float] = Field(None, ge=0, le=100)
     institution_summary: str = ""
     institution_score: Optional[float] = Field(None, ge=0, le=100)
-    chip_summary: str = ""
+    chip_summary: Optional[Dict[str, Any]] = Field(default=None)
     chip_score: Optional[float] = Field(None, ge=0, le=100)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""
@@ -348,14 +348,20 @@ class SentimentDim(DimEnvelope):
     narrative: str = ""
 
 
+class HolderInfo(BaseModel):
+    """股权信息条目：姓名 + 来源等级。"""
+    name: str
+    source: Optional[str] = None  # news/announcement/knowledge_base/inferred
+
+
 class OwnershipDim(DimEnvelope):
     """股权高管研究员：实控人/十大股东/高管背景与变动（同花顺数据源）。"""
 
     dim: Literal["ownership"] = "ownership"
     controller: str = ""
-    top_holders: List[str] = Field(default_factory=list)
-    executives: List[str] = Field(default_factory=list)
-    recent_changes: List[str] = Field(default_factory=list)
+    top_holders: List[HolderInfo] = Field(default_factory=list)
+    executives: List[HolderInfo] = Field(default_factory=list)
+    recent_changes: List[HolderInfo] = Field(default_factory=list)
     data_gaps: List[str] = Field(default_factory=list)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""

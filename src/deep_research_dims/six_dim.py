@@ -325,9 +325,12 @@ def _score_from_intel(intel_payload: Optional[Dict[str, Any]]) -> Dict[str, Opti
 def _researcher_score(payload: Optional[Dict[str, Any]], key: str = "score") -> Optional[Dict[str, Any]]:
     """研究员打分 → 指标分（basis=llm，summary=narrative）；研究员缺失/降級 → None 走规则回退。"""
     p = payload or {}
-    if p.get("status") != "ok":
+    status = p.get("status")
+    if status is not None and status != "ok":
         return None
     score = p.get(key)
+    if score is None:
+        return None
     if not isinstance(score, (int, float)):
         return None
     return {
@@ -338,6 +341,49 @@ def _researcher_score(payload: Optional[Dict[str, Any]], key: str = "score") -> 
         "data_gap": False,
         "summary": str(p.get("narrative") or "")[:200] or f"研究员给分 {score}（未附论据，低置信）",
     }
+
+
+def _chip_from_context(ctx: SharedContext) -> Optional[Dict[str, Any]]:
+    """chip_summary 为 None 时从 SharedContext.chip dict 取筹码数据兜底评分。"""
+    chip = getattr(ctx, "chip", None)
+    if not isinstance(chip, dict) or not chip:
+        return None
+    try:
+        avg_cost = chip.get("avg_cost")
+        profit_ratio = chip.get("profit_ratio")
+        concentration = chip.get("concentration_90") or chip.get("concentration_70")
+        price = ctx.quote.get("price") if ctx.quote else None
+        if avg_cost is None and profit_ratio is None:
+            return None
+        if price and avg_cost:
+            deviation = abs(float(avg_cost) - float(price)) / float(price)
+            # 偏离 <5% → 集中度高；>20% → 分散
+            if deviation < 0.05:
+                chip_score = 80.0
+                summary = f"平均成本{avg_cost:.2f}元，偏离当前价仅{deviation*100:.1f}%，筹码集中"
+            elif deviation < 0.15:
+                chip_score = 55.0
+                summary = f"平均成本{avg_cost:.2f}元，偏离当前价{deviation*100:.1f}%，筹码较集中"
+            else:
+                chip_score = 30.0
+                summary = f"平均成本{avg_cost:.2f}元，偏离当前价{deviation*100:.1f}%，筹码较分散"
+        elif concentration is not None:
+            # 无当前价时用浓度评估
+            chip_score = 30.0 + min(concentration * 50, 30)  # 0~0.6 → 30~60分
+            summary = f"筹码集中度{concentration:.3f}，参考评分{chip_score:.0f}"
+        else:
+            chip_score = 50.0
+            summary = "筹码数据部分可用（平均成本缺失），使用中性分"
+        return {
+            "id": "chip_score",
+            "score": chip_score,
+            "confidence": "low",
+            "basis": "rule",
+            "data_gap": avg_cost is None,
+            "summary": summary,
+        }
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def build_six_dim(
@@ -373,7 +419,8 @@ def build_six_dim(
         "资金面": {
             "capital_flow": _researcher_score(capital_payload, "flow_score"),
             "institution_change": _researcher_score(capital_payload, "institution_change_score"),
-            "chip_cost": _researcher_score(capital_payload, "chip_score"),
+            "chip_cost": _researcher_score(capital_payload, "chip_score")
+            or _chip_from_context(ctx),
         },
         "情绪面": {
             "institute_view": _researcher_score(sentiment_payload, "institute_score"),

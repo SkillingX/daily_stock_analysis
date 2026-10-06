@@ -98,6 +98,26 @@ def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
     return {"dim": dim_id, "status": "degraded", "degraded_reason": "研究员不可用"}
 
 
+def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
+    """当天同代码已生成过报告则返回已有记录，避免重复生成。"""
+    from datetime import date
+    today = date.today().isoformat()[:10]  # "2026-10-05"
+    try:
+        from src.storage import get_db
+        db = get_db()
+        rows, _ = db.list_fundamentals_reports(code, limit=10, offset=0)
+        for r in rows:
+            created = str(r.get("created_at") or "")
+            if created.startswith(today):
+                # 列表只返回少量字段，再查一次拿完整字段
+                full = db.get_fundamentals_report(r["id"])
+                if full:
+                    return full
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
     """生成基本面专项报告（经营模式/主营产品/行业地位/龙头与大盘对比 + 财务体检）。"""
     from src.agent.tools.data_tools import _get_fetcher_manager
@@ -119,6 +139,22 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
             name = str(getattr(quote, "name", "") or "").strip() or code
         except Exception:  # noqa: BLE001
             name = code
+
+    # 当天已生成过则直接返回已有报告，避免重复
+    existing = _same_day_dedup_report(code)
+    if existing is not None:
+        try:
+            md = Path(existing["md_path"]).read_text(encoding="utf-8")
+        except OSError:
+            md = ""
+        return {
+            "report_id": existing["id"],
+            "stock_code": code,
+            "stock_name": existing.get("stock_name") or name,
+            "status": "already_exists",
+            "markdown": md,
+            "dims": json.loads(existing.get("dims_json") or "{}"),
+        }
 
     from src.deep_research_dims.context import build_shared_context
 

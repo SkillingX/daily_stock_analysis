@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from src.schemas.deep_research_dims import DIM_MODELS, DimEnvelope
+from src.schemas.deep_research_dims import DIM_MODELS, DimEnvelope, HolderInfo
 
 
 @dataclass(frozen=True)
@@ -56,10 +56,30 @@ def generic_parse(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[DimE
         if k not in fields:
             continue
         ann = fields[k].annotation
-        # Dict 注解字段（如 BusinessDim 结构化输出）原样放行，不做 dict→str 压缩
-        if (isinstance(ann, type) and issubclass(ann, dict)) or getattr(ann, "__origin__", None) is dict:
+        # List[HolderInfo] / List[dict] → 展平 name 字段拼成字符串列表
+        if isinstance(v, list) and ann not in (str, int, float, bool):
+            payload[k] = _coerce_list(dim_id, k, v)
+        elif (isinstance(ann, type) and issubclass(ann, dict)) or getattr(ann, "__origin__", None) is dict:
             payload[k] = v if isinstance(v, dict) else ({} if v is None else {"value": v})
         else:
             payload[k] = coerce_value(k, v)
     payload["status"] = "ok"
     return model(**payload), steps
+
+
+def _coerce_list(dim_id: str, key: str, value: list) -> list:
+    """List[dict] → List[str]，对 ownership 三字段取 dict["name"] 拼字符串；其余原样返回。"""
+    ownership_list_keys = {"top_holders", "executives", "recent_changes"}
+    if dim_id == "ownership" and key in ownership_list_keys:
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("holder_name") or str(item)
+            elif isinstance(item, str):
+                name = item
+            else:
+                name = str(item)
+            result.append(HolderInfo(name=name))
+        return result
+    # 普通 list（如 List[str]）原样返回
+    return value

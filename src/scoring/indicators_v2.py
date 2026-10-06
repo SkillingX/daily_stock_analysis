@@ -60,7 +60,7 @@ def aggregate_v2_dimensions(
         indicators: List[Dict[str, Any]] = []
         for ind_id, ind_name, weight, _source in spec:
             result = (indicator_results.get(dim) or {}).get(ind_id)
-            if not result:
+            if not result or result.get("score") is None:
                 result = gap_indicator(ind_id, "该指标尚未接线数据源")
             indicators.append(
                 {

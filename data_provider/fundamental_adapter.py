@@ -490,14 +490,34 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"dividend:{dividend_source}")
 
         # Institution / top shareholders
-        inst_df, inst_source, inst_errors = self._call_df_candidates(
-            [
-                ("stock_institute_hold", {}),
-                ("stock_institute_recommend", {}),
-            ]
-        )
+        # 注意：stock_institute_hold 无个股筛选参数，返回全市场表格；stock_institute_recommend
+        # 为新浪评级页面，已无法访问。先尝试全市场表再内存过滤；失败则静默降级。
+        inst_df: Optional[pd.DataFrame] = None
+        inst_source: Optional[str] = None
+        inst_errors: List[str] = []
+        try:
+            import akshare as ak
+            fn = getattr(ak, "stock_institute_hold", None)
+            if fn:
+                df_all = fn()
+                if isinstance(df_all, pd.DataFrame) and not df_all.empty:
+                    code_cols = [c for c in df_all.columns if any(k in str(c) for k in ("代码", "证券代码", "symbol", "ts_code"))]
+                    if code_cols:
+                        target = _normalize_code(stock_code)
+                        for col in code_cols:
+                            try:
+                                mask = df_all[col].astype(str).map(_normalize_code) == target
+                                inst_df = df_all[mask]
+                                inst_source = "stock_institute_hold"
+                                break
+                            except Exception:
+                                continue
+        except Exception as exc:  # noqa: BLE001
+            inst_errors.append(f"stock_institute_hold:{type(exc).__name__}")
+        # stock_institute_recommend（新天财经评级页面）已无法访问，跳过
+
         result["errors"].extend(inst_errors)
-        if inst_df is not None:
+        if inst_df is not None and not inst_df.empty:
             row = _extract_latest_row(inst_df, stock_code)
             if row is not None:
                 inst_change = _safe_float(
@@ -506,10 +526,9 @@ class AkshareFundamentalAdapter:
                 result["institution"]["institution_holding_change"] = inst_change
                 result["source_chain"].append(f"institution:{inst_source}")
 
+        # 十大股东：stock_zh_a_gdhs_detail_em 支持个股筛选，稳定可用
         top10_df, top10_source, top10_errors = self._call_df_candidates(
             [
-                ("stock_gdfx_top_10_em", {"symbol": stock_code}),
-                ("stock_gdfx_top_10_em", {}),
                 ("stock_zh_a_gdhs_detail_em", {"symbol": stock_code}),
                 ("stock_zh_a_gdhs_detail_em", {}),
             ]

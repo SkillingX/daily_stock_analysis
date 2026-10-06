@@ -25,7 +25,13 @@
 {% if business.business_model is mapping %}
 **要点**
 {% for k, v in business.business_model.items() %}
-{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v if v is string else v | tojson }}
+{% if v is string %}
+{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v }}
+{% elif v is mapping %}
+{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
+{% else %}
+{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v }}
+{% endif %}
 {% endfor %}
 {% endif %}
 {% if business.main_products %}
@@ -35,11 +41,23 @@
 {% for item in mp.业务板块 %}
 - 🔴 **{{ item.name }}**：{{ item.desc }}（{{ item.level or 'inferred' }}）
 {% endfor %}
-{% if mp.收入结构 %}*收入结构：{{ mp.收入结构 if mp.收入结构 is string else mp.收入结构 | tojson }}*
+{% if mp.收入结构 is defined %}
+{% set ysjg = mp.收入结构 %}
+{% if ysjg is string %}
+*收入结构：{{ ysjg }}*
+{% elif ysjg is mapping %}
+*收入结构：{% for k, v in ysjg.items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% endfor %}*
+{% endif %}
 {% endif %}
 {% elif mp is mapping %}
 {% for k, v in mp.items() %}
-- **{{ k }}**：{{ v if v is string else v | tojson }}
+{% if v is string %}
+- **{{ k }}**：{{ v }}
+{% elif v is mapping %}
+- **{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
+{% else %}
+- **{{ k }}**：{{ v }}
+{% endif %}
 {% endfor %}
 {% else %}
 - {{ mp }}
@@ -73,7 +91,13 @@
 {% endfor %}
 {% elif vs is mapping %}
 {% for k, v in vs.items() %}
-{{ loop.index }}. 🔴 **{{ k }}**：{{ v if v is string else v | tojson }}
+{% if v is string %}
+{{ loop.index }}. 🔴 **{{ k }}**：{{ v }}
+{% elif v is mapping %}
+{{ loop.index }}. 🔴 **{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
+{% else %}
+{{ loop.index }}. 🔴 **{{ k }}**：{{ v }}
+{% endif %}
 {% endfor %}
 {% elif vs %}
 {{ vs }}

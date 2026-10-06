@@ -22,8 +22,16 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 # 长线子集（依赖闭包自动补 data；跳过快照类短线维度不为批量场景付费）
+# 注意：必须包含所有 researcher 维度，否则这些研究员根本不会被调用
 LONG_TRACK_SUBSET = frozenset(
-    {"supply_chain", "intel", "six_dim", "bayesian", "scenarios", "conclusion"}
+    {
+        # system 维度
+        "supply_chain", "intel", "six_dim", "bayesian", "scenarios",
+        "conclusion", "plan", "signal", "data", "phase", "history",
+        # researcher 维度（核心研究维度，必须包含）
+        "technical", "capital", "ownership", "sentiment", "us_china",
+        "business", "fundamental", "sector",
+    }
 )
 
 

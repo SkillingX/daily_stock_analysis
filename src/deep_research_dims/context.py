@@ -93,7 +93,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         raw = manager.get_fundamental_context(code)
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
-        financial = (compact.get("financial") or {}).get("data") or {}
+        financial = (compact.get("growth") or {}).get("data") or {}
         institution = (compact.get("institution") or {}).get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
         industry_hint = ""
@@ -109,8 +109,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "market_cap": valuation.get("market_cap")
             or valuation.get("total_market_cap"),
             "roe": financial.get("roe"),
-            "revenue_growth": financial.get("revenue_growth")
-            or financial.get("revenue_yoy"),
+            "revenue_growth": financial.get("revenue_yoy")
+            or financial.get("revenue_growth"),
+            "net_profit_yoy": financial.get("net_profit_yoy"),
             "gross_margin": financial.get("gross_margin"),
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
