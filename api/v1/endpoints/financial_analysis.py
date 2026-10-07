@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -12,6 +13,13 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from src.schemas.financial_analysis import (
+    FinancialAnalysisDeleteResponse,
+    FinancialAnalysisDetailResponse,
+    FinancialAnalysisGenerateResponse,
+    FinancialAnalysisListResponse,
+    FinancialAnalysisReportItem,
+)
 from src.services import financial_analysis_service
 from src.storage import get_db
 
@@ -26,10 +34,10 @@ def _validate_id(report_id: str) -> str:
     return report_id
 
 
-@router.post("/generate")
+@router.post("/generate", response_model=FinancialAnalysisGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None):
     try:
-        return await asyncio.to_thread(
+        raw = await asyncio.to_thread(
             financial_analysis_service.generate_report, stock_code, stock_name
         )
     except ValueError as exc:
@@ -37,29 +45,48 @@ async def generate(stock_code: str, stock_name: Optional[str] = None):
     except Exception as exc:  # noqa: BLE001
         logger.error("[FinAnalysis] 生成失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"生成失败：{exc}")
+    # 走 Pydantic 校验（response_model 会再做一次）
+    return FinancialAnalysisGenerateResponse.model_validate({
+        "report_id": raw.get("report_id"),
+        "stock_code": raw["stock_code"],
+        "stock_name": raw["stock_name"],
+        "status": raw["status"],
+        "markdown": raw["markdown"],
+        "analysis": raw["analysis"],
+    })
 
 
-@router.get("/reports")
+@router.get("/reports", response_model=FinancialAnalysisListResponse)
 async def list_reports(stock_code: Optional[str] = None,
                        limit: int = Query(50, ge=1, le=200),
                        offset: int = Query(0, ge=0)):
-    rows, total = await asyncio.to_thread(
+    rows, _total = await asyncio.to_thread(
         get_db().list_financial_analysis_reports, stock_code, limit, offset
     )
-    return {"success": True, "data": rows, "total": total}
+    items = [FinancialAnalysisReportItem.model_validate(r) for r in rows]
+    return {"success": True, "data": items, "total": _total}
 
 
-@router.get("/reports/{report_id}")
+@router.get("/reports/{report_id}", response_model=FinancialAnalysisDetailResponse)
 async def get_report(report_id: str):
     _validate_id(report_id)
     record = await asyncio.to_thread(get_db().get_financial_analysis_report, report_id)
     if record is None:
         raise HTTPException(status_code=404, detail="报告不存在")
-    try:
-        record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
-    except OSError:
-        record["markdown"] = ""
-    return {"success": True, "data": record}
+    # storage 层 analysis_json 持久化为 JSON 字符串，schema 期望 dict — 显式反序列化
+    raw_analysis = record.get("analysis_json")
+    if isinstance(raw_analysis, str) and raw_analysis:
+        try:
+            record["analysis_json"] = json.loads(raw_analysis)
+        except json.JSONDecodeError:
+            record["analysis_json"] = None
+    if record.get("md_path"):
+        try:
+            record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
+        except OSError:
+            record["markdown"] = ""
+    item = FinancialAnalysisReportItem.model_validate(record)
+    return {"success": True, "data": item}
 
 
 @router.get("/reports/{report_id}/markdown")
@@ -71,13 +98,14 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
-    kwargs = {"media_type": "text/markdown; charset=utf-8"}
-    if download:
-        kwargs["filename"] = f"{report_id}.md"
-    return FileResponse(str(path), **kwargs)
+    media_type = "text/markdown; charset=utf-8"
+    filename = f"{report_id}.md" if download else None
+    if filename:
+        return FileResponse(str(path), media_type=media_type, filename=filename)
+    return FileResponse(str(path), media_type=media_type)
 
 
-@router.delete("/reports/{report_id}")
+@router.delete("/reports/{report_id}", response_model=FinancialAnalysisDeleteResponse)
 async def delete_report(report_id: str):
     _validate_id(report_id)
     paths = await asyncio.to_thread(get_db().delete_financial_analysis_report, report_id)

@@ -11,7 +11,9 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from icontract import ensure, require
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,28 @@ def _fetch_gross_margin_akshare(code: str, years: list[int]) -> dict[int, float]
         return {}
 
 
+@require(
+    lambda series: isinstance(series, dict),
+    "series must be a dict",
+)
+@require(
+    lambda fund: isinstance(fund, dict),
+    "fund must be a dict",
+)
+@ensure(
+    lambda result: (
+        isinstance(result, dict)
+        and {"dims", "health_score", "gaps", "years", "valuation"}.issubset(result.keys())
+    ),
+    "_score_dims must return the documented dict contract",
+)
+@ensure(
+    lambda result: (
+        result["health_score"] is None
+        or 0.0 <= result["health_score"] <= 100.0
+    ),
+    "health_score must be None or in [0, 100]",
+)
 def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     """四维度分档打分（多年序列优先，AkShare 兜底毛利率）。"""
     years_data: list[Dict[str, Any]] = series.get("years") or []
@@ -267,6 +291,26 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _raw_code_valid(raw_code: Any) -> bool:
+    """icontract 安全的 precondition：先判 isinstance 再 len()，避免 int 上 len 抛错。"""
+    return isinstance(raw_code, str) and len(raw_code) > 0
+
+
+@require(
+    lambda raw_code: _raw_code_valid(raw_code),
+    "raw_code must be a non-empty string",
+)
+@ensure(
+    lambda result: (
+        isinstance(result, dict)
+        and {"stock_code", "stock_name", "status", "markdown", "analysis"}.issubset(result.keys())
+    ),
+    "generate_report must return the documented dict contract",
+)
+@ensure(
+    lambda result: result["status"] in ("success", "failed", "already_exists"),
+    "status must be one of success/failed/already_exists",
+)
 def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
     """生成个股财务分析专项报告。"""
     from src.services.stock_code_utils import normalize_code
