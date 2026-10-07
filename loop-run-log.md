@@ -286,3 +286,22 @@
 | 推送步骤 | `git push origin feat/choice-mcp-end-to-end` → PR #44 自动更新（4 commits ahead of main） |
 | Friction | (a) `_judge_direction` 三方判定中 tertiary=0 会落入「与 secondary 同侧」分支（因为 `0 > 0` 是 False）→ 起初误以为是「zero-value 短路」，实测发现是正确行为，只是测试断言要改成「primary outlier medium」。(b) `_pick_value` substring 匹配对未来多行 server 仍脆弱——本次未触及，因为真实 MCP 只返 1 行 + 已有 unknown-shape WARN。 |
 | Adjustment | (1) 加 N 源时**必须**把 N-ary judge 一次性写完整（不要先做 2-source 然后期待 PR review 提醒加 3-source）—— 此次 P0 是 PR review 没看出的盲点，下次 reviewer 要专门 grep "len(readings)"。(2) config loader 凡是用户希望「显式空串 = 禁用」语义的字段，统一 None/"" 区分，避免 `or` 链的隐式回落。(3) 任何「借自其他模块的共享函数」扩展行为时，必须在原模块加显式单测，不要只靠 consumer 模块的测间接覆盖。 |
+
+### 2026-10-06 00:30 个股板块分析模块 commit + push + Draft PR
+
+| 字段 | 值 |
+|------|-----|
+| Loop | Manual — Ship |
+| Level | L1 |
+| Branch | `feat/sector-analysis`（从 main 切） |
+| Duration | ~5 min |
+| Tokens | 估算 ~15k（git 操作 + py_compile + gh CLI 为主，无文件写入/编辑） |
+| Trigger | manual (user "loop engineering 方式记录一下进度，然后把当前代码 push 到远程仓库") |
+| Sub-agents | 0 |
+| Result | success（chore commit `1011364` + feat commit `5d620b1` push 完成 → Draft PR #49 已创建） |
+| 备注 | **(1) working tree 盘点**：5 个新文件 + 7 个 modified + 1 个 `.omc/state/hud-stdin-cache.json` modified（omc 工具缓存，`.omc/` 已在 `.gitignore` 但被历史错误追踪）。用户走"按建议方案"——**两 commit + 切分支 + draft PR + 治本**.omc。(2) **Commit 1** `chore: untrack .omc state files (compliance with .gitignore)` (`1011364`)：`git rm --cached` 两个 .omc 文件（`.omc/state/hud-stdin-cache.json`、`.omc/state/sessions/<uuid>/hud-state.json`），磁盘文件保留供 omc 工具继续使用；`.gitignore` 已经有 `.omc/` 不需改。(3) **Commit 2** `feat(sector-analysis): add individual stock sector analysis module` (`5d620b1`)：12 文件 +1323/-2，覆盖后端 service (653 行) / endpoint (92 行) / ORM + CRUD / 行业基率 expose 分位 / j2 模板 (90 行) / 测试 (184 行) + Web 前端页面 + 路由 + 侧边栏 + i18n + 机械关键词加 `专用设备`。(4) **推送**：`git push -u origin feat/sector-analysis` → 远端 `feat/sector-analysis` 分支 + `2 commits ahead of main`。(5) **PR #49 Draft**：base=main, head=feat/sector-analysis, body 按 `.github/PULL_REQUEST_TEMPLATE.md` 全填：PR Type=feat / Background / Scope 12 项 / Issue 无（仓库 issues disabled） / Verification 仅 `py_compile` 5 文件 / Visual Evidence 不适用（新页面无既有 UI 对比）/ Compatibility & Risk 拆 兼容 / 未验证 / 风险点 2 条 / Rollback `gh pr revert` 一步走 / EXTRACT_PROMPT 不适用。**Issue Link** 接受标准写成"模块契约对齐 financial-analysis、Web 入口/侧边栏/i18n 三件齐备、含 CRUD + 路由冒烟测试"。 |
+| Loop-gate check | ✅ max-files=12 在 `-fret-in` 单 commit 内（per-commit 维度不超限；总 PR diff 仍 < Loop-gate hardcap）；✅ no denylist hit；✅ 无自动 merge 触发（draft PR）；✅ 自动 tag 不触发（commit title 无 #patch/#minor/#major）。action=check 通过。 |
+| Compatibility & Risk | **零回归**：纯追加（API + Web + i18n + 表追加）。`SectorAnalysisReport` 新表与 `FinancialAnalysisReport` 共存。`机械` 关键词扩展仅追加 `专用设备`（既有 `工业母机/机器人/高端制造/装备` 不变）。`.omc` untrack 不影响任何运行时行为，omc 工具照常读磁盘。 |
+| 推送步骤 | `git checkout -b feat/sector-analysis` → `git rm --cached` 两个 omc 文件 → `git commit chore (1011364)` → `git add` 12 sector files → `git commit feat (5d620b1)` → `git push -u origin feat/sector-analysis` → `gh pr create --draft --base main --head feat/sector-analysis --body <PR_BODY>` → `https://github.com/gyc567/daily_stock_analysis/pull/49`。 |
+| Friction | (a) `.omc/` 已在 `.gitignore` 但历史有两个文件被追踪——典型的 `.gitignore` 后于 `git add` 路径，被 git 视为已追踪文件不忽略。修法：`git rm --cached <files>` 把它们从 index 删除、保留磁盘文件，今后就遵循 .gitignore。(b) `request_user_input` 在 Default 模式不可用——按 AGENTS.md 第一性原理"不可逆 push 需对同步确认"，用 `request_user_input` 工具失败后改用纯文字一段式确认，用户"按你说的来"——接受。(c) gh CLI token 来自 keyring（凭据管理器），未出现在环境变量/日志/磁盘配置——遵循"凭据只走凭据管理器"硬规则。 |
+| Adjustment | (1) Loop Engineering 推进里"git 改远端状态"必须 dual-step 走（commit + push），且 **commit 之前**做 push 策略确认（切分支 vs 直 push main）+ 默认建议是"feature branch + draft PR"，与既往 2026-08-11 PR #32 处理一致。(2) `.gitignore` 加治历史路径后，必须立刻 `git ls-files | grep <prefix>` 排查"已追踪但应忽略"文件，分批 `git rm --cached` 治理；本次发现 2 份（hud-stdin-cache + sessions/<uuid>/hud-state），后续如再有 omc 工具累积可定期扫。(3) Loop-run-log 默认**先 push 后写**（参考 2026-08-11 那条 "Commit + Push + Draft PR"），但本轮把 `loop-run-log.md` 留作单独第三次 commit（docs(loop)）—— 因为 loop-run-log 自身作为仓库资产需要可审查 diff，且**只有先 push 才能拿到 PR URL 写到 Adjustment/Friction**。 |

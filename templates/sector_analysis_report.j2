@@ -1,0 +1,90 @@
+# {{ stock_name }}（{{ stock_code }}）板块分析报告
+
+> 报告 id：{{ report_id }} ｜ 生成时间：{{ as_of }}
+> 综合板块得分：**{{ a.sector_score if a.sector_score is not none else 'N/A' }}/100 —— {{ a.band }}** ｜ 对个股的 β 含义：{{ a.beta_meaning }}
+> 权重：政策倾向 {{ (a.weights.policy * 100)|round(0) }}% + 行业基率 {{ (a.weights.base_rate * 100)|round(0) }}% + 板块景气 {{ (a.weights.prosperity * 100)|round(0) }}%
+> 本报告基于公开数据与启发式规则，仅供研究参考，不构成投资建议
+
+## 一、板块定位
+
+{% set ident = a.identification %}
+- 东财行业归属：**{{ ident.industry_em or '未识别' }}**
+{% if ident.industry_cninfo %}- 巨潮证监会行业：**{{ ident.industry_cninfo }}**
+{% endif %}
+- 申万行业链（成分验证）：
+{% set sw = ident.sw_chain %}
+{% if sw and (sw.l3 or sw.l2) %}
+  - 申万一级：{{ sw.l1 or 'N/A' }}
+  - 申万二级：{{ sw.l2 or 'N/A' }}
+  - 申万三级：{{ sw.l3 or 'N/A' }}{% if sw.l3_code %}（{{ sw.l3_code }}）{% endif %}
+{% else %}
+  - （申万链未锁定，见数据缺口）
+{% endif %}
+- 景气查询板块名：{{ ident.sector_name or 'N/A' }}
+
+## 二、政策倾向（行业 DNA 库）
+
+{% set p = a.policy %}
+- 判定：**{{ p.label }}**{% if p.lean %}（{{ p.lean }}）{% else %}（未识别）{% endif %} ｜ 档位分：{{ p.score if p.score is not none else 'N/A' }}/100
+- 说明：政策倾向来自行业 DNA 库的关键词匹配（supportive=支持 / neutral=中性 / restrictive=限制），
+  反映产业目录、政策文件对该行业的总体取向；方向确定但兑现为收入需要经过「项目验收」类闸门。
+
+## 三、行业基率（启发式默认表，可迭代）
+
+{% set b = a.base_rate %}
+- 命中基率：**{{ (b.base_rate * 100)|round(0) }}%**（{{ b.hit_keyword or '未命中' }}）
+- 命中依据：{{ b.basis }}
+- 全表分位：{{ (b.percentile * 100)|round(0) if b.percentile is not none else 'N/A' }}%（高于表中 {{ (b.percentile * 100)|round(0) if b.percentile is not none else '—' }}% 的行业）
+- 🔴 **基率表版本：{{ b.table_version }}（更新于 {{ b.table_updated }}，共 {{ b.table_industry_count }} 个行业）**
+- 说明：基率为该行业「长期获胜概率」的先验锚点（0-1），启发式默认值；
+  迭代方式：修改 `data/deep_research/industry_base_rates.json` 后热生效，报告自动携带新版本号。
+
+## 四、板块景气（东财行业板块全表）
+
+{% set pr = a.prosperity %}
+{% if pr.sector_found %}
+- 板块：**{{ pr.row.board_name }}** ｜ 全表排名：{{ pr.rank_of }} / {{ pr.total_boards }}（按涨跌幅）
+- 涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}%
+- 总市值：{{ pr.row.total_market_cap if pr.row.total_market_cap is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
+- 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
+
+| 景气维度 | 得分（0-100） | 口径 |
+|---------|--------------|------|
+| 动量（涨跌幅全表分位） | {{ pr.momentum if pr.momentum is not none else 'N/A' }} | 前 10% = 100 分 |
+| 活跃度（换手率/全表中位） | {{ pr.activity if pr.activity is not none else 'N/A' }} | 中位 = 50 分 |
+| 资金（成交额/全表中位） | {{ pr.capital if pr.capital is not none else 'N/A' }} | 中位 = 50 分 |
+| 广度（上涨家数占比） | {{ pr.breadth if pr.breadth is not none else 'N/A' }} | 全涨 = 100 分 |
+
+- 景气综合分：**{{ a.prosperity_score if a.prosperity_score is not none else 'N/A' }}/100**（可用维度均值）
+{% else %}
+- ⚠️ 板块景气未产出：{{ pr.gaps[0] if pr.gaps else '未知原因' }}
+{% endif %}
+
+## 五、综合结论
+
+- 综合板块得分：**{{ a.sector_score if a.sector_score is not none else 'N/A' }}/100 —— {{ a.band }}**
+- 对个股的 β 含义：{{ a.beta_meaning }}
+- 操作提示：板块分 ≥75 顺风时个股回调优先找买点；≤50 逆风时仓位打折、买点从严；
+  50-65 之间板块基本中性，个股自身证据（订单/业绩/资金）主导定价。
+
+{% if a.gaps %}
+## 数据缺口（按纪律不编造）
+
+{% for g in a.gaps %}
+- {{ g }}
+{% endfor %}
+{% endif %}
+
+## 附录：行业基率全表（{{ b.table_version }}，{{ b.table_updated }} 更新）
+
+| 行业关键词 | 基率 | 说明 |
+|-----------|------|------|
+{% for r in b.all_rates %}
+| {{ r.keyword }}{% if r.keyword == b.hit_keyword %} ⬅ 本次命中{% endif %} | {{ (r.base_rate * 100)|round(0) }}% | {{ r.note }} |
+{% endfor %}
+| （默认） | 50% | 未命中行业使用板块中性值 |
+
+*基率表为启发式默认值（龙头胜率口径），迭代方式：直接修改 `data/deep_research/industry_base_rates.json`
+的数值并更新 `_updated` 字段，服务热加载生效，报告自动携带新版本号。*
+
+*本报告由 AI 生成，所引数据以生成时点为准；不构成投资建议。*

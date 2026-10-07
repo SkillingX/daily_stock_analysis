@@ -69,3 +69,39 @@ def lookup_base_rate(text: str | None) -> Tuple[float, str]:
                 if isinstance(rate, (int, float)) and 0.0 <= rate <= 1.0:
                     return float(rate), f"industry_base_rate:{kw}"
     return default, "neutral_default"
+
+
+def table_meta() -> Dict[str, Any]:
+    """基率表元信息（报告强制透出：迭代闭环可见）。"""
+    table = _load_table()
+    return {
+        "version": str(table.get("_version") or "unknown"),
+        "updated": str(table.get("_updated") or "unknown"),
+        "industry_count": len(_entries()),
+    }
+
+
+def all_rates() -> List[Dict[str, Any]]:
+    """全表条目（附录展示 + 分位计算用），每条附命中关键词首位。"""
+    out = []
+    for entry in _entries():
+        kws = entry.get("keywords") or []
+        rate = entry.get("base_rate")
+        if isinstance(rate, (int, float)):
+            out.append(
+                {
+                    "keyword": kws[0] if kws and isinstance(kws[0], str) else "",
+                    "base_rate": float(rate),
+                    "note": str(entry.get("note") or ""),
+                }
+            )
+    return out
+
+
+def rate_percentile(rate: float) -> Optional[float]:
+    """当前值在全表分布中的分位（0-1，1=比所有行业都高）。表空返回 None。"""
+    rates = [e["base_rate"] for e in all_rates()]
+    if not rates:
+        return None
+    below = sum(1 for r in rates if r < rate)
+    return round(below / len(rates), 2)

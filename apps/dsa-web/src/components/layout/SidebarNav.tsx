@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { BarChart3, BookOpen, Compass, FileText, Gauge, Home, LogOut, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
+import { BarChart3, BookOpen, Compass, FileText, Gauge, Home, LayoutGrid, LogOut, Network, Search, Settings2, ShieldAlert, TrendingUp } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
 import { ALPHASIFT_CONFIG_CHANGED_EVENT, SYSTEM_CONFIG_CHANGED_EVENT, alphasiftApi } from '../../api/alphasift';
 import { useAuth } from '../../contexts/AuthContext';
@@ -33,6 +33,7 @@ const NAV_ITEMS: NavItem[] = [
   { key: 'deep-research', labelKey: 'layout.nav.deepResearch', to: '/deep-research', icon: FileText },
   { key: 'fundamentals', labelKey: 'layout.nav.fundamentals', to: '/fundamentals', icon: FileText },
   { key: 'financial-analysis', labelKey: 'layout.nav.financialAnalysis', to: '/financial-analysis', icon: Gauge },
+  { key: 'sector-analysis', labelKey: 'layout.nav.sectorAnalysis', to: '/sector-analysis', icon: LayoutGrid },
   { key: 'policy-minesweeper', labelKey: 'layout.nav.policyMinesweeper', to: '/policy-minesweeper', icon: ShieldAlert },
   { key: 'knowledge-base', labelKey: 'layout.nav.knowledgeBase', to: '/knowledge-base', icon: BookOpen },
   // A股分析（/chat）按需求仅菜单隐藏，路由保留
