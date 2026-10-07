@@ -164,6 +164,8 @@ module = [
     "src.notification_sender.ntfy_sender",
     "src.notification_sender.gotify_sender",
     "src.agent.tools.registry",
+    "src.services.sector_analysis_service",
+    "src.schemas.sector_analysis",
 ]
 enable_error_code = ["ignore-without-code"]
 disallow_untyped_defs = true

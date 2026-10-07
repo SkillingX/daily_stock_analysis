@@ -91,8 +91,8 @@ def _sw_tables() -> Optional[Dict[str, Any]]:
     try:
         import akshare as ak
 
-        third = ak.sw_index_third_info()
-        second = ak.sw_index_second_info()
+        third = _ak_with_retry(ak.sw_index_third_info)
+        second = _ak_with_retry(ak.sw_index_second_info)
         if third is None or second is None or third.empty or second.empty:
             return None
         _SW_TABLES_CACHE = {"third": third, "second": second}
@@ -182,6 +182,8 @@ def _resolve_sw_chain(code: str, industry_text: str) -> Dict[str, Any]:
         try:
             import akshare as ak
 
+            # 注意：此处不包 _ak_with_retry — 候选循环里 1-8 个候选要快速失败切换
+            # 加 retry 会让最坏情况延迟从 ~0.5s/cand 变成 ~5s/cand
             cons = ak.index_component_sw(symbol=code_col)
         except Exception:  # noqa: BLE001 - 单个候选失败继续下一个
             continue
@@ -241,7 +243,7 @@ def _identify_sector(code: str) -> Dict[str, Any]:
         try:
             import akshare as ak
 
-            df = ak.stock_profile_cninfo(symbol=code)
+            df = _ak_with_retry(ak.stock_profile_cninfo, symbol=code)
             if df is not None and not df.empty:
                 row0 = df.iloc[0]
                 industry = str(row0.get("所属行业") or "").strip()
@@ -354,7 +356,8 @@ def _base_rate_pillar(lookup_text: str) -> Dict[str, Any]:
 # P4 板块景气支柱（东财行业板块全表：动量/活跃度/资金/广度）
 # ---------------------------------------------------------------------------
 
-def _median(values: List[float]) -> Optional[float]:
+def _median(values: List[Optional[float]]) -> Optional[float]:
+    """中位数计算。接受 ``Optional[float]``，自动过滤 None。"""
     vals = sorted(v for v in values if v is not None)
     if not vals:
         return None
@@ -418,7 +421,7 @@ def _prosperity_pillar(sector_name: str) -> Dict[str, Any]:
         try:
             import akshare as ak
 
-            df = ak.stock_sector_spot(indicator="行业")
+            df = _ak_with_retry(ak.stock_sector_spot, indicator="行业")
             table_kind = "sina"
         except Exception as exc:  # noqa: BLE001
             out["gaps"].append(f"板块景气：新浪板块表也失败 {str(exc)[:50]}")
@@ -500,7 +503,7 @@ def _prosperity_pillar(sector_name: str) -> Dict[str, Any]:
     elif table_kind == "sina" and col_map["volume"] and col_map["volume"] in df.columns:
         vol_col, cnt_col = col_map["volume"], col_map["co_count"]
         if cnt_col and cnt_col in df.columns:
-            per_co = []
+            per_co: List[Optional[float]] = []
             for v, c in zip(df[vol_col].tolist(), df[cnt_col].tolist()):
                 v_n, c_n = _num(v), _num(c)
                 if v_n is not None and c_n:
@@ -572,9 +575,11 @@ def _PROSPERITY_DIMS_OK(p: Any) -> bool:
     "result must be None or in [0, 100]",
 )
 def _prosperity_score(p: Dict[str, Any]) -> Optional[float]:
-    vals = [p.get(d) for d in _PROSPERITY_DIMS]
-    vals = [v for v in vals if isinstance(v, (int, float))]
-    return round(sum(vals) / len(vals), 2) if vals else None
+    vals: List[Optional[float]] = [p.get(d) for d in _PROSPERITY_DIMS]
+    nums: List[float] = [v for v in vals if isinstance(v, (int, float))]
+    if not nums:
+        return None
+    return round(sum(nums) / len(nums), 2)
 
 
 @require(

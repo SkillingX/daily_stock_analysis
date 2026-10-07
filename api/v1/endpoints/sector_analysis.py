@@ -100,10 +100,14 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
-    kwargs = {"media_type": "text/markdown; charset=utf-8"}
-    if download:
-        kwargs["filename"] = f"{report_id}.md"
-    return FileResponse(str(path), **kwargs)
+    from starlette.datastructures import MutableHeaders  # noqa: F401
+    # FileResponse 的 kwargs 是 Unpack[ResponseInit]，pyright strict 不能用裸 Dict[str, str]
+    # 这里展开为 explicit 关键字避免 pyright 把 kwargs 视为宽类型
+    media_type = "text/markdown; charset=utf-8"
+    filename = f"{report_id}.md" if download else None
+    if filename:
+        return FileResponse(str(path), media_type=media_type, filename=filename)
+    return FileResponse(str(path), media_type=media_type)
 
 
 @router.delete("/reports/{report_id}", response_model=SectorAnalysisDeleteResponse)

@@ -77,10 +77,12 @@ jobs:
             -p src.notification_sender.serverchan3_sender \
             -p src.notification_sender.ntfy_sender \
             -p src.notification_sender.gotify_sender \
-            -p src.agent.tools.registry
+            -p src.agent.tools.registry \
+            -p src.services.sector_analysis_service \
+            -p src.schemas.sector_analysis
 
       - name: Contract smoke test
         env:
           ICONTRACT_SLOW: "true"
         run: |
-          python -m pytest tests/test_realtime_types_contract.py tests/test_risk_check_contract.py tests/test_data_fetcher_caching.py -v --tb=short
+          python -m pytest tests/test_realtime_types_contract.py tests/test_risk_check_contract.py tests/test_data_fetcher_caching.py tests/test_sector_analysis_contracts.py tests/test_sector_analysis_schemas.py -v --tb=short
