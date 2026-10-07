@@ -512,8 +512,12 @@ def run_dual_track(
             else:
                 dims["fundamental"] = f1_dim
 
-    def _build_data_dim() -> Optional[DataDim]:
-        """S2 数据透视：缓存优先；fresh 时 LLM 叙述（与探索 Agent 并行，叙述耗时隐藏）。"""
+    def _build_data_dim() -> Optional["DataDim | DimEnvelope"]:
+        """S2 数据透视：缓存优先；fresh 时 LLM 叙述（与探索 Agent 并行，叙述耗时隐藏）。
+
+        返回类型实际可能是 ``DimEnvelope``（缓存命中时）或 ``DataDim``（fresh 时）。
+        类型注解用 Union 让静态检查通过；运行时 isinstance 校验放在调用点。
+        """
         if "data" not in selected:
             return None
         dim = try_cache("data")

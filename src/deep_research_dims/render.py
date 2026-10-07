@@ -347,19 +347,37 @@ def _ev_sensitivity(scenarios: Any) -> str:
     r_anchor = _to_float(getattr(bear, "value_anchor", None))
     if None in (n_anchor, b_prob, n_prob, r_prob, b_anchor, r_anchor):
         return ""
-    if n_prob <= 0 or n_prob >= 1 or b_prob + r_prob <= 0:
+    if (
+        n_prob <= 0 or n_prob >= 1 or (b_prob is not None and r_prob is not None and b_prob + r_prob <= 0)
+    ):  # type: ignore[operator]
         return ""
 
-    shifts = [("中性锚 -10%", n_anchor * 0.9), ("中性锚不变", n_anchor), ("中性锚 +10%", n_anchor * 1.1)]
+    # 上面的 None in 检查已排除 None，但 pyright 推不动，加 isinstance narrow：
+    assert n_anchor is not None and b_anchor is not None and r_anchor is not None
+    n_anchor_f: float = n_anchor
+    b_anchor_f: float = b_anchor
+    r_anchor_f: float = r_anchor
+    shifts = [
+        ("中性锚 -10%", n_anchor_f * 0.9),  # type: ignore[operator]
+        ("中性锚不变", n_anchor_f),  # type: ignore[operator]
+        ("中性锚 +10%", n_anchor_f * 1.1),  # type: ignore[operator]
+    ]
     probs = [0.4, 0.5, 0.6]
     header = "| 期望值（现价对照） | " + " | ".join(f"中性概率 {int(p * 100)}%" for p in probs) + " |"
     sep = "|" + "---|" * (len(probs) + 1)
     rows = [header, sep]
+    b_anchor_f2: float = b_anchor
+    r_anchor_f2: float = r_anchor
     for label, anchor in shifts:
         cells = []
+        anchor_f: float = anchor
         for p in probs:
             rest = 1.0 - p
-            ev = b_anchor * (rest * b_prob / (b_prob + r_prob)) + anchor * p + r_anchor * (rest * r_prob / (b_prob + r_prob))
+            ev = (
+                b_anchor_f2 * (rest * b_prob / (b_prob + r_prob))  # type: ignore[operator]
+                + anchor_f * p  # type: ignore[operator]
+                + r_anchor_f2 * (rest * r_prob / (b_prob + r_prob))  # type: ignore[operator]
+            )
             cells.append(f"{ev:.2f}")
         rows.append(f"| {label} | " + " | ".join(cells) + " |")
     return "\n".join(rows)

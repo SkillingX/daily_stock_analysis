@@ -371,7 +371,7 @@ class MxMcpFetcher:
                         self._endpoint,
                         http_client=_httpx.AsyncClient(
                             headers=headers, timeout=self._timeout
-                        ),  # type: ignore[arg-type] — httpx vs httpx2 namespace mismatch
+                        ),
                     ) as streams:
                         # mcp 2.x yields 2-tuple; 1.x legacy yielded 3-tuple.
                         if len(streams) == 3:  # pragma: no cover — 1.x legacy
@@ -384,8 +384,8 @@ class MxMcpFetcher:
                 else:  # mcp < 2.0 (legacy)
                     async with streamable_http_client(
                         self._endpoint,
-                        headers=headers,  # type: ignore[call-arg] — 1.x legacy kwarg
-                        timeout=self._timeout,  # type: ignore[call-arg]
+                        headers=headers,
+                        timeout=self._timeout,
                     ) as streams:
                         if len(streams) == 3:  # pragma: no cover — 1.x legacy
                             read, write, _ = streams  # type: ignore[misc]

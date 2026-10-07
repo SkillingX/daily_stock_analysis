@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +92,10 @@ def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
             payload = dim.model_dump()
             if dim.status == "ok":
                 save_cached_dim(code, dim_id, payload)
-            return payload
+            return cast(Dict[str, Any], payload)
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
-    return {"dim": dim_id, "status": "degraded", "degraded_reason": "研究员不可用"}
+    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": "研究员不可用"})
 
 
 def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:

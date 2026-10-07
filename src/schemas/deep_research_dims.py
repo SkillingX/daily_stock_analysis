@@ -329,7 +329,10 @@ class CapitalDim(DimEnvelope):
     flow_score: Optional[float] = Field(None, ge=0, le=100)
     institution_summary: str = ""
     institution_score: Optional[float] = Field(None, ge=0, le=100)
-    chip_summary: Optional[Dict[str, Any]] = Field(default=None)
+    chip_summary: Optional[str] = None
+    """筹码摘要文本：LLM 返回 dict（{text, status}）由 ``_coerce_researcher_value``
+    提取 ``text`` 子字段；schema 用 str 与精校后路径一致（Pydantic strict 模式
+    拒绝 dict→str 隐式转换，必须在精校阶段定型）。"""
     chip_score: Optional[float] = Field(None, ge=0, le=100)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""

@@ -652,7 +652,8 @@ class PortfolioRepository:
             ]
             if not candidates:
                 return None
-            return min(candidates)
+            result: Optional[date] = min(candidates)  # type: ignore[assignment]
+            return result
 
     def query_trades(
         self,

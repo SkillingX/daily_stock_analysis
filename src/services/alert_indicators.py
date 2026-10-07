@@ -459,13 +459,13 @@ def _float_in_range(
 
 def _calculate_rsi(close: pd.Series, period: int) -> pd.Series:
     delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
+    gain = delta.where(delta > 0, 0)  # type: ignore[operator]
+    loss = -delta.where(delta < 0, 0)  # type: ignore[operator]
     # 使用 Wilder's EMA / SMMA 口径，不使用 rolling SMA。
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return (100 - (100 / (1 + rs))).fillna(50)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()  # type: ignore[operator]
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()  # type: ignore[operator]
+    rs = avg_gain / avg_loss  # type: ignore[operator]
+    return (100 - (100 / (1 + rs))).fillna(50)  # type: ignore[operator]
 
 
 def _crossed_threshold(

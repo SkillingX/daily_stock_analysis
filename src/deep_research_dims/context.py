@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
         if df is None or df.empty:
             ctx.limitation("日线历史数据缺失")
             return []
-        records = df.tail(days).to_dict(orient="records")
+        records: List[Dict[str, Any]] = df.tail(days).to_dict(orient="records")  # type: ignore[assignment]
         for r in records:
             if "date" in r:
                 r["date"] = str(r["date"])
@@ -193,7 +193,12 @@ def _safe_chip(code: str, ctx: SharedContext) -> Dict[str, Any]:
             ctx.limitation("筹码分布数据缺失")
             return {}
         data = getattr(dist, "to_dict", None)
-        return data() if callable(data) else dict(dist) if isinstance(dist, dict) else {}
+        result: Dict[str, Any] = {}
+        if callable(data):
+            result = data()  # type: ignore[assignment]
+        elif isinstance(dist, dict):
+            result = dict(dist)
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 筹码装配失败 %s: %s", code, exc)
         ctx.limitation(f"筹码分布装配失败: {exc}")

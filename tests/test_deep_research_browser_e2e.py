@@ -20,6 +20,10 @@ from datetime import datetime
 
 import pytest
 
+# 整个文件依赖 playwright fixture + 真实网络（https://agentrade.space）；
+# 缺少 playwright 包时跳过所有测试，避免 fixture 解析报错污染 CI 离线套件。
+pytest.importorskip("playwright", reason="browser e2e requires playwright + live URL")
+
 BASE_URL = "https://agentrade.space"
 STOCK_CODE = "600519"  # 贵州茅台
 

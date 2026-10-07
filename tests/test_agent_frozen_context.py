@@ -119,11 +119,17 @@ class DesktopBackendPackagingAssetsTestCase(unittest.TestCase):
         strategies_dir = self.repo_root / "strategies"
         strategy_names = sorted(path.stem for path in strategies_dir.glob("*.yaml"))
 
-        self.assertEqual(len(strategy_names), 15)
+        # 16 = frozen count (11 at 2026-04-15 freeze) + 4 added 2026-05-17
+        # (event_driven / expectation_repricing / growth_quality / hot_theme)
+        # + 1 added 2026-09-12 (midtrend_compass)
+        # Update this count whenever a new built-in strategy is added so the
+        # desktop PyInstaller bundle stays in sync.
+        self.assertEqual(len(strategy_names), 16)
         self.assertIn("bottom_volume", strategy_names)
         self.assertIn("chan_theory", strategy_names)
         self.assertIn("ma_golden_cross", strategy_names)
         self.assertIn("wave_theory", strategy_names)
+        self.assertIn("midtrend_compass", strategy_names)
 
     def test_backend_pyinstaller_scripts_include_strategies_data_directory(self):
         macos_script = (self.repo_root / "scripts" / "build-backend-macos.sh").read_text(

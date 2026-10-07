@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 from src.config import get_config
 from src.services.stock_code_utils import normalize_code
@@ -417,7 +417,7 @@ class DeepResearchService:
             if dims_path.exists():
                 import json
 
-                return json.loads(dims_path.read_text(encoding="utf-8"))
+                return cast(Dict[str, Any], json.loads(dims_path.read_text(encoding="utf-8")))
         except (OSError, ValueError) as exc:
             logger.warning("[DeepResearch] 读取维度产物失败 %s: %s", dims_path, exc)
         return None

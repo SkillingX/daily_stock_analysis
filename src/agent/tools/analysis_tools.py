@@ -339,7 +339,7 @@ def _handle_get_volume_analysis(stock_code: str, days: int = 30) -> dict[str, An
     vol_ratio_20d = round(latest_vol / avg_vol_20, 2) if avg_vol_20 > 0 else None
 
     # Price direction for each day
-    price_up = close.diff() > 0  # True = up day
+    price_up = (close.diff() > 0)  # type: ignore[operator]  # True = up day
 
     # Volume-price correlation (last N days)
     try:

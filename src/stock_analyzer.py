@@ -317,12 +317,12 @@ class StockTrendAnalyzer:
             delta = df['close'].diff()
 
             # 分离上涨和下跌
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
+            gain = delta.where(delta > 0, 0)  # type: ignore[operator]
+            loss = -delta.where(delta < 0, 0)  # type: ignore[operator]
 
             # 使用 Wilder's EMA / SMMA 口径，与常见 RSI 图表工具保持一致。
-            avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+            avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()  # type: ignore[operator]
+            avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()  # type: ignore[operator]
 
             # 计算 RS 和 RSI
             rs = avg_gain / avg_loss

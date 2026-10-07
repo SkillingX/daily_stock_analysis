@@ -33,6 +33,8 @@ def _load_table() -> Dict[str, Any]:
         except (OSError, ValueError) as exc:
             logger.warning("[BaseRate] 基率表读取失败 %s: %s", _BASE_RATES_PATH, exc)
             _cache = {"rates": [], "default": {"base_rate": 0.5}}
+    # _cache 初始化为 None，但此处已被 if 分支保证赋值；断言避免 type ignore 噪音
+    assert _cache is not None
     return _cache
 
 

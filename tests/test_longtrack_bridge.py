@@ -387,9 +387,9 @@ class TestFinalConclusion:
 
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=_Adapter(), force_refresh=True)
         assert "总评分 50 分" in result.final_conclusion
-        # v2：终读结论文本进「二、怎么在这只票上赚到钱」
+        # v2：终读结论文本进「一、结论」（template v2 重构后 §1 = 结论）
         assert "总评分 50 分" in result.markdown
-        assert "## 二、怎么在这只票上赚到钱" in result.markdown
+        assert "## 一、结论" in result.markdown
         # 数字注入式：事实面含评分与行动
         assert captured.get("total_score") is not None
         assert captured.get("action") in ("建仓", "加仓", "持有", "减仓", "止损", "观察")
@@ -415,8 +415,8 @@ class TestFinalConclusion:
         orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=None, force_refresh=True)
         assert result.final_conclusion == ""
-        # 模板回退：无 LLM 时第二节仍渲染（信号一句话兜底）
-        assert "## 二、怎么在这只票上赚到钱" in result.markdown
+        # 模板回退：无 LLM 时第一节仍渲染（信号一句话兜底）
+        assert "## 一、结论" in result.markdown
 
 
 class TestResearcherParseCoercion:

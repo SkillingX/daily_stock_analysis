@@ -3324,9 +3324,6 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Storage] list_score_journal failed: %s", exc)
             return []
-        except Exception as exc:
-            logger.error("prune_deep_research_reports failed: %s", exc)
-            return []
 
     # ==================================================================
     # 政策与公告双维度排雷（PolicyMinesweeper）CRUD
@@ -3652,19 +3649,6 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 .all()
             )
             return list(rows), int(total)
-
-    def get_latest_supply_chain_report_by_stock(
-        self, stock_code: str,
-    ) -> Optional[SupplyChainReport]:
-        """按股票取最新供应链专项报告（产业链研究员复用：有则直取）。"""
-        with self.get_session() as session:
-            row = session.execute(
-                select(SupplyChainReport)
-                .where(SupplyChainReport.stock_code == stock_code)
-                .order_by(desc(SupplyChainReport.created_at))
-                .limit(1)
-            ).scalars().first()
-            return row
 
     def get_supply_chain_report(self, report_id: str) -> Optional[SupplyChainReport]:
         """按主键查询单条报告。"""
