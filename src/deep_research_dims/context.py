@@ -77,9 +77,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     行情/日线/筹码刻意不缓存（价格数据必须新鲜）；基本面缓存失败不缓存，
     保留下次重试机会。
     """
-    from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
+    from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
 
-    cache_key = f"stage0_fund_v2_{code}"
+    cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     if cached is not None:
         return cached

@@ -2845,7 +2845,8 @@ class DataFetcherManager:
             return normalized not in ("", "-", "nan", "none", "null", "n/a", "na")
         if isinstance(payload, dict):
             return any(
-                DataFetcherManager._has_meaningful_payload(v) for v in payload.values()
+                DataFetcherManager._has_meaningful_payload(v)
+                for key, v in payload.items() if key != "report_date"
             )
         if isinstance(payload, pd.DataFrame):
             if payload.empty:
