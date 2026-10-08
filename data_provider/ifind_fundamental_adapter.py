@@ -27,10 +27,10 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading
+from .cross_source_validator import AnchorReading, caliber_from_label, observation_time_from_fields, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -126,23 +126,16 @@ _PERIOD_FIELDS = {
     "revenue_yoy",
     "net_profit_yoy",
 }
-# iFinD PE/PB 口径
-_CALIBERS: Dict[str, Optional[str]] = {
-    "pe_ratio": "TTM",
-    "pb_ratio": "TTM",
-}
-
-
 # ------------------------------------------------------------------
 # 解析（纯函数，100% 可单测）
 # ------------------------------------------------------------------
 
 
-def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
+def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
     """从 iFinD ``data.answer`` Markdown 表格中提取「表头: 值」映射。
 
     表格格式（Phase 0 实测）：``|表头1|表头2|...|\n|---|---|---|\n|值1|值2|...|``
-    仅解析第一行数据（最新值），忽略参数信息段。
+    指期优先，否则选已确认最新期；没有期间证据时保留首个独立观测且不推断日期。
     """
     lines = text.strip().splitlines()
     if not lines:
@@ -155,10 +148,12 @@ def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
             break
     if sep_idx < 0:
         return {}
-    headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-    result: Dict[str, str] = {}
+    headers = [h.strip() for h in lines[sep_idx - 1].strip().strip("|").split("|")]
+    rows: List[Dict[str, str]] = []
     for row in lines[sep_idx + 1 :]:
-        cells = [c.strip() for c in row.split("|") if c.strip()]
+        if not row.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
         if not cells or cells[0] in (
             "# 指标参数信息",
             "# 行情衍生指标日期提示",
@@ -166,11 +161,11 @@ def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
             "",
         ):
             continue  # pragma: no cover — Phase 0 响应参数段在表格外，数据行先触发 break
-        for i, cell in enumerate(cells):
-            if i < len(headers):
-                result[headers[i]] = cell
-        break  # 只取第一行数据
-    return result
+        rows.append(dict(zip(headers, cells)))
+    if keywords is not None:
+        rows = [row for row in rows if _extract_ifind_value(row, keywords)[0] is not None]
+    selected = select_report_period([report_period_from_fields(row) for row in rows], period)
+    return rows[selected if selected is not None else 0] if rows else {}
 
 
 def _parse_ifind_markdown_series(
@@ -291,17 +286,21 @@ def _parse_ifind_response(
         if isinstance(resp_json, dict)
         else str(raw_text)
     )
-    table = _parse_ifind_markdown_table(answer)
+    table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords)
     if not table:
         return None
-    value, _col = _extract_ifind_value(table, keywords)
+    value, col = _extract_ifind_value(table, keywords)
     if value is None:
         return None
+    actual, basis = report_period_from_fields(table, col)
     return AnchorReading(
         source="ifind",
         value=value,
-        caliber=_CALIBERS.get(field),
-        period=period if field in _PERIOD_FIELDS else None,
+        caliber=caliber_from_label(field, col),
+        period=actual if field in _PERIOD_FIELDS else None,
+        period_basis=basis if field in _PERIOD_FIELDS else "unknown",
+        requested_period=period if field in _PERIOD_FIELDS else None,
+        observed_at=observation_time_from_fields(table), fetched_at=table.get("fetched_at"),
     )
 
 
@@ -625,9 +624,4 @@ class IfindSource:
             return None
         if reading is None:
             return None
-        return AnchorReading(
-            source="ifind",
-            value=reading.value,
-            caliber=_CALIBERS.get(field, reading.caliber),
-            period=period if field in _PERIOD_FIELDS else reading.period,
-        )
+        return replace(reading, source="ifind", requested_period=reading.requested_period if reading.requested_period is not None else period if field in _PERIOD_FIELDS else None)

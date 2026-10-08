@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -33,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .cross_source_validator import AnchorReading
+from .cross_source_validator import AnchorReading, caliber_from_label, observation_time_from_fields, report_period_from_fields, select_report_period
 from .ifind_fundamental_adapter import _safe_float
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ class FuyaoItem(BaseModel):
     缺失字段让 AnchorReading 走 None；数值统一由 :func:`_safe_float` 转 float。
     """
 
-    model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, extra="ignore")
 
     thscode: str = Field(..., description="带交易所后缀的标的符号")
     report: Optional[str] = Field(default=None, description="fuyao YYYY-N 期间编码")
@@ -64,7 +64,7 @@ class FuyaoResponse(BaseModel):
     对 API 后续新增字段（如 ``timestamp``）保持容忍。
     """
 
-    model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, extra="ignore")
 
     code: int = Field(..., description="业务状态码；0 = success")
     message: str = Field(default="")
@@ -110,7 +110,7 @@ _ENDPOINT_BY_FIELD: Dict[str, _EndpointSpec] = {
 
 _CALIBERS: Dict[str, Optional[str]] = {
     "pe_ratio": "TTM",
-    "pb_ratio": "TTM",
+    "pb_ratio": "MRQ",
 }
 
 
@@ -223,6 +223,7 @@ def _parse_fuyao_response(
     spec = _endpoint_for(field)
     if spec is None:
         return None
+    readings: list[AnchorReading] = []
     for raw in items_raw:
         try:
             item = FuyaoItem.model_validate(raw)
@@ -231,13 +232,23 @@ def _parse_fuyao_response(
         value = _safe_float(item.fields.get(spec.item_key))
         if value is None:
             continue
-        return AnchorReading(
+        period_fields = dict(item.fields)
+        if item.report is not None:
+            encoded = re.fullmatch(r"(\d{4})-([1-4])", item.report)
+            report_label = f"{encoded[1]}{('一季报', '中报', '三季报', '年报')[int(encoded[2]) - 1]}" if encoded else item.report
+            period_fields.setdefault("report_period", report_label)
+        actual, basis = report_period_from_fields(period_fields, spec.item_key)
+        readings.append(AnchorReading(
             source="fuyao",
             value=value,
-            caliber=_CALIBERS.get(field),
-            period=period if spec.needs_period else None,
-        )
-    return None
+            caliber=_CALIBERS.get(field) or caliber_from_label(field, spec.item_key),
+            period=actual if spec.needs_period else None,
+            period_basis=basis if spec.needs_period else "unknown",
+            requested_period=period if spec.needs_period else None,
+            observed_at=observation_time_from_fields(item.fields), fetched_at=item.fields.get("fetched_at"),
+        ))
+    selected = select_report_period([(reading.period, reading.period_basis) for reading in readings], period)
+    return readings[selected if selected is not None else 0] if readings else None
 
 
 # ------------------------------------------------------------------
@@ -366,9 +377,4 @@ class FuyaoSource:
             return None
         if reading is None:
             return None
-        return AnchorReading(
-            source=self.name,
-            value=reading.value,
-            caliber=reading.caliber,
-            period=reading.period,
-        )
+        return replace(reading, source=self.name, requested_period=reading.requested_period if reading.requested_period is not None else period if field in _ENDPOINT_BY_FIELD and _ENDPOINT_BY_FIELD[field].needs_period else None)

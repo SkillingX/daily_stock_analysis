@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from typing import cast  # added by mypy_codemod
+from .cross_source_validator import normalize_report_period, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +142,10 @@ def _select_financial_row(df: pd.DataFrame, stock_code: str) -> Tuple[Optional[p
     """Select one confirmed latest period for either supported financial table shape."""
     if "指标" in df.columns:
         periods = {col: _normalize_report_date(col) for col in df.columns if col not in ("指标", "选项")}
-        dated = [(col, period) for col, period in periods.items() if period is not None]
-        if dated:
-            column, actual_period = max(dated, key=lambda item: item[1])
+        position = select_report_period([normalize_report_period(col) for col in periods])
+        if position is not None:
+            column = list(periods)[position]
+            actual_period = periods[column]
         elif len(periods) == 1:
             column, actual_period = next(iter(periods)), None
         else:
@@ -155,12 +157,9 @@ def _select_financial_row(df: pd.DataFrame, stock_code: str) -> Tuple[Optional[p
         return None, None
     date_cols = [col for col in rows.columns if str(col) in (*_DIVIDEND_KEYWORD_MAP["report_date"], "日期")]
     if date_cols:
-        periods_by_row = rows[date_cols[0]].map(_normalize_report_date)
-        dated_rows = periods_by_row.notna()
-        if dated_rows.any():
-            # Positional selection also supports duplicate provider dataframe indices.
-            position = max((i for i in range(len(rows)) if dated_rows.iloc[i]), key=lambda i: periods_by_row.iloc[i])
-            return rows.iloc[position], periods_by_row.iloc[position]
+        position = select_report_period([normalize_report_period(value) for value in rows[date_cols[0]].tolist()])
+        if position is not None:
+            return rows.iloc[position], _normalize_report_date(rows.iloc[position][date_cols[0]])
     return (rows.iloc[0], None) if len(rows) == 1 else (None, None)
 
 
@@ -229,13 +228,7 @@ def _filter_rows_by_code(df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
 
 
 def _normalize_report_date(value: Any) -> Optional[str]:
-    text = str(value).strip()
-    if not re.fullmatch(r"\d{8}|\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T].*)?", text):
-        return None
-    if re.fullmatch(r"\d{8}", text):
-        value = f"{text[:4]}-{text[4:6]}-{text[6:]}"
-    parsed = _safe_datetime(value)
-    return parsed.date().isoformat() if parsed else None
+    return normalize_report_period(str(value) if isinstance(value, int) else value)[0]
 
 
 def _build_dividend_payload(

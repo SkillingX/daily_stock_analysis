@@ -2988,36 +2988,28 @@ class DataFetcherManager:
     def _derive_as_of_date(
         result_ctx: Dict[str, Any],
     ) -> Optional[str]:
-        """Compute the as-of date (``YYYY-MM-DD``) for a result context.
+        """Latest confirmed response period, without inferring dates from unrelated text."""
+        from .cross_source_validator import normalize_report_period, report_period_from_fields
 
-        The result context may carry an explicit ``as_of`` (set by the
-        iFinD / Tushare fallback adapter) which we normalise to
-        ``YYYY-MM-DD`` (the adapter emits ``YYYY1231``). When that is
-        missing we scan the block payloads for the most recent 4-digit
-        year and anchor it to ``YYYY-12-31``. Returns ``None`` when no
-        year can be derived at all.
-        """
-        explicit = result_ctx.get("as_of") if isinstance(result_ctx, dict) else None
-        if isinstance(explicit, str) and explicit:
-            text = explicit.strip()
-            if len(text) == 8 and text.isdigit():
-                # ``YYYYMMDD`` -> ``YYYY-MM-DD``
-                return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
-            if len(text) >= 7 and text[4:5] == "-" and text[6:7].isdigit():
-                return text[:10]
-        latest_year: Optional[int] = None
+        explicit, _basis = normalize_report_period(result_ctx.get("as_of"))
+        if explicit is not None:
+            return explicit
+        actual_dates: list[str] = []
         for block_name in ("earnings", "growth", "institution", "valuation"):
             block = result_ctx.get(block_name) if isinstance(result_ctx, dict) else None
             if not isinstance(block, dict):
                 continue
             data = block.get("data")
             if isinstance(data, dict) and data:
-                year = DataFetcherManager._scan_latest_year(data)
-                if year is not None and (latest_year is None or year > latest_year):
-                    latest_year = year
-        if latest_year is None:
-            return None
-        return f"{latest_year}-12-31"
+                actual, _basis = report_period_from_fields(data)
+                if actual is not None:
+                    actual_dates.append(actual)
+                report = data.get("financial_report")
+                if isinstance(report, dict):
+                    actual, _basis = report_period_from_fields(report)
+                    if actual is not None:
+                        actual_dates.append(actual)
+        return max(actual_dates) if actual_dates else None
 
     @staticmethod
     def _is_growth_block_thin(payload: Dict[str, Any]) -> bool:

@@ -75,7 +75,7 @@ class _FakeMXClient:
         self.calls.append(("snapshot", code))
         return self._snapshot
 
-    def query_financials(self, code, period):
+    def query_financials(self, code, period, field=None):
         self.calls.append(("financials", code, period))
         return self._financials
 
@@ -350,11 +350,11 @@ class TestMXSource(unittest.TestCase):
 
     def test_read_financial_field_carries_period(self):
         src = MXSource(
-            client=_FakeMXClient(available=True, financials={"营业收入": "1e10"})
+            client=_FakeMXClient(available=True, financials={"营业收入": "1e10", "_mx_period": "2024年报"})
         )
         r = src.read("600519", "revenue", period="2024年报")
         self.assertEqual(r.value, 1e10)
-        self.assertEqual(r.period, "2024年报")
+        self.assertEqual(r.period, "2024-12-31")
 
     def test_read_capital_field(self):
         src = MXSource(
@@ -395,7 +395,7 @@ class _PeriodFakeMXClient:
     def fetch_snapshot(self, code):
         return {}
 
-    def query_financials(self, code, period):
+    def query_financials(self, code, period, field=None):
         self.calls.append((code, period))
         return self._by_period.get(period, {})
 
@@ -451,7 +451,8 @@ class TestMXSourceGrowthFields(unittest.TestCase):
         self.assertIsInstance(r, AnchorReading)
         self.assertAlmostEqual(r.value, 15.38)
         self.assertEqual(r.source, "mx")
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
 
     def test_read_net_profit_yoy_missing_returns_none(self):
         # bundle 无净利润同比增长率列 → None
@@ -471,14 +472,14 @@ class TestMXSourcePeriodFallback(unittest.TestCase):
         client = _PeriodFakeMXClient(
             available=True,
             financials_by_period={
-                "2024年报": {"营业收入": "1e10"},
+                "2024年报": {"营业收入": "1e10", "_mx_period": "2024年报"},
                 None: {"营业收入": "9e9"},
             },
         )
         src = MXSource(client=client)
         r = src.read("600519", "revenue", period="2024年报")
         self.assertAlmostEqual(r.value, 1e10)
-        self.assertEqual(r.period, "2024年报")
+        self.assertEqual(r.period, "2024-12-31")
 
     def test_period_miss_falls_back_to_latest(self):
         # 指期 bundle 不含该字段 → 回退 None(latest)，period=None

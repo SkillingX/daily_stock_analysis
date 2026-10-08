@@ -17,12 +17,11 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import time
 from threading import Lock
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from .cross_source_validator import AnchorReading
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
 from typing import cast  # added by mypy_codemod
 
 logger = logging.getLogger(__name__)
@@ -153,39 +152,10 @@ def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[
     return None
 
 
-# MX 中文报告期 → YYYYMMDD（用于 as_of 透传）
-_PERIOD_RE = re.compile(r"(20\d{2})\s*(年\s*)?(一季报|中报|三季报|年报|年度|半年报)?")
-_PERIOD_TO_MONTHDAY = {
-    "一季报": "0331",
-    "中报": "0630",
-    "半年报": "0630",
-    "三季报": "0930",
-    "年报": "1231",
-    "年度": "1231",
-}
-
-
 def _cn_period_to_yyyymmdd(period: Any) -> Optional[str]:
-    """把 MX 中文报告期（如 ``'2026一季报'`` / ``'2025年报'``）转成 ``YYYYMMDD``。
-
-    返回 ``YYYYMMDD``（8 位紧凑格式），与 iFinD/Tushare adapter 的 ``as_of`` 格式一致。
-    必须包含「一季报/中报/半年报/三季报/年报/年度」其中一个报告期标识，否则返回 None。
-    """
-    if not isinstance(period, str):
-        return None
-    s = period.strip()
-    m = _PERIOD_RE.search(s)
-    if not m:
-        return None
-    year = int(m.group(1))
-    kind = m.group(3)
-    if kind and kind in _PERIOD_TO_MONTHDAY:
-        return f"{year}{_PERIOD_TO_MONTHDAY[kind]}"
-    if "年报" in s or "年度" in s:
-        return f"{year}1231"
-    if "中报" in s or "半年报" in s:
-        return f"{year}0630"
-    return None
+    """Compatibility format for actual response periods used by bundle adapters."""
+    actual, _basis = normalize_report_period(period)
+    return actual.replace("-", "") if actual is not None else None
 
 
 # ------------------------------------------------------------------
@@ -218,14 +188,11 @@ def _post(
     return {"error": last_err or "unknown"}
 
 
-def _extract_first_table_row(result: Any) -> Dict[str, Any]:
-    """从 MX query 响应提取首个表格的「指标→值」映射（取最新值）。best-effort。
+def _extract_first_table_row(result: Any, period: Optional[str] = None, field: Optional[str] = None) -> Dict[str, Any]:
+    """从首个 MX 表格读取同一实际期，指期优先、缺期回退已确认最新期。
 
-    MX 妙想 ``dataTableDTOList[0].table.headName`` 列顺序为「最新→最旧」，
-    例如 ``['2026一季报', '2025年报', '2025三季报', '2025中报', '2025一季报', '2024年报']``。
-    因此 ``values[0]`` 对应最新报告期，``values[-1]`` 对应最旧报告期。
-
-    同步透出 ``_mx_period``（最新列名）供上层 fallback 推导 ``as_of``。
+    按 headName 的实际日期选列，不假设源列顺序；_mx_period 是所选响应列，
+    无法辨认的日期保持未知。非期间型的单值表保留既有首观测读取行为。
     """
     if not isinstance(result, dict) or result.get("error"):
         return {}
@@ -247,6 +214,20 @@ def _extract_first_table_row(result: Any) -> Dict[str, Any]:
 
     head_name = table.get("headName") or []
     head_first = head_name[0] if isinstance(head_name, list) and head_name else None
+    position = 0
+    if isinstance(head_name, list):
+        periods = [normalize_report_period(label) for label in head_name]
+        if field is not None:
+            keywords = _FINANCIAL_FIELDS.get(field) or _GROWTH_FIELDS.get(field) or []
+            picker = _pick_growth_value if field in _GROWTH_FIELDS else _pick_value
+            for index in range(len(periods)):
+                candidate = {str(name_map.get(key) or key): values[index] for key, values in table.items() if key != "headName" and isinstance(values, list) and len(values) > index}
+                if picker(candidate, keywords) is None:
+                    periods[index] = (None, "unknown")
+        selected = select_report_period(periods, period)
+        if selected is not None:
+            position = selected
+        head_first = head_name[position] if head_name else None
 
     out: Dict[str, Any] = {
         "_mx_entity": dto.get("entityName") or "",
@@ -257,7 +238,7 @@ def _extract_first_table_row(result: Any) -> Dict[str, Any]:
             continue
         label = name_map.get(key) or name_map.get(str(key)) or str(key)
         if isinstance(values, list) and values:
-            out[str(label)] = values[0]  # MX headName 最新→最旧，取首列 = 最新
+            out[str(label)] = values[position] if position < len(values) else None
         else:
             out[str(label)] = values
     return out
@@ -310,13 +291,13 @@ class MXClient:
             self.query(f"{code} 最新价 总市值 流通市值 市盈率 市净率")
         )
 
-    def query_financials(self, code: str, period: Optional[str]) -> Dict[str, Any]:
+    def query_financials(self, code: str, period: Optional[str], field: Optional[str] = None) -> Dict[str, Any]:
         """财务指标：营收/归母净利润/ROE/毛利率/营收同比（带报告期）。"""
         suffix = f" {period}" if period else ""
         return _extract_first_table_row(
             self.query(
                 f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率{suffix}"
-            )
+            ), period=period, field=field
         )
 
     def query_capital(self, code: str) -> Dict[str, Any]:
@@ -350,56 +331,34 @@ class MXSource:
         if not self._client.available:
             return None
         try:
-            value, reading_period = self._fetch_field(code, field, period)
-        except Exception as exc:  # noqa: BLE001 — fail-open：MX 异常不影响其他源
+            picker = _pick_value
+            if field in _SNAPSHOT_FIELDS:
+                bundle, keywords = self._client.fetch_snapshot(code), _SNAPSHOT_FIELDS[field]
+            elif field in _PERIOD_FIELDS:
+                keywords = _FINANCIAL_FIELDS.get(field) or _GROWTH_FIELDS[field]
+                if field in _GROWTH_FIELDS:
+                    picker = _pick_growth_value
+                bundle = self._client.query_financials(code, period, field=field)
+                if period and picker(bundle, keywords) is None:
+                    bundle = self._client.query_financials(code, None, field=field)
+            elif field in _CAPITAL_FIELDS:
+                bundle, keywords = self._client.query_capital(code), _CAPITAL_FIELDS[field]
+            else:
+                return None
+            for label, raw in bundle.items():
+                value = picker({label: raw}, keywords)
+                if value is None:
+                    continue
+                actual, basis = report_period_from_fields({**bundle, "report_period": bundle.get("_mx_period")}, label) if field in _PERIOD_FIELDS else (None, "unknown")
+                observed = observation_time_from_fields(bundle, bundle.get("_mx_period") if field not in _PERIOD_FIELDS else None)
+                return AnchorReading(
+                    source=self.name, value=value,
+                    caliber=caliber_from_label(field, label),
+                    period=actual, period_basis=basis,
+                    requested_period=period if field in _PERIOD_FIELDS else None,
+                    observed_at=observed, fetched_at=bundle.get("fetched_at"),
+                )
+            return None
+        except Exception as exc:  # noqa: BLE001 — 单个源异常不影响其他源
             logger.debug("[MXSource] read %s/%s failed: %s", code, field, exc)
             return None
-        if value is None:
-            return None
-        return AnchorReading(
-            source=self.name,
-            value=value,
-            caliber=None,  # MX 自然语言口径不稳定，留 None（validator 不会误判）
-            period=reading_period,
-        )
-
-    def _fetch_field(
-        self, code: str, field: str, period: Optional[str]
-    ) -> Tuple[Optional[float], Optional[str]]:
-        """返回 (value, period)。按字段类别选 query。"""
-        if field in _SNAPSHOT_FIELDS:
-            return _pick_value(
-                self._client.fetch_snapshot(code), _SNAPSHOT_FIELDS[field]
-            ), None
-        if field in _FINANCIAL_FIELDS:
-            return self._fetch_financial_value(
-                code, _FINANCIAL_FIELDS[field], _pick_value, period
-            )
-        if field in _GROWTH_FIELDS:
-            return self._fetch_financial_value(
-                code, _GROWTH_FIELDS[field], _pick_growth_value, period
-            )
-        if field in _CAPITAL_FIELDS:
-            return _pick_value(
-                self._client.query_capital(code), _CAPITAL_FIELDS[field]
-            ), None
-        return None, None
-
-    def _fetch_financial_value(
-        self,
-        code: str,
-        keywords: List[str],
-        picker: Callable[[Dict[str, Any], List[str]], Optional[float]],
-        period: Optional[str],
-    ) -> Tuple[Optional[float], Optional[str]]:
-        """财务/增长字段取值：带 period 优先按期查，取不到回退最新(period=None)。
-
-        回退保证 MX「最新」可靠路径不丢失（小盘股指定期数据可能缺失）；
-        回退后 period=None，validator 报告期检查会跳过（任一 None 即跳过），
-        仍可走数值比对，不触发「报告期不一致」，也不丢 MX 当前可用的最新值。
-        """
-        if period:
-            val = picker(self._client.query_financials(code, period), keywords)
-            if val is not None:
-                return val, period
-        return picker(self._client.query_financials(code, None), keywords), None

@@ -25,8 +25,10 @@ import logging
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
+from dataclasses import dataclass, replace
+from datetime import date, datetime
+from typing import Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
+from icontract import ensure
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,102 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 MODE_NUMERIC = "numeric"  # 数值容差比对（PE/PB/市值/营收/净利/ROE/当前价/融资余额）
 MODE_DIRECTION = "direction"  # 方向+量级比对（主力净流入；两源算法口径不同）
+PeriodBasis = Literal["annual", "YTD", "single_quarter", "unknown"]
+FINANCIAL_ANCHORS = frozenset({"revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy"})
+
+
+def normalize_report_period(value: object) -> tuple[Optional[str], PeriodBasis]:
+    """Normalize an explicit response period; query text is never period evidence."""
+    if isinstance(value, (date, datetime)):
+        return value.strftime("%Y-%m-%d"), "unknown"
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str):
+        return None, "unknown"
+    text = value.strip()
+    chinese = re.fullmatch(r"(\d{4})\s*(?:年\s*)?(一季报|一季度报告|中报|半年报|半年度报告|三季报|三季度报告|年报|年度|年度报告)", text)
+    if chinese:
+        suffix = {"一季报": "03-31", "一季度报告": "03-31", "中报": "06-30", "半年报": "06-30", "半年度报告": "06-30", "三季报": "09-30", "三季度报告": "09-30", "年报": "12-31", "年度": "12-31", "年度报告": "12-31"}[chinese[2]]
+        return f"{chinese[1]}-{suffix}", "annual" if suffix == "12-31" else "YTD"
+    pieces = text.split()
+    basis: PeriodBasis = "unknown"
+    if len(pieces) == 2 and pieces[1] in ("annual", "YTD", "single_quarter"):
+        basis = pieces[1]  # type: ignore[assignment]
+        text = pieces[0]
+    if re.fullmatch(r"\d{8}", text):
+        text = f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})([ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?", text)
+    if match is None:
+        return None, "unknown"
+    try:
+        parsed = datetime.fromisoformat(f"{match[1]}-{int(match[2]):02d}-{int(match[3]):02d}{match[4] or ''}")
+    except ValueError:
+        return None, "unknown"
+    return parsed.date().isoformat(), basis
+
+
+def report_period_from_fields(fields: Dict[str, Any], label: str = "") -> tuple[Optional[str], PeriodBasis]:
+    """Read explicit response metadata, excluding request/query text."""
+    raw = next((fields[key] for key in ("period_end", "report_period", "报告期", "期末日期", "report_date", "报告日期") if fields.get(key) is not None), None)
+    actual, basis = normalize_report_period(raw)
+    explicit = fields.get("period_basis")
+    if explicit is None:
+        if "单季" in label or "single_quarter" in label:
+            explicit = "single_quarter"
+        elif "累计" in label or "YTD" in label:
+            explicit = "YTD"
+    if explicit == "annual":
+        basis = "annual"
+    elif explicit in ("YTD", "累计"):
+        basis = "YTD"
+    elif explicit in ("single_quarter", "单季"):
+        basis = "single_quarter"
+    return actual, basis
+
+
+def observation_time_from_fields(fields: Dict[str, Any], column: object = None) -> Optional[str]:
+    """Keep supplier observation timestamps separate from financial report dates."""
+    value = next((fields[key] for key in ("observed_at", "provider_timestamp", "数据时间", "时间", "日期") if fields.get(key) is not None), None)
+    if value is not None:
+        return str(value)
+    if isinstance(column, str):
+        actual, basis = normalize_report_period(re.sub(r"[（(]日[）)]$", "", column))
+        if actual is not None and basis == "unknown":
+            return column
+    return None
+
+
+def select_report_period(periods: Sequence[tuple[Optional[str], PeriodBasis]], requested: Optional[str] = None) -> Optional[int]:
+    """Select a confirmed requested period, otherwise the confirmed latest period."""
+    confirmed = [(i, end, basis) for i, (end, basis) in enumerate(periods) if end is not None]
+    target, target_basis = normalize_report_period(requested)
+    matches = [item for item in confirmed if item[1] == target and (target_basis == "unknown" or item[2] in (target_basis, "unknown"))]
+    if matches:
+        return matches[0][0]
+    return max(confirmed, key=lambda item: item[1])[0] if confirmed else None
+
+
+def caliber_from_label(field: str, label: str) -> Optional[str]:
+    """Use the returned field identity, never the natural-language request."""
+    if field == "pe_ratio":
+        return "TTM" if any(marker in label.upper() for marker in ("TTM", "滚动")) else None
+    if field == "pb_ratio":
+        return "MRQ" if "MRQ" in label.upper() else None
+    if field in {"net_profit", "net_profit_yoy"}:
+        if any(marker in label for marker in ("扣非", "扣除")):
+            return None
+        if any(marker in label for marker in ("归母", "母公司股东", "母公司所有者", "parent_holder")):
+            return "parent_net_profit_yoy" if field.endswith("yoy") else "parent_net_profit"
+        return None
+    if field == "roe":
+        return "weighted_roe" if any(marker in label.lower() for marker in ("加权", "weighted")) else None
+    if field == "gross_margin":
+        return "gross_margin" if "毛利率" in label or label == "gross_margin" else None
+    if field in {"revenue", "revenue_yoy"}:
+        if any(marker in label for marker in ("营业总收入", "营业收入", "营收")):
+            stem = "total_operating_revenue" if "营业总收入" in label else "operating_revenue"
+            return stem + "_yoy" if field.endswith("yoy") else stem
+    return None
 
 
 @dataclass(frozen=True)
@@ -89,6 +187,16 @@ class AnchorReading:
     value: float
     caliber: Optional[str] = None  # 口径，如 "TTM"/"static"；None=未知/不适用
     period: Optional[str] = None  # 报告期，如 "2024年报"；None=不适用（行情/资金）
+    requested_period: Optional[str] = None
+    period_basis: PeriodBasis = "unknown"
+    observed_at: Optional[str] = None
+    fetched_at: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        actual, inferred_basis = normalize_report_period(self.period)
+        object.__setattr__(self, "period", actual)
+        if self.period_basis == "unknown":
+            object.__setattr__(self, "period_basis", inferred_basis)
 
 
 @dataclass(frozen=True)
@@ -104,6 +212,10 @@ class AnchorVerification:
     caliber: Optional[str] = None
     period: Optional[str] = None
     note: str = ""
+    requested_period: Optional[str] = None
+    period_basis: PeriodBasis = "unknown"
+    observed_at: Optional[str] = None
+    fetched_at: Optional[str] = None
 
     def to_compact(self) -> Dict[str, Any]:
         """压缩为 LLM 友好的 dict（省 token）。"""
@@ -118,6 +230,14 @@ class AnchorVerification:
             payload["caliber"] = self.caliber
         if self.period:
             payload["period"] = self.period
+        if self.requested_period is not None:
+            payload["requested_period"] = self.requested_period
+        if self.period is not None:
+            payload["period_basis"] = self.period_basis
+        if self.observed_at is not None:
+            payload["observed_at"] = self.observed_at
+        if self.fetched_at is not None:
+            payload["fetched_at"] = self.fetched_at
         if self.note:
             payload["note"] = self.note
         return payload
@@ -187,6 +307,17 @@ def _magnitude_tier(value: float) -> int:
     return int(math.floor(math.log10(abs(value))))
 
 
+@ensure(
+    lambda result, primary, secondary, spec, tertiary:
+    result.confidence != "high" or spec.field not in FINANCIAL_ANCHORS or all(
+        reading is None or (
+            reading.period is not None and reading.period == primary.period
+            and reading.period_basis != "unknown" and reading.period_basis == primary.period_basis
+            and reading.caliber is not None and reading.caliber == primary.caliber
+        ) for reading in (primary, secondary, tertiary)
+    ),
+    "Strict financial agreement requires the same confirmed period, basis and metric definition",
+)
 def _judge_numeric(
     primary: AnchorReading,
     secondary: AnchorReading,
@@ -200,6 +331,29 @@ def _judge_numeric(
       - (primary, secondary) 不一致 + tertiary 与任一方一致 → medium（少数派标记为 outlier）
       - 三源两两都不一致 → low（3-way 真冲突）
     """
+    readings = (primary, secondary) if tertiary is None else (primary, secondary, tertiary)
+    reason = ""
+    if spec.field in FINANCIAL_ANCHORS:
+        if any(reading.period is None for reading in readings):
+            reason = "实际报告期未知"
+        elif len({reading.period for reading in readings}) > 1:
+            reason = "实际报告期不一致"
+        elif any(reading.period_basis == "unknown" for reading in readings):
+            reason = "累计/单季期间口径未知"
+        elif len({reading.period_basis for reading in readings}) > 1:
+            reason = "累计/单季期间口径不一致"
+        elif any(reading.caliber is None for reading in readings):
+            reason = "指标口径未知"
+        elif len({reading.caliber for reading in readings}) > 1:
+            reason = "指标口径不一致"
+    elif spec.field in {"pe_ratio", "pb_ratio"} and any(reading.caliber is None for reading in readings):
+        reason = "估值口径未知"
+    if reason:
+        return AnchorVerification(
+            field=spec.field, value=primary.value, confidence="medium",
+            sources=tuple(reading.source for reading in readings), agreed=False,
+            caliber=primary.caliber, period=primary.period, note=f"不可比：{reason}",
+        )
     diff = _discrepancy_pct(primary.value, secondary.value)
 
     # 口径检查（仅 caliber_aware 且两源都带口径时启用）
@@ -220,20 +374,6 @@ def _judge_numeric(
             period=primary.period,
             note=f"口径不一致（{primary.source}={primary.caliber}/"
             f"{secondary.source}={secondary.caliber}），未做数值比对",
-        )
-
-    # 报告期检查（两源都带期且不同）
-    if primary.period and secondary.period and primary.period != secondary.period:
-        return AnchorVerification(
-            field=spec.field,
-            value=primary.value,
-            confidence="medium",
-            sources=(primary.source, secondary.source),
-            agreed=False,
-            discrepancy_pct=diff,
-            caliber=primary.caliber,
-            period=primary.period,
-            note=f"报告期不一致（{primary.period}/{secondary.period}），未做数值比对",
         )
 
     # 容差比对（primary vs secondary）
@@ -516,16 +656,21 @@ class CrossSourceValidator:
 
         if not readings:
             return _judge_missing(field)
+        primary = readings[0]
         if len(readings) == 1:
-            return _judge_single(readings[0], spec.field)
+            result = _judge_single(readings[0], spec.field)
+        else:
+            primary, secondary = readings[0], readings[1]
+            tertiary = readings[2] if len(readings) >= 3 else None
+            if spec.mode == MODE_DIRECTION:
+                result = _judge_direction(primary, secondary, spec.field, tertiary=tertiary)
+            else:
+                result = _judge_numeric(primary, secondary, spec, tertiary=tertiary)
 
-        # 双源及以上：primary = readings[0]，secondary = readings[1]；
-        # tertiary = readings[2]（当存在时进入 3-way majority vote，否则 2-source 行为不变）。
-        primary, secondary = readings[0], readings[1]
-        tertiary = readings[2] if len(readings) >= 3 else None
-        if spec.mode == MODE_DIRECTION:
-            return _judge_direction(primary, secondary, spec.field, tertiary=tertiary)
-        return _judge_numeric(primary, secondary, spec, tertiary=tertiary)
+        return replace(
+            result, requested_period=primary.requested_period, period_basis=primary.period_basis,
+            observed_at=primary.observed_at, fetched_at=primary.fetched_at,
+        )
 
     def _collect(
         self, code: str, field: str, period: Optional[str]

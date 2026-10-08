@@ -90,7 +90,7 @@ class TestJudgeNumeric(unittest.TestCase):
 
     def test_low_when_over_tolerance(self):
         v = _judge_numeric(
-            _reading("mx", 30.0), _reading("ifind", 40.0), self._spec(tol=10.0)
+            _reading("mx", 30.0, "TTM"), _reading("ifind", 40.0, "TTM"), self._spec(tol=10.0)
         )
         self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
@@ -105,9 +105,9 @@ class TestJudgeNumeric(unittest.TestCase):
 
     def test_medium_when_period_mismatch(self):
         v = _judge_numeric(
-            _reading("mx", 100, period="2024年报"),
-            _reading("ifind", 100, period="2024三季报"),
-            self._spec(),
+            _reading("mx", 100, "operating_revenue", "2024年报"),
+            _reading("ifind", 100, "operating_revenue", "2024三季报"),
+            AnchorSpec("revenue", MODE_NUMERIC, 3.0),
         )
         self.assertEqual(v.confidence, "medium")
         self.assertIn("报告期不一致", v.note)
@@ -120,12 +120,12 @@ class TestJudgeNumeric(unittest.TestCase):
         )
         self.assertEqual(v.confidence, "high")
 
-    def test_caliber_check_skipped_when_one_side_none(self):
-        # 一方无口径：不触发口径检查，继续数值比对
+    def test_unknown_valuation_caliber_prevents_strict_verification(self):
         v = _judge_numeric(
             _reading("mx", 30.0, "TTM"), _reading("ifind", 30.1, None), self._spec()
         )
-        self.assertEqual(v.confidence, "high")
+        self.assertEqual(v.confidence, "medium")
+        self.assertFalse(v.agreed)
 
     def test_three_way_all_agree_high(self):
         """3源全部在容差内一致 → high（含 tertiary 的 sources tuple）。"""
@@ -170,10 +170,10 @@ class TestJudgeNumeric(unittest.TestCase):
     def test_three_way_all_disagree_low(self):
         """3源两两都不一致 → low（3-way 真冲突）。"""
         v = _judge_numeric(
-            _reading("mx", 30.0),
-            _reading("ifind", 50.0),
+            _reading("mx", 30.0, "TTM"),
+            _reading("ifind", 50.0, "TTM"),
             self._spec(tol=10.0),
-            tertiary=_reading("mx_mcp", 70.0),
+            tertiary=_reading("mx_mcp", 70.0, "TTM"),
         )
         self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
@@ -393,9 +393,9 @@ class TestCrossSourceValidator(unittest.TestCase):
 
     def test_verify_three_sources_three_way_disagreement_low(self):
         """3 源：3-way 真冲突 → low。"""
-        mx = _FakeSource("mx", {"pe_ratio": _reading("mx", 30.0)})
-        ifind = _FakeSource("ifind", {"pe_ratio": _reading("ifind", 50.0)})
-        mx_mcp = _FakeSource("mx_mcp", {"pe_ratio": _reading("mx_mcp", 70.0)})
+        mx = _FakeSource("mx", {"pe_ratio": _reading("mx", 30.0, "TTM")})
+        ifind = _FakeSource("ifind", {"pe_ratio": _reading("ifind", 50.0, "TTM")})
+        mx_mcp = _FakeSource("mx_mcp", {"pe_ratio": _reading("mx_mcp", 70.0, "TTM")})
         v = CrossSourceValidator(sources=[mx, ifind, mx_mcp])
         result = v.verify("600519", "pe_ratio")
         self.assertEqual(result.confidence, "low")
@@ -428,14 +428,14 @@ class TestCrossSourceValidator(unittest.TestCase):
         self.assertEqual(result.sources, ("mx", "ifind"))  # tertiary 被 _collect 过滤掉
 
     def test_verify_period_passed_through(self):
-        mx = _FakeSource("mx", {"revenue": _reading("mx", 1e10, None, "2024年报")})
+        mx = _FakeSource("mx", {"revenue": _reading("mx", 1e10, "operating_revenue", "2024年报")})
         ifind = _FakeSource(
-            "ifind", {"revenue": _reading("ifind", 1.02e10, None, "2024年报")}
+            "ifind", {"revenue": _reading("ifind", 1.02e10, "operating_revenue", "2024年报")}
         )
         v = CrossSourceValidator(sources=[mx, ifind])
         result = v.verify("600519", "revenue", period="2024年报")
         self.assertEqual(result.confidence, "high")
-        self.assertEqual(result.period, "2024年报")
+        self.assertEqual(result.period, "2024-12-31")
 
     def test_verify_exception_isolation_one_source_booms(self):
         # mx 抛异常，ifind 正常 → 退化为单源 medium，不崩
