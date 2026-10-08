@@ -48,10 +48,10 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 7  # v7：BusinessDim 四字段真正落 Dict 注解（v6 仅注释漂移）；v6=18 维研究员 payload
+SCHEMA_VERSION = 7  # BusinessDim 四字段为 Dict；F1结构仅由财务mapping版本隔离
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 8  # 逐字段补缺与真实阶段预算，不复用旧部分块
+FUNDAMENTAL_MAPPING_VERSION = 9  # F1逐字段品质及评分资格，旧无品质缓存拒读
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 
@@ -76,6 +76,8 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
     if dim in _FUNDAMENTAL_MAPPING_DIMS:
         from src.config import get_config
+        if get_config().deep_research_cross_validate:
+            return None  # 本次核验依赖当前读数，不能复用以前的high或派生评分
         if record.get("cross_validation_enabled") != bool(get_config().deep_research_cross_validate):
             return None
     saved_at = str(record.get("saved_at") or "")

@@ -171,7 +171,9 @@ class TestValuationBasis:
         assert dim.valuation_basis == "PB"
 
     def test_profit_maker_uses_pe(self):
-        dim = build_scenarios_dim(_ctx(), current_price=13.0)
+        ctx = _ctx()
+        ctx.fundamental["field_meta"] = {"pe_ratio": {"source": "mx", "value": ctx.fundamental["pe_ttm"], "caliber": "TTM", "unit": "multiple"}}
+        dim = build_scenarios_dim(ctx, current_price=13.0)
         assert dim.valuation_basis == "PE_TTM"
         assert dim.probability_sum == pytest.approx(1.0)
 
@@ -583,7 +585,7 @@ class TestSnapshotCache:
         monkeypatch.delenv("FUYAO_API_KEY", raising=False)
 
         class _Fund:
-            def get_fundamental_context(self, code):
+            def get_fundamental_context(self, code, budget_seconds=None):
                 return {"valuation": {"data": {}}, "financial": {"data": {}}}
 
         monkeypatch.setattr(

@@ -118,6 +118,18 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def report_markdown(record: Dict[str, Any]) -> str:
+    """Read historical files without rewriting them; legacy quality remains unknown."""
+    try:
+        markdown = Path(record["md_path"]).read_text(encoding="utf-8")
+    except OSError:
+        markdown = ""
+    dims = json.loads(record.get("dims_json") or "{}")
+    if not (dims.get("financial") or {}).get("data_quality"):
+        markdown = "> 财务数据未核验：历史报告没有字段质量证据，不能认定已验证。\n\n" + markdown
+    return markdown
+
+
 def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
     """生成基本面专项报告（经营模式/主营产品/行业地位/龙头与大盘对比 + 财务体检）。"""
     from src.agent.tools.data_tools import _get_fetcher_manager
@@ -143,10 +155,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
     # 当天已生成过则直接返回已有报告，避免重复
     existing = _same_day_dedup_report(code)
     if existing is not None:
-        try:
-            md = Path(existing["md_path"]).read_text(encoding="utf-8")
-        except OSError:
-            md = ""
+        md = report_markdown(existing)
         return {
             "report_id": existing["id"],
             "stock_code": code,

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from src.services import fundamentals_service
 from src.storage import get_db
@@ -60,10 +60,7 @@ async def get_report(report_id: str):
     record = await asyncio.to_thread(get_db().get_fundamentals_report, report_id)
     if record is None:
         raise HTTPException(status_code=404, detail="报告不存在")
-    try:
-        record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
-    except OSError:
-        record["markdown"] = ""
+    record["markdown"] = fundamentals_service.report_markdown(record)
     return {"success": True, "data": record}
 
 
@@ -76,6 +73,10 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
+    import json
+    dims = json.loads(record.get("dims_json") or "{}")
+    if not (dims.get("financial") or {}).get("data_quality"):
+        return PlainTextResponse(fundamentals_service.report_markdown(record), media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{report_id}.md"'} if download else None)
     kwargs = {"media_type": "text/markdown; charset=utf-8"}
     if download:
         kwargs["filename"] = f"{report_id}.md"

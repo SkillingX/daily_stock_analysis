@@ -51,6 +51,8 @@ def reset_fetcher_manager() -> None:
     global _fetcher_manager_singleton
     with _fetcher_manager_lock:
         _fetcher_manager_singleton = None
+    from src.agent.tools.cross_validation_helpers import reset_validator
+    reset_validator()
 
 
 def _get_db() -> Any:

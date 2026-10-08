@@ -399,6 +399,11 @@ def _build_fundamentals_block(
         "status": raw_status or None,
         "coverage": coverage,
         "source_chain": source_chain,
+        "financial_quality": {
+            field: record
+            for block in (context.get("valuation") or {}, context.get("growth") or {})
+            for field, record in (block.get("field_meta") or {}).items()
+        },
     }
     metadata = {
         key: value for key, value in metadata.items() if value not in (None, {}, [])

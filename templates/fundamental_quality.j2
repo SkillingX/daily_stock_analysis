@@ -1,0 +1,15 @@
+{% if financial.data_quality %}
+{% set quality = financial.data_quality %}
+> 财务数据：取得 {{ quality.obtained_count }}/6 ｜ 规则可用 {{ quality.rule_usable_count }}/6 ｜ 评分组件 {{ quality.health_components }}/5 ｜ {{ quality.state }}
+{% for warning in quality.warnings %}
+> - {{ warning }}
+{% endfor %}
+
+| 指标 | 采用值 | 来源 | 实际期间 | 口径 / 单位 / 币种 | 核验状态 | 规则可用 |
+| --- | ---: | --- | --- | --- | --- | --- |
+{% for name, field in quality.fields.items() %}
+| {{ {'pe_ratio':'PE','pb_ratio':'PB','roe':'ROE','gross_margin':'毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name, name) }} | {{ field.reading.value if field.reading else '缺失' }} | {{ field.reading.source if field.reading else '未知' }} | {{ (field.reading.period or '期间未知') if field.reading else '未知' }}{% if field.reading %} / {{ field.reading.period_basis }}{% endif %} | {% if field.reading %}{{ field.reading.caliber or '未知' }} / {{ field.reading.unit or '未知' }} / {{ field.reading.currency or '不适用或未知' }}{% else %}未知{% endif %} | {{ field.quality.status }}{% if field.quality.reason_codes %} / {{ field.quality.reason_codes|join(', ') }}{% endif %} | {{ '是' if field.rule_eligible else '否' }}{% if field.input_reasons %}：{{ field.input_reasons|join(', ') }}{% endif %} |
+{% endfor %}
+{% else %}
+> 财务数据未核验：历史载荷没有字段质量证据，不能据此认定已验证。
+{% endif %}

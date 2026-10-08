@@ -58,13 +58,12 @@ def reset_validator() -> None:
         _validator_instance = None
 
 
-def _build_sources(config: Any) -> List[SourceAdapter]:
+def _build_sources(config: Any, primary_mx_source: Optional[SourceAdapter] = None) -> List[SourceAdapter]:
     """构建数据源列表：MX 主源 + iFinD/Choice MCP/fuyao 验证源（按需启用）。"""
     from data_provider.mx_data_adapter import MXSource
 
-    sources: List[SourceAdapter] = [
-        MXSource()
-    ]  # 无 key 时 available=False，read 返回 None
+    sources: List[SourceAdapter] = [primary_mx_source if primary_mx_source is not None else MXSource()]
+    # Reuse the acquired MX response, including this refresh's scoped cache identity.
     if getattr(config, "ifind_mcp_endpoint", None) and getattr(
         config, "ifind_mcp_token", None
     ):
@@ -115,7 +114,8 @@ def _get_validator() -> Optional[CrossSourceValidator]:
         return _validator_instance
     with _validator_lock:
         if _validator_instance is None:
-            sources = _build_sources(config)
+            from src.agent.tools.data_tools import _get_fetcher_manager
+            sources = _build_sources(config, primary_mx_source=_get_fetcher_manager()._mx_source)
             if not sources:
                 return None
             _validator_instance = CrossSourceValidator(sources=sources)

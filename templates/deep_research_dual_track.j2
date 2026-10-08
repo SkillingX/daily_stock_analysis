@@ -167,14 +167,15 @@
 #### 财务与基本面（F1）
 
 {{ dim_links('fundamental') }}
+{% with financial=fundamental %}{% include 'fundamental_quality.j2' %}{% endwith %}
 {% if fundamental.health_score is not none %}
 - 财务健康分：**{{ fundamental.health_score }}/100**
 {% endif %}
 {% if fundamental.profitability %}
-- 盈利质量：ROE {{ fundamental.profitability.roe.value or '缺失' }}（{{ fundamental.profitability.roe.label }}）｜ 毛利率 {{ fundamental.profitability.gross_margin.value or '缺失' }}（{{ fundamental.profitability.gross_margin.label }}）
+- 盈利质量：ROE {{ fundamental.profitability.roe.value if fundamental.profitability.roe.value is not none else '缺失' }}（{{ fundamental.profitability.roe.label }}）｜ 毛利率 {{ fundamental.profitability.gross_margin.value if fundamental.profitability.gross_margin.value is not none else '缺失' }}（{{ fundamental.profitability.gross_margin.label }}）
 {% endif %}
 {% if fundamental.growth_quality %}
-- 成长质量：营收同比 {{ fundamental.growth_quality.revenue_yoy.value or '缺失' }} ｜ 净利同比 {{ fundamental.growth_quality.net_profit_yoy.value or '缺失' }}{% if fundamental.growth_quality.scissors is not none %}（剪刀差 {{ fundamental.growth_quality.scissors }}）{% endif %}
+- 成长质量：营收同比 {{ fundamental.growth_quality.revenue_yoy.value if fundamental.growth_quality.revenue_yoy.value is not none else '缺失' }} ｜ 净利同比 {{ fundamental.growth_quality.net_profit_yoy.value if fundamental.growth_quality.net_profit_yoy.value is not none else '缺失' }}{% if fundamental.growth_quality.scissors is not none %}（剪刀差 {{ fundamental.growth_quality.scissors }}）{% endif %}
 {% endif %}
 - 估值：{{ fundamental.valuation_detail.assessment }}
 {% if fundamental.data_gaps %}

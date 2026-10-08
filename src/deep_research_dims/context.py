@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
+from icontract import require, ensure
 from time import monotonic
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+
+@require(lambda denominator: denominator != 0, "Financial ratios require a nonzero denominator")
+@ensure(lambda result: result.is_finite(), "Derived financial evidence must be finite")
+def _financial_percentage(numerator: Decimal, denominator: Decimal) -> Decimal:
+    return numerator / denominator * Decimal(100)
 
 
 @dataclass
@@ -87,7 +95,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     deadline = monotonic() + config.fundamental_stage_timeout_seconds
     cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
-    if cached is not None:
+    if cached is not None and not config.deep_research_cross_validate:
         return cached
     try:
         from src.agent.tools.data_tools import (
@@ -96,7 +104,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         )
 
         manager = _get_fetcher_manager()
-        raw = manager.get_fundamental_context(code)
+        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, deadline - monotonic()))
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
@@ -128,64 +136,92 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "source": "fundamental_context",
             "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
         }
-        # fuyao 兜底（按官方文档契约：GET /api/a-share/... + X-api-key）：
-        # 主链（tushare/efinance 等）拿不到的关键字段用同花顺 fuyao 补，
-        # 估值快照 + 利润表/资产负债表推算 ROE/毛利率/增速。
-        def _fuyao_get(path: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            import os as _os
-            import requests as _rq
+        from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
+        from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
+        aliases = {"pe_ratio": "pe_ttm", "pb_ratio": "pb", "roe": "roe", "gross_margin": "gross_margin", "revenue_yoy": "revenue_growth", "net_profit_yoy": "net_profit_yoy"}
+        records = result["field_meta"]
+        primary = {}
+        for field, key in aliases.items():
+            reading = reading_from_field_record(result.get(key), records.get(field))
+            if reading is not None:
+                primary[field] = reading
+                previous = records.get(field) or {}
+                conflict = previous.get("value") == reading.value and (previous.get("quality") or {}).get("status") == "conflict"
+                records[field] = adopted_field_record(field, reading, AnchorQuality(status="conflict" if conflict else "unverified"))
+        # Normal missing-field fallback is independent of opt-in verification.
+        if config.enable_fuyao and config.fuyao_api_key and config.fuyao_endpoint:
+            import requests
+            from data_provider.cross_source_validator import AnchorReading, normalize_anchor_value, report_period_from_fields
+            from data_provider.fuyao_adapter import _to_thscode
 
-            key = (_os.getenv("FUYAO_API_KEY") or "").strip()
-            remaining = min(config.fundamental_fetch_timeout_seconds, deadline - monotonic())
-            if not key or remaining <= 0:
-                return None
+            def fetch(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+                remaining = min(config.fundamental_fetch_timeout_seconds, deadline - monotonic())
+                if remaining <= 0:
+                    return {}
+                def request_body() -> Any:
+                    response = requests.get(f"{config.fuyao_endpoint.rstrip('/')}{path}", params=params, headers={"X-api-key": config.fuyao_api_key}, timeout=remaining)
+                    response.raise_for_status()
+                    return response.json()
+                body, error, _ = manager._run_with_timeout(request_body, remaining, "fuyao_fallback")
+                if error:
+                    ctx.limitation("Fuyao补值未完成：超时或源错误")
+                    return {}
+                if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+                    ctx.limitation("Fuyao补值响应格式不合法")
+                    return {}
+                items = body["data"].get("item") or []
+                if not isinstance(items, list) or items and not isinstance(items[0], dict):
+                    ctx.limitation("Fuyao补值响应格式不合法")
+                    return {}
+                return items[0] if body.get("code") in (0, None) and items else {}
+
             try:
-                resp = _rq.get(
-                    f"https://fuyao.aicubes.cn{path}",
-                    params=params,
-                    headers={"X-api-key": key},
-                    timeout=remaining,
-                )
-                body = resp.json()
-            except Exception:  # noqa: BLE001
-                return None
-            if resp.status_code == 429 or (isinstance(body, dict) and body.get("code") not in (0, None)):
-                return None
-            data = body.get("data") or {}
-            items = data.get("item") or []
-            return items[0] if items else None
-
-        try:
-            thscode = f"{code}.SH" if code.startswith(("60", "68", "9")) else f"{code}.SZ"
-            snap = _fuyao_get("/api/a-share/valuations/snapshot", {"thscodes": thscode})
-            if snap:
-                if result.get("pe_ttm") is None:
-                    result["pe_ttm"] = snap.get("pe_ttm")
-                if result.get("pb") is None:
-                    result["pb"] = snap.get("pb_mrq")
-                result["source"] = "fundamental_context+fuyao"
-            income = _fuyao_get(
-                "/api/a-share/financials/income-statements",
-                {"thscode": thscode, "period": "annual", "limit": 2},
-            )
-            balance = _fuyao_get(
-                "/api/a-share/financials/balance-sheets",
-                {"thscode": thscode, "period": "annual", "limit": 1},
-            )
-            if income:
-                rev = income.get("operating_income")
-                cost = income.get("operating_costs")
-                np_ = income.get("parent_holder_net_profit")
-                if result.get("gross_margin") is None and rev and cost is not None:
-                    result["gross_margin"] = round((rev - cost) / rev * 100, 2)
-                if result.get("roe") is None and np_ and balance:
-                    equity = balance.get("holder_equity_total")
-                    if equity:
-                        result["roe"] = round(np_ / equity * 100, 2)
-        except Exception as exc:  # noqa: BLE001 - 兜底失败不阻断
-            logger.debug("[DualTrack] fuyao 兜底失败 %s: %s", code, exc)
+                symbol = _to_thscode(code)
+                if result["pe_ttm"] is None or result["pb"] is None:
+                    snapshot = fetch("/api/a-share/valuations/snapshot", {"thscodes": symbol})
+                    for field, key, raw_key, caliber in (("pe_ratio", "pe_ttm", "pe_ttm", "TTM"), ("pb_ratio", "pb", "pb_mrq", "MRQ")):
+                        value, unit, currency, error = normalize_anchor_value(field, snapshot.get(raw_key), raw_key)
+                        if result[key] is None and value is not None:
+                            reading = AnchorReading("fuyao", value, caliber=caliber, unit=unit, currency=currency, normalization_error=error)
+                            if adopted_field_record(field, reading)["rule_eligible"]:
+                                result[key], primary[field] = value, reading
+                                records[field] = adopted_field_record(field, reading, selection_reason="fuyao_fallback")
+                if result["roe"] is None or result["gross_margin"] is None:
+                    income = fetch("/api/a-share/financials/income-statements", {"thscode": symbol, "period": "annual", "limit": 2})
+                    period, basis = report_period_from_fields(income)
+                    if period is not None and basis == "annual":
+                        if result["gross_margin"] is None:
+                            rev, _, currency, err = normalize_anchor_value("revenue", income.get("operating_income"), "operating_income", unit=income.get("unit"), currency=income.get("currency"))
+                            cost, _, cost_currency, cost_err = normalize_anchor_value("revenue", income.get("operating_costs"), "operating_costs", unit=income.get("unit"), currency=income.get("currency"))
+                            if rev is not None and rev != 0 and cost is not None and not err and not cost_err and currency is not None and currency == cost_currency:
+                                value = float(_financial_percentage(Decimal(str(rev)) - Decimal(str(cost)), Decimal(str(rev))))
+                                reading = AnchorReading("fuyao", value, caliber="gross_margin", unit="percentage_point", period=period, period_basis=basis)
+                                result["gross_margin"], primary["gross_margin"] = value, reading
+                                records["gross_margin"] = adopted_field_record("gross_margin", reading, selection_reason="fuyao_derived")
+                        if result["roe"] is None:
+                            balance = fetch("/api/a-share/financials/balance-sheets", {"thscode": symbol, "period": "annual", "limit": 1})
+                            balance_period, _ = report_period_from_fields(balance)
+                            profit, _, currency, err = normalize_anchor_value("net_profit", income.get("parent_holder_net_profit"), "parent_holder_net_profit", unit=income.get("unit"), currency=income.get("currency"))
+                            equity, _, eq_currency, eq_err = normalize_anchor_value("net_profit", balance.get("holder_equity_total"), "holder_equity_total", unit=balance.get("unit"), currency=balance.get("currency"))
+                            if period == balance_period and profit is not None and equity is not None and equity != 0 and not err and not eq_err and currency is not None and currency == eq_currency:
+                                value = float(_financial_percentage(Decimal(str(profit)), Decimal(str(equity))))
+                                reading = AnchorReading("fuyao", value, caliber="parent_net_profit/ending_equity", unit="percentage_point", period=period, period_basis=basis)
+                                result["roe"], primary["roe"] = value, reading
+                                records["roe"] = adopted_field_record("roe", reading, selection_reason="fuyao_derived")
+            except (requests.RequestException, ValueError, OverflowError) as exc:
+                ctx.limitation(f"Fuyao补值失败: {type(exc).__name__}")
+        cross_validation = build_cross_validation_block(code, aliases, primary_readings=primary, deadline=deadline)
+        if cross_validation:
+            result["cross_validation"] = cross_validation
+            for field, anchor in cross_validation["anchors"].items():
+                record = field_record_from_validation(field, anchor)
+                if record is not None:
+                    records[field] = record
+                    key = aliases[field]
+                    if result.get(key) is None:
+                        result[key] = record["value"]
         # 全 None 的占位结果不缓存（缓存污染 bug：失败抓取会被固化 24h）
-        if result.get("pe_ttm") is not None or result.get("roe") is not None:
+        if any(result.get(key) is not None for key in ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy")):
             save_snapshot(cache_key, result)
         else:
             ctx.limitation("基本面数据全缺（快照不缓存，下次重试）")

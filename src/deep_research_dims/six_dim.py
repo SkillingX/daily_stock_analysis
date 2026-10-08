@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from src.deep_research_dims.context import SharedContext
+from src.deep_research_dims.fundamental_dim import eligible_financial_value
 from src.scoring.bayesian import map_prior
 from src.scoring.indicators_v2 import (
     aggregate_v2_dimensions,
@@ -273,6 +274,8 @@ def _score_from_f2(f2_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
 
 def _score_from_f1(f1_payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     f1 = f1_payload or {}
+    if not (f1.get("data_quality") or {}).get("health_components"):
+        return None
     health = f1.get("health_score")
     if not isinstance(health, (int, float)):
         return None
@@ -440,8 +443,8 @@ def build_six_dim(
         "宏观": {},
     }
     valuation = score_valuation(
-        fund.get("pe_ttm") if isinstance(fund.get("pe_ttm"), (int, float)) else None,
-        fund.get("pb") if isinstance(fund.get("pb"), (int, float)) else None,
+        eligible_financial_value(fund, "pe_ratio"),
+        eligible_financial_value(fund, "pb_ratio"),
     )
     indicator_results["基本面"]["valuation"] = valuation
 
@@ -468,6 +471,7 @@ def build_six_dim(
                     basis=i["basis"],
                     confidence=i["confidence"],
                     summary=i["summary"],
+                    data_gap=i["data_gap"],
                 )
                 for i in d["indicators"]
             ],

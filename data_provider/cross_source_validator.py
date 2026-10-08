@@ -203,6 +203,8 @@ def select_report_period(periods: Sequence[tuple[Optional[str], PeriodBasis]], r
 
 def caliber_from_label(field: str, label: str) -> Optional[str]:
     """Use the returned field identity, never the natural-language request."""
+    if field.endswith("_yoy") and any(marker in label.lower() for marker in ("环比", "qoq")):
+        return None
     if field == "pe_ratio":
         return "TTM" if any(marker in label.upper() for marker in ("TTM", "滚动")) else None
     if field == "pb_ratio":
@@ -450,6 +452,10 @@ def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]
         return ("roe_method_unknown",)
     if field == "pb_ratio" and reading.caliber != "MRQ":
         return ("pb_method_unknown",)
+    if field == "revenue_yoy" and reading.caliber not in {"operating_revenue_yoy", "total_operating_revenue_yoy"}:
+        return ("revenue_definition_unknown",)
+    if field == "net_profit_yoy" and reading.caliber != "parent_net_profit_yoy":
+        return ("profit_definition_unknown",)
     return ()
 
 

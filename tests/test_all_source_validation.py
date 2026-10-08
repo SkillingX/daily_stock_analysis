@@ -183,9 +183,11 @@ def test_warm_financial_dimension_cache_does_not_survive_validation_mode_change(
 
     monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(get_config(), "deep_research_cross_validate", True)
-    dim_cache.save_cached_dim("600519", "fundamental", {"health_score": 90, "quality": "verified"})
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+    from tests.test_f1_financial_quality import context
+    dim_cache.save_cached_dim("600519", "fundamental", build_fundamental_dim(context({"pe_ratio": 30, "pb_ratio": 2, "roe": 18, "gross_margin": 40, "revenue_yoy": 10, "net_profit_yoy": 10})).model_dump(mode="json"))
     dim_cache.save_cached_dim("600519", "business", {"name": "business fixture"})
-    assert dim_cache.load_cached_dim("600519", "fundamental") is not None
+    assert dim_cache.load_cached_dim("600519", "fundamental") is None  # 启用核验时重算当前证据
     monkeypatch.setattr(get_config(), "deep_research_cross_validate", False)
     assert dim_cache.load_cached_dim("600519", "fundamental") is None
     assert dim_cache.load_cached_dim("600519", "business") is not None

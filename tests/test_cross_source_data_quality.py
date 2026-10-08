@@ -72,7 +72,7 @@ def test_choice_response_columns_preserve_actual_requested_period() -> None:
 def test_unknown_actual_financial_period_is_not_strictly_verified(field: str) -> None:
     from data_provider.cross_source_validator import Unit
     unit: Unit = "currency_base" if field in {"revenue", "net_profit"} else "percentage_point"
-    caliber = "weighted_roe" if field == "roe" else "published"
+    caliber = {"roe": "weighted_roe", "revenue_yoy": "operating_revenue_yoy", "net_profit_yoy": "parent_net_profit_yoy"}.get(field, "published")
     primary = AnchorReading("mx", 100.0, caliber=caliber, period="2025年报", unit=unit, currency="CNY")
     secondary = AnchorReading("ifind", 100.0, caliber=caliber, period=None, unit=unit, currency="CNY")
     source = SimpleNamespace(name="ifind", read=lambda *args: secondary)
