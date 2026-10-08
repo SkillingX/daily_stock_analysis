@@ -7,7 +7,7 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -29,11 +29,11 @@ def _validate_id(report_id: str) -> str:
 
 
 @router.post("/generate")
-async def generate(stock_code: str, stock_name: Optional[str] = None):
+async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false") -> dict[str, Any]:
     """同步生成基本面专项报告（研究员并行+缓存，约 1-2 分钟）。"""
     try:
         return await asyncio.to_thread(
-            fundamentals_service.generate_fundamentals_report, stock_code, stock_name
+            fundamentals_service.generate_fundamentals_report, stock_code, stock_name, force_refresh == "true"
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

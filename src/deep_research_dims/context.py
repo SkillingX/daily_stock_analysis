@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextvars import copy_context
 import logging
 from decimal import Decimal
 from icontract import require, ensure
@@ -95,7 +96,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     deadline = monotonic() + config.fundamental_stage_timeout_seconds
     cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
-    if cached is not None and not config.deep_research_cross_validate:
+    from data_provider.mx_data_adapter import financial_refresh
+    refresh = financial_refresh.get()
+    if cached is not None and not config.deep_research_cross_validate and not (refresh and refresh[0] == code):
         return cached
     try:
         from src.agent.tools.data_tools import (
@@ -283,7 +286,7 @@ def build_shared_context(stock_code: str, stock_name: str) -> SharedContext:
     with ThreadPoolExecutor(max_workers=4) as pool:
         fut_quote = pool.submit(_safe_quote, stock_code, ctx)
         fut_history = pool.submit(_safe_history, stock_code, 260, ctx)
-        fut_fund = pool.submit(_safe_fundamental, stock_code, ctx)
+        fut_fund = pool.submit(copy_context().run, _safe_fundamental, stock_code, ctx)
         fut_chip = pool.submit(_safe_chip, stock_code, ctx)
         ctx.quote = fut_quote.result()
         ctx.history = fut_history.result()

@@ -15,6 +15,7 @@ header 带 ``apikey``。返回嵌套 JSON，``_extract_first_table_row`` 把首�
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import logging
 import os
 import time
@@ -30,6 +31,7 @@ BASE = "https://mkapi2.dfcfs.com/finskillshub/api/claw"
 QUERY_URL = f"{BASE}/query"
 
 _MX_TTL = 30 * 60  # 30 min —— MX 响应半实时，缓存以控配额
+financial_refresh: ContextVar[Optional[tuple[str, str]]] = ContextVar("fundamentals_refresh", default=None)
 
 # 标准锚点 → MX 返回的中文字段关键词（命中其一即可）。按字段类别分组。
 _SNAPSHOT_FIELDS: Dict[str, List[str]] = {
@@ -271,12 +273,12 @@ class MXClient:
         self.available = bool(self.api_key)
         self.timeout = timeout
         self._ttl = ttl
-        self._cache: Dict[str, List[Any]] = {}  # query -> [ts, result]
+        self._cache: Dict[str, List[Any]] = {}  # query -> [ts, result, this-refresh identity]
         self._cache_lock = (
             Lock()
         )  # CrossSourceValidator 在线程池并发调用 query，需保护缓存
 
-    def query(self, tool_query: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
+    def query(self, tool_query: str, *, deadline: Optional[float] = None, refresh_id: Optional[str] = None) -> Dict[str, Any]:
         """自然语言查询，带 TTL 缓存。无 key 返回 error dict。
 
         线程安全：CrossSourceValidator 用 ThreadPoolExecutor 并发取多源，
@@ -290,26 +292,28 @@ class MXClient:
         now = time.time()
         with self._cache_lock:
             hit = self._cache.get(tool_query)
-            if hit and now - hit[0] < self._ttl:
+            if hit and now - hit[0] < self._ttl and (refresh_id is None or len(hit) > 2 and hit[2] == refresh_id):
                 return cast(Dict[str, Any], hit[1])
         # 锁外执行 HTTP（不阻塞其他 query 的缓存读）
         result = _post(QUERY_URL, {"toolQuery": tool_query}, self.api_key, self.timeout, **({"deadline": deadline} if deadline is not None else {}))
         with self._cache_lock:
-            self._cache[tool_query] = [now, result]
+            self._cache[tool_query] = [now, result, refresh_id]
         return result
 
     def fetch_snapshot(self, code: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """行情+估值快照：最新价/总市值/流通市值/PE/PB。"""
+        refresh = financial_refresh.get()
         return _extract_first_table_row(
-            self.query(f"{code} 最新价 总市值 流通市值 市盈率 市净率", **({"deadline": deadline} if deadline is not None else {}))
+            self.query(f"{code} 最新价 总市值 流通市值 市盈率 市净率", **({"refresh_id": refresh[1]} if refresh and refresh[0] == code else {}), **({"deadline": deadline} if deadline is not None else {}))
         )
 
     def query_financials(self, code: str, period: Optional[str], field: Optional[str] = None, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """财务指标：营收/归母净利润/ROE/毛利率/营收同比（带报告期）。"""
         suffix = f" {period}" if period else ""
+        refresh = financial_refresh.get()
         return _extract_first_table_row(
             self.query(
-                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率 归属于母公司净利润同比增长率{suffix}", **({"deadline": deadline} if deadline is not None else {})
+                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率 归属于母公司净利润同比增长率{suffix}", **({"refresh_id": refresh[1]} if refresh and refresh[0] == code else {}), **({"deadline": deadline} if deadline is not None else {})
             ), period=period, field=field
         )
 

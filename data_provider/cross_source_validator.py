@@ -16,6 +16,7 @@ import re
 import json
 from inspect import signature
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field as dataclass_field, fields as dataclass_fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, Overflow
@@ -777,7 +778,7 @@ class CrossSourceValidator:
             if not self._slots.acquire(blocking=False):
                 busy_errors.append((source.name, "source_busy"))
                 continue
-            future = self._pool.submit(_safe_read, source)
+            future = self._pool.submit(copy_context().run, _safe_read, source)
             future.add_done_callback(lambda _: self._slots.release())
             futures.append((source, future))
         wait([future for _, future in futures], timeout=None if deadline is None else max(0.0, deadline - monotonic()))

@@ -19,6 +19,7 @@ import os
 import random
 import re
 import time
+from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -2741,7 +2742,7 @@ class DataFetcherManager:
                 except ValueError:
                     pass
 
-        worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
+        worker = Thread(target=copy_context().run, args=(runner,), daemon=True, name=f"fundamental-{task_name}")
         try:
             worker.start()
         except Exception as exc:
@@ -3599,7 +3600,9 @@ class DataFetcherManager:
             0, int(getattr(config, "fundamental_cache_max_entries", 256))
         )
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
-        if cache_ttl > 0:
+        from .mx_data_adapter import financial_refresh
+        refresh = financial_refresh.get()
+        if cache_ttl > 0 and not (refresh and refresh[0] == stock_code):
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
