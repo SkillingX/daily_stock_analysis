@@ -6,6 +6,8 @@ Contract tests for get_capital_flow tool output semantics.
 import os
 import sys
 import unittest
+from dataclasses import asdict
+from data_provider.cross_source_validator import AnchorReading, CrossSourceValidator
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -132,11 +134,12 @@ class TestBackfillCapitalFlow(unittest.TestCase):
         }
 
     def _cv(self, main_inflow_value=2.5e8):
-        return {"enabled": True, "anchors": {"main_inflow": {"v": main_inflow_value}}}
+        return {"enabled": True, "anchors": {"main_inflow": CrossSourceValidator([]).verify("688486", "main_inflow", primary_reading=AnchorReading("mx", main_inflow_value, unit="currency_base", currency="CNY")).to_compact()}}
 
     def _cum(self):
         return {
             "main_net_inflow": 3.0e8,
+            "field_meta": {"main_inflow": asdict(AnchorReading("ifind", 3.0e8, unit="currency_base", currency="CNY"))},
             "inflow_5d": 13.0,
             "inflow_10d": 19.0,
             "daily_series": [{"date": "20260625", "value": 3.0e8}],
@@ -167,7 +170,7 @@ class TestBackfillCapitalFlow(unittest.TestCase):
         # main_net_inflow 优先双源 CV（mx+ifind）；5d/10d 仍来自 iFinD 累计
         out = _backfill_capital_flow(self._failed_result(), self._cv(9.9e8), self._cum())
         self.assertEqual(out["main_net_inflow"], 9.9e8)  # CV 优先
-        self.assertEqual(out["capital_flow_fallback"]["source"], "mx+ifind")
+        self.assertEqual(out["capital_flow_fallback"]["source"], "mx")
         self.assertEqual(out["inflow_5d"], 13.0)
         self.assertEqual(out["inflow_10d"], 19.0)
 
@@ -189,7 +192,7 @@ class TestBackfillCapitalFlow(unittest.TestCase):
         out = _backfill_capital_flow(self._failed_result(), self._cv(), {})
         self.assertEqual(out["main_net_inflow"], 2.5e8)
         self.assertIsNone(out["inflow_5d"])
-        self.assertEqual(out["capital_flow_fallback"]["source"], "mx+ifind")
+        self.assertEqual(out["capital_flow_fallback"]["source"], "mx")
         self.assertEqual(out["capital_flow_fallback"]["daily_series"], [])
 
     def test_cv_anchor_none_falls_back_to_cumulative(self):
@@ -208,7 +211,7 @@ class TestGetCapitalFlowBackfillE2E(unittest.TestCase):
         return {
             "enabled": True,
             "anchors": {
-                "main_inflow": {"v": main_value, "conf": "medium"},
+                "main_inflow": CrossSourceValidator([]).verify("688486", "main_inflow", primary_reading=AnchorReading("mx", main_value, unit="currency_base", currency="CNY")).to_compact(),
                 "margin_balance": {"v": 1.2e9, "conf": "high"},
             },
             "summary": "1/2 锚点双源验证通过",
@@ -250,7 +253,7 @@ class TestGetCapitalFlowBackfillE2E(unittest.TestCase):
         # CV 块 + 来源标注
         self.assertTrue(result["cross_validation"]["enabled"])
         fb = result["capital_flow_fallback"]
-        self.assertEqual(fb["source"], "mx+ifind")
+        self.assertEqual(fb["source"], "mx")
         self.assertEqual(len(fb["daily_series"]), 1)
 
     def test_no_backfill_when_cv_off_zero_regression(self):

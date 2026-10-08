@@ -25,7 +25,7 @@ from src.agent.tools.data_tools import (
 
 def _quote(**kw):
     """构造轻量 realtime quote（字段对齐 UnifiedRealtimeQuote 用法）。"""
-    base = {"pe_ratio": 67.89, "pb_ratio": 8.23, "total_mv": 2.5948e11, "circ_mv": 2.5948e11}
+    base = {"source": "ifind", "currency": "CNY", "field_meta": {"pe_ratio": {"caliber": "TTM"}, "pb_ratio": {"caliber": "MRQ"}}, "pe_ratio": 67.89, "pb_ratio": 8.23, "total_mv": 2.5948e11, "circ_mv": 2.5948e11}
     base.update(kw)
     return SimpleNamespace(**base)
 

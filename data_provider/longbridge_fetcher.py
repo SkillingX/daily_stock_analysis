@@ -821,6 +821,7 @@ class LongbridgeFetcher(BaseFetcher):
         pb_ratio = None
         total_mv = None
         circ_mv = None
+        field_meta: dict[str, dict[str, str]] = {}
         name = ""
 
         if static is not None:
@@ -849,6 +850,7 @@ class LongbridgeFetcher(BaseFetcher):
             eps_for_pe = None
             if eps_ttm is not None and eps_ttm > 0:
                 eps_for_pe = eps_ttm
+                field_meta["pe_ratio"] = {"caliber": "TTM"}
             elif eps_plain is not None and eps_plain > 0:
                 eps_for_pe = eps_plain
             if eps_for_pe:
@@ -883,6 +885,7 @@ class LongbridgeFetcher(BaseFetcher):
             pb_ratio=pb_ratio,
             total_mv=total_mv,
             circ_mv=circ_mv,
+            field_meta=field_meta,
         )
 
         logger.info(

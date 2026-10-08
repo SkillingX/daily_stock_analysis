@@ -130,6 +130,7 @@ def test_stock_info_valuation_fallback_only_fills_none(
     fallback = UnifiedRealtimeQuote(
         "600519", name="样本", source=RealtimeSource.EFINANCE,
         price=20.0, pe_ratio=25.0, pb_ratio=2.0, total_mv=100.0, circ_mv=80.0,
+        currency="CNY", field_meta={"pe_ratio": {"caliber": "TTM"}, "pb_ratio": {"caliber": "MRQ"}},
     )
     provider = Mock(side_effect=[quote, fallback])
     financial_sources["fetcher"].get_realtime_quote = provider
@@ -178,7 +179,7 @@ def test_latest_period_gaps_and_zero_never_borrow_an_older_value(
         frame = frame[["20260630", "指标", "20251231"]]
     financial_sources["frame"] = frame
     bundle = data_tools._get_fetcher_manager()._fundamental_adapter.get_fundamental_bundle("600519")
-    assert bundle["growth"] == {
+    assert {key: value for key, value in bundle["growth"].items() if key != "field_meta"} == {
         "roe": None, "gross_margin": 0.0, "revenue_yoy": -5.0,
         "net_profit_yoy": 0.0, "report_date": "2026-06-30",
     }

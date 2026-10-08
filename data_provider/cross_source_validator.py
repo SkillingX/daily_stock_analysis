@@ -13,14 +13,15 @@ from __future__ import annotations
 import logging
 import math
 import re
+import json
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field, fields as dataclass_fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, Overflow
 from time import monotonic
 from typing import Annotated, Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
 from icontract import ensure
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ def caliber_from_label(field: str, label: str) -> Optional[str]:
     if field in {"net_profit", "net_profit_yoy"}:
         if any(marker in label for marker in ("扣非", "扣除")):
             return None
-        if any(marker in label for marker in ("归母", "母公司股东", "母公司所有者", "parent_holder")):
+        if any(marker in label for marker in ("归母", "归属母公司", "归属于母公司", "母公司股东", "母公司所有者", "parent_holder")):
             return "parent_net_profit_yoy" if field.endswith("yoy") else "parent_net_profit"
         return None
     if field == "roe":
@@ -284,6 +285,7 @@ class AnchorReading:
     raw_currency: Optional[str] = None
     normalization_error: Optional[str] = None
     source_family: Optional[str] = None
+    is_stale: Optional[bool] = None
 
     def __post_init__(self) -> None:
         actual, inferred_basis = normalize_report_period(self.period)
@@ -327,7 +329,7 @@ class AnchorVerification:
     def to_compact(self) -> Dict[str, Any]:
         """压缩为 LLM 友好的 dict（省 token）。"""
         payload: Dict[str, Any] = {
-            "v": _round(self.value),
+            "v": self.value,
             "conf": self.confidence,
             "src": list(self.sources),
             "agreed": self.agreed,
@@ -397,13 +399,6 @@ def _is_valid_code(code: str) -> bool:
     return bool(_CODE_RE.match(code.strip()))
 
 
-def _round(value: Optional[float]) -> Optional[float]:
-    """压缩精度，避免 LLM 上下文里长小数。None 透传（缺失锚点）。"""
-    if value is None:
-        return None
-    return round(float(value), 4)
-
-
 @ensure(lambda result: 0.0 <= result <= 200.0, "Relative difference on finite readings cannot exceed 200 percent")
 def _discrepancy_pct(a: float, b: float) -> float:
     """相对差异百分比（以较大绝对值为基准）。"""
@@ -434,6 +429,8 @@ def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]
     """Intrinsic input validity; unknown financial periods still allow limited local use."""
     if not math.isfinite(reading.value):
         return ("invalid_value",)
+    if reading.is_stale:
+        return ("stale",)
     if reading.normalization_error:
         return (reading.normalization_error,)
     expected = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
@@ -445,7 +442,45 @@ def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]
         return ("currency_unknown",)
     if field in FINANCIAL_ANCHORS | {"pe_ratio", "pb_ratio"} and reading.caliber is None:
         return ("caliber_unknown",)
+    if field == "pe_ratio" and reading.caliber != "TTM":
+        return ("pe_not_ttm",)
+    if field == "roe" and reading.caliber != "weighted_roe":
+        return ("roe_method_unknown",)
+    if field == "pb_ratio" and reading.caliber != "MRQ":
+        return ("pb_method_unknown",)
     return ()
+
+
+def reading_from_field_record(value: object, record: Optional[Dict[str, Any]] = None) -> Optional[AnchorReading]:
+    """Decode current field evidence; stale metadata cannot label a different scalar."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    record = record or {}
+    if record.get("value", value) != value:
+        record = {}
+    metadata = {item.name: record[item.name] for item in dataclass_fields(AnchorReading) if item.name in record and item.name not in {"source", "value"}}
+    payload = {"source": str(record.get("source") or "unknown"), "value": float(value), **metadata}
+    try:
+        return TypeAdapter(AnchorReading).validate_json(json.dumps(payload), strict=True)
+    except (ValidationError, TypeError, ValueError):
+        return AnchorReading("unknown", float(value), normalization_error="metadata_invalid")
+
+
+def adopted_field_record(field: str, reading: AnchorReading, quality: Optional[AnchorQuality] = None, selection_reason: str = "primary", *, previous_record: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """One field record projects its scalar and consumer eligibility from existing evidence."""
+    previous = previous_record or {}
+    current_conflict = previous.get("value") == reading.value and (previous.get("quality") or {}).get("status") == "conflict"
+    quality = quality or AnchorQuality(status="conflict" if current_conflict else "unverified")
+    reasons = reading_input_reasons(reading, field)
+    if field not in FINANCIAL_ANCHORS and field in ANCHOR_SPECS and reading.observed_at is not None:
+        from src.config import get_config
+        limits = _comparison_reasons(reading, ANCHOR_SPECS[field], None, get_config().realtime_cache_ttl)
+        reasons += tuple(reason for reason in limits if reason in {"stale", "time_in_future"} and reason not in reasons)
+    return {
+        "field": field, **asdict(reading), "quality": quality.model_dump(mode="json"),
+        "input_reasons": list(reasons), "rule_eligible": not reasons and quality.status != "conflict",
+        "selection_reason": selection_reason,
+    }
 
 
 def _comparison_reasons(reading: AnchorReading, spec: AnchorSpec, code: Optional[str], ttl: int) -> tuple[str, ...]:
@@ -671,7 +706,7 @@ class CrossSourceValidator:
         field: str,
         period: Optional[str] = None,
         primary_reading: Optional[AnchorReading] = None,
-        *, enabled: bool = True, deadline: Optional[float] = None,
+        *, enabled: bool = True, deadline: Optional[float] = None, expected_currency: Optional[str] = None,
     ) -> AnchorVerification:
         """验证单个锚点；源异常隔离，保留失败证据。
 
@@ -691,7 +726,14 @@ class CrossSourceValidator:
             (primary_reading, *collected) if primary_reading is not None else collected
         )
 
+        if field in MONEY_ANCHORS and expected_currency is not None:
+            readings = tuple(replace(reading, normalization_error="currency_mismatch") if reading.currency is not None and reading.currency != expected_currency else reading for reading in readings)
+
         valid = tuple(reading for reading in readings if math.isfinite(reading.value))
+        if primary_reading is None:
+            selected = next((reading for reading in valid if adopted_field_record(field, reading)["rule_eligible"]), None)
+            if selected is not None:
+                valid = (selected, *(reading for reading in valid if reading is not selected))
         errors += tuple((reading.source, "invalid_value") for reading in readings if not math.isfinite(reading.value))
         return _judge_readings(valid, spec, code=code, enabled=enabled, source_errors=errors)
 

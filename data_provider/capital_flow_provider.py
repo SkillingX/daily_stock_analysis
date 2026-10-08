@@ -56,10 +56,14 @@ def get_main_inflow_cumulative(
     series = fetcher.fetch_main_inflow_series(code, days)
     if not series:
         return {}
+    from data_provider.cross_source_validator import AnchorReading, adopted_field_record
+    # Legacy series contain scalar values only; they do not prove unit/currency.
+    reading = AnchorReading("ifind", series[0][1], observed_at=series[0][0])
     return {
         "main_net_inflow": series[0][1],  # 最新日
         "inflow_5d": compute_cumulative(series, _WINDOW_5D),
         "inflow_10d": compute_cumulative(series, _WINDOW_10D),
         "daily_series": [{"date": d, "value": v} for d, v in series],
         "source": "ifind",
+        "field_meta": {"main_inflow": adopted_field_record("main_inflow", reading, selection_reason="fallback")},
     }

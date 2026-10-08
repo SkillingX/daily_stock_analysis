@@ -707,6 +707,8 @@ class EfinanceFetcher(BaseFetcher):
                 code=stock_code,
                 name=str(row.get(name_col, "")),
                 source=RealtimeSource.EFINANCE,
+                currency="CNY",
+                field_meta={"pe_ratio": {"raw_label": pe_col}},
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),

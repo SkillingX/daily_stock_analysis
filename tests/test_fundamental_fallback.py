@@ -170,7 +170,7 @@ class TestTushareIfindAdapter(unittest.TestCase):
         # earnings stays empty (no text summary available from iFinD)
         self.assertEqual(bundle["earnings"], {})
         # as_of is the latest period
-        self.assertEqual(bundle["as_of"], "20251231")
+        self.assertEqual(bundle["as_of"], "2025-12-31")
 
     def test_unavailable_adapter_returns_not_supported(self) -> None:
         fake = _FakeIfindSource(available=False)

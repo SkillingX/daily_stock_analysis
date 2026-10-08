@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 from .ifind_fundamental_adapter import IfindSource
+from .cross_source_validator import AnchorReading, adopted_field_record
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class TushareIfindFundamentalAdapter:
 
     def __init__(
         self,
-        ifind_source: Any = None,
+        ifind_source: Optional[IfindSource] = None,
         tushare_token: Optional[str] = None,
     ) -> None:
         self._ifind = ifind_source
@@ -139,6 +140,7 @@ class TushareIfindFundamentalAdapter:
         as_of = period or _latest_period_for_as_of()
 
         growth: Dict[str, Any] = {}
+        field_meta: Dict[str, Any] = {}
         earnings: Dict[str, Any] = {}
         institution: Dict[str, Any] = {}
         source_chain: List[Dict[str, Any]] = []
@@ -150,9 +152,10 @@ class TushareIfindFundamentalAdapter:
         anchor_results = self._read_growth_fields_concurrent(
             list(_FIELD_TO_IFIND_ANCHOR.items()), ts_code, as_of
         )
-        for bundle_key, anchor, value in anchor_results:
-            if value is not None:
-                growth[bundle_key] = value
+        for bundle_key, anchor, reading in anchor_results:
+            if reading is not None:
+                growth[bundle_key] = reading.value
+                field_meta[anchor] = adopted_field_record(anchor, reading, selection_reason="fallback")
                 source_chain.append(
                     {
                         "provider": f"ifind:{anchor}",
@@ -181,17 +184,17 @@ class TushareIfindFundamentalAdapter:
         has_content = bool(growth or earnings or institution)
         return {
             "status": "partial" if has_content else "not_supported",
-            "growth": growth,
+            "growth": {**growth, "field_meta": field_meta} if field_meta else growth,
             "earnings": earnings,
             "institution": institution,
             "source_chain": source_chain,
             "errors": errors,
-            "as_of": as_of,
+            "as_of": max((record["period"] for record in field_meta.values() if record.get("period")), default=None),
         }
 
     def _read_growth_field(
         self, anchor: str, ts_code: str, period: str
-    ) -> Optional[float]:
+    ) -> Optional[AnchorReading]:
         if self._ifind is None or not self._ifind.available:
             return None
         # iFinD does not always return data for the latest period (e.g.
@@ -204,7 +207,7 @@ class TushareIfindFundamentalAdapter:
         for candidate in candidates:
             reading = self._ifind.read(ts_code, anchor, candidate)
             if reading is not None and reading.value is not None:
-                return float(reading.value)
+                return reading
         return None
 
     def _read_growth_fields_concurrent(
@@ -212,7 +215,7 @@ class TushareIfindFundamentalAdapter:
         items: List[Tuple[str, str]],
         ts_code: str,
         period: str,
-    ) -> List[Tuple[str, str, Optional[float]]]:
+    ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
         """Read multiple growth anchors concurrently via iFinD.
 
         Returns a list of ``(bundle_key, anchor, value)`` tuples in the same
@@ -244,7 +247,7 @@ class TushareIfindFundamentalAdapter:
         items: List[Tuple[str, str]],
         ts_code: str,
         period: str,
-    ) -> List[Tuple[str, str, Optional[float]]]:
+    ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
         """Read growth anchors in parallel via a ThreadPoolExecutor.
 
         Each worker thread calls ``IfindSource.read`` synchronously. The
@@ -266,14 +269,14 @@ class TushareIfindFundamentalAdapter:
             if fallback_period != period:
                 period_candidates.append(fallback_period)
 
-        def _read_one(anchor: str) -> Optional[float]:
+        def _read_one(anchor: str) -> Optional[AnchorReading]:
             for candidate in period_candidates:
                 try:
                     reading = self._ifind.read(ts_code, anchor, candidate)
                 except Exception:  # noqa: BLE001 — fail-open
                     continue
                 if reading is not None and reading.value is not None:
-                    return float(reading.value)
+                    return reading
             return None
 
         # ``ThreadPoolExecutor`` lets each thread block on a single
@@ -285,7 +288,7 @@ class TushareIfindFundamentalAdapter:
             future_to_anchor = {
                 executor.submit(_read_one, anchor): anchor for _, anchor in items
             }
-            anchor_to_value: Dict[str, Optional[float]] = {}
+            anchor_to_value: Dict[str, Optional[AnchorReading]] = {}
             for future in concurrent.futures.as_completed(
                 future_to_anchor, timeout=None
             ):

@@ -15,16 +15,36 @@ data_tools 各 handler 只需一行调用，不感知验证细节（低耦合）
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
 
 from data_provider.cross_source_validator import (
     AnchorReading,
+    AnchorQuality,
+    adopted_field_record,
+    reading_from_field_record,
     CrossSourceValidator,
     SourceAdapter,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def field_record_from_validation(field: str, anchor: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Use the actual selected reading, never reconstruct provenance from source counts."""
+    readings = anchor.get("readings") or []
+    reading = reading_from_field_record(anchor.get("v"), readings[0] if readings else {})
+    if reading is None:
+        return None
+    main_reasons = (readings[0].get("reason_codes") or []) if readings else []
+    if "stale" in main_reasons:
+        reading = replace(reading, is_stale=True)
+    elif "time_in_future" in main_reasons:
+        reading = replace(reading, normalization_error="time_in_future")
+    quality_data = anchor.get("quality") or {}
+    quality = AnchorQuality(status=quality_data.get("status", "unverified"), reason_codes=tuple(quality_data.get("reason_codes") or ()))
+    return adopted_field_record(field, reading, quality, selection_reason="validation_candidate")
 
 _validator_instance: Optional[CrossSourceValidator] = None
 _validator_lock = Lock()
@@ -108,6 +128,7 @@ def build_cross_validation_block(
     primary_readings: Optional[Dict[str, AnchorReading]] = None,
     validator: Optional[CrossSourceValidator] = None,
     deadline: Optional[float] = None,
+    expected_currencies: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """构建 ``cross_validation`` 块。
 
@@ -132,6 +153,7 @@ def build_cross_validation_block(
                 period=period,
                 primary_reading=primary_readings.get(field),
                 **({"deadline": deadline} if deadline is not None else {}),
+                **({"expected_currency": expected_currencies[field]} if expected_currencies and field in expected_currencies else {}),
             )
         except Exception as exc:  # noqa: BLE001 — fail-open：单锚点失败不阻塞其余
             logger.debug("[CrossValidate] verify %s/%s failed: %s", code, field, exc)

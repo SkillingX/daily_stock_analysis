@@ -30,7 +30,7 @@ import threading
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -258,13 +258,20 @@ def _extract_ifind_value(
     返回 (value, used_column)。找不到关键词 → (None, "")。
     中文金额单位（万亿/亿/万）由 ``_safe_float`` 统一换算。
     """
+    fallback: Tuple[Optional[float], str] = (None, "")
     for kw in keywords:
         for col, val in table.items():
             if kw in col:
                 v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
-                    return v, col
-    return None, ""
+                    if field is None:
+                        return v, col
+                    _, unit, currency, error = normalize_anchor_value(field, val, col, unit=table.get("unit"), currency=table.get("currency"))
+                    if not reading_input_reasons(AnchorReading("ifind", v, caliber=caliber_from_label(field, col), unit=unit, currency=currency, normalization_error=error), field):
+                        return v, col
+                    if fallback[0] is None:
+                        fallback = (v, col)
+    return fallback
 
 
 def _parse_ifind_response(

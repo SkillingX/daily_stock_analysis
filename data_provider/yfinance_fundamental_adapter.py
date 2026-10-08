@@ -29,7 +29,7 @@ mark the block as ``partial`` when only some fields are populated.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -202,7 +202,19 @@ class YfinanceFundamentalAdapter:
             "roe": _ratio_to_pct(info.get("returnOnEquity")),
             "gross_margin": _ratio_to_pct(info.get("grossMargins")),
         }
+        from data_provider.cross_source_validator import AnchorReading, adopted_field_record
+        growth_meta: Dict[str, Any] = {}
+        for field, label, caliber in (
+            ("revenue_yoy", "revenueGrowth", "total_operating_revenue_yoy"),
+            ("net_profit_yoy", "earningsGrowth", None),
+            ("roe", "returnOnEquity", "return_on_equity"),
+            ("gross_margin", "grossMargins", "gross_margin"),
+        ):
+            value = growth_payload[field]
+            if value is not None:
+                growth_meta[field] = adopted_field_record(field, AnchorReading("yfinance.info", value, caliber=caliber, unit="percentage_point", raw_value=str(info.get(label)), raw_label=label, raw_unit="ratio"))
         if any(v is not None for v in growth_payload.values()):
+            growth_payload["field_meta"] = growth_meta
             result["growth"] = growth_payload
             result["source_chain"].append("growth:yfinance.info")
 

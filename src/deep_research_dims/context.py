@@ -57,7 +57,9 @@ def _safe_quote(code: str, ctx: SharedContext) -> Dict[str, Any]:
         if quote is None:
             ctx.limitation("实时行情缺失")
             return {}
+        from data_provider.realtime_types import quote_field_records
         return {
+            "field_meta": quote_field_records(quote),
             "price": getattr(quote, "price", None),
             "change_pct": getattr(quote, "change_percent", None)
             or getattr(quote, "change_pct", None),
@@ -121,6 +123,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
             "source": "fundamental_context",
+            "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
         }
         # fuyao 兜底（按官方文档契约：GET /api/a-share/... + X-api-key）：
         # 主链（tushare/efinance 等）拿不到的关键字段用同花顺 fuyao 补，

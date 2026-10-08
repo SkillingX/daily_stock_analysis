@@ -27,7 +27,6 @@ from data_provider.cross_source_validator import (  # noqa: E402
     _judge_single,
     _judge_unknown,
     _magnitude_tier,
-    _round,
     _within_tolerance,
 )
 from data_provider.cross_source_validator import AnchorSpec  # noqa: E402
@@ -54,9 +53,9 @@ class _FakeSource:
 
 
 class TestPureFunctions(unittest.TestCase):
-    def test_round_truncates_precision(self):
-        self.assertEqual(_round(3.14159265), 3.1416)
-        self.assertEqual(_round(30.0), 30.0)
+    def test_compact_preserves_adopted_precision(self):
+        reading = _reading("mx", 3.14159265)
+        self.assertEqual(_judge_single(reading, "pe_ratio").to_compact()["v"], reading.value)
 
     def test_discrepancy_pct(self):
         self.assertAlmostEqual(_discrepancy_pct(100, 99), 1.0)

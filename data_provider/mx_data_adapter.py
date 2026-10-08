@@ -21,7 +21,7 @@ import time
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 from typing import cast  # added by mypy_codemod
 
 logger = logging.getLogger(__name__)
@@ -296,7 +296,7 @@ class MXClient:
         suffix = f" {period}" if period else ""
         return _extract_first_table_row(
             self.query(
-                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率{suffix}"
+                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率 归属于母公司净利润同比增长率{suffix}"
             ), period=period, field=field
         )
 
@@ -345,25 +345,38 @@ class MXSource:
                 bundle, keywords = self._client.query_capital(code), _CAPITAL_FIELDS[field]
             else:
                 return None
-            for label, raw in bundle.items():
-                value = picker({label: raw}, keywords, field=field)
-                if value is None:
-                    continue
-                actual, basis = report_period_from_fields({**bundle, "report_period": bundle.get("_mx_period")}, label) if field in _PERIOD_FIELDS else (None, "unknown")
-                value, unit, currency, error = normalize_anchor_value(field, raw, label, unit=bundle.get("unit"), currency=bundle.get("currency"))
-                if value is None:
-                    continue
-                observed = observation_time_from_fields(bundle, bundle.get("_mx_period") if field not in _PERIOD_FIELDS else None)
-                return AnchorReading(
-                    source=self.name, value=value,
-                    caliber=caliber_from_label(field, label),
-                    period=actual, period_basis=basis,
-                    requested_period=period if field in _PERIOD_FIELDS else None,
-                    observed_at=observed, fetched_at=bundle.get("fetched_at"),
-                    unit=unit, currency=currency, raw_value=str(raw), raw_label=label, normalization_error=error,
-                    raw_unit=bundle.get("unit"), raw_currency=bundle.get("currency"),
-                )
-            return None
+            return self.read_bundle(bundle, field, period)
         except Exception as exc:  # noqa: BLE001 — 单个源异常不影响其他源
             logger.debug("[MXSource] read %s/%s failed: %s", code, field, exc)
             return None
+
+    def read_bundle(self, bundle: Dict[str, Any], field: str, period: Optional[str] = None) -> Optional[AnchorReading]:
+        """Parse an acquired bundle without issuing another request."""
+        keywords = _SNAPSHOT_FIELDS.get(field) or _FINANCIAL_FIELDS.get(field) or _GROWTH_FIELDS.get(field) or _CAPITAL_FIELDS.get(field)
+        if not keywords:
+            return None
+        picker = _pick_growth_value if field in _GROWTH_FIELDS else _pick_value
+        fallback: Optional[AnchorReading] = None
+        for label, raw in bundle.items():
+            value = picker({label: raw}, keywords, field=field)
+            if value is None:
+                continue
+            actual, basis = report_period_from_fields({**bundle, "report_period": bundle.get("_mx_period")}, label) if field in _PERIOD_FIELDS else (None, "unknown")
+            value, unit, currency, error = normalize_anchor_value(field, raw, label, unit=bundle.get("unit"), currency=bundle.get("currency"))
+            if value is None:
+                continue
+            observed = observation_time_from_fields(bundle, bundle.get("_mx_period") if field not in _PERIOD_FIELDS else None)
+            reading = AnchorReading(
+                source=self.name, value=value,
+                caliber=caliber_from_label(field, label),
+                period=actual, period_basis=basis,
+                requested_period=period if field in _PERIOD_FIELDS else None,
+                observed_at=observed, fetched_at=bundle.get("fetched_at"),
+                unit=unit, currency=currency, raw_value=str(raw), raw_label=label, normalization_error=error,
+                raw_unit=bundle.get("unit"), raw_currency=bundle.get("currency"),
+            )
+            if not reading_input_reasons(reading, field):
+                return reading
+            if fallback is None:
+                fallback = reading
+        return fallback

@@ -981,14 +981,14 @@ class DataFetcherManager:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
-            return f"{normalized_code}|budget=default"
+            return f"{normalized_code}|facts=1|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|budget={budget_bucket}"
+        return f"{normalized_code}|facts=1|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -1751,6 +1751,8 @@ class DataFetcherManager:
             setattr(quote, "provider_timestamp", None)
             setattr(quote, "stale_seconds", None)
             setattr(quote, "is_stale", None)
+            from data_provider.realtime_types import quote_field_records
+            quote.field_meta = quote_field_records(quote)
             return quote
 
         setattr(quote, "provider_timestamp", provider_dt.isoformat())
@@ -1761,6 +1763,17 @@ class DataFetcherManager:
         ttl = realtime_cache_ttl if realtime_cache_ttl is not None else 600
         setattr(quote, "stale_seconds", stale_seconds)
         setattr(quote, "is_stale", stale_seconds > int(ttl))
+        from data_provider.realtime_types import quote_field_records
+        from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+        records = quote_field_records(quote)
+        for field, record in records.items():
+            observed = self._parse_realtime_timestamp(record.get("observed_at"))
+            if observed is not None:
+                record["is_stale"] = (fetched_dt - observed).total_seconds() > int(ttl)
+                reading = reading_from_field_record(record.get("value"), record)
+                if reading is not None:
+                    records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
+        quote.field_meta = records
         return quote
 
     def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
@@ -2088,11 +2101,23 @@ class DataFetcherManager:
         *primary* has None. Returns list of field names that were filled.
         """
         filled = []
+        from data_provider.realtime_types import quote_field_records
+        primary.field_meta = quote_field_records(primary)
+        secondary_meta = quote_field_records(secondary)
+        known_currencies = {record.get("currency") for key, record in primary.field_meta.items() if key in {"current_price", "total_mv", "circ_mv"} and record.get("currency")}
+        if getattr(primary, "currency", None):
+            known_currencies.add(primary.currency)
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
                 if val is not None:
+                    if f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"} and not (secondary_meta.get(f) or {}).get("rule_eligible"):
+                        continue
+                    if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
+                        continue
                     setattr(primary, f, val)
+                    if f in secondary_meta:
+                        primary.field_meta[f] = {**secondary_meta[f], "selection_reason": "quote_supplement"}
                     filled.append(f)
         return filled
 
@@ -2828,12 +2853,30 @@ class DataFetcherManager:
         source_chain: Optional[List[Dict[str, Any]]] = None,
         errors: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        data = dict(payload or {})
+        metadata = dict(data.pop("field_meta", {}) or {})
+        financial = data.get("financial_report")
+        if isinstance(financial, dict) and "field_meta" in financial:
+            financial = dict(financial)
+            metadata.update(financial.pop("field_meta") or {})
+            data["financial_report"] = financial
+        from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+        for field, record in list(metadata.items()):
+            reading = reading_from_field_record(record.get("value"), record)
+            if reading is not None:
+                if reading.period is not None and DataFetcherManager._detect_payload_staleness({"as_of": reading.period}):
+                    from dataclasses import replace
+                    reading = replace(reading, is_stale=True)
+                from data_provider.cross_source_validator import AnchorQuality
+                quality = AnchorQuality(status="conflict") if (record.get("quality") or {}).get("status") == "conflict" else None
+                metadata[field] = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
         return {
             "status": status,
             "coverage": {"status": status},
             "source_chain": source_chain or [],
             "errors": errors or [],
-            "data": payload or {},
+            "data": data,
+            "field_meta": metadata,
         }
 
     @staticmethod
@@ -2846,7 +2889,7 @@ class DataFetcherManager:
         if isinstance(payload, dict):
             return any(
                 DataFetcherManager._has_meaningful_payload(v)
-                for key, v in payload.items() if key != "report_date"
+                for key, v in payload.items() if key not in {"report_date", "field_meta"}
             )
         if isinstance(payload, pd.DataFrame):
             if payload.empty:
@@ -3281,6 +3324,9 @@ class DataFetcherManager:
             if quote_payload
             else None,
         }
+        if quote_payload is not None:
+            from data_provider.realtime_types import quote_field_records
+            valuation_payload["field_meta"] = quote_field_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -3591,6 +3637,9 @@ class DataFetcherManager:
             if quote_payload
             else None,
         }
+        if quote_payload is not None:
+            from data_provider.realtime_types import quote_field_records
+            valuation_payload["field_meta"] = quote_field_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -3742,9 +3791,18 @@ class DataFetcherManager:
                         _fallback_ms,
                     )
                     for key, value in fb_growth.items():
+                        if key == "field_meta":
+                            continue
                         if value is not None and growth_payload.get(key) is None:
+                            record = (fb_growth.get("field_meta") or {}).get(key)
+                            if key in {"roe", "gross_margin", "revenue_yoy", "net_profit_yoy"} and not (record or {}).get("rule_eligible"):
+                                continue
                             growth_payload[key] = value
+                            if record is not None:
+                                growth_payload.setdefault("field_meta", {})[key] = record
                     for key, value in fb_earnings.items():
+                        if key == "field_meta":
+                            continue
                         if value is not None and earnings_payload.get(key) is None:
                             earnings_payload[key] = value
                     for key, value in fb_institution.items():
@@ -3788,41 +3846,17 @@ class DataFetcherManager:
                     )
                     if isinstance(_mx_bundle, dict):
                         _mx_period_raw = _mx_bundle.get("_mx_period")
-                        # Direct field mapping: growth anchors → MX label keywords
-                        # MX labels carry both absolute (营业收入) and 同比增长率 columns.
-                        # Use _pick_growth_value for 同比 fields, _pick_value for absolute.
-                        from data_provider.mx_data_adapter import (
-                            _pick_value as _mx_pick_value,
-                            _pick_growth_value as _mx_pick_growth,
-                        )
-
-                        for _dst_field, _keywords, _picker in (
-                            (
-                                "revenue_yoy",
-                                ["营业收入", "营业总收入", "营收"],
-                                _mx_pick_growth,
-                            ),
-                            (
-                                "net_profit_yoy",
-                                ["归属母公司股东的净利润", "归母净利润", "净利润"],
-                                _mx_pick_growth,
-                            ),
-                            (
-                                "roe",
-                                ["净资产收益率ROE(加权)", "净资产收益率", "ROE"],
-                                _mx_pick_value,
-                            ),
-                            (
-                                "gross_margin",
-                                ["毛利率", "销售毛利率"],
-                                _mx_pick_value,
-                            ),
-                        ):
-                            if growth_payload.get(_dst_field) is not None:
+                        from data_provider.cross_source_validator import adopted_field_record
+                        for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
+                            if growth_payload.get(field) is not None:
                                 continue
-                            _v = _picker(_mx_bundle, _keywords)
-                            if _v is not None:
-                                growth_payload[_dst_field] = _v
+                            reading = self._mx_source.read_bundle(_mx_bundle, field)
+                            if reading is None:
+                                continue
+                            record = adopted_field_record(field, reading, selection_reason="fallback")
+                            if record["rule_eligible"]:
+                                growth_payload[field] = record["value"]
+                                growth_payload.setdefault("field_meta", {})[field] = record
                                 _mx_filled = True
                 except Exception:  # noqa: BLE001 — fail-open
                     _mx_bundle = None
@@ -3838,10 +3872,14 @@ class DataFetcherManager:
                         try:
                             _mx_ar = self._mx_source.read(stock_code, _mx_field)
                             if _mx_ar is not None and _mx_ar.value is not None:
-                                growth_payload[_mx_field] = _mx_ar.value
-                                _mx_filled = True
-                                if _mx_ar.period and not _mx_period_raw:
-                                    _mx_period_raw = _mx_ar.period
+                                from data_provider.cross_source_validator import adopted_field_record
+                                _record = adopted_field_record(_mx_field, _mx_ar, selection_reason="fallback")
+                                if _record["rule_eligible"]:
+                                    growth_payload[_mx_field] = _record["value"]
+                                    growth_payload.setdefault("field_meta", {})[_mx_field] = _record
+                                    _mx_filled = True
+                                    if _mx_ar.period and not _mx_period_raw:
+                                        _mx_period_raw = _mx_ar.period
                         except Exception:  # noqa: BLE001 — fail-open
                             pass
 
@@ -4120,7 +4158,7 @@ class DataFetcherManager:
         sector_rankings = payload.get("sector_rankings") or {}
         has_stock_flow = False
         if isinstance(stock_flow, dict):
-            has_stock_flow = any(v is not None for v in stock_flow.values())
+            has_stock_flow = self._has_meaningful_payload(stock_flow)
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(
             sector_rankings.get("bottom")
         )

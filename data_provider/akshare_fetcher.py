@@ -1134,6 +1134,8 @@ class AkshareFetcher(BaseFetcher):
                 code=stock_code,
                 name=str(row.get("名称", "")),
                 source=RealtimeSource.AKSHARE_EM,
+                currency="CNY",
+                field_meta={"pe_ratio": {"caliber": "dynamic_pe", "raw_label": "市盈率-动态"}, "pb_ratio": {"raw_label": "市净率"}},
                 price=safe_float(row.get("最新价")),
                 change_pct=safe_float(row.get("涨跌幅")),
                 change_amount=safe_float(row.get("涨跌额")),

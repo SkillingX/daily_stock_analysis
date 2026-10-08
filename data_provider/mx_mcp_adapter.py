@@ -30,7 +30,7 @@ import os
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 from .ifind_fundamental_adapter import _safe_float
 
 logger = logging.getLogger(__name__)
@@ -228,13 +228,20 @@ def _pick_value(pairs: Dict[str, str], keywords: List[str], field: Optional[str]
 
     返回 ``(value, used_column)``。找不到 → ``(None, "")``。
     """
+    fallback: Tuple[Optional[float], str] = (None, "")
     for kw in keywords:
         for col, val in pairs.items():
             if kw in col:
                 v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
-                    return v, col
-    return None, ""
+                    if field is None:
+                        return v, col
+                    _, unit, currency, error = normalize_anchor_value(field, val, col, unit=pairs.get("unit"), currency=pairs.get("currency"))
+                    if not reading_input_reasons(AnchorReading("mx_mcp", v, caliber=caliber_from_label(field, col), unit=unit, currency=currency, normalization_error=error), field):
+                        return v, col
+                    if fallback[0] is None:
+                        fallback = (v, col)
+    return fallback
 
 
 def _parse_mx_mcp_response(
