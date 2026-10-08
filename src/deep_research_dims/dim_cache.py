@@ -51,6 +51,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 SCHEMA_VERSION = 7  # v7：BusinessDim 四字段真正落 Dict 注解（v6 仅注释漂移）；v6=18 维研究员 payload
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
+_FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 
 def _cache_path(stock_code: str, dim: str) -> str:
@@ -70,6 +71,8 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         return None
     if record.get("schema_version") != SCHEMA_VERSION:
         return None  # 旧契约 payload 不兼容（C4）：视为 miss，重算并覆盖
+    if dim in _FUNDAMENTAL_MAPPING_DIMS and record.get("mapping_version") != 2:
+        return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
     saved_at = str(record.get("saved_at") or "")
     payload = record.get("payload")
     if not isinstance(payload, dict):
@@ -96,6 +99,8 @@ def save_cached_dim(stock_code: str, dim: str, payload: Dict[str, Any]) -> None:
             "dim": dim,
             "payload": payload,
         }
+        if dim in _FUNDAMENTAL_MAPPING_DIMS:
+            record["mapping_version"] = 2
         with open(_cache_path(stock_code, dim), "w", encoding="utf-8") as fh:
             json.dump(record, fh, ensure_ascii=False, default=str)
     except (OSError, TypeError, ValueError) as exc:

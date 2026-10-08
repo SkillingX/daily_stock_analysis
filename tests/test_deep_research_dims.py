@@ -604,7 +604,7 @@ class TestSnapshotCache:
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
-        dim_cache.save_snapshot("stage0_fund_600519", {"pe_ttm": 19.09})
+        dim_cache.save_snapshot("stage0_fund_v2_600519", {"pe_ttm": 19.09})
 
         def _boom(*a, **k):
             raise AssertionError("命中快照不应调用 fetcher")

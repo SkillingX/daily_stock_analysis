@@ -682,7 +682,7 @@ def _fallback_valuation_from_quote(
         return valuation
     merged = dict(valuation)
     for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv"):
-        if not merged.get(field):
+        if merged.get(field) is None:
             merged[field] = getattr(quote, field, None)
     return merged
 
@@ -703,7 +703,7 @@ def _handle_get_stock_info(stock_code: str) -> dict[str, Any]:
     compact_context = _compact_fundamental_context(fundamental_context)
     valuation = compact_context.get("valuation", {}).get("data", {})
     # fail-open：fundamental valuation 受严格超时易缺失，用 get_realtime_quote 兜底估值
-    if not valuation.get("pe_ratio"):
+    if any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
         valuation = _fallback_valuation_from_quote(manager, stock_code, valuation)
 
     # opt-in 交叉验证：估值/财务/增长锚点。period 驱动 iFinD 财务类查询返回数据；

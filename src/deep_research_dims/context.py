@@ -79,7 +79,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     """
     from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
 
-    cache_key = f"stage0_fund_{code}"
+    cache_key = f"stage0_fund_v2_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     if cached is not None:
         return cached
@@ -104,13 +104,17 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                     industry_hint = value.strip()
                     break
         result = {
-            "pe_ttm": valuation.get("pe_ratio") or valuation.get("pe_ttm"),
+            "pe_ttm": next(
+                (valuation[k] for k in ("pe_ratio", "pe_ttm") if valuation.get(k) is not None), None
+            ),
             "pb": valuation.get("pb_ratio"),
-            "market_cap": valuation.get("market_cap")
-            or valuation.get("total_market_cap"),
+            "market_cap": next(
+                (valuation[k] for k in ("total_mv", "market_cap", "total_market_cap") if valuation.get(k) is not None), None
+            ),
             "roe": financial.get("roe"),
-            "revenue_growth": financial.get("revenue_yoy")
-            or financial.get("revenue_growth"),
+            "revenue_growth": next(
+                (financial[k] for k in ("revenue_yoy", "revenue_growth") if financial.get(k) is not None), None
+            ),
             "net_profit_yoy": financial.get("net_profit_yoy"),
             "gross_margin": financial.get("gross_margin"),
             "institution_holding_change": institution.get("institution_holding_change"),
