@@ -40,3 +40,13 @@ MX、iFinD、Choice MCP 和 Fuyao 的读数 `period` 表示源响应确认的实
 MX、iFinD、Choice 和 Fuyao 的核验读数同时读取单元格与返回字段单位。货币量使用 `currency_base`，百分比使用 `percentage_point`，估值使用 `multiple`；明确 `ratio` 的 0.18 转为 18 个百分点，单独的 0.18 保留原值并标记单位未知。金额缩放通过 `Decimal`，在既有 JSON number 边界转为有限数值。
 
 `unit`、`currency`、`raw_value`、`raw_label`、显式声明的 `raw_unit` / `raw_currency` 与 `normalization_error` 随 Source 包装及 compact 保留。表头万元与数值亿元矛盾、金额币种未知或币种不同均不可比；不会自动汇兑或默认人民币。百分比和倍数不要求币种。未规范化的原值保留作证据，不代表规则可用。旧期间版本 4 的核验缓存也不再复用；不修改历史报告或数据库。
+
+## 全源证据与核验状态
+
+核验保留既选主值，全部已取得读数进入 `readings`，失败和超时进入 `source_errors`。同实际期、口径、单位及适用时间的全部有效对参加容差检查；第三、第四源及未知家族的可比读数也会揭示冲突。任何可比对冲突都保留主值作证据并返回 `conflict/low/false`，不会多数投票、平均或换主值。异期或异口径额外读数单列不可比，不否定其他已证明独立的佐证。
+
+MX/Choice 属东财家族，iFinD/Fuyao 属同花顺家族；家族只限制独立佐证资格。未知家族不算独立票，但不会从数值冲突检查中排除。`verified/high/true` 需要相对于主源的已知独立家族；同家族一致只有 `single_source/medium/false`。其他状态为 `missing/low/false`、`unverified/medium/false`、`not_comparable/medium/false`，原因使用稳定 `reason_codes`。`conf` 与 `v` 继续作为兼容字段，证据值不等于允许评分。
+
+行情和资金的时间取自 `observed_at`，不能用 `fetched_at` 补证。行情须有完整数据时间且未超出现有 `REALTIME_CACHE_TTL`；融资余额使用既有市场有效交易日。财务使用实际财期，不要求抓取秒相同。资金流只核验方向相同及量级差不超过原一档；相邻档可通过，零值不能作非零方向证明，也不能掩盖其他源反向冲突。
+
+截止前返回的读数仍参加判定，未完成源明确超时，核验返回不等待慢源结束。每个现有 validator 复用固定上限的取数线程池；已过截止不提交新调用。具体底层调用预算传递由补缺流程统一处理。关闭当前核验开关后不会使用进程缓存 validator 联网，财务快照及 F1/六维/情景缓存按当前核验模式隔离，业务和行业缓存保留。

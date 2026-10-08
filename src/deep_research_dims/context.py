@@ -78,8 +78,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     保留下次重试机会。
     """
     from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
+    from src.config import get_config
 
-    cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_{code}"
+    cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     if cached is not None:
         return cached

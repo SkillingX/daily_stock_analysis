@@ -5,6 +5,7 @@ Requires project dependencies; all provider transports are fixture responses.
 
 from types import SimpleNamespace
 import json
+from datetime import datetime, timezone
 
 import pytest
 import requests
@@ -78,7 +79,7 @@ def test_unknown_actual_financial_period_is_not_strictly_verified(field: str) ->
     assert result.value == 100.0
     assert result.confidence == "medium"
     assert not result.agreed
-    assert "报告期未知" in result.note
+    assert "period_unknown" in result.quality.reason_codes
 
 
 def test_ifind_response_period_survives_source_wrapper() -> None:
@@ -124,7 +125,7 @@ def test_unknown_or_incompatible_financial_period_basis_prevents_verification(se
     secondary = AnchorReading("ifind", 100.0, caliber="operating_revenue", period=secondary_period, period_basis=basis, unit="currency_base", currency="CNY")
     result = CrossSourceValidator([SimpleNamespace(name="ifind", read=lambda *args: secondary)]).verify("600519", "revenue", primary_reading=primary)
     assert result.confidence == "medium" and not result.agreed
-    assert "期间口径" in result.note
+    assert any(code.startswith("period_basis_") for code in result.quality.reason_codes)
 
 
 def test_confirmed_annual_date_and_chinese_period_are_equivalent() -> None:
@@ -183,7 +184,7 @@ def test_explicit_single_quarter_basis_survives_all_source_routes(source: str, m
     peer = AnchorReading("peer", 50.0, caliber=reading.caliber, period="2026中报", unit=reading.unit, currency=reading.currency)
     result = CrossSourceValidator([SimpleNamespace(name="peer", read=lambda *args: peer)]).verify("600519", "revenue", primary_reading=reading)
     assert result.confidence == "medium" and not result.agreed
-    assert "期间口径不一致" in result.note
+    assert "period_basis_mismatch" in result.quality.reason_codes
 
 
 @pytest.mark.parametrize("source", ["ifind", "choice"])
@@ -233,26 +234,30 @@ def test_mx_quote_date_column_keeps_full_observation_time(observed: str, monkeyp
 @pytest.mark.parametrize("source", ["mx", "ifind", "choice", "fuyao"])
 @pytest.mark.parametrize("label,raw", [("总市值（万元，人民币）", "100000"), ("总市值（元，人民币）", "1000000000"), ("总市值（人民币）", "100000万元")])
 def test_equivalent_amount_units_through_real_sources(source: str, label: str, raw: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed = datetime.now(timezone.utc).isoformat()
     if source == "mx":
         response = mx_financial_response(["2026中报"], [raw])
         response["data"]["data"]["searchDataResultDTO"]["dataTableDTOList"][0]["nameMap"]["row1"] = label
+        dto = response["data"]["data"]["searchDataResultDTO"]["dataTableDTOList"][0]
+        dto["nameMap"]["obs"] = "observed_at"
+        dto["table"]["obs"] = [observed]
         monkeypatch.setattr(requests, "post", lambda *args, **kwargs: SimpleNamespace(status_code=200, json=lambda: response))
         reading = MXSource(MXClient(api_key="offline-fixture")).read("600519", "total_mv")
     elif source == "ifind":
-        text = json.dumps({"data": {"answer": f"|{label}|\n|---|\n|{raw}|"}})
+        text = json.dumps({"data": {"answer": f"|{label}|observed_at|\n|---|---|\n|{raw}|{observed}|"}})
         reading = _parse_ifind_response(text, ["总市值"], "total_mv", None)
     elif source == "choice":
-        reading = _parse_mx_mcp_response(json.dumps({"response": {label: raw}}), ["总市值"], "total_mv", None)
+        reading = _parse_mx_mcp_response(json.dumps({"response": {label: raw, "observed_at": observed}}), ["总市值"], "total_mv", None)
     else:
         unit = "万元" if "万元" in label else "元" if "（元" in label else None
-        fields = {"total_mv": raw, "currency": "CNY"}
+        fields = {"total_mv": raw, "currency": "CNY", "observed_at": observed}
         if unit:
             fields["unit"] = unit
         reading = _parse_fuyao_response(json.dumps({"code": 0, "data": {"items": [{"thscode": "600519.SH", "fields": fields}]}}), "total_mv", None)
     assert reading is not None and reading.value == 1_000_000_000.0
     assert reading.unit == "currency_base" and reading.currency == "CNY"
-    peer = AnchorReading("peer", 1_000_000_000.0, unit="currency_base", currency="CNY")
-    result = CrossSourceValidator([SimpleNamespace(name="peer", read=lambda *args: peer)]).verify("600519", "total_mv", primary_reading=reading)
+    peer = AnchorReading("ifind" if source in {"mx", "choice"} else "mx", 1_000_000_000.0, unit="currency_base", currency="CNY", observed_at=observed)
+    result = CrossSourceValidator([SimpleNamespace(name=peer.source, read=lambda *args: peer)]).verify("600519", "total_mv", primary_reading=reading)
     assert result.confidence == "high" and result.agreed
     compact = result.to_compact()
     assert compact["unit"] == "currency_base" and compact["currency"] == "CNY"

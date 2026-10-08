@@ -85,13 +85,13 @@ def _build_sources(config: Any) -> List[SourceAdapter]:
 def _get_validator() -> Optional[CrossSourceValidator]:
     """懒加载 validator（进程级单例）。开关关 / 无源 → None。"""
     global _validator_instance
-    if _validator_instance is not None:
-        return _validator_instance
     from src.config import get_config
 
     config = get_config()
     if not getattr(config, "deep_research_cross_validate", False):
         return None
+    if _validator_instance is not None:
+        return _validator_instance
     with _validator_lock:
         if _validator_instance is None:
             sources = _build_sources(config)
@@ -107,6 +107,7 @@ def build_cross_validation_block(
     period: Optional[str] = None,
     primary_readings: Optional[Dict[str, AnchorReading]] = None,
     validator: Optional[CrossSourceValidator] = None,
+    deadline: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """构建 ``cross_validation`` 块。
 
@@ -130,6 +131,7 @@ def build_cross_validation_block(
                 field,
                 period=period,
                 primary_reading=primary_readings.get(field),
+                **({"deadline": deadline} if deadline is not None else {}),
             )
         except Exception as exc:  # noqa: BLE001 — fail-open：单锚点失败不阻塞其余
             logger.debug("[CrossValidate] verify %s/%s failed: %s", code, field, exc)
@@ -142,5 +144,5 @@ def build_cross_validation_block(
     return {
         "enabled": True,
         "anchors": anchors,
-        "summary": f"{agreed}/{total} 锚点双源验证通过",
+        "summary": f"{agreed}/{total} 锚点取得独立来源佐证",
     }

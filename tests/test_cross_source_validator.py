@@ -9,6 +9,7 @@ to_compact 序列化、锚点规格表完整性。
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -32,9 +33,10 @@ from data_provider.cross_source_validator import (  # noqa: E402
 from data_provider.cross_source_validator import AnchorSpec  # noqa: E402
 
 
-def _reading(source: str, value: float, caliber=None, period=None) -> AnchorReading:
+def _reading(source: str, value: float, caliber=None, period=None, source_family=None) -> AnchorReading:
     return AnchorReading(source=source, value=value, caliber=caliber, period=period,
-                         unit="multiple" if caliber in {"TTM", "MRQ", "static", "dynamic"} else "currency_base", currency="CNY")
+                         unit="multiple" if caliber in {"TTM", "MRQ", "static", "dynamic"} else "currency_base", currency="CNY",
+                         observed_at=datetime.now(timezone.utc).isoformat(), source_family=source_family)
 
 
 class _FakeSource:
@@ -102,7 +104,7 @@ class TestJudgeNumeric(unittest.TestCase):
             _reading("mx", 30.0, "TTM"), _reading("ifind", 30.0, "static"), self._spec()
         )
         self.assertEqual(v.confidence, "medium")
-        self.assertIn("口径不一致", v.note)
+        self.assertIn("caliber_mismatch", v.quality.reason_codes)
 
     def test_medium_when_period_mismatch(self):
         v = _judge_numeric(
@@ -111,13 +113,13 @@ class TestJudgeNumeric(unittest.TestCase):
             AnchorSpec("revenue", MODE_NUMERIC, 3.0),
         )
         self.assertEqual(v.confidence, "medium")
-        self.assertIn("报告期不一致", v.note)
+        self.assertIn("period_mismatch", v.quality.reason_codes)
 
     def test_caliber_check_skipped_when_not_aware(self):
         # 行情类 caliber_aware=False：口径不同仍走数值比对
         spec = AnchorSpec("current_price", MODE_NUMERIC, 1.0, caliber_aware=False)
         v = _judge_numeric(
-            _reading("realtime", 100.0, "spot"), _reading("ifind", 100.5, "spot"), spec
+            _reading("realtime", 100.0, "spot", source_family="eastmoney"), _reading("ifind", 100.5, "spot"), spec
         )
         self.assertEqual(v.confidence, "high")
 
@@ -139,34 +141,32 @@ class TestJudgeNumeric(unittest.TestCase):
         self.assertEqual(v.confidence, "high")
         self.assertTrue(v.agreed)
         self.assertEqual(v.sources, ("mx", "ifind", "mx_mcp"))
-        self.assertIn("3源一致", v.note)
+        self.assertEqual(v.quality.status, "verified")
 
     def test_three_way_tertiary_supports_primary(self):
-        """primary+tertiary 一致，secondary outlier → medium（标记 outlier）。"""
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
         v = _judge_numeric(
             _reading("mx", 30.5, "TTM", "2024年报"),
             _reading("ifind", 50.0, "TTM", "2024年报"),  # outlier
             self._spec(tol=10.0),
             tertiary=_reading("mx_mcp", 30.7, "TTM", "2024年报"),
         )
-        self.assertEqual(v.confidence, "medium")
+        self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
         self.assertEqual(v.sources, ("mx", "ifind", "mx_mcp"))
         self.assertIn("ifind", v.note)
-        self.assertIn("outlier", v.note)
 
     def test_three_way_tertiary_supports_secondary(self):
-        """secondary+tertiary 一致，primary outlier → medium（outlier 仍是 primary 但 verdict 标 outlier）。"""
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
         v = _judge_numeric(
             _reading("mx", 50.0, "TTM", "2024年报"),  # outlier
             _reading("ifind", 30.5, "TTM", "2024年报"),
             self._spec(tol=10.0),
             tertiary=_reading("mx_mcp", 30.7, "TTM", "2024年报"),
         )
-        self.assertEqual(v.confidence, "medium")
+        self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
         self.assertIn("mx", v.note)
-        self.assertIn("outlier", v.note)
 
     def test_three_way_all_disagree_low(self):
         """3源两两都不一致 → low（3-way 真冲突）。"""
@@ -179,7 +179,7 @@ class TestJudgeNumeric(unittest.TestCase):
         self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
         self.assertEqual(v.sources, ("mx", "ifind", "mx_mcp"))
-        self.assertIn("3源不一致", v.note)
+        self.assertEqual(v.quality.status, "conflict")
 
     def test_three_way_caliber_mismatch_unchanged(self):
         """caliber 不一致时仍然 medium（不进入 3-way 容差比对），保留旧行为。"""
@@ -190,7 +190,7 @@ class TestJudgeNumeric(unittest.TestCase):
             tertiary=_reading("mx_mcp", 30.0, "TTM"),
         )
         self.assertEqual(v.confidence, "medium")
-        self.assertIn("口径不一致", v.note)
+        self.assertIn("caliber_mismatch", v.quality.reason_codes)
 
 
 class TestJudgeDirection(unittest.TestCase):
@@ -200,12 +200,12 @@ class TestJudgeDirection(unittest.TestCase):
         )
         self.assertEqual(v.confidence, "high")
         self.assertTrue(v.agreed)
-        self.assertEqual(v.caliber, "方向比对")
+        self.assertIn("方向相同、量级差≤1档", v.note)
 
     def test_medium_same_direction_far_tier(self):
         v = _judge_direction(_reading("mx", 1e8), _reading("ifind", 1e4), "main_inflow")
         self.assertEqual(v.confidence, "medium")
-        self.assertIn("量级差异大", v.note)
+        self.assertIn("magnitude_mismatch", v.quality.reason_codes)
 
     def test_low_opposite_direction(self):
         v = _judge_direction(
@@ -220,14 +220,14 @@ class TestJudgeDirection(unittest.TestCase):
             _reading("mx", -2e8), _reading("ifind", -1.8e8), "main_inflow"
         )
         self.assertEqual(v.confidence, "high")
-        self.assertIn("净流出", v.note)
+        self.assertEqual(v.quality.status, "verified")
 
     def test_zero_value_is_medium_not_high(self):
         # 零值（收盘/数据缺失）方向不可靠 → medium（避免双零误判 high）
         v = _judge_direction(_reading("mx", 0.0), _reading("ifind", 0.0), "main_inflow")
         self.assertEqual(v.confidence, "medium")
         self.assertFalse(v.agreed)
-        self.assertIn("零值", v.note)
+        self.assertIn("direction_zero", v.quality.reason_codes)
 
     def test_one_zero_value_is_medium(self):
         # 单边零值同样不可靠
@@ -235,45 +235,39 @@ class TestJudgeDirection(unittest.TestCase):
         self.assertEqual(v.confidence, "medium")
 
     def test_three_way_opposite_with_tertiary_supports_primary(self):
-        """primary 与 secondary 方向相反，tertiary 偏 primary → medium（secondary outlier）。"""
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
         v = _judge_direction(
             _reading("mx", 2.3e8),  # 净流入
             _reading("ifind", -5e7),  # 净流出
             "main_inflow",
             tertiary=_reading("mx_mcp", 2.0e8),  # 净流入（支持 primary）
         )
-        self.assertEqual(v.confidence, "medium")
+        self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
         self.assertEqual(v.sources, ("mx", "ifind", "mx_mcp"))
-        self.assertIn("secondary", v.note)
-        self.assertIn("outlier", v.note)
 
     def test_three_way_opposite_with_tertiary_supports_secondary(self):
-        """primary 与 secondary 方向相反，tertiary 偏 secondary → medium（primary outlier）。"""
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
         v = _judge_direction(
             _reading("mx", -5e7),  # 净流出（primary outlier）
             _reading("ifind", 2.3e8),  # 净流入
             "main_inflow",
             tertiary=_reading("mx_mcp", 2.0e8),  # 净流入（支持 secondary）
         )
-        self.assertEqual(v.confidence, "medium")
+        self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
-        self.assertIn("primary", v.note)
-        self.assertIn("outlier", v.note)
 
     def test_three_way_three_different_directions_low(self):
-        """primary 与 secondary 方向相反，tertiary 也偏 secondary（0 视为非正）→ medium（primary outlier）。"""
-        # tertiary=0 → d_tertiary=False，与 secondary 同侧 → 判 primary 为 outlier
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
+        # 合法零值不能掩盖其他两源的方向冲突
         v = _judge_direction(
             _reading("mx", 2.3e8),  # primary 净流入
             _reading("ifind", -5e7),  # secondary 净流出
             "main_inflow",
             tertiary=_reading("mx_mcp", 0.0),  # 0 → 与 secondary 同侧（≤0）
         )
-        self.assertEqual(v.confidence, "medium")
+        self.assertEqual(v.confidence, "low")
         self.assertFalse(v.agreed)
-        self.assertIn("primary", v.note)
-        self.assertIn("outlier", v.note)
 
 
 class TestJudgeEdgeCases(unittest.TestCase):
@@ -377,7 +371,7 @@ class TestCrossSourceValidator(unittest.TestCase):
         self.assertIn("main_inflow", result.field)
 
     def test_verify_three_sources_tertiary_tiebreaker_medium(self):
-        """3 源：mx vs ifind 不一致，mx_mcp 偏 mx → medium（ifind outlier）。"""
+        """可比少数源分歧也是冲突，不使用多数投票覆盖。"""
         mx = _FakeSource("mx", {"pe_ratio": _reading("mx", 30.0, "TTM", "2024年报")})
         ifind = _FakeSource(
             "ifind", {"pe_ratio": _reading("ifind", 50.0, "TTM", "2024年报")}  # outlier
@@ -387,7 +381,7 @@ class TestCrossSourceValidator(unittest.TestCase):
         )
         v = CrossSourceValidator(sources=[mx, ifind, mx_mcp])
         result = v.verify("600519", "pe_ratio")
-        self.assertEqual(result.confidence, "medium")
+        self.assertEqual(result.confidence, "low")
         self.assertFalse(result.agreed)
         self.assertEqual(result.sources, ("mx", "ifind", "mx_mcp"))
         self.assertIn("ifind", result.note)
@@ -400,10 +394,10 @@ class TestCrossSourceValidator(unittest.TestCase):
         v = CrossSourceValidator(sources=[mx, ifind, mx_mcp])
         result = v.verify("600519", "pe_ratio")
         self.assertEqual(result.confidence, "low")
-        self.assertIn("3源不一致", result.note)
+        self.assertEqual(result.quality.status, "conflict")
 
     def test_verify_three_sources_direction_tertiary_breaks_tie(self):
-        """3 源方向判定：primary vs secondary 反向，tertiary 偏 primary → medium。"""
+        """三源方向相反时披露冲突，不用多数票仲裁。"""
         mx = _FakeSource("mx", {"main_inflow": _reading("mx", 2e8)})  # 净流入
         ifind = _FakeSource(
             "ifind", {"main_inflow": _reading("ifind", -3e7)}  # 净流出
@@ -413,7 +407,7 @@ class TestCrossSourceValidator(unittest.TestCase):
         )
         v = CrossSourceValidator(sources=[mx, ifind, mx_mcp])
         result = v.verify("600519", "main_inflow")
-        self.assertEqual(result.confidence, "medium")
+        self.assertEqual(result.confidence, "low")
         self.assertEqual(result.sources, ("mx", "ifind", "mx_mcp"))
 
     def test_verify_tertiary_missing_only_two_evaluated(self):
@@ -457,10 +451,11 @@ class TestCrossSourceValidator(unittest.TestCase):
         # 行情类：注入 realtime 主源 + MX 验证源 → realtime 为 primary
         mx = _FakeSource("mx", {"current_price": _reading("mx", 100.5)})
         v = CrossSourceValidator(sources=[mx])
-        primary = AnchorReading(source="realtime", value=100.0, unit="currency_base", currency="CNY")
+        primary = AnchorReading(source="realtime", value=100.0, unit="currency_base", currency="CNY", observed_at=datetime.now(timezone.utc).isoformat())
         result = v.verify("600519", "current_price", primary_reading=primary)
         self.assertEqual(result.sources[0], "realtime")
-        self.assertEqual(result.confidence, "high")  # 100.0 vs 100.5 ≈ 0.5% < 1%
+        self.assertEqual(result.confidence, "medium")
+        self.assertEqual(result.quality.status, "not_comparable")  # 主源家族未知，数值相等也不伪称独立验证
 
 
 class TestToCompact(unittest.TestCase):
@@ -494,7 +489,7 @@ class TestToCompact(unittest.TestCase):
             agreed=False,
         )
         payload = v.to_compact()
-        self.assertEqual(set(payload.keys()), {"v", "conf", "src"})
+        self.assertEqual(set(payload.keys()), {"v", "conf", "src", "quality", "agreed", "readings", "conflicts", "source_errors"})
 
 
 class TestAnchorSpecs(unittest.TestCase):

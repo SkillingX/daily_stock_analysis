@@ -1,22 +1,11 @@
 # -*- coding: utf-8 -*-
-"""跨数据源交叉验证层（KISS · 纯逻辑判定，无网络依赖）。
+"""Cross-source evidence for the adopted anchor value.
 
-职责：对同一锚点（如 ``pe_ratio``），收集多个数据源的读数，按
-「容差 + 口径 + 报告期」三重判定产出置信度；资金流类按「方向 + 量级」判定
-（东财/同花顺主力净流入算法口径不同，不能盲目数值比对）。
-
-设计要点（高内聚低耦合）：
-- 本模块**只做判定**，不联网。所有 IO（取数）由调用方注入的 ``SourceAdapter`` 负责，
-  通过 Protocol 解耦 —— 加第三源只需实现 ``read``，不改本模块。
-- 判定逻辑全部是纯函数（``_judge_*``），无副作用，易做 100% 单测。
-- ``CrossSourceValidator.verify`` 编排「收集 → 判定」，收集时并行 + 异常隔离（fail-open）。
-
-置信度语义：
-- ``high``   双源取到且通过判定（数值容差内 / 方向+量级一致）
-- ``medium`` 仅单源，或口径/报告期不一致而未做数值比对，或方向同但量级差异大
-- ``low``    数值超容差（冲突），或资金流方向相反（真异常）
-
-对应方案 ``rippling-percolating-fairy.md`` 第三节锚点分级与第四节验证流程。
+All comparable pairs participate, including same-family and unknown-family readings.
+Only a proven family independent of the main reading supports verified/high/true.
+Source failures are isolated and disclosed; conflicts never replace the adopted value.
+Financial comparisons require confirmed period, basis and definition. Quote comparisons
+require supplier observation time within the existing realtime cache window.
 """
 
 from __future__ import annotations
@@ -24,12 +13,14 @@ from __future__ import annotations
 import logging
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
-from datetime import date, datetime
+from concurrent.futures import ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass, field as dataclass_field
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, Overflow
-from typing import Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
+from time import monotonic
+from typing import Annotated, Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
 from icontract import ensure
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +41,15 @@ _CURRENCY_MARKERS = {
     "SGD": ("SGD", "新加坡元"), "AUD": ("AUD", "澳元"),
     "CAD": ("CAD", "加元"), "CHF": ("CHF", "瑞士法郎"),
 }
+_SOURCE_FAMILIES = {"mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney"}
+QualityStatus = Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"]
+
+
+class AnchorQuality(BaseModel):
+    """Stable, low sensitivity quality state at the context output boundary."""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    status: QualityStatus = "unverified"
+    reason_codes: tuple[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]*$")], ...] = ()
 
 
 @ensure(lambda result: result[0] is None or math.isfinite(result[0]), "JSON numeric values must be finite")
@@ -245,8 +245,7 @@ ANCHOR_SPECS: Dict[str, AnchorSpec] = {
     "revenue": AnchorSpec("revenue", MODE_NUMERIC, 3.0),
     "net_profit": AnchorSpec("net_profit", MODE_NUMERIC, 3.0),
     "roe": AnchorSpec("roe", MODE_NUMERIC, 3.0),
-    # 毛利率 / 营收同比：派生指标，两源口径（毛利/销售毛利率；同比基准期）非标准化，
-    # caliber_aware=False 避免口径判定误伤，容差放宽（毛利率 15%、增速 20%）
+    # 保留既有派生指标容差；财务期间与定义由统一判定检查。
     "gross_margin": AnchorSpec("gross_margin", MODE_NUMERIC, 15.0, caliber_aware=False),
     "revenue_yoy": AnchorSpec("revenue_yoy", MODE_NUMERIC, 20.0, caliber_aware=False),
     # 净利润同比：派生指标，波动较大，容差放宽至 25%
@@ -284,12 +283,15 @@ class AnchorReading:
     raw_unit: Optional[str] = None
     raw_currency: Optional[str] = None
     normalization_error: Optional[str] = None
+    source_family: Optional[str] = None
 
     def __post_init__(self) -> None:
         actual, inferred_basis = normalize_report_period(self.period)
         object.__setattr__(self, "period", actual)
         if self.period_basis == "unknown":
             object.__setattr__(self, "period_basis", inferred_basis)
+        if self.source_family is None:
+            object.__setattr__(self, "source_family", _SOURCE_FAMILIES.get(self.source.lower()))
 
 
 @dataclass(frozen=True)
@@ -316,6 +318,11 @@ class AnchorVerification:
     raw_unit: Optional[str] = None
     raw_currency: Optional[str] = None
     normalization_error: Optional[str] = None
+    quality: AnchorQuality = dataclass_field(default_factory=AnchorQuality)
+    readings: tuple[AnchorReading, ...] = ()
+    reading_reasons: tuple[tuple[str, ...], ...] = ()
+    conflicts: tuple[tuple[str, str], ...] = ()
+    source_errors: tuple[tuple[str, str], ...] = ()
 
     def to_compact(self) -> Dict[str, Any]:
         """压缩为 LLM 友好的 dict（省 token）。"""
@@ -323,6 +330,8 @@ class AnchorVerification:
             "v": _round(self.value),
             "conf": self.confidence,
             "src": list(self.sources),
+            "agreed": self.agreed,
+            "quality": self.quality.model_dump(mode="json"),
         }
         if self.discrepancy_pct is not None:
             payload["diff"] = round(self.discrepancy_pct, 2)
@@ -344,25 +353,14 @@ class AnchorVerification:
             value = getattr(self, key)
             if value is not None:
                 payload[key] = value
+        conflicted = {name for pair in self.conflicts for name in pair}
+        payload["readings"] = [
+            {**asdict(reading), "relation": "conflict" if reading.source in conflicted else "not_comparable" if reasons else "single_source" if len(self.readings) == 1 else "consistent", "reason_codes": list(reasons) + (["family_unknown"] if reading.source_family is None else [])}
+            for reading, reasons in zip(self.readings, self.reading_reasons)
+        ]
+        payload["conflicts"] = [list(pair) for pair in self.conflicts]
+        payload["source_errors"] = [{"source": name, "reason_code": reason} for name, reason in self.source_errors]
         return payload
-
-
-def _unit_comparison_reason(readings: Sequence[AnchorReading], field: str) -> Optional[str]:
-    if any(reading.normalization_error for reading in readings):
-        return "单位规范化失败"
-    if any(reading.unit is None for reading in readings):
-        return "单位未知"
-    if len({reading.unit for reading in readings}) > 1:
-        return "单位不一致"
-    expected = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
-    if any(reading.unit != expected for reading in readings):
-        return "单位不适用于该指标"
-    if field in MONEY_ANCHORS:
-        if any(reading.currency not in _CURRENCY_MARKERS for reading in readings):
-            return "币种未知"
-        if len({reading.currency for reading in readings}) > 1:
-            return "币种不一致"
-    return None
 
 
 # ------------------------------------------------------------------
@@ -406,17 +404,20 @@ def _round(value: Optional[float]) -> Optional[float]:
     return round(float(value), 4)
 
 
+@ensure(lambda result: 0.0 <= result <= 200.0, "Relative difference on finite readings cannot exceed 200 percent")
 def _discrepancy_pct(a: float, b: float) -> float:
     """相对差异百分比（以较大绝对值为基准）。"""
-    base = max(abs(a), abs(b))
+    left, right = Decimal(str(a)), Decimal(str(b))
+    base = max(abs(left), abs(right))
     if base == 0:
         return 0.0
-    return abs(a - b) / base * 100.0
+    return float(abs(left - right) / base * Decimal(100))
 
 
 def _within_tolerance(a: float, b: float, tol_pct: float) -> bool:
     """相对容差判定。"""
-    return _discrepancy_pct(a, b) <= tol_pct
+    left, right = Decimal(str(a)), Decimal(str(b))
+    return abs(left - right) * Decimal(100) <= Decimal(str(tol_pct)) * max(abs(left), abs(right))
 
 
 def _magnitude_tier(value: float) -> int:
@@ -429,281 +430,189 @@ def _magnitude_tier(value: float) -> int:
     return int(math.floor(math.log10(abs(value))))
 
 
-@ensure(
-    lambda result, primary, secondary, spec, tertiary:
-    result.confidence != "high" or spec.field not in FINANCIAL_ANCHORS or all(
-        reading is None or (
-            reading.period is not None and reading.period == primary.period
-            and reading.period_basis != "unknown" and reading.period_basis == primary.period_basis
-            and reading.caliber is not None and reading.caliber == primary.caliber
-        ) for reading in (primary, secondary, tertiary)
-    ),
-    "Strict financial agreement requires the same confirmed period, basis and metric definition",
-)
-def _judge_numeric(
-    primary: AnchorReading,
-    secondary: AnchorReading,
-    spec: AnchorSpec,
-    tertiary: Optional[AnchorReading] = None,
+def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]:
+    """Intrinsic input validity; unknown financial periods still allow limited local use."""
+    if not math.isfinite(reading.value):
+        return ("invalid_value",)
+    if reading.normalization_error:
+        return (reading.normalization_error,)
+    expected = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
+    if reading.unit is None:
+        return ("unit_unknown",)
+    if reading.unit != expected:
+        return ("unit_incompatible",)
+    if field in MONEY_ANCHORS and reading.currency not in _CURRENCY_MARKERS:
+        return ("currency_unknown",)
+    if field in FINANCIAL_ANCHORS | {"pe_ratio", "pb_ratio"} and reading.caliber is None:
+        return ("caliber_unknown",)
+    return ()
+
+
+def _comparison_reasons(reading: AnchorReading, spec: AnchorSpec, code: Optional[str], ttl: int) -> tuple[str, ...]:
+    reasons = reading_input_reasons(reading, spec.field)
+    if reasons:
+        return reasons
+    if spec.field in FINANCIAL_ANCHORS:
+        if reading.period is None:
+            return ("period_unknown",)
+        if reading.period_basis == "unknown":
+            return ("period_basis_unknown",)
+        return ()
+    if reading.observed_at is None:
+        return ("time_unknown",)
+    from src.core.trading_calendar import get_effective_trading_date, get_market_for_stock, get_market_now
+
+    market = get_market_for_stock(code or "")
+    now = get_market_now(market) if market else datetime.now(timezone.utc)
+    text = re.sub(r"[（(]日[）)]$", "", reading.observed_at)
+    try:
+        observed = datetime.fromisoformat(text.replace("/", "-"))
+    except ValueError:
+        actual, _basis = normalize_report_period(text)
+        if actual is None:
+            return ("time_unknown",)
+        observed = datetime.fromisoformat(actual)
+    if observed.tzinfo is None:
+        if market is None and ":" in text:
+            return ("time_zone_unknown",)
+        observed = observed.replace(tzinfo=now.tzinfo)
+    if spec.field == "margin_balance":
+        return () if observed.astimezone(now.tzinfo).date() == get_effective_trading_date(market, current_time=now) else ("stale",)
+    if ":" not in text:
+        return ("time_unknown",)
+    age = (now - observed).total_seconds()
+    if age < 0:
+        return ("time_in_future",)
+    return ("stale",) if age > ttl else ()
+
+
+def _pair_reasons(left: AnchorReading, right: AnchorReading, spec: AnchorSpec) -> tuple[str, ...]:
+    if left.unit != right.unit:
+        return ("unit_mismatch",)
+    if spec.field in MONEY_ANCHORS and left.currency != right.currency:
+        return ("currency_mismatch",)
+    if spec.field in FINANCIAL_ANCHORS:
+        if left.period != right.period:
+            return ("period_mismatch",)
+        if left.period_basis != right.period_basis:
+            return ("period_basis_mismatch",)
+    if (spec.caliber_aware or spec.field in FINANCIAL_ANCHORS) and left.caliber != right.caliber:
+        return ("caliber_mismatch",)
+    return ()
+
+
+@ensure(lambda result: result.agreed == (result.quality.status == "verified"), "Only verified evidence may claim agreement")
+@ensure(lambda result: result.confidence == ("high" if result.quality.status == "verified" else "low" if result.quality.status in {"conflict", "missing"} else "medium"), "Quality and legacy confidence must describe the same decision")
+def _judge_readings(
+    readings: Sequence[AnchorReading], spec: AnchorSpec, *, enabled: bool = True,
+    code: Optional[str] = None, ttl: Optional[int] = None,
+    source_errors: tuple[tuple[str, str], ...] = (),
 ) -> AnchorVerification:
-    """数值模式判定：口径 → 报告期 → 容差。
-
-    三源 majority vote（``tertiary`` 提供时）：
-      - (primary, secondary) 一致 → high（tertiary 仅记录一致性，不提升 confidence）
-      - (primary, secondary) 不一致 + tertiary 与任一方一致 → medium（少数派标记为 outlier）
-      - 三源两两都不一致 → low（3-way 真冲突）
-    """
-    readings = (primary, secondary) if tertiary is None else (primary, secondary, tertiary)
-    reason = _unit_comparison_reason(readings, spec.field) or ""
-    if not reason and spec.field in FINANCIAL_ANCHORS:
-        if any(reading.period is None for reading in readings):
-            reason = "实际报告期未知"
-        elif len({reading.period for reading in readings}) > 1:
-            reason = "实际报告期不一致"
-        elif any(reading.period_basis == "unknown" for reading in readings):
-            reason = "累计/单季期间口径未知"
-        elif len({reading.period_basis for reading in readings}) > 1:
-            reason = "累计/单季期间口径不一致"
-        elif any(reading.caliber is None for reading in readings):
-            reason = "指标口径未知"
-        elif len({reading.caliber for reading in readings}) > 1:
-            reason = "指标口径不一致"
-    elif not reason and spec.field in {"pe_ratio", "pb_ratio"} and any(reading.caliber is None for reading in readings):
-        reason = "估值口径未知"
-    if reason:
-        return AnchorVerification(
-            field=spec.field, value=primary.value, confidence="medium",
-            sources=tuple(reading.source for reading in readings), agreed=False,
-            caliber=primary.caliber, period=primary.period, note=f"不可比：{reason}",
-        )
-    diff = _discrepancy_pct(primary.value, secondary.value)
-
-    # 口径检查（仅 caliber_aware 且两源都带口径时启用）
-    if (
-        spec.caliber_aware
-        and primary.caliber
-        and secondary.caliber
-        and primary.caliber != secondary.caliber
-    ):
-        return AnchorVerification(
-            field=spec.field,
-            value=primary.value,
-            confidence="medium",
-            sources=(primary.source, secondary.source),
-            agreed=False,
-            discrepancy_pct=diff,
-            caliber=primary.caliber,
-            period=primary.period,
-            note=f"口径不一致（{primary.source}={primary.caliber}/"
-            f"{secondary.source}={secondary.caliber}），未做数值比对",
-        )
-
-    # 容差比对（primary vs secondary）
-    agreed_ps = _within_tolerance(primary.value, secondary.value, spec.tolerance_pct)
-    if agreed_ps:
-        return AnchorVerification(
-            field=spec.field,
-            value=primary.value,
-            confidence="high",
-            sources=(
-                (primary.source, secondary.source, tertiary.source)
-                if tertiary is not None
-                else (primary.source, secondary.source)
-            ),
-            agreed=True,
-            discrepancy_pct=diff,
-            caliber=primary.caliber,
-            period=primary.period,
-            note="" if tertiary is None else f"3源一致（含{tertiary.source}）",
-        )
-
-    # primary vs secondary 不一致：tertiary 提供时做 3-way majority
-    if tertiary is not None:
-        # tertiary 必带口径/期一致（来源同一查询）；不再做 caliber/period 二次判定
-        pt_ok = _within_tolerance(
-            primary.value, tertiary.value, spec.tolerance_pct
-        )
-        st_ok = _within_tolerance(
-            secondary.value, tertiary.value, spec.tolerance_pct
-        )
-        # majority vote：(primary, tertiary) 赢 / (secondary, tertiary) 赢 / 全不一致
-        if pt_ok and not st_ok:
-            outlier = secondary
-            agreed_value = primary.value
-        elif st_ok and not pt_ok:
-            outlier = primary
-            agreed_value = primary.value  # primary 仍是 primary，但 verdict 反映 tertiary 校正
-        else:
-            # 两两都不一致 → 3-way 真冲突
-            return AnchorVerification(
-                field=spec.field,
-                value=primary.value,
-                confidence="low",
-                sources=(primary.source, secondary.source, tertiary.source),
-                agreed=False,
-                discrepancy_pct=diff,
-                caliber=primary.caliber,
-                period=primary.period,
-                note=(
-                    f"3源不一致：{primary.source}={_round(primary.value)}/"
-                    f"{secondary.source}={_round(secondary.value)}/"
-                    f"{tertiary.source}={_round(tertiary.value)}，"
-                    f"差异{diff:.1f}%"
-                ),
-            )
-        return AnchorVerification(
-            field=spec.field,
-            value=agreed_value,
-            confidence="medium",
-            sources=(primary.source, secondary.source, tertiary.source),
-            agreed=False,
-            discrepancy_pct=diff,
-            caliber=primary.caliber,
-            period=primary.period,
-            note=(
-                f"{primary.source}+{tertiary.source} 一致，"
-                f"{outlier.source}={_round(outlier.value)} 为 outlier"
-            ),
-        )
-
-    # 2-source 不一致 → 旧行为不变
+    """Check all semantically relevant pairs; family controls support, never membership."""
+    from src.config import get_config
+    ttl = int(get_config().realtime_cache_ttl) if ttl is None else ttl
+    if not readings:
+        return AnchorVerification(spec.field, None, "low", (), False, note="所有数据源均无该锚点数据", quality=AnchorQuality(status="missing", reason_codes=("missing",)), source_errors=source_errors)
+    primary = readings[0]
+    reasons = [_comparison_reasons(reading, spec, code, ttl) for reading in readings]
+    if spec.mode == MODE_DIRECTION:
+        reasons = [reason or (("direction_zero",) if reading.value == 0 else ()) for reading, reason in zip(readings, reasons)]
+    for index, reading in enumerate(readings[1:], 1):
+        # Known main semantics constrain relevance; missing evidence does not hide other explicit mismatches.
+        mismatches: list[str] = []
+        if primary.period is not None and reading.period is not None and spec.field in FINANCIAL_ANCHORS and reading.period != primary.period:
+            mismatches.append("period_mismatch")
+        if primary.caliber is not None and reading.caliber is not None and (spec.caliber_aware or spec.field in FINANCIAL_ANCHORS) and reading.caliber != primary.caliber:
+            mismatches.append("caliber_mismatch")
+        if primary.unit is not None and reading.unit is not None and reading.unit != primary.unit:
+            mismatches.append("unit_mismatch")
+        if primary.currency is not None and reading.currency is not None and spec.field in MONEY_ANCHORS and reading.currency != primary.currency:
+            mismatches.append("currency_mismatch")
+        if primary.period_basis != "unknown" and reading.period_basis != "unknown" and spec.field in FINANCIAL_ANCHORS and reading.period_basis != primary.period_basis:
+            mismatches.append("period_basis_mismatch")
+        reasons[index] += tuple(mismatches)
+    group = [index for index, reason in enumerate(reasons) if not reason]
+    conflicts: list[tuple[str, str]] = []
+    limitations: set[str] = set()
+    differences: list[float] = []
+    for position, left_index in enumerate(group):
+        for right_index in group[position + 1:]:
+            left, right = readings[left_index], readings[right_index]
+            pair_reasons = _pair_reasons(left, right, spec)
+            if pair_reasons:
+                limitations.update(pair_reasons)
+                reasons[left_index] += pair_reasons
+                reasons[right_index] += pair_reasons
+                continue
+            differences.append(_discrepancy_pct(left.value, right.value))
+            if spec.mode == MODE_DIRECTION:
+                if left.value and right.value and (left.value > 0) != (right.value > 0):
+                    conflicts.append((left.source, right.source))
+                elif left.value == 0 or right.value == 0:
+                    limitations.add("direction_zero")
+                elif abs(_magnitude_tier(left.value) - _magnitude_tier(right.value)) > 1:
+                    limitations.add("magnitude_mismatch")
+                    reasons[left_index] += ("magnitude_mismatch",)
+                    reasons[right_index] += ("magnitude_mismatch",)
+            elif not _within_tolerance(left.value, right.value, spec.tolerance_pct):
+                conflicts.append((left.source, right.source))
+    independent = primary.source_family is not None and any(
+        index != 0 and readings[index].source_family is not None and readings[index].source_family != primary.source_family
+        and not _pair_reasons(primary, readings[index], spec) for index in group
+    )
+    status: QualityStatus
+    if not enabled:
+        status = "unverified"
+    elif conflicts:
+        status = "conflict"
+    elif len(readings) == 1 and primary.source_family is not None and not reading_input_reasons(primary, spec.field) and not {"stale", "time_in_future", "direction_zero"}.intersection(reasons[0]):
+        status = "single_source"
+    elif reasons[0]:
+        status = "not_comparable"
+    elif independent and not limitations:
+        status = "verified"
+    elif primary.source_family is not None and len(group) == len(readings) and all(reading.source_family == primary.source_family for reading in readings) and not limitations:
+        status = "single_source"
+    else:
+        status = "not_comparable"
+    codes = {reason for item in reasons for reason in item} | limitations | {reason for _, reason in source_errors}
+    if any(reading.source_family is None for reading in readings):
+        codes.add("family_unknown")
+    if conflicts:
+        codes.add("direction_conflict" if spec.mode == MODE_DIRECTION else "numeric_conflict")
+    if status == "single_source":
+        codes.add("single_family")
+    if not enabled:
+        codes.add("validation_disabled")
+    messages = {"missing": "缺失", "unverified": "未核验", "single_source": "单源家族，未独立交叉验证", "not_comparable": "不可比或独立性未证明", "verified": "独立来源佐证通过", "conflict": "方向冲突" if spec.mode == MODE_DIRECTION else "数据冲突"}
+    note = messages[status]
+    if conflicts:
+        note += "：" + "; ".join(f"{left}/{right}" for left, right in conflicts)
+    if status == "verified" and spec.mode == MODE_DIRECTION:
+        note += "（方向相同、量级差≤1档，不证明金额相同）"
+    if codes:
+        note += "；" + ", ".join(sorted(codes))
     return AnchorVerification(
-        field=spec.field,
-        value=primary.value,
-        confidence="low",
-        sources=(primary.source, secondary.source),
-        agreed=False,
-        discrepancy_pct=diff,
-        caliber=primary.caliber,
-        period=primary.period,
-        note=f"数据冲突：{primary.source}={_round(primary.value)}/"
-        f"{secondary.source}={_round(secondary.value)}，差异{diff:.1f}%",
+        spec.field, primary.value, "high" if status == "verified" else "low" if status == "conflict" else "medium",
+        tuple(reading.source for reading in readings), status == "verified", max(differences) if differences else None,
+        primary.caliber, primary.period, note, requested_period=primary.requested_period, period_basis=primary.period_basis,
+        observed_at=primary.observed_at, fetched_at=primary.fetched_at, unit=primary.unit, currency=primary.currency,
+        raw_value=primary.raw_value, raw_label=primary.raw_label, raw_unit=primary.raw_unit, raw_currency=primary.raw_currency,
+        normalization_error=primary.normalization_error, quality=AnchorQuality(status=status, reason_codes=tuple(sorted(codes))),
+        readings=tuple(readings), reading_reasons=tuple(tuple(sorted(set(reason))) for reason in reasons), conflicts=tuple(conflicts), source_errors=source_errors,
     )
 
 
-def _judge_direction(
-    primary: AnchorReading,
-    secondary: AnchorReading,
-    field: str,
-    tertiary: Optional[AnchorReading] = None,
-) -> AnchorVerification:
-    """方向+量级判定（主力净流入；两源算法口径不同）。
+def _judge_numeric(primary: AnchorReading, secondary: AnchorReading, spec: AnchorSpec, tertiary: Optional[AnchorReading] = None) -> AnchorVerification:
+    return _judge_readings((primary, secondary) if tertiary is None else (primary, secondary, tertiary), spec)
 
-    3-source 时（``tertiary`` 提供）：majority vote —— 同方向 ≥2 → high；否则 medium。
-    """
-    readings = (primary, secondary) if tertiary is None else (primary, secondary, tertiary)
-    reason = _unit_comparison_reason(readings, field)
-    if reason:
-        return AnchorVerification(field, primary.value, "medium", tuple(reading.source for reading in readings), False, note=f"不可比：{reason}")
-    diff = _discrepancy_pct(primary.value, secondary.value)
-    sources_pair = (
-        (primary.source, secondary.source, tertiary.source)
-        if tertiary is not None
-        else (primary.source, secondary.source)
-    )
-    # 零值视为「无数据/收盘」，方向不可靠 → medium（避免双零误判 high）
-    if primary.value == 0 or secondary.value == 0:
-        return AnchorVerification(
-            field=field,
-            value=primary.value,
-            confidence="medium",
-            sources=sources_pair,
-            agreed=False,
-            discrepancy_pct=diff,
-            caliber="方向比对",
-            note="含零值（可能收盘/数据缺失），方向不可靠",
-        )
-    # 显式三元（避免 bool 当索引：True==1/False==0 与方向词顺序错位）
-    primary_word = "净流入" if primary.value > 0 else "净流出"
-    secondary_word = "净流入" if secondary.value > 0 else "净流出"
-    d_primary = primary.value > 0
-    d_secondary = secondary.value > 0
 
-    # 方向相反 = 真冲突
-    if d_primary != d_secondary:
-        # 3-source 时：tertiary 偏向任一方 → medium；否则 → low（保持旧行为）
-        if tertiary is not None:
-            tertiary_word = "净流入" if tertiary.value > 0 else "净流出"
-            d_tertiary = tertiary.value > 0
-            if d_tertiary == d_primary:
-                return AnchorVerification(
-                    field=field,
-                    value=primary.value,
-                    confidence="medium",
-                    sources=sources_pair,
-                    agreed=False,
-                    discrepancy_pct=diff,
-                    caliber="方向比对",
-                    note=(
-                        f"方向冲突：{primary.source}+{tertiary.source}={primary_word}/"
-                        f"{secondary.source}={secondary_word}，secondary 为 outlier"
-                    ),
-                )
-            if d_tertiary == d_secondary:
-                return AnchorVerification(
-                    field=field,
-                    value=primary.value,
-                    confidence="medium",
-                    sources=sources_pair,
-                    agreed=False,
-                    discrepancy_pct=diff,
-                    caliber="方向比对",
-                    note=(
-                        f"方向冲突：{primary.source}={primary_word}/"
-                        f"{secondary.source}+{tertiary.source}={secondary_word}，primary 为 outlier"
-                    ),
-                )
-        return AnchorVerification(
-            field=field,
-            value=primary.value,
-            confidence="low",
-            sources=sources_pair,
-            agreed=False,
-            discrepancy_pct=diff,
-            caliber="方向比对",
-            note=f"方向冲突：{primary.source}={primary_word}/"
-            f"{secondary.source}={secondary_word}，需核对",
-        )
-
-    # 方向一致，查量级同档
-    same_word = primary_word
-    tier_diff = abs(_magnitude_tier(primary.value) - _magnitude_tier(secondary.value))
-    if tier_diff <= 1:
-        return AnchorVerification(
-            field=field,
-            value=primary.value,
-            confidence="high",
-            sources=(primary.source, secondary.source),
-            agreed=True,
-            discrepancy_pct=diff,
-            caliber="方向比对",
-            note=f"方向一致（{same_word}）+量级同档",
-        )
-    return AnchorVerification(
-        field=field,
-        value=primary.value,
-        confidence="medium",
-        sources=(primary.source, secondary.source),
-        agreed=True,
-        discrepancy_pct=diff,
-        caliber="方向比对",
-        note=f"方向一致（{same_word}）但量级差异大，两源算法口径不同",
-    )
+def _judge_direction(primary: AnchorReading, secondary: AnchorReading, field: str, tertiary: Optional[AnchorReading] = None) -> AnchorVerification:
+    return _judge_readings((primary, secondary) if tertiary is None else (primary, secondary, tertiary), ANCHOR_SPECS[field])
 
 
 def _judge_single(reading: AnchorReading, field: str) -> AnchorVerification:
-    """仅单源：medium，诚实标注未交叉验证。"""
-    return AnchorVerification(
-        field=field,
-        value=reading.value,
-        confidence="medium",
-        sources=(reading.source,),
-        agreed=False,
-        discrepancy_pct=None,
-        caliber=reading.caliber,
-        period=reading.period,
-        note=f"单源（{reading.source}），未交叉验证",
-    )
+    return _judge_readings((reading,), ANCHOR_SPECS[field])
 
 
 def _judge_missing(field: str) -> AnchorVerification:
@@ -714,7 +623,7 @@ def _judge_missing(field: str) -> AnchorVerification:
         confidence="low",
         sources=(),
         agreed=False,
-        note="所有数据源均无该锚点数据",
+        note="所有数据源均无该锚点数据", quality=AnchorQuality(status="missing", reason_codes=("missing",)),
     )
 
 
@@ -726,7 +635,7 @@ def _judge_unknown(field: str) -> AnchorVerification:
         confidence="low",
         sources=(),
         agreed=False,
-        note="未知锚点规格，未配置验证",
+        note="未知锚点规格，未配置验证", quality=AnchorQuality(status="missing", reason_codes=("unknown_anchor",)),
     )
 
 
@@ -754,6 +663,7 @@ class CrossSourceValidator:
             dict(specs) if specs else dict(ANCHOR_SPECS)
         )
         self._max_workers = max(1, int(max_workers))
+        self._pool = ThreadPoolExecutor(max_workers=self._max_workers)
 
     def verify(
         self,
@@ -761,8 +671,9 @@ class CrossSourceValidator:
         field: str,
         period: Optional[str] = None,
         primary_reading: Optional[AnchorReading] = None,
+        *, enabled: bool = True, deadline: Optional[float] = None,
     ) -> AnchorVerification:
-        """验证单个锚点。永不抛异常（fail-open）。
+        """验证单个锚点；源异常隔离，保留失败证据。
 
         ``primary_reading``：可选，注入的主源读数（如行情类的 realtime_quote），
         置于读数列表首位作 primary；其余从 ``sources`` 收集作验证源。
@@ -775,42 +686,26 @@ class CrossSourceValidator:
         if not _is_valid_code(code):
             return _judge_missing(field)
 
-        collected = self._collect(code, field, period)
+        collected, errors = self._collect(code, field, period, deadline) if enabled else ((), ())
         readings = (
             (primary_reading, *collected) if primary_reading is not None else collected
         )
 
-        if not readings:
-            return _judge_missing(field)
-        primary = readings[0]
-        if len(readings) == 1:
-            result = _judge_single(readings[0], spec.field)
-        else:
-            primary, secondary = readings[0], readings[1]
-            tertiary = readings[2] if len(readings) >= 3 else None
-            if spec.mode == MODE_DIRECTION:
-                result = _judge_direction(primary, secondary, spec.field, tertiary=tertiary)
-            else:
-                result = _judge_numeric(primary, secondary, spec, tertiary=tertiary)
-
-        return replace(
-            result, requested_period=primary.requested_period, period_basis=primary.period_basis,
-            observed_at=primary.observed_at, fetched_at=primary.fetched_at,
-            unit=primary.unit, currency=primary.currency, raw_value=primary.raw_value,
-            raw_label=primary.raw_label, normalization_error=primary.normalization_error,
-            raw_unit=primary.raw_unit, raw_currency=primary.raw_currency,
-        )
+        valid = tuple(reading for reading in readings if math.isfinite(reading.value))
+        errors += tuple((reading.source, "invalid_value") for reading in readings if not math.isfinite(reading.value))
+        return _judge_readings(valid, spec, code=code, enabled=enabled, source_errors=errors)
 
     def _collect(
-        self, code: str, field: str, period: Optional[str]
-    ) -> Tuple[AnchorReading, ...]:
+        self, code: str, field: str, period: Optional[str], deadline: Optional[float] = None,
+    ) -> tuple[tuple[AnchorReading, ...], tuple[tuple[str, str], ...]]:
         """并行收集各源读数。任一源异常/返回 None 都被隔离（fail-open）。"""
         if not self._sources:
-            return ()
+            return (), ()
 
-        def _safe_read(source: SourceAdapter) -> Optional[AnchorReading]:
+        def _safe_read(source: SourceAdapter) -> tuple[Optional[AnchorReading], Optional[str]]:
             try:
-                return source.read(code, field, period)
+                reading = source.read(code, field, period)
+                return reading, None if reading is not None else "missing"
             except Exception as exc:  # noqa: BLE001 — fail-open：源异常不影响其他源
                 logger.debug(
                     "[CrossValidate] source %s read %s failed: %s",
@@ -818,12 +713,22 @@ class CrossSourceValidator:
                     field,
                     exc,
                 )
-                return None
+                return None, "timeout" if "timeout" in type(exc).__name__.lower() else "source_error"
 
-        if len(self._sources) == 1:
-            reading = _safe_read(self._sources[0])
-            return (reading,) if reading else ()
-
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            results = list(pool.map(_safe_read, self._sources))
-        return tuple(r for r in results if r is not None)
+        if deadline is not None and deadline <= monotonic():
+            return (), tuple((source.name, "timeout") for source in self._sources)
+        futures = [(source, self._pool.submit(_safe_read, source)) for source in self._sources]
+        wait([future for _, future in futures], timeout=None if deadline is None else max(0.0, deadline - monotonic()))
+        readings: list[AnchorReading] = []
+        errors: list[tuple[str, str]] = []
+        for source, future in futures:
+            if not future.done():
+                future.cancel()
+                errors.append((source.name, "timeout"))
+                continue
+            reading, error = future.result()
+            if reading is not None:
+                readings.append(reading)
+            if error:
+                errors.append((source.name, error))
+        return tuple(readings), tuple(errors)
