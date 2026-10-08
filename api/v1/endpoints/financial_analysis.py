@@ -25,7 +25,7 @@ from src.storage import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_REPORT_ID_RE = re.compile(r"^fa_\d{12}(_\d+)?$")
+_REPORT_ID_RE = re.compile(r"^fa_\d{14}(_\d+)?$")  # ID pattern: fa_YYYYMMDDHHMMSS (14 digits)
 
 
 def _validate_id(report_id: str) -> str:
