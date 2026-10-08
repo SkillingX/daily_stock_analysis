@@ -22,6 +22,10 @@ Phase 0 探测结果（2026-06-25）：
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from inspect import signature
+from functools import partial
+from time import monotonic
 import json
 import logging
 import os
@@ -321,6 +325,19 @@ def _parse_ifind_response(
 # ------------------------------------------------------------------
 
 
+async def _apply_mcp_request_deadline(request: Any, *, deadline: float) -> None:
+    """SDK hook: reject expired wire calls and cap each request's own timeout."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("financial MCP deadline exhausted")
+    configured = request.extensions.get("timeout") or {}
+    request.extensions["timeout"] = {
+        part: min(value, remaining) if isinstance(value, (int, float)) else remaining
+        for part in ("connect", "read", "write", "pool")
+        for value in [configured.get(part)]
+    }
+
+
 class IfindFetcher:
     """iFinD MCP 客户端（async，``fetch`` 同步包装 ``_async_fetch``）。
 
@@ -424,7 +441,7 @@ class IfindFetcher:
             return None
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取（封装 async MCP）。无 token/失败 → None。
 
@@ -436,14 +453,18 @@ class IfindFetcher:
         """
         if not self.available:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:
-            return asyncio.run(self._async_fetch(code, field, period))
+            call = self._async_fetch(code, field, period, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindFetcher] fetch %s/%s failed: %s", code, field, exc)
             return None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，Phase 1 已验证连通性
-        self, code: str, field: str, period: Optional[str]
+        self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """Execute one iFinD MCP call.
 
@@ -462,19 +483,32 @@ class IfindFetcher:
             return None
         tool, query_tpl, keywords = _IFIND_ANCHOR_QUERIES[field]
         query = query_tpl.format(code=code, period=period or "")
-        from mcp import ClientSession  # type: ignore
-        from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         headers = {"Authorization": self._token}
         last_error: Optional[str] = None
         for attempt in range(2):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+            if timeout <= 0:
+                return None
             try:
-                async with streamablehttp_client(
-                    self._endpoint, headers=headers, timeout=self._timeout
-                ) as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        result = await session.call_tool(tool, {"query": query})
+                async with AsyncExitStack() as stack:
+                    close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+                    if "http_client" in signature(transport).parameters:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+                        client = create_mcp_http_client(headers=headers)
+                        client.timeout = timeout
+                        if deadline is not None:
+                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                        await stack.enter_async_context(client)
+                        streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+                    else:
+                        streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+                    await session.initialize()
+                    result = await session.call_tool(tool, {"query": query})
                 # Parsing happens after the context manager closes so
                 # we are not holding a connection while doing regex work.
                 content = getattr(result, "content", None) or []
@@ -547,7 +581,7 @@ class IfindFetcher:
                 self._session_context = None
 
     def fetch_main_inflow_series(
-        self, code: str, days: int = 12
+        self, code: str, days: int = 12, *, deadline: Optional[float] = None
     ) -> Optional[List[Tuple[str, float]]]:
         """取近 ``days`` 日主力净流入额序列（最新在前）。无 token/失败 → None。
 
@@ -559,31 +593,46 @@ class IfindFetcher:
         """
         if not self.available:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:  # pragma: no cover — 真实 MCP 调用（已实测连通）
-            return asyncio.run(self._async_fetch_series(code, days))
+            call = self._async_fetch_series(code, days, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # pragma: no cover  # noqa: BLE001 — fail-open
             logger.debug("[IfindFetcher] series %s failed: %s", code, exc)
             return None
 
     async def _async_fetch_series(  # pragma: no cover — 真实 MCP 调用
-        self, code: str, days: int
+        self, code: str, days: int, *, deadline: Optional[float] = None
     ) -> Optional[List[Tuple[str, float]]]:
         """执行一次 iFinD MCP 调用，解析多行序列。"""
-        from mcp import ClientSession  # type: ignore
-        from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         # Phase 0 实测：「近{days}日主力净流入额」会被 iFinD 折叠为「最新」单值；
         # 改用「近{days}个交易日」措辞才返回多行每日序列（实测近10个交易日→11行）。
         query = f"{code} 近{days}个交易日主力净流入额"
         headers = {"Authorization": self._token}
-        async with streamablehttp_client(
-            self._endpoint, headers=headers, timeout=self._timeout
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "get_stock_performance", {"query": query}
-                )
+        timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+        if timeout <= 0:
+            return None
+        async with AsyncExitStack() as stack:
+            close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+            if "http_client" in signature(transport).parameters:
+                from mcp.shared._httpx_utils import create_mcp_http_client
+                client = create_mcp_http_client(headers=headers)
+                client.timeout = timeout
+                if deadline is not None:
+                    client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                await stack.enter_async_context(client)
+                streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+            else:
+                streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await session.initialize()
+            result = await session.call_tool("get_stock_performance", {"query": query})
         content = getattr(result, "content", None) or []
         raw_text = next(
             (getattr(b, "text", "") for b in content if getattr(b, "text", None)), ""
@@ -622,7 +671,7 @@ class IfindSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
@@ -630,7 +679,7 @@ class IfindSource:
         if field not in _IFIND_ANCHOR_QUERIES:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindSource] read %s/%s failed: %s", code, field, exc)
             return None

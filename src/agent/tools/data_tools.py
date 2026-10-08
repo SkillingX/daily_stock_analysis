@@ -10,6 +10,8 @@ Tools:
 """
 
 import logging
+from time import monotonic
+from inspect import signature
 from datetime import date
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
@@ -685,7 +687,7 @@ get_analysis_context_tool = ToolDefinition(
 
 
 def _fallback_valuation_from_quote(
-    manager: Any, stock_code: str, valuation: Dict[str, Any], field_meta: Optional[Dict[str, Any]] = None,
+    manager: Any, stock_code: str, valuation: Dict[str, Any], field_meta: Optional[Dict[str, Any]] = None, *, deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """fundamental valuation 超时缺失时，用 ``get_realtime_quote`` 兜底 pe/pb/市值。
 
@@ -696,8 +698,14 @@ def _fallback_valuation_from_quote(
 
     只补缺失字段，fundamental 已拿到的非空值优先保留（不覆盖更优来源）。
     """
+    if deadline is not None and deadline <= monotonic():
+        return valuation
     try:
-        quote = manager.get_realtime_quote(stock_code)
+        if deadline is not None and hasattr(manager, "_run_with_timeout"):
+            from src.config import get_config
+            quote, _, _ = manager._run_with_timeout(lambda: manager.get_realtime_quote(stock_code), min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic())), "valuation_quote_fallback")
+        else:
+            quote = manager.get_realtime_quote(stock_code)
     except Exception as exc:
         logger.debug("get_stock_info valuation fallback failed %s: %s", stock_code, exc)
         return valuation
@@ -717,11 +725,14 @@ def _fallback_valuation_from_quote(
     return merged
 
 
-def _handle_get_stock_info(stock_code: str) -> dict[str, Any]:
+def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None) -> dict[str, Any]:
     """Get stock fundamental information through unified fundamental context."""
     manager = _get_fetcher_manager()
+    from src.config import get_config
+    deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_stage_timeout_seconds
     try:
-        fundamental_context = manager.get_fundamental_context(stock_code)
+        budget = {"budget_seconds": max(0.0, deadline - monotonic())} if "budget_seconds" in signature(manager.get_fundamental_context).parameters else {}
+        fundamental_context = manager.get_fundamental_context(stock_code, **budget)
     except Exception as e:
         logger.warning(
             f"get_stock_info via fundamental pipeline failed for {stock_code}: {e}"
@@ -735,7 +746,7 @@ def _handle_get_stock_info(stock_code: str) -> dict[str, Any]:
     valuation_meta = dict(compact_context.get("valuation", {}).get("field_meta") or {})
     # fail-open：fundamental valuation 受严格超时易缺失，用 get_realtime_quote 兜底估值
     if any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
-        valuation = _fallback_valuation_from_quote(manager, stock_code, valuation, valuation_meta)
+        valuation = _fallback_valuation_from_quote(manager, stock_code, valuation, valuation_meta, deadline=deadline)
     compact_context["valuation"] = {**compact_context.get("valuation", {}), "data": valuation, "field_meta": valuation_meta}
     primary_readings = {}
     for block_name in ("valuation", "growth", "earnings"):
@@ -770,6 +781,7 @@ def _handle_get_stock_info(stock_code: str) -> dict[str, Any]:
         ],
         period=_latest_annual_period(),
         primary_readings=primary_readings,
+        deadline=deadline,
     )
     # akshare growth 失败时用 CV 回填毛利率/营收增速/ROE，避免报告「数据缺失」
     if _cv:
@@ -790,13 +802,20 @@ def _handle_get_stock_info(stock_code: str) -> dict[str, Any]:
         }
 
     sector_rankings = compact_context.get("boards", {}).get("data", {})
-    belong_boards = manager.get_belong_boards(stock_code)
-
+    belong_boards = fundamental_context.get("belong_boards") or []
     stock_name = stock_code.upper()
-    try:
+    if hasattr(manager, "_run_with_timeout"):
+        budget_seconds = min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))
+        if not belong_boards and budget_seconds > 0:
+            fetched_boards, _, _ = manager._run_with_timeout(lambda: manager.get_belong_boards(stock_code), budget_seconds, "stock_info_boards")
+            belong_boards = fetched_boards or []
+        budget_seconds = min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))
+        if budget_seconds > 0:
+            fetched_name, _, _ = manager._run_with_timeout(lambda: manager.get_stock_name(stock_code), budget_seconds, "stock_info_name")
+            stock_name = fetched_name or stock_name
+    else:
+        belong_boards = manager.get_belong_boards(stock_code)
         stock_name = manager.get_stock_name(stock_code) or stock_name
-    except Exception:
-        pass
 
     response = {
         "code": stock_code.upper(),
@@ -971,9 +990,12 @@ ALL_DATA_TOOLS = [
 
 def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
     """Get main-force capital flow data for a stock."""
+    from src.config import get_config
+    deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     manager = _get_fetcher_manager()
     try:
-        ctx = manager.get_capital_flow_context(stock_code)
+        budget = {"budget_seconds": min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))} if "budget_seconds" in signature(manager.get_capital_flow_context).parameters else {}
+        ctx = manager.get_capital_flow_context(stock_code, **budget)
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
         return {
@@ -1025,7 +1047,7 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
         records["main_inflow"] = adopted_field_record("main_inflow", main, previous_record=records.get("main_inflow"))
     result["field_meta"] = records
     currency = ctx.get("currency") or stock_flow.get("currency") or (records.get("main_inflow") or {}).get("currency")
-    _cv = build_cross_validation_block(stock_code, ["main_inflow", "margin_balance"], expected_currencies={field: currency for field in ("main_inflow", "margin_balance")} if currency else None, primary_readings={"main_inflow": main} if main is not None else None)
+    _cv = build_cross_validation_block(stock_code, ["main_inflow", "margin_balance"], deadline=deadline, expected_currencies={field: currency for field in ("main_inflow", "margin_balance")} if currency else None, primary_readings={"main_inflow": main} if main is not None else None)
     if _cv:
         for field, anchor in _cv["anchors"].items():
             record = field_record_from_validation(field, anchor)
@@ -1033,7 +1055,7 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
                 records[field] = record
         # iFinD 多日累计（稳定源）：akshare push2his 不可达 → 主力净流入/5d/10d 回填
         result = _backfill_capital_flow(
-            result, _cv, get_main_inflow_cumulative(stock_code)
+            result, _cv, get_main_inflow_cumulative(stock_code, deadline=deadline) if deadline > monotonic() else {}
         )
         result["cross_validation"] = _cv
     return result

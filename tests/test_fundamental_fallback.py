@@ -84,8 +84,8 @@ class TestThinBlockDetection(unittest.TestCase):
             )
         )
 
-    def test_growth_not_thin_when_any_anchor_present(self) -> None:
-        self.assertFalse(
+    def test_growth_still_thin_when_some_anchors_missing(self) -> None:
+        self.assertTrue(
             DataFetcherManager._is_growth_block_thin(  # type: ignore[attr-defined]
                 {
                     "revenue_yoy": 10.5,
@@ -141,16 +141,16 @@ class TestTushareIfindAdapter(unittest.TestCase):
     def _readings(self) -> Dict[Any, AnchorReading]:
         return {
             ("600519", "revenue_yoy", "20251231"): AnchorReading(
-                source="ifind", value=15.0, caliber=None, period="20251231"
+                source="ifind", value=15.0, caliber="operating_revenue_yoy", unit="percentage_point", period="20251231"
             ),
             ("600519", "net_profit_yoy", "20251231"): AnchorReading(
-                source="ifind", value=12.0, caliber=None, period="20251231"
+                source="ifind", value=12.0, caliber="parent_net_profit_yoy", unit="percentage_point", period="20251231"
             ),
             ("600519", "roe", "20251231"): AnchorReading(
-                source="ifind", value=33.5, caliber=None, period="20251231"
+                source="ifind", value=33.5, caliber="weighted_roe", unit="percentage_point", period="20251231"
             ),
             ("600519", "gross_margin", "20251231"): AnchorReading(
-                source="ifind", value=91.0, caliber=None, period="20251231"
+                source="ifind", value=91.0, caliber="gross_margin", unit="percentage_point", period="20251231"
             ),
         }
 
@@ -186,7 +186,7 @@ class TestTushareIfindAdapter(unittest.TestCase):
             available=True,
             readings={
                 ("600519", "roe", "20250630"): AnchorReading(
-                    source="ifind", value=33.0, caliber=None, period="20250630"
+                    source="ifind", value=33.0, caliber="weighted_roe", unit="percentage_point", period="20250630"
                 ),
             },
         )
@@ -250,7 +250,8 @@ class TestTushareIfindAdapter(unittest.TestCase):
                     return AnchorReading(
                         source="ifind",
                         value=anchor_to_value[field],
-                        caliber=None,
+                        caliber={"roe": "weighted_roe", "gross_margin": "gross_margin", "revenue_yoy": "operating_revenue_yoy", "net_profit_yoy": "parent_net_profit_yoy"}[field],
+                        unit="percentage_point",
                         period=period,
                     )
                 return None

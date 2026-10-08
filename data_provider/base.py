@@ -981,14 +981,14 @@ class DataFetcherManager:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
-            return f"{normalized_code}|facts=1|budget=default"
+            return f"{normalized_code}|facts=2|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|facts=1|budget={budget_bucket}"
+        return f"{normalized_code}|facts=2|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -2715,6 +2715,9 @@ class DataFetcherManager:
         timeout_value = max(0.0, timeout_seconds)
         if timeout_value <= 0:
             return None, f"{task_name} timeout", 0
+        from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+        eastmoney_patch(budget_only=True)
+        deadline = time.monotonic() + timeout_value
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
 
@@ -2726,11 +2729,13 @@ class DataFetcherManager:
             )
 
         def runner() -> None:
+            token = request_deadline.set(deadline)
             try:
                 result_holder["value"] = task()
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
+                request_deadline.reset(token)
                 try:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
@@ -3056,13 +3061,29 @@ class DataFetcherManager:
 
     @staticmethod
     def _is_growth_block_thin(payload: Dict[str, Any]) -> bool:
-        """A growth block is "thin" when all four anchor fields are missing
-        or None. We only fall back to Tushare / iFinD in that case.
+        """A growth block needs fallback when any required anchor is missing.
         """
         if not isinstance(payload, dict):
             return True
         keys = ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin")
-        return all(payload.get(k) is None for k in keys)
+        return any(payload.get(k) is None for k in keys)
+
+    @classmethod
+    def _fill_growth_fields(cls, growth: Dict[str, Any], candidate: Dict[str, Any], reason: str) -> None:
+        """Fill only missing individual fields from already acquired valid readings."""
+        from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
+        for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
+            if growth.get(field) is not None:
+                continue
+            metadata = (candidate.get("field_meta") or {}).get(field) or {}
+            reading = reading_from_field_record(candidate.get(field), metadata)
+            if reading is None or (reading.period and cls._detect_payload_staleness({"as_of": reading.period})):
+                continue
+            quality = AnchorQuality(status="conflict") if (metadata.get("quality") or {}).get("status") == "conflict" else None
+            record = adopted_field_record(field, reading, quality, selection_reason=reason)
+            if record["rule_eligible"]:
+                growth[field] = record["value"]
+                growth.setdefault("field_meta", {})[field] = record
 
     @staticmethod
     def _is_earnings_block_thin(payload: Dict[str, Any]) -> bool:
@@ -3588,6 +3609,7 @@ class DataFetcherManager:
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         remaining_seconds = stage_timeout
+        stage_deadline = time.monotonic() + stage_timeout
         result_ctx: Dict[str, Any] = {
             "market": market,
             "valuation": {},
@@ -3606,7 +3628,7 @@ class DataFetcherManager:
 
         def _consume_budget(consumed_ms: int) -> None:
             nonlocal remaining_seconds
-            remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
+            remaining_seconds = max(0.0, min(remaining_seconds - consumed_ms / 1000.0, stage_deadline - time.monotonic()))
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
         if valuation_timeout > 0:
@@ -3736,6 +3758,8 @@ class DataFetcherManager:
         else:
             institution_payload = dict(institution_payload)
 
+        self._fill_growth_fields(growth_payload, earnings_payload.get("financial_report") or {}, "primary_earnings")
+
         # Fallback to Tushare / iFinD when the AkShare bundle came back empty
         # or stale. We only fill in fields that are missing on the primary
         # path; if AkShare already returned a value we trust it. The fallback
@@ -3754,15 +3778,16 @@ class DataFetcherManager:
             # fans out across anchors inside that budget. ``remaining_seconds``
             # is decremented so subsequent stages (capital_flow, etc.)
             # still get a slice.
-            fallback_budget = max(
-                min(8.0, fetch_timeout),
-                max(remaining_seconds - 4.0, 0.0),
-            )
+            _consume_budget(0)
+            fallback_budget = min(fetch_timeout, remaining_seconds)
             if fallback_budget > 0:
                 _fallback_start = time.time()
                 fallback_bundle, _fallback_err, _fallback_ms = self._run_with_retry(
                     lambda: self._tushare_ifind_adapter.get_fundamental_bundle(
-                        stock_code
+                        stock_code,
+                        fields=tuple(field for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin") if growth_payload.get(field) is None),
+                        include_institution=self._is_institution_block_thin(institution_payload),
+                        deadline=min(stage_deadline, time.monotonic() + fallback_budget),
                     ),
                     fallback_budget,
                     "fundamental_fallback_tushare_ifind",
@@ -3790,16 +3815,8 @@ class DataFetcherManager:
                         str(fallback_bundle.get("status", "not_supported")),
                         _fallback_ms,
                     )
-                    for key, value in fb_growth.items():
-                        if key == "field_meta":
-                            continue
-                        if value is not None and growth_payload.get(key) is None:
-                            record = (fb_growth.get("field_meta") or {}).get(key)
-                            if key in {"roe", "gross_margin", "revenue_yoy", "net_profit_yoy"} and not (record or {}).get("rule_eligible"):
-                                continue
-                            growth_payload[key] = value
-                            if record is not None:
-                                growth_payload.setdefault("field_meta", {})[key] = record
+                    self._fill_growth_fields(growth_payload, fb_growth, "fallback")
+                    self._fill_growth_fields(growth_payload, fb_earnings.get("financial_report") or {}, "fallback_earnings")
                     for key, value in fb_earnings.items():
                         if key == "field_meta":
                             continue
@@ -3819,10 +3836,7 @@ class DataFetcherManager:
                     if isinstance(bundle_chain, list):
                         bundle_chain.extend(fallback_chain)
                     fb_errors = fallback_bundle.get("errors", []) or []
-                    if fb_errors:
-                        # Surface fallback failures as non-fatal hints; do not
-                        # trip the bundle into "failed" status.
-                        pass
+                    bundle_errors.extend(fb_errors)
 
 # MX fallback for growth fields still missing after primary + Tushare/iFinD.
         # MX is an official API (东方财富妙想 Skills Hub) that is more stable than
@@ -3832,18 +3846,24 @@ class DataFetcherManager:
         # Strategy: do ONE batch query (query_financials) so we get both the
         # latest report期 from ``headName[0]`` AND the financial values in a
         # single HTTP call (控配额). Per-field read() is fallback for retries.
+        _consume_budget(0)
         if self._mx_source.available and self._is_growth_block_thin(growth_payload):
-            mx_budget = max(0.0, min(6.0, remaining_seconds - 2.0))
+            mx_budget = min(fetch_timeout, remaining_seconds)
             if mx_budget > 0:
-                _mx_start = time.time()
+                _mx_start = time.monotonic()
+                mx_deadline = min(stage_deadline, _mx_start + mx_budget)
                 _mx_filled = False
                 _mx_period_raw: Optional[str] = None
                 _mx_bundle: Optional[Dict[str, Any]] = None
                 # Batch query (capped at 1 HTTP for budget discipline)
                 try:
-                    _mx_bundle = self._mx_source._client.query_financials(  # type: ignore[attr-defined]
-                        stock_code, None
+                    _mx_payload, _mx_error, _ = self._run_with_timeout(
+                        lambda: self._mx_source._client.query_financials(stock_code, None, deadline=mx_deadline),
+                        max(0.0, mx_deadline - time.monotonic()), "fundamental_mx_batch",
                     )
+                    _mx_bundle = _mx_payload if isinstance(_mx_payload, dict) else None
+                    if _mx_error:
+                        bundle_errors.append(_mx_error)
                     if isinstance(_mx_bundle, dict):
                         _mx_period_raw = _mx_bundle.get("_mx_period")
                         from data_provider.cross_source_validator import adopted_field_record
@@ -3854,10 +3874,8 @@ class DataFetcherManager:
                             if reading is None:
                                 continue
                             record = adopted_field_record(field, reading, selection_reason="fallback")
-                            if record["rule_eligible"]:
-                                growth_payload[field] = record["value"]
-                                growth_payload.setdefault("field_meta", {})[field] = record
-                                _mx_filled = True
+                            self._fill_growth_fields(growth_payload, {field: record["value"], "field_meta": {field: record}}, "fallback_mx")
+                            _mx_filled = _mx_filled or growth_payload.get(field) is not None
                 except Exception:  # noqa: BLE001 — fail-open
                     _mx_bundle = None
 
@@ -3870,20 +3888,24 @@ class DataFetcherManager:
                 ):
                     if growth_payload.get(_mx_field) is None:
                         try:
-                            _mx_ar = self._mx_source.read(stock_code, _mx_field)
+                            _mx_ar, _mx_error, _ = self._run_with_timeout(
+                                lambda field=_mx_field: self._mx_source.read(stock_code, field, deadline=mx_deadline),
+                                max(0.0, mx_deadline - time.monotonic()), f"fundamental_mx_{_mx_field}",
+                            )
+                            if _mx_error:
+                                bundle_errors.append(_mx_error)
                             if _mx_ar is not None and _mx_ar.value is not None:
                                 from data_provider.cross_source_validator import adopted_field_record
                                 _record = adopted_field_record(_mx_field, _mx_ar, selection_reason="fallback")
-                                if _record["rule_eligible"]:
-                                    growth_payload[_mx_field] = _record["value"]
-                                    growth_payload.setdefault("field_meta", {})[_mx_field] = _record
+                                self._fill_growth_fields(growth_payload, {_mx_field: _record["value"], "field_meta": {_mx_field: _record}}, "fallback_mx")
+                                if growth_payload.get(_mx_field) is not None:
                                     _mx_filled = True
                                     if _mx_ar.period and not _mx_period_raw:
                                         _mx_period_raw = _mx_ar.period
                         except Exception:  # noqa: BLE001 — fail-open
                             pass
 
-                _mx_ms = int((time.time() - _mx_start) * 1000)
+                _mx_ms = int((time.monotonic() - _mx_start) * 1000)
                 _consume_budget(_mx_ms)
                 if _mx_filled:
                     if isinstance(bundle_chain, list):

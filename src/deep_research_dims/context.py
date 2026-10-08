@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -82,6 +83,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
     from src.config import get_config
 
+    config = get_config()
+    deadline = monotonic() + config.fundamental_stage_timeout_seconds
     cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     if cached is not None:
@@ -133,14 +136,15 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             import requests as _rq
 
             key = (_os.getenv("FUYAO_API_KEY") or "").strip()
-            if not key:
+            remaining = min(config.fundamental_fetch_timeout_seconds, deadline - monotonic())
+            if not key or remaining <= 0:
                 return None
             try:
                 resp = _rq.get(
                     f"https://fuyao.aicubes.cn{path}",
                     params=params,
                     headers={"X-api-key": key},
-                    timeout=20,
+                    timeout=remaining,
                 )
                 body = resp.json()
             except Exception:  # noqa: BLE001

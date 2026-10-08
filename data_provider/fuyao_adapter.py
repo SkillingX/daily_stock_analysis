@@ -8,7 +8,7 @@
 设计（与 :class:`MxMcpSource` 同范式）：
 - :class:`FuyaoSource` 实现 :class:`SourceAdapter`，依赖注入 fetcher 解耦，
   字段映射 / 解析是纯同步代码，**100% 可单测**。
-- :class:`FuyaoFetcher` 封装真实 HTTP 调用（``requests.Session`` + retry adapter），
+- :class:`FuyaoFetcher` 封装真实 HTTP 调用（``requests.Session`` + 显式预算重试），
   同步阻塞；fuyao 是 REST + 同步范式（与 iFinD/MCP 的 async 范式不同）。
 - fail-open：无 key / 抓取异常 / 超时 / 业务错误 → ``None``，不阻塞其他源。
 
@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import os
 import re
 from dataclasses import dataclass, replace
@@ -30,8 +31,6 @@ from typing import Any, Dict, Optional, Tuple
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
 
@@ -287,25 +286,15 @@ class FuyaoFetcher:
 
     @staticmethod
     def _build_session() -> requests.Session:
-        """构造带 retry adapter 的 requests.Session（仅对幂等状态码重试）。"""
-        sess = requests.Session()
-        retry = Retry(
-            total=2,
-            backoff_factor=0.3,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["POST", "GET"]),
-            raise_on_status=False,
-        )
-        sess.mount("https://", HTTPAdapter(max_retries=retry))
-        sess.mount("http://", HTTPAdapter(max_retries=retry))
-        return sess
+        """构造无隐藏重试的会话；fetch 按剩余预算显式重试。"""
+        return requests.Session()
 
     @property
     def available(self) -> bool:
         return bool(self._endpoint and self._api_key)
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取。无 token / 失败 → None。"""
         if not self.available:
@@ -329,21 +318,25 @@ class FuyaoFetcher:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            resp = self._session.post(url, json=payload, headers=headers, timeout=self._timeout)
-        except requests.RequestException as exc:  # noqa: BLE001 — fail-open
-            logger.debug(
-                "[FuyaoFetcher] POST %s failed for %s/%s: %s",
-                spec.path, code, field, exc,
-            )
-            return None
-        if resp.status_code != 200:
-            logger.debug(
-                "[FuyaoFetcher] non-200 for %s/%s: status=%s body=%s",
-                code, field, resp.status_code, (resp.text or "")[:80],
-            )
-            return None
-        return _parse_fuyao_response(resp.text, field, period)
+        for attempt in range(3):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                return None
+            try:
+                resp = self._session.post(url, json=payload, headers=headers, timeout=timeout)
+            except requests.RequestException as exc:
+                logger.debug("[FuyaoFetcher] POST %s failed: %s", spec.path, type(exc).__name__)
+                return None
+            if resp.status_code == 200:
+                return _parse_fuyao_response(resp.text, field, period)
+            if resp.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                logger.debug("[FuyaoFetcher] non-200 for %s/%s: status=%s", code, field, resp.status_code)
+                return None
+            pause = 0.3 * (2 ** attempt)
+            if deadline is not None and deadline - time.monotonic() <= pause:
+                return None
+            time.sleep(pause)
+        return None
 
 
 # ------------------------------------------------------------------
@@ -369,13 +362,13 @@ class FuyaoSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：单源异常不影响其他源
             logger.debug("[FuyaoSource] read %s/%s failed: %s", code, field, exc)
             return None

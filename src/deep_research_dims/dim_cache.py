@@ -51,7 +51,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 SCHEMA_VERSION = 7  # v7：BusinessDim 四字段真正落 Dict 注解（v6 仅注释漂移）；v6=18 维研究员 payload
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 7  # 采用值的逐字段元信息，不复用无来源缓存
+FUNDAMENTAL_MAPPING_VERSION = 8  # 逐字段补缺与真实阶段预算，不复用旧部分块
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 

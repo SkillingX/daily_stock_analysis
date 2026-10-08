@@ -162,7 +162,7 @@ def _cn_period_to_yyyymmdd(period: Any) -> Optional[str]:
 # HTTP + 解析（移植自 mx_api.py，纯函数化便于单测）
 # ------------------------------------------------------------------
 def _post(
-    url: str, body: Dict[str, Any], api_key: str, timeout: int = 30, attempts: int = 2
+    url: str, body: Dict[str, Any], api_key: str, timeout: float = 30, attempts: int = 2, *, deadline: Optional[float] = None
 ) -> Dict[str, Any]:
     """POST + 小重试。返回解析 JSON 或 ``{"error": ...}``。"""
     try:
@@ -173,18 +173,29 @@ def _post(
     headers = {"Content-Type": "application/json", "apikey": api_key}
     last_err: Optional[str] = None
     for i in range(attempts):
+        remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
+        if remaining <= 0:
+            return {"error": "timeout"}
         try:
-            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            r = requests.post(url, headers=headers, json=body, timeout=remaining)
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
                 if r.status_code in (401, 403):  # key 问题不重试
                     break
-                time.sleep(1.0 * (i + 1))
+                if i + 1 < attempts:
+                    pause = 1.0 * (i + 1)
+                    if deadline is not None and deadline - time.monotonic() <= pause:
+                        return {"error": "timeout"}
+                    time.sleep(pause)
                 continue
             return cast(Dict[str, Any], r.json())
         except Exception as exc:  # noqa: BLE001 — 网络/解析错误统一捕获
             last_err = f"{type(exc).__name__}: {str(exc)[:200]}"
-            time.sleep(1.0 * (i + 1))
+            if i + 1 < attempts:
+                pause = 1.0 * (i + 1)
+                if deadline is not None and deadline - time.monotonic() <= pause:
+                    return {"error": "timeout"}
+                time.sleep(pause)
     return {"error": last_err or "unknown"}
 
 
@@ -265,7 +276,7 @@ class MXClient:
             Lock()
         )  # CrossSourceValidator 在线程池并发调用 query，需保护缓存
 
-    def query(self, tool_query: str) -> Dict[str, Any]:
+    def query(self, tool_query: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """自然语言查询，带 TTL 缓存。无 key 返回 error dict。
 
         线程安全：CrossSourceValidator 用 ThreadPoolExecutor 并发取多源，
@@ -274,35 +285,37 @@ class MXClient:
         """
         if not self.available:
             return {"error": "MX_APIKEY not set"}
+        if deadline is not None and deadline <= time.monotonic():
+            return {"error": "timeout"}
         now = time.time()
         with self._cache_lock:
             hit = self._cache.get(tool_query)
             if hit and now - hit[0] < self._ttl:
                 return cast(Dict[str, Any], hit[1])
         # 锁外执行 HTTP（不阻塞其他 query 的缓存读）
-        result = _post(QUERY_URL, {"toolQuery": tool_query}, self.api_key, self.timeout)
+        result = _post(QUERY_URL, {"toolQuery": tool_query}, self.api_key, self.timeout, **({"deadline": deadline} if deadline is not None else {}))
         with self._cache_lock:
             self._cache[tool_query] = [now, result]
         return result
 
-    def fetch_snapshot(self, code: str) -> Dict[str, Any]:
+    def fetch_snapshot(self, code: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """行情+估值快照：最新价/总市值/流通市值/PE/PB。"""
         return _extract_first_table_row(
-            self.query(f"{code} 最新价 总市值 流通市值 市盈率 市净率")
+            self.query(f"{code} 最新价 总市值 流通市值 市盈率 市净率", **({"deadline": deadline} if deadline is not None else {}))
         )
 
-    def query_financials(self, code: str, period: Optional[str], field: Optional[str] = None) -> Dict[str, Any]:
+    def query_financials(self, code: str, period: Optional[str], field: Optional[str] = None, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """财务指标：营收/归母净利润/ROE/毛利率/营收同比（带报告期）。"""
         suffix = f" {period}" if period else ""
         return _extract_first_table_row(
             self.query(
-                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率 归属于母公司净利润同比增长率{suffix}"
+                f"{code} 营业收入 归属于母公司净利润 净资产收益率 毛利率 营业收入同比增长率 归属于母公司净利润同比增长率{suffix}", **({"deadline": deadline} if deadline is not None else {})
             ), period=period, field=field
         )
 
-    def query_capital(self, code: str) -> Dict[str, Any]:
+    def query_capital(self, code: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
         """资金类：主力净流入/融资余额。"""
-        return _extract_first_table_row(self.query(f"{code} 主力净流入额 融资余额"))
+        return _extract_first_table_row(self.query(f"{code} 主力净流入额 融资余额", **({"deadline": deadline} if deadline is not None else {})))
 
 
 # ------------------------------------------------------------------
@@ -325,24 +338,25 @@ class MXSource:
         return self._client.available
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """读取单锚点。失败/无 key/无数据 → None（fail-open）。"""
-        if not self._client.available:
+        if not self._client.available or (deadline is not None and deadline <= time.monotonic()):
             return None
         try:
+            budget = {"deadline": deadline} if deadline is not None else {}
             picker = _pick_value
             if field in _SNAPSHOT_FIELDS:
-                bundle, keywords = self._client.fetch_snapshot(code), _SNAPSHOT_FIELDS[field]
+                bundle, keywords = self._client.fetch_snapshot(code, **budget), _SNAPSHOT_FIELDS[field]
             elif field in _PERIOD_FIELDS:
                 keywords = _FINANCIAL_FIELDS.get(field) or _GROWTH_FIELDS[field]
                 if field in _GROWTH_FIELDS:
                     picker = _pick_growth_value
-                bundle = self._client.query_financials(code, period, field=field)
+                bundle = self._client.query_financials(code, period, field=field, **budget)
                 if period and picker(bundle, keywords, field=field) is None:
-                    bundle = self._client.query_financials(code, None, field=field)
+                    bundle = self._client.query_financials(code, None, field=field, **budget)
             elif field in _CAPITAL_FIELDS:
-                bundle, keywords = self._client.query_capital(code), _CAPITAL_FIELDS[field]
+                bundle, keywords = self._client.query_capital(code, **budget), _CAPITAL_FIELDS[field]
             else:
                 return None
             return self.read_bundle(bundle, field, period)

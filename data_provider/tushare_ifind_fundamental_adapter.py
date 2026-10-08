@@ -23,6 +23,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+from time import monotonic
+from threading import BoundedSemaphore
+from inspect import signature
+from contextvars import copy_context
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -90,6 +94,8 @@ class TushareIfindFundamentalAdapter:
         ifind_source: Optional[IfindSource] = None,
         tushare_token: Optional[str] = None,
     ) -> None:
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._slots = BoundedSemaphore(4)
         self._ifind = ifind_source
         self._tushare_token = tushare_token
         self._tushare_pro = None
@@ -128,7 +134,7 @@ class TushareIfindFundamentalAdapter:
         return bool(self._tushare_pro) or bool(self._ifind and self._ifind.available)
 
     def get_fundamental_bundle(
-        self, stock_code: str, period: str = ""
+        self, stock_code: str, period: str = "", *, fields: Optional[Tuple[str, ...]] = None, include_institution: bool = True, deadline: Optional[float] = None
     ) -> Dict[str, Any]:
         """Return a bundle in the same shape as ``AkshareFundamentalAdapter``.
 
@@ -150,7 +156,7 @@ class TushareIfindFundamentalAdapter:
         # the slowest single call. iFinD MCP can be slow when multiple
         # sessions reconnect; serial reads would multiply latency.
         anchor_results = self._read_growth_fields_concurrent(
-            list(_FIELD_TO_IFIND_ANCHOR.items()), ts_code, as_of
+            [(key, anchor) for key, anchor in _FIELD_TO_IFIND_ANCHOR.items() if fields is None or key in fields], ts_code, as_of, deadline
         )
         for bundle_key, anchor, reading in anchor_results:
             if reading is not None:
@@ -170,7 +176,7 @@ class TushareIfindFundamentalAdapter:
         # summary string, so we leave the bundle empty here. The orchestrator
         # already considers ``earnings.data = {}`` as ``partial`` and the
         # staleness detector will not flag it.
-        top10 = self._read_top10_holders(ts_code, as_of)
+        top10 = self._read_top10_holders(ts_code, as_of) if include_institution and (deadline is None or deadline > monotonic()) else None
         if top10 is not None:
             institution["top10_holder_change"] = top10
             source_chain.append(
@@ -193,7 +199,7 @@ class TushareIfindFundamentalAdapter:
         }
 
     def _read_growth_field(
-        self, anchor: str, ts_code: str, period: str
+        self, anchor: str, ts_code: str, period: str, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         if self._ifind is None or not self._ifind.available:
             return None
@@ -205,8 +211,11 @@ class TushareIfindFundamentalAdapter:
             if fallback_period != period:
                 candidates.append(fallback_period)
         for candidate in candidates:
-            reading = self._ifind.read(ts_code, anchor, candidate)
-            if reading is not None and reading.value is not None:
+            if deadline is not None and deadline <= monotonic():
+                return None
+            budget = {"deadline": deadline} if deadline is not None and "deadline" in signature(self._ifind.read).parameters else {}
+            reading = self._ifind.read(ts_code, anchor, candidate, **budget)
+            if reading is not None and adopted_field_record(anchor, reading)["rule_eligible"]:
                 return reading
         return None
 
@@ -215,6 +224,7 @@ class TushareIfindFundamentalAdapter:
         items: List[Tuple[str, str]],
         ts_code: str,
         period: str,
+        deadline: Optional[float] = None,
     ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
         """Read multiple growth anchors concurrently via iFinD.
 
@@ -226,11 +236,11 @@ class TushareIfindFundamentalAdapter:
             return []
         if self._ifind is None or not self._ifind.available:
             return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period))
+                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
                 for bk, anchor in items
             ]
         try:
-            return self._gather_growth_reads(items, ts_code, period)
+            return self._gather_growth_reads(items, ts_code, period, deadline)
         except Exception as exc:  # noqa: BLE001 — fall back to serial
             logger.debug(
                 "[TushareIfindFallback] concurrent read failed: %s, "
@@ -238,7 +248,7 @@ class TushareIfindFundamentalAdapter:
                 exc,
             )
             return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period))
+                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
                 for bk, anchor in items
             ]
 
@@ -247,6 +257,7 @@ class TushareIfindFundamentalAdapter:
         items: List[Tuple[str, str]],
         ts_code: str,
         period: str,
+        deadline: Optional[float] = None,
     ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
         """Read growth anchors in parallel via a ThreadPoolExecutor.
 
@@ -257,47 +268,28 @@ class TushareIfindFundamentalAdapter:
         """
         if self._ifind is None:
             return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period))
+                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
                 for bk, anchor in items
             ]
 
-        # Period candidates: the caller's anchor-specific period, then a
-        # short list of recent fiscal periods. We only parallelize
-        # across anchors; periods within an anchor are walked serially.
-        period_candidates: List[Optional[str]] = [period or None]
-        for fallback_period in _RECENT_PERIODS:
-            if fallback_period != period:
-                period_candidates.append(fallback_period)
-
-        def _read_one(anchor: str) -> Optional[AnchorReading]:
-            for candidate in period_candidates:
-                try:
-                    reading = self._ifind.read(ts_code, anchor, candidate)
-                except Exception:  # noqa: BLE001 — fail-open
-                    continue
-                if reading is not None and reading.value is not None:
-                    return reading
-            return None
-
-        # ``ThreadPoolExecutor`` lets each thread block on a single
-        # synchronous ``IfindSource.read`` call without serialising the
-        # others. ``max_workers`` matches the number of anchors so we
-        # fan out fully while still bounding memory.
-        max_workers = max(1, min(len(items), 4))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_anchor = {
-                executor.submit(_read_one, anchor): anchor for _, anchor in items
-            }
-            anchor_to_value: Dict[str, Optional[AnchorReading]] = {}
-            for future in concurrent.futures.as_completed(
-                future_to_anchor, timeout=None
-            ):
-                anchor = future_to_anchor[future]
-                try:
-                    anchor_to_value[anchor] = future.result()
-                except Exception:  # noqa: BLE001 — fail-open
-                    anchor_to_value[anchor] = None
-        return [(bk, anchor, anchor_to_value.get(anchor)) for bk, anchor in items]
+        futures = {}
+        for _, anchor in items:
+            if (deadline is not None and deadline <= monotonic()) or not self._slots.acquire(blocking=False):
+                continue
+            future = self._pool.submit(copy_context().run, self._read_growth_field, anchor, ts_code, period, deadline)
+            future.add_done_callback(lambda _: self._slots.release())
+            futures[anchor] = future
+        concurrent.futures.wait(list(futures.values()), timeout=None if deadline is None else max(0.0, deadline - monotonic()))
+        values: Dict[str, Optional[AnchorReading]] = {}
+        for anchor, future in futures.items():
+            if not future.done():
+                future.cancel()
+                continue
+            try:
+                values[anchor] = future.result()
+            except Exception as exc:
+                logger.debug("[TushareIfindFallback] %s failed: %s", anchor, type(exc).__name__)
+        return [(key, anchor, values.get(anchor)) for key, anchor in items]
 
     def _read_top10_holders(self, ts_code: str, period: str) -> Optional[float]:
         # Tushare top10_holders is restricted on basic-plan tokens; we still

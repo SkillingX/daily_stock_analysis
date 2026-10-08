@@ -14,11 +14,13 @@ import logging
 import math
 import re
 import json
+from inspect import signature
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field as dataclass_field, fields as dataclass_fields, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, Overflow
 from time import monotonic
+from threading import BoundedSemaphore
 from typing import Annotated, Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
 from icontract import ensure
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -374,7 +376,7 @@ class SourceAdapter(Protocol):
     name: str
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """读取某股票某锚点。失败返回 None（fail-open），不抛异常。"""
         ...
@@ -699,6 +701,7 @@ class CrossSourceValidator:
         )
         self._max_workers = max(1, int(max_workers))
         self._pool = ThreadPoolExecutor(max_workers=self._max_workers)
+        self._slots = BoundedSemaphore(self._max_workers)
 
     def verify(
         self,
@@ -746,8 +749,11 @@ class CrossSourceValidator:
 
         def _safe_read(source: SourceAdapter) -> tuple[Optional[AnchorReading], Optional[str]]:
             try:
-                reading = source.read(code, field, period)
-                return reading, None if reading is not None else "missing"
+                if deadline is not None and deadline <= monotonic():
+                    return None, "timeout"
+                kwargs = {"deadline": deadline} if deadline is not None and "deadline" in signature(source.read).parameters else {}
+                reading = source.read(code, field, period, **kwargs)
+                return reading, None if reading is not None else "timeout" if deadline is not None and deadline <= monotonic() else "missing"
             except Exception as exc:  # noqa: BLE001 — fail-open：源异常不影响其他源
                 logger.debug(
                     "[CrossValidate] source %s read %s failed: %s",
@@ -759,10 +765,18 @@ class CrossSourceValidator:
 
         if deadline is not None and deadline <= monotonic():
             return (), tuple((source.name, "timeout") for source in self._sources)
-        futures = [(source, self._pool.submit(_safe_read, source)) for source in self._sources]
+        futures = []
+        busy_errors = []
+        for source in self._sources:
+            if not self._slots.acquire(blocking=False):
+                busy_errors.append((source.name, "source_busy"))
+                continue
+            future = self._pool.submit(_safe_read, source)
+            future.add_done_callback(lambda _: self._slots.release())
+            futures.append((source, future))
         wait([future for _, future in futures], timeout=None if deadline is None else max(0.0, deadline - monotonic()))
         readings: list[AnchorReading] = []
-        errors: list[tuple[str, str]] = []
+        errors: list[tuple[str, str]] = list(busy_errors)
         for source, future in futures:
             if not future.done():
                 future.cancel()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
+from time import monotonic
 from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -140,6 +141,9 @@ def build_cross_validation_block(
     validator = validator if validator is not None else _get_validator()
     if validator is None:
         return None
+    if deadline is None and isinstance(validator, CrossSourceValidator):
+        from src.config import get_config
+        deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     primary_readings = primary_readings or {}
     anchors: Dict[str, Any] = {}
     agreed = 0

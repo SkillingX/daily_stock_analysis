@@ -24,6 +24,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from inspect import signature
+from functools import partial
+from time import monotonic
 import json
 import logging
 import os
@@ -31,7 +35,7 @@ from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
-from .ifind_fundamental_adapter import _safe_float
+from .ifind_fundamental_adapter import _apply_mcp_request_deadline, _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -329,15 +333,19 @@ class MxMcpFetcher:
         return bool(self._endpoint and self._api_key)
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取（封装 async MCP）。无 token/失败 → None。"""
         if not self.available:
             return None
         if field not in _MX_MCP_ANCHOR_QUERIES:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:
-            return asyncio.run(self._async_fetch(code, field, period))
+            call = self._async_fetch(code, field, period, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug(
                 "[MxMcpFetcher] fetch %s/%s failed: %s", code, field, exc
@@ -345,62 +353,37 @@ class MxMcpFetcher:
             return None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，CI 不覆盖
-        self, code: str, field: str, period: Optional[str]
+        self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """执行一次 Choice MCP 调用。"""
-        import inspect
-        from mcp import ClientSession  # type: ignore
-        # mcp 2.x renamed ``streamablehttp_client`` → ``streamable_http_client`` AND changed
-        # the signature from ``(url, headers=..., timeout=...)`` to ``(url, *, http_client=...)``.
-        # Detect at runtime; pass headers + timeout via ``httpx.AsyncClient`` for 2.x, pass
-        # kwargs directly for 1.x legacy.
-        try:  # pragma: no cover — real MCP call path, CI not covered
-            from mcp.client.streamable_http import streamable_http_client  # type: ignore
-        except ImportError:  # pragma: no cover — 1.x legacy
-            from mcp.client.streamable_http import (  # type: ignore
-                streamablehttp_client,  # type: ignore[attr-defined]
-            )
-            streamable_http_client = streamablehttp_client  # type: ignore[assignment]
-
-        sig_params = inspect.signature(streamable_http_client).parameters
-        uses_http_client_kwarg = "http_client" in sig_params
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         tool, query_tpl, keywords = _MX_MCP_ANCHOR_QUERIES[field]
         query = query_tpl.format(code=code, period=period or "")
         headers = {"em_api_key": self._api_key}
         last_error: Optional[str] = None
         for attempt in range(2):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+            if timeout <= 0:
+                return None
             try:
-                if uses_http_client_kwarg:  # mcp >= 2.0
-                    import httpx as _httpx  # type: ignore
-
-                    async with streamable_http_client(
-                        self._endpoint,
-                        http_client=_httpx.AsyncClient(
-                            headers=headers, timeout=self._timeout
-                        ),
-                    ) as streams:
-                        # mcp 2.x yields 2-tuple; 1.x legacy yielded 3-tuple.
-                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
-                            read, write, _ = streams  # type: ignore[misc]
-                        else:
-                            read, write = streams  # type: ignore[misc]
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            result = await session.call_tool(tool, {"query": query})
-                else:  # mcp < 2.0 (legacy)
-                    async with streamable_http_client(
-                        self._endpoint,
-                        headers=headers,
-                        timeout=self._timeout,
-                    ) as streams:
-                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
-                            read, write, _ = streams  # type: ignore[misc]
-                        else:
-                            read, write = streams  # type: ignore[misc]
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            result = await session.call_tool(tool, {"query": query})
+                async with AsyncExitStack() as stack:
+                    close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+                    if "http_client" in signature(transport).parameters:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+                        client = create_mcp_http_client(headers=headers)
+                        client.timeout = timeout
+                        if deadline is not None:
+                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                        await stack.enter_async_context(client)
+                        streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+                    else:
+                        streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+                    await session.initialize()
+                    result = await session.call_tool(tool, {"query": query})
                 # 解析在上下文管理器关闭后做，避免持连接做正则
                 content = getattr(result, "content", None) or []
                 raw_text = next(
@@ -451,7 +434,7 @@ class MxMcpSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
@@ -459,7 +442,7 @@ class MxMcpSource:
         if field not in _MX_MCP_ANCHOR_QUERIES:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：MX 异常不影响其他源
             logger.debug("[MxMcpSource] read %s/%s failed: %s", code, field, exc)
             return None
