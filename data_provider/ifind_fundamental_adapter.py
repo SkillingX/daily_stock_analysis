@@ -30,7 +30,7 @@ import threading
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ _PERIOD_FIELDS = {
 # ------------------------------------------------------------------
 
 
-def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
+def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """从 iFinD ``data.answer`` Markdown 表格中提取「表头: 值」映射。
 
     表格格式（Phase 0 实测）：``|表头1|表头2|...|\n|---|---|---|\n|值1|值2|...|``
@@ -163,7 +163,7 @@ def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keyword
             continue  # pragma: no cover — Phase 0 响应参数段在表格外，数据行先触发 break
         rows.append(dict(zip(headers, cells)))
     if keywords is not None:
-        rows = [row for row in rows if _extract_ifind_value(row, keywords)[0] is not None]
+        rows = [row for row in rows if _extract_ifind_value(row, keywords, field=field)[0] is not None]
     selected = select_report_period([report_period_from_fields(row) for row in rows], period)
     return rows[selected if selected is not None else 0] if rows else {}
 
@@ -251,7 +251,7 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _extract_ifind_value(
-    table: Dict[str, str], keywords: List[str]
+    table: Dict[str, str], keywords: List[str], field: Optional[str] = None
 ) -> Tuple[Optional[float], str]:
     """从解析后的表中按关键词取数值。
 
@@ -261,7 +261,7 @@ def _extract_ifind_value(
     for kw in keywords:
         for col, val in table.items():
             if kw in col:
-                v = _safe_float(val)
+                v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
                     return v, col
     return None, ""
@@ -286,13 +286,16 @@ def _parse_ifind_response(
         if isinstance(resp_json, dict)
         else str(raw_text)
     )
-    table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords)
+    table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords, field=field)
     if not table:
         return None
-    value, col = _extract_ifind_value(table, keywords)
+    value, col = _extract_ifind_value(table, keywords, field=field)
     if value is None:
         return None
     actual, basis = report_period_from_fields(table, col)
+    value, unit, currency, error = normalize_anchor_value(field, table[col], col, unit=table.get("unit"), currency=table.get("currency"))
+    if value is None:
+        return None
     return AnchorReading(
         source="ifind",
         value=value,
@@ -301,6 +304,8 @@ def _parse_ifind_response(
         period_basis=basis if field in _PERIOD_FIELDS else "unknown",
         requested_period=period if field in _PERIOD_FIELDS else None,
         observed_at=observation_time_from_fields(table), fetched_at=table.get("fetched_at"),
+        unit=unit, currency=currency, raw_value=table[col], raw_label=col, normalization_error=error,
+        raw_unit=table.get("unit"), raw_currency=table.get("currency"),
     )
 
 

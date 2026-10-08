@@ -30,7 +30,7 @@ import os
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
 from .ifind_fundamental_adapter import _safe_float
 
 logger = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ _PERIOD_FIELDS = {
 # ------------------------------------------------------------------
 
 
-def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
+def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """从 Choice MCP 响应任意层级抽取 ``{指标名: 字符串值}`` 映射。
 
     支持形态（按发现顺序）：
@@ -158,7 +158,7 @@ def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keyword
                         columns = elem.get("columns") or []
                         periods = [normalize_report_period(col) for col in columns[1:]]
                         if keywords is not None:
-                            periods = [candidate if any(isinstance(row, list) and len(row) > pos + 1 and any(kw in str(row[0]) for kw in keywords) and _safe_float(row[pos + 1]) is not None for row in items) else (None, "unknown") for pos, candidate in enumerate(periods)]
+                            periods = [candidate if any(isinstance(row, list) and len(row) > pos + 1 and any(kw in str(row[0]) for kw in keywords) and (normalize_anchor_value(field, row[pos + 1], str(row[0]))[0] if field is not None else _safe_float(row[pos + 1])) is not None for row in items) else (None, "unknown") for pos, candidate in enumerate(periods)]
                         selected = select_report_period(periods, period)
                         position = selected + 1 if selected is not None else 1
                         pairs = {str(row[0]).strip(): str(row[position]).strip() for row in items if isinstance(row, list) and len(row) > position}
@@ -167,7 +167,7 @@ def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keyword
                         return pairs
         # 2) {"response": ...} 包装（递归；iFind / 旧 fixture 兼容）
         if "response" in payload:
-            return _extract_key_value_pairs(payload["response"], period=period, keywords=keywords)
+            return _extract_key_value_pairs(payload["response"], period=period, keywords=keywords, field=field)
         # 3) 扁平 dict（含一层嵌套 → 父键.子键 前缀）
         out: Dict[str, str] = {}
         for k, v in payload.items():
@@ -182,16 +182,16 @@ def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keyword
         return out
     if isinstance(payload, list):
         for item in payload:
-            found = _extract_key_value_pairs(item, period=period, keywords=keywords)
+            found = _extract_key_value_pairs(item, period=period, keywords=keywords, field=field)
             if found:
                 return found
         return {}
     if isinstance(payload, str):
-        return _parse_response_str(payload, period=period, keywords=keywords)
+        return _parse_response_str(payload, period=period, keywords=keywords, field=field)
     return {}
 
 
-def _parse_response_str(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
+def _parse_response_str(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """解析 Choice MCP ``response`` 字符串字段。
 
     - 若 ``text`` 是合法 JSON → 走 ``_extract_key_value_pairs`` 递归抽取
@@ -207,12 +207,12 @@ def _parse_response_str(text: str, period: Optional[str] = None, keywords: Optio
     except (json.JSONDecodeError, ValueError):
         parsed = None
     if parsed is not None:
-        return _extract_key_value_pairs(parsed, period=period, keywords=keywords)
+        return _extract_key_value_pairs(parsed, period=period, keywords=keywords, field=field)
     # 退化：Markdown 表（与 iFinD 形态类似，宽松匹配首行数据）
-    return _parse_markdown_first_row(text, period=period, keywords=keywords)
+    return _parse_markdown_first_row(text, period=period, keywords=keywords, field=field)
 
 
-def _parse_markdown_first_row(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None) -> Dict[str, str]:
+def _parse_markdown_first_row(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """Markdown 表首行数据 → ``{header: value}``。
 
     仅在响应字段不是 JSON 时退化使用；找第一个 ``|---|`` 分隔行确定表头，
@@ -220,10 +220,10 @@ def _parse_markdown_first_row(text: str, period: Optional[str] = None, keywords:
     """
     from .ifind_fundamental_adapter import _parse_ifind_markdown_table
 
-    return _parse_ifind_markdown_table(text, period=period, keywords=keywords)
+    return _parse_ifind_markdown_table(text, period=period, keywords=keywords, field=field)
 
 
-def _pick_value(pairs: Dict[str, str], keywords: List[str]) -> Tuple[Optional[float], str]:
+def _pick_value(pairs: Dict[str, str], keywords: List[str], field: Optional[str] = None) -> Tuple[Optional[float], str]:
     """从 ``pairs`` 中按关键词模糊匹配取值。
 
     返回 ``(value, used_column)``。找不到 → ``(None, "")``。
@@ -231,7 +231,7 @@ def _pick_value(pairs: Dict[str, str], keywords: List[str]) -> Tuple[Optional[fl
     for kw in keywords:
         for col, val in pairs.items():
             if kw in col:
-                v = _safe_float(val)
+                v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
                     return v, col
     return None, ""
@@ -250,7 +250,7 @@ def _parse_mx_mcp_response(
     """
     if not raw_text:
         return None
-    pairs = _extract_key_value_pairs(json.loads(raw_text) if raw_text.strip().startswith(("{", "[")) else raw_text, period=period, keywords=keywords)
+    pairs = _extract_key_value_pairs(json.loads(raw_text) if raw_text.strip().startswith(("{", "[")) else raw_text, period=period, keywords=keywords, field=field)
     if not pairs:
         # 高信噪比预警：响应不是 MCP / JSON / Markdown 任何已知 shape。
         # 这是上游协议变更或 server 异常的强信号，而不是单字段缺失。
@@ -260,10 +260,13 @@ def _parse_mx_mcp_response(
             (raw_text[:80] + "...") if len(raw_text) > 80 else raw_text,
         )
         return None
-    value, col = _pick_value(pairs, keywords)
+    value, col = _pick_value(pairs, keywords, field=field)
     if value is None:
         return None
     actual, basis = report_period_from_fields(pairs, col)
+    value, unit, currency, error = normalize_anchor_value(field, pairs[col], col, unit=pairs.get("unit"), currency=pairs.get("currency"))
+    if value is None:
+        return None
     observed = observation_time_from_fields(pairs, pairs.get("report_period") if field not in _PERIOD_FIELDS else None)
     return AnchorReading(
         source="mx_mcp",
@@ -273,6 +276,8 @@ def _parse_mx_mcp_response(
         period_basis=basis if field in _PERIOD_FIELDS else "unknown",
         requested_period=period if field in _PERIOD_FIELDS else None,
         observed_at=observed, fetched_at=pairs.get("fetched_at"),
+        unit=unit, currency=currency, raw_value=pairs[col], raw_label=col, normalization_error=error,
+        raw_unit=pairs.get("unit"), raw_currency=pairs.get("currency"),
     )
 
 

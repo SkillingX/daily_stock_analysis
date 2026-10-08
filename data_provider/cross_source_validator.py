@@ -27,6 +27,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation, Overflow
 from typing import Any, Dict, Literal, Optional, Protocol, Sequence, Tuple
 from icontract import ensure
 
@@ -39,6 +40,91 @@ MODE_NUMERIC = "numeric"  # 数值容差比对（PE/PB/市值/营收/净利/ROE/
 MODE_DIRECTION = "direction"  # 方向+量级比对（主力净流入；两源算法口径不同）
 PeriodBasis = Literal["annual", "YTD", "single_quarter", "unknown"]
 FINANCIAL_ANCHORS = frozenset({"revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy"})
+PERCENTAGE_ANCHORS = frozenset({"roe", "gross_margin", "revenue_yoy", "net_profit_yoy"})
+MONEY_ANCHORS = frozenset({"current_price", "total_mv", "circ_mv", "revenue", "net_profit", "main_inflow", "margin_balance"})
+Unit = Literal["currency_base", "percentage_point", "multiple", "shares"]
+_CURRENCY_MARKERS = {
+    "CNY": ("CNY", "RMB", "人民币"), "USD": ("USD", "美元"),
+    "HKD": ("HKD", "港元", "港币"), "EUR": ("EUR", "欧元"),
+    "JPY": ("JPY", "日元"), "GBP": ("GBP", "英镑"),
+    "SGD": ("SGD", "新加坡元"), "AUD": ("AUD", "澳元"),
+    "CAD": ("CAD", "加元"), "CHF": ("CHF", "瑞士法郎"),
+}
+
+
+@ensure(lambda result: result[0] is None or math.isfinite(result[0]), "JSON numeric values must be finite")
+def normalize_anchor_value(
+    field: str, raw: object, label: str = "", *, unit: Optional[str] = None,
+    currency: Optional[str] = None,
+) -> tuple[Optional[float], Optional[Unit], Optional[str], Optional[str]]:
+    """Normalize supplier scales with Decimal; missing evidence never implies a unit."""
+    text = str(raw).strip().replace(",", "")
+    number = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(.*)", text)
+    if isinstance(raw, bool) or number is None:
+        return None, None, currency, "invalid_value"
+    try:
+        value = Decimal(number[1])
+    except InvalidOperation:
+        return None, None, currency, "invalid_value"
+    scales = {"": Decimal(1), "千": Decimal(1000), "万": Decimal(10000), "百万": Decimal(1000000), "亿": Decimal(100000000), "十亿": Decimal(1000000000), "百亿": Decimal(10000000000), "千亿": Decimal(100000000000), "万亿": Decimal(1000000000000)}
+
+    def declared(text: str) -> tuple[Optional[Unit], Decimal]:
+        if text in ("currency_base", "percentage_point", "multiple", "shares"):
+            return text, Decimal(1)  # type: ignore[return-value]
+        if "ratio" in text.lower() or "比例" in text:
+            return "percentage_point", Decimal(100)
+        if "%" in text or "％" in text or "百分点" in text:
+            return "percentage_point", Decimal(1)
+        if "倍" in text:
+            return "multiple", Decimal(1)
+        match = re.search(r"(万亿|千亿|百亿|十亿|百万|亿|万|千)?(元|股)", text)
+        if match:
+            return ("currency_base" if match[2] == "元" else "shares"), scales[match[1] or ""]
+        if text.strip() in scales and text.strip():
+            return "currency_base", scales[text.strip()]
+        return None, Decimal(1)
+
+    header = declared(label)
+    explicit = declared(unit) if unit is not None else header
+    cell = declared(number[2])
+    currencies = {code for code, markers in _CURRENCY_MARKERS.items() if any(marker in f"{label} {number[2]} {unit or ''}".upper() for marker in markers)}
+    error: Optional[str] = None
+    if currency is not None:
+        explicit_currency = str(currency).strip().upper()
+        if explicit_currency in _CURRENCY_MARKERS:
+            currency = explicit_currency
+            currencies.add(currency)
+        else:
+            currency = None
+            error = "currency_unknown"
+    if len(currencies) > 1:
+        error = "currency_conflict"
+    elif currency is None and len(currencies) == 1:
+        currency = next(iter(currencies))
+    if field not in MONEY_ANCHORS:
+        currency, error = None, None
+    if unit is not None and header[0] is not None and explicit != header:
+        error = "unit_conflict"
+    header = explicit
+    if header[0] is not None and cell[0] is not None and header != cell:
+        error = "unit_conflict"
+    canonical, factor = cell if cell[0] is not None else header
+    if canonical is None and field in {"pe_ratio", "pb_ratio"} and not number[2].strip() and unit is None:
+        canonical = "multiple"
+    expected: Unit = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
+    if canonical != expected:
+        error = error or ("unit_unknown" if canonical is None else "unit_incompatible")
+    if number[2].strip() and cell[0] is None:
+        error = error or "unit_unknown"
+    if unit is not None and header[0] is None:
+        error = error or "unit_unknown"
+    try:
+        normalized = float(value * factor)
+    except (InvalidOperation, Overflow, OverflowError):
+        return None, None, currency, "invalid_value"
+    if not math.isfinite(normalized):
+        return None, None, currency, "invalid_value"
+    return normalized, canonical if error is None else None, currency, error
 
 
 def normalize_report_period(value: object) -> tuple[Optional[str], PeriodBasis]:
@@ -191,6 +277,13 @@ class AnchorReading:
     period_basis: PeriodBasis = "unknown"
     observed_at: Optional[str] = None
     fetched_at: Optional[str] = None
+    unit: Optional[Unit] = None
+    currency: Optional[str] = None
+    raw_value: Optional[str] = None
+    raw_label: Optional[str] = None
+    raw_unit: Optional[str] = None
+    raw_currency: Optional[str] = None
+    normalization_error: Optional[str] = None
 
     def __post_init__(self) -> None:
         actual, inferred_basis = normalize_report_period(self.period)
@@ -216,6 +309,13 @@ class AnchorVerification:
     period_basis: PeriodBasis = "unknown"
     observed_at: Optional[str] = None
     fetched_at: Optional[str] = None
+    unit: Optional[Unit] = None
+    currency: Optional[str] = None
+    raw_value: Optional[str] = None
+    raw_label: Optional[str] = None
+    raw_unit: Optional[str] = None
+    raw_currency: Optional[str] = None
+    normalization_error: Optional[str] = None
 
     def to_compact(self) -> Dict[str, Any]:
         """压缩为 LLM 友好的 dict（省 token）。"""
@@ -240,7 +340,29 @@ class AnchorVerification:
             payload["fetched_at"] = self.fetched_at
         if self.note:
             payload["note"] = self.note
+        for key in ("unit", "currency", "raw_value", "raw_label", "raw_unit", "raw_currency", "normalization_error"):
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
         return payload
+
+
+def _unit_comparison_reason(readings: Sequence[AnchorReading], field: str) -> Optional[str]:
+    if any(reading.normalization_error for reading in readings):
+        return "单位规范化失败"
+    if any(reading.unit is None for reading in readings):
+        return "单位未知"
+    if len({reading.unit for reading in readings}) > 1:
+        return "单位不一致"
+    expected = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
+    if any(reading.unit != expected for reading in readings):
+        return "单位不适用于该指标"
+    if field in MONEY_ANCHORS:
+        if any(reading.currency not in _CURRENCY_MARKERS for reading in readings):
+            return "币种未知"
+        if len({reading.currency for reading in readings}) > 1:
+            return "币种不一致"
+    return None
 
 
 # ------------------------------------------------------------------
@@ -332,8 +454,8 @@ def _judge_numeric(
       - 三源两两都不一致 → low（3-way 真冲突）
     """
     readings = (primary, secondary) if tertiary is None else (primary, secondary, tertiary)
-    reason = ""
-    if spec.field in FINANCIAL_ANCHORS:
+    reason = _unit_comparison_reason(readings, spec.field) or ""
+    if not reason and spec.field in FINANCIAL_ANCHORS:
         if any(reading.period is None for reading in readings):
             reason = "实际报告期未知"
         elif len({reading.period for reading in readings}) > 1:
@@ -346,7 +468,7 @@ def _judge_numeric(
             reason = "指标口径未知"
         elif len({reading.caliber for reading in readings}) > 1:
             reason = "指标口径不一致"
-    elif spec.field in {"pe_ratio", "pb_ratio"} and any(reading.caliber is None for reading in readings):
+    elif not reason and spec.field in {"pe_ratio", "pb_ratio"} and any(reading.caliber is None for reading in readings):
         reason = "估值口径未知"
     if reason:
         return AnchorVerification(
@@ -469,6 +591,10 @@ def _judge_direction(
 
     3-source 时（``tertiary`` 提供）：majority vote —— 同方向 ≥2 → high；否则 medium。
     """
+    readings = (primary, secondary) if tertiary is None else (primary, secondary, tertiary)
+    reason = _unit_comparison_reason(readings, field)
+    if reason:
+        return AnchorVerification(field, primary.value, "medium", tuple(reading.source for reading in readings), False, note=f"不可比：{reason}")
     diff = _discrepancy_pct(primary.value, secondary.value)
     sources_pair = (
         (primary.source, secondary.source, tertiary.source)
@@ -670,6 +796,9 @@ class CrossSourceValidator:
         return replace(
             result, requested_period=primary.requested_period, period_basis=primary.period_basis,
             observed_at=primary.observed_at, fetched_at=primary.fetched_at,
+            unit=primary.unit, currency=primary.currency, raw_value=primary.raw_value,
+            raw_label=primary.raw_label, normalization_error=primary.normalization_error,
+            raw_unit=primary.raw_unit, raw_currency=primary.raw_currency,
         )
 
     def _collect(

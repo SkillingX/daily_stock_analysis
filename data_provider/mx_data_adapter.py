@@ -21,7 +21,7 @@ import time
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, report_period_from_fields, select_report_period
 from typing import cast  # added by mypy_codemod
 
 logger = logging.getLogger(__name__)
@@ -109,7 +109,7 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pick_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[float]:
+def _pick_value(bundle: Dict[str, Any], keywords: List[str], field: Optional[str] = None) -> Optional[float]:
     """从 ``{中文label: 值}`` 中按关键词模糊匹配取首个可解析数值。
 
     排除含「同比/增长率」的列——财务 query 同时返回绝对值与同比增长率，
@@ -123,7 +123,7 @@ def _pick_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[float]:
             # 跳过增长率/同比列（绝对值锚点优先）
             if any(skip in label_s for skip in ("同比增长", "增长率", "环比")):
                 continue
-            val = _safe_float(raw)
+            val = normalize_anchor_value(field, raw, label_s)[0] if field is not None else _safe_float(raw)
             if val is not None:
                 return val
     return None
@@ -133,7 +133,7 @@ def _pick_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[float]:
 _GROWTH_MARKERS = ("同比增长", "增长率", "环比")
 
 
-def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[float]:
+def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str], field: Optional[str] = None) -> Optional[float]:
     """取「同比增长率」类数值，与 :func:`_pick_value` 互补。
 
     仅命中**同时**含关键词**和**增长率标记（同比/增长率/环比）的列，用于 ``revenue_yoy``。
@@ -146,7 +146,7 @@ def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str]) -> Optional[
         if any(kw in label_s for kw in keywords) and any(
             m in label_s for m in _GROWTH_MARKERS
         ):
-            val = _safe_float(raw)
+            val = normalize_anchor_value(field, raw, label_s)[0] if field is not None else _safe_float(raw)
             if val is not None:
                 return val
     return None
@@ -222,7 +222,7 @@ def _extract_first_table_row(result: Any, period: Optional[str] = None, field: O
             picker = _pick_growth_value if field in _GROWTH_FIELDS else _pick_value
             for index in range(len(periods)):
                 candidate = {str(name_map.get(key) or key): values[index] for key, values in table.items() if key != "headName" and isinstance(values, list) and len(values) > index}
-                if picker(candidate, keywords) is None:
+                if picker(candidate, keywords, field=field) is None:
                     periods[index] = (None, "unknown")
         selected = select_report_period(periods, period)
         if selected is not None:
@@ -339,17 +339,20 @@ class MXSource:
                 if field in _GROWTH_FIELDS:
                     picker = _pick_growth_value
                 bundle = self._client.query_financials(code, period, field=field)
-                if period and picker(bundle, keywords) is None:
+                if period and picker(bundle, keywords, field=field) is None:
                     bundle = self._client.query_financials(code, None, field=field)
             elif field in _CAPITAL_FIELDS:
                 bundle, keywords = self._client.query_capital(code), _CAPITAL_FIELDS[field]
             else:
                 return None
             for label, raw in bundle.items():
-                value = picker({label: raw}, keywords)
+                value = picker({label: raw}, keywords, field=field)
                 if value is None:
                     continue
                 actual, basis = report_period_from_fields({**bundle, "report_period": bundle.get("_mx_period")}, label) if field in _PERIOD_FIELDS else (None, "unknown")
+                value, unit, currency, error = normalize_anchor_value(field, raw, label, unit=bundle.get("unit"), currency=bundle.get("currency"))
+                if value is None:
+                    continue
                 observed = observation_time_from_fields(bundle, bundle.get("_mx_period") if field not in _PERIOD_FIELDS else None)
                 return AnchorReading(
                     source=self.name, value=value,
@@ -357,6 +360,8 @@ class MXSource:
                     period=actual, period_basis=basis,
                     requested_period=period if field in _PERIOD_FIELDS else None,
                     observed_at=observed, fetched_at=bundle.get("fetched_at"),
+                    unit=unit, currency=currency, raw_value=str(raw), raw_label=label, normalization_error=error,
+                    raw_unit=bundle.get("unit"), raw_currency=bundle.get("currency"),
                 )
             return None
         except Exception as exc:  # noqa: BLE001 — 单个源异常不影响其他源

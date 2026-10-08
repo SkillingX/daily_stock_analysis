@@ -33,8 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .cross_source_validator import AnchorReading, caliber_from_label, observation_time_from_fields, report_period_from_fields, select_report_period
-from .ifind_fundamental_adapter import _safe_float
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +46,7 @@ logger = logging.getLogger(__name__)
 class FuyaoItem(BaseModel):
     """单条 fuyao 数据点。``fields`` 承载指标值（Any 以容忍 string/int/float/null）；
 
-    缺失字段让 AnchorReading 走 None；数值统一由 :func:`_safe_float` 转 float。
+    缺失字段让 AnchorReading 走 None；数值按返回单位规范化。
     """
 
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, extra="ignore")
@@ -229,7 +228,7 @@ def _parse_fuyao_response(
             item = FuyaoItem.model_validate(raw)
         except Exception:  # noqa: BLE001 — 跳过畸形 item
             continue
-        value = _safe_float(item.fields.get(spec.item_key))
+        value = normalize_anchor_value(field, item.fields.get(spec.item_key), spec.item_key)[0]
         if value is None:
             continue
         period_fields = dict(item.fields)
@@ -238,6 +237,9 @@ def _parse_fuyao_response(
             report_label = f"{encoded[1]}{('一季报', '中报', '三季报', '年报')[int(encoded[2]) - 1]}" if encoded else item.report
             period_fields.setdefault("report_period", report_label)
         actual, basis = report_period_from_fields(period_fields, spec.item_key)
+        value, unit, currency, error = normalize_anchor_value(field, item.fields[spec.item_key], spec.item_key, unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), currency=item.fields.get("currency"))
+        if value is None:
+            continue
         readings.append(AnchorReading(
             source="fuyao",
             value=value,
@@ -246,6 +248,8 @@ def _parse_fuyao_response(
             period_basis=basis if spec.needs_period else "unknown",
             requested_period=period if spec.needs_period else None,
             observed_at=observation_time_from_fields(item.fields), fetched_at=item.fields.get("fetched_at"),
+            unit=unit, currency=currency, raw_value=str(item.fields[spec.item_key]), raw_label=spec.item_key, normalization_error=error,
+            raw_unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), raw_currency=item.fields.get("currency"),
         ))
     selected = select_report_period([(reading.period, reading.period_basis) for reading in readings], period)
     return readings[selected if selected is not None else 0] if readings else None

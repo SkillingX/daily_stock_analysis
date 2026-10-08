@@ -33,7 +33,8 @@ from data_provider.cross_source_validator import AnchorSpec  # noqa: E402
 
 
 def _reading(source: str, value: float, caliber=None, period=None) -> AnchorReading:
-    return AnchorReading(source=source, value=value, caliber=caliber, period=period)
+    return AnchorReading(source=source, value=value, caliber=caliber, period=period,
+                         unit="multiple" if caliber in {"TTM", "MRQ", "static", "dynamic"} else "currency_base", currency="CNY")
 
 
 class _FakeSource:
@@ -456,7 +457,7 @@ class TestCrossSourceValidator(unittest.TestCase):
         # 行情类：注入 realtime 主源 + MX 验证源 → realtime 为 primary
         mx = _FakeSource("mx", {"current_price": _reading("mx", 100.5)})
         v = CrossSourceValidator(sources=[mx])
-        primary = AnchorReading(source="realtime", value=100.0)
+        primary = AnchorReading(source="realtime", value=100.0, unit="currency_base", currency="CNY")
         result = v.verify("600519", "current_price", primary_reading=primary)
         self.assertEqual(result.sources[0], "realtime")
         self.assertEqual(result.confidence, "high")  # 100.0 vs 100.5 ≈ 0.5% < 1%
