@@ -94,3 +94,7 @@ API 兼容增加 `POST /api/v1/fundamentals/generate?stock_code=600519&force_ref
 每次明确刷新生成独立 ID、文件和记录。旧 ID 及新追加的数字后缀 ID 都保持原读取契约；两次并发刷新可保存两个版本。列表与默认复用统一按已有 created_at 降序、同时间按 ID 降序，created_at 在本次生成开始时记录，不按保存完成顺序重排。生成异常或保存失败保留旧成功版；保存失败的本次文件清理，不覆盖历史。前端同一在途操作防重复提交，POST 不自动重试，另一次点击表示新意图。连接超时不能证明服务未保存，可先刷新历史列表确认；不承诺 HTTP exactly-once。
 
 离线恢复/失败/并发与真实缓存验收：`python -m pytest tests/test_fundamentals_refresh.py`；页面在途与失败行为：在 `apps/dsa-web` 执行 `npm run test -- src/pages/__tests__/FundamentalsPage.test.tsx`。回滚本提交恢复原 API/Web 与复用策略，旧读取器仍可按 ID 读取这些追加版本，无需删除记录或清库。本专题没有配对英文文件。
+
+## 候选提交验证
+
+远端没有自动触发门禁时，可对同一候选分支手动执行现有验证流水线：`gh workflow run ci.yml --ref <candidate-branch>` 和 `gh workflow run type-safety.yml --ref <candidate-branch>`。手动 CI 执行治理、后端、Docker 和 Web 检查，类型流水线执行类型与契约检查；保留原有 PR / push 触发条件。用 `gh run list` 核对运行 head SHA，再用 `gh pr checks` 查看该候选的结论。检查尚未运行或尚未结束不能计为通过，这些检查也不替代真实供应商与生产验收。
