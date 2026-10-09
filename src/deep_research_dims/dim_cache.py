@@ -51,7 +51,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 SCHEMA_VERSION = 7  # BusinessDim 四字段为 Dict；F1结构仅由财务mapping版本隔离
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 9  # F1逐字段品质及评分资格，旧无品质缓存拒读
+FUNDAMENTAL_MAPPING_VERSION = 10  # 字段水平与同比定义收敛，拒读旧财务资格
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 

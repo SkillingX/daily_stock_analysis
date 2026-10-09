@@ -204,8 +204,15 @@ def select_report_period(periods: Sequence[tuple[Optional[str], PeriodBasis]], r
 
 def caliber_from_label(field: str, label: str) -> Optional[str]:
     """Use the returned field identity, never the natural-language request."""
-    if field.endswith("_yoy") and any(marker in label.lower() for marker in ("环比", "qoq")):
-        return None
+    text = label.lower()
+    if field.endswith("_yoy"):
+        if not ("同比" in text or re.search(r"(?<![a-z])yoy(?![a-z])", text)):
+            return None
+        if any(marker in text for marker in ("环比", "qoq", "复合", "cagr", "年均")):
+            return None
+    elif field in FINANCIAL_ANCHORS | {"pe_ratio", "pb_ratio"}:
+        if any(marker in text for marker in ("同比", "yoy", "环比", "qoq", "增长", "增速", "增幅", "变化", "变动", "复合", "cagr")):
+            return None
     if field == "pe_ratio":
         return "TTM" if any(marker in label.upper() for marker in ("TTM", "滚动")) else None
     if field == "pb_ratio":
@@ -217,7 +224,9 @@ def caliber_from_label(field: str, label: str) -> Optional[str]:
             return "parent_net_profit_yoy" if field.endswith("yoy") else "parent_net_profit"
         return None
     if field == "roe":
-        return "weighted_roe" if any(marker in label.lower() for marker in ("加权", "weighted")) else None
+        if any(marker in text for marker in ("非加权", "不加权", "unweighted", "non-weighted")):
+            return None
+        return "weighted_roe" if "加权" in text or re.search(r"\bweighted\b", text) else None
     if field == "gross_margin":
         return "gross_margin" if "毛利率" in label or label == "gross_margin" else None
     if field in {"revenue", "revenue_yoy"}:

@@ -982,14 +982,14 @@ class DataFetcherManager:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
-            return f"{normalized_code}|facts=2|budget=default"
+            return f"{normalized_code}|facts=3|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|facts=2|budget={budget_bucket}"
+        return f"{normalized_code}|facts=3|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""

@@ -94,7 +94,7 @@ def test_canonical_market_cap_reaches_f1(financial_sources: dict[str, Any]) -> N
     assert build_fundamental_dim(ctx).valuation_detail["market_cap"] == 100_000_000_000.0
 
 
-@pytest.mark.parametrize("old_key", ["stage0_fund_600519", "stage0_fund_v2_600519", "stage0_fund_v3_600519"])
+@pytest.mark.parametrize("old_key", ["stage0_fund_600519", "stage0_fund_v2_600519", "stage0_fund_v3_600519", "stage0_fund_v9_cv0_600519"])
 def test_legacy_mapping_snapshot_is_not_reused(financial_sources: dict[str, Any], old_key: str) -> None:
     dim_cache.save_snapshot(old_key, {"pe_ttm": None, "revenue_growth": None, "market_cap": None})
     ctx = context.build_shared_context("600519", "样本")
