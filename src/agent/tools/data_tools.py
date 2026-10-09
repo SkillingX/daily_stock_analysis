@@ -693,10 +693,10 @@ def _fallback_valuation_from_quote(
 ) -> Dict[str, Any]:
     """fundamental valuation 超时缺失时，用 ``get_realtime_quote`` 兜底 pe/pb/市值。
 
-    fundamental pipeline 的 valuation 受严格 fetch 超时（默认 3s）限制，而
-    ``get_realtime_quote`` 带 em→sina→tencent fallback 实测可达 4-5s，em 源失败时
-    易超时 → pe/pb/市值全 None（投研报告「数据缺失」）。估值是报告核心，此处用无
-    超时限制的 ``get_realtime_quote`` 兜底补全缺失字段；失败则保持原值，不阻塞。
+    ``get_stock_info`` 传入财务阶段的 deadline；备用行情抓取最多使用
+    fundamental_fetch_timeout_seconds 与真实剩余时间中的较小值。
+    截止时间已过时不发请求，失败保留已有值；未传 deadline 的兼容调用沿用
+    manager 的单次行情取数方式。
 
     只补缺失字段，fundamental 已拿到的非空值优先保留（不覆盖更优来源）。
     """
