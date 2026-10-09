@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - [chore] 现有 CI 与类型契约门禁增加手动候选验证入口；手动 CI 同样覆盖 Web 构建，保留原 PR/push 触发条件。
+- [测试] 财务报告集成回归固定报告时钟，保留完整品质、评分、API/历史序列化与 Markdown 断言，消除独立构建跨秒产生的误报。
 
 - [修复] 金额规范化保留亿美元、亿港元、万日元等外币单位的倍率，拒绝无法完整识别或相互矛盾的单位，避免等价金额被误判为跨源冲突。
 

@@ -292,6 +292,8 @@ def test_service_api_history_preserve_quality_and_actual_markdown(monkeypatch: p
     from src.storage import get_db
     from src.deep_research_dims import context as context_module
     ctx = context(values)
+    # Independent builds must compare under one report clock, even across seconds.
+    monkeypatch.setattr("src.schemas.deep_research_dims.datetime", SimpleNamespace(now=lambda: datetime.fromisoformat(ctx.as_of)))
     # This seam replaces normalized transport facts; F1, rule consumers, service,
     # storage, actual template and HTTP serialization all execute unchanged.
     monkeypatch.setattr(context_module, "build_shared_context", lambda *args: ctx)
