@@ -730,6 +730,8 @@ class TushareFetcher(BaseFetcher):
                     code=normalized_code,
                     name=str(row.get("name", "")),
                     source=RealtimeSource.TUSHARE,
+                currency="CNY",
+                field_meta={"pe_ratio": {"raw_label": "pe"}},
                     price=safe_float(row.get("price")),
                     change_pct=safe_float(
                         row.get("pct_chg")

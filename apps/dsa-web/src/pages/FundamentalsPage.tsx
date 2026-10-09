@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Download, FileText, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
@@ -19,6 +19,9 @@ export default function FundamentalsPage() {
   const [history, setHistory] = useState<FundamentalsItem[]>([]);
   const [detail, setDetail] = useState<{ id: string; markdown: string; stock_name?: string } | null>(null);
   const [generating, setGenerating] = useState(false);
+  const inFlight = useRef(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const loadHistory = useCallback(async () => {
@@ -28,23 +31,29 @@ export default function FundamentalsPage() {
 
   useEffect(() => { void loadHistory(); }, [loadHistory]);
 
-  const handleGenerate = useCallback(async () => {
+  const handleGenerate = useCallback(async (forceRefresh = false) => {
+    if (inFlight.current) return;
     if (!selected) { setError('请先选择一只 A 股'); return; }
-    setError(null); setGenerating(true); setDetail(null);
+    inFlight.current = true;
+    setError(null); setNotice(null); setGenerating(true); setRefreshing(forceRefresh);
     try {
       const res = await apiClient.post<{ report_id: string | null; markdown: string }>(
-        `/api/v1/fundamentals/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}`,
+        `/api/v1/fundamentals/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}&force_refresh=${forceRefresh}`,
+        undefined, { timeout: 180000 },
       );
       if (res.data.report_id) {
         setDetail({ id: res.data.report_id, markdown: res.data.markdown });
+        if (forceRefresh) setNotice('新报告已保存，历史报告保留；数据完整度以财务品质说明为准。');
         await loadHistory();
       } else {
-        setError('报告落库失败，请重试');
+        setError('报告保存失败，已有报告保留。');
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '生成失败');
+      setError(e instanceof Error ? `${e.message}；可查看历史列表确认是否已保存新版本，操作不会自动重试。` : '生成失败，已有报告保留。');
     } finally {
       setGenerating(false);
+      setRefreshing(false);
+      inFlight.current = false;
     }
   }, [selected, loadHistory]);
 
@@ -106,8 +115,18 @@ export default function FundamentalsPage() {
               {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               {generating ? '生成中（约1-2分钟）...' : '生成报告'}
             </button>
+            <button
+              onClick={() => void handleGenerate(true)}
+              disabled={generating || !selected}
+              className="inline-flex h-11 items-center gap-2 rounded-xl border border-cyan/40 px-4 text-sm text-cyan hover:bg-cyan/10 disabled:opacity-60"
+            >
+              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+              {refreshing ? '刷新财务数据中...' : '刷新数据并生成新报告'}
+            </button>
           </div>
+          <p className="text-xs text-muted-text">普通生成复用当天最新报告。显式刷新重取所选股票的财务数据，并保留历史版本。</p>
           {error && <p className="text-sm text-red-400">{error}</p>}
+          {notice && <p className="text-sm text-cyan" role="status">{notice}</p>}
         </header>
 
         <div className="rounded-[1.25rem] border border-white/8 bg-card/82 p-5">

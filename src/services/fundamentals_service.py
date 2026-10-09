@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +26,8 @@ def get_fundamentals_dir() -> Path:
 
 
 def _resolve_unique_id(base: str) -> str:
-    from src.storage import get_db
-
-    rid = base
-    seq = 1
-    while get_db().get_fundamentals_report(rid) is not None:
-        rid = f"{base}_{seq}"
-        seq += 1
-    return rid
+    # Numeric suffix preserves the existing report-ID API and rollback readers.
+    return f"{base}_{uuid4().int}"
 
 
 def _rule_dim(dim_id: str, code: str, name: str, ctx: Any, position_text: str = "") -> Dict[str, Any]:
@@ -118,7 +113,19 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
+def report_markdown(record: Dict[str, Any]) -> str:
+    """Read historical files without rewriting them; legacy quality remains unknown."""
+    try:
+        markdown = Path(record["md_path"]).read_text(encoding="utf-8")
+    except OSError:
+        markdown = ""
+    dims = json.loads(record.get("dims_json") or "{}")
+    if not (dims.get("financial") or {}).get("data_quality"):
+        markdown = "> 财务数据未核验：历史报告没有字段质量证据，不能认定已验证。\n\n" + markdown
+    return markdown
+
+
+def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """生成基本面专项报告（经营模式/主营产品/行业地位/龙头与大盘对比 + 财务体检）。"""
     from src.agent.tools.data_tools import _get_fetcher_manager
 
@@ -129,6 +136,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
     code = normalize_code(raw) if raw else ""
     if not code or not code.isdigit() or len(code) != 6:
         raise ValueError(f"仅支持 A 股 6 位代码：{raw_code}")
+    created_at = datetime.now()
     name = (raw_name or "").strip()
     # 名称里夹带代码后缀时剥掉（如"新莱应材 300260.SZ"）
     if name and code in name:
@@ -141,12 +149,9 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
             name = code
 
     # 当天已生成过则直接返回已有报告，避免重复
-    existing = _same_day_dedup_report(code)
+    existing = None if force_refresh else _same_day_dedup_report(code)
     if existing is not None:
-        try:
-            md = Path(existing["md_path"]).read_text(encoding="utf-8")
-        except OSError:
-            md = ""
+        md = report_markdown(existing)
         return {
             "report_id": existing["id"],
             "stock_code": code,
@@ -158,7 +163,12 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
 
     from src.deep_research_dims.context import build_shared_context
 
-    ctx = build_shared_context(code, name)
+    from data_provider.mx_data_adapter import financial_refresh
+    token = financial_refresh.set((code, uuid4().hex) if force_refresh else None)
+    try:
+        ctx = build_shared_context(code, name)
+    finally:
+        financial_refresh.reset(token)
     business = _research_dim("business", code, name)
     dims = {
         "business": business,
@@ -166,7 +176,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
         "financial": _rule_dim("fundamental", code, name, ctx),
     }
     as_of = datetime.now().isoformat(timespec="seconds")
-    rid = _resolve_unique_id(_ID_PATTERN.format(ts=datetime.now()))
+    rid = _resolve_unique_id(_ID_PATTERN.format(ts=created_at))
     md = _render_markdown(name, code, as_of, dims, rid)
     md_path = get_fundamentals_dir() / f"{rid}.md"
     md_path.write_text(md, encoding="utf-8")
@@ -179,10 +189,13 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
                 "id": rid, "stock_code": code, "stock_name": name,
                 "md_path": str(md_path),
                 "dims_json": json.dumps(dims, ensure_ascii=False, default=str),
+                "created_at": created_at,
             }
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 落库失败: %s", exc)
+    if not ok:
+        md_path.unlink(missing_ok=True)
     return {
         "report_id": rid if ok else None,
         "stock_code": code, "stock_name": name,

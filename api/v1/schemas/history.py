@@ -182,6 +182,18 @@ class AnalysisContextPackOverviewSubject(BaseModel):
     market: Optional[str] = Field(None, description="市场")
 
 
+class FinancialQualityOverview(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    status: Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"] = "unverified"
+    rule_eligible: bool = False
+    source: Optional[str] = Field(None, max_length=100)
+    period: Optional[str] = Field(None, max_length=100)
+    period_basis: Optional[str] = Field(None, max_length=100)
+    caliber: Optional[str] = Field(None, max_length=100)
+    unit: Optional[str] = Field(None, max_length=100)
+    currency: Optional[str] = Field(None, max_length=100)
+
+
 class AnalysisContextPackOverviewBlock(BaseModel):
     """AnalysisContextPack 可见摘要数据块"""
 
@@ -200,6 +212,7 @@ class AnalysisContextPackOverviewBlock(BaseModel):
     source: Optional[str] = Field(None, description="数据来源")
     warnings: List[str] = Field(default_factory=list, description="数据块告警码")
     missing_reasons: List[str] = Field(default_factory=list, description="缺失原因")
+    financial_quality: Dict[str, FinancialQualityOverview] = Field(default_factory=dict, description="已有财务字段的低敏品质透传，不额外核验")
 
 
 class AnalysisContextPackOverviewCounts(BaseModel):

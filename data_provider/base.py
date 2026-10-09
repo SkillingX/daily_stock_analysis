@@ -19,6 +19,7 @@ import os
 import random
 import re
 import time
+from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -981,14 +982,14 @@ class DataFetcherManager:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
-            return f"{normalized_code}|budget=default"
+            return f"{normalized_code}|facts=6|budget=default"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|budget={budget_bucket}"
+        return f"{normalized_code}|facts=6|budget={budget_bucket}"
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -1751,6 +1752,8 @@ class DataFetcherManager:
             setattr(quote, "provider_timestamp", None)
             setattr(quote, "stale_seconds", None)
             setattr(quote, "is_stale", None)
+            from data_provider.realtime_types import quote_field_records
+            quote.field_meta = quote_field_records(quote)
             return quote
 
         setattr(quote, "provider_timestamp", provider_dt.isoformat())
@@ -1761,6 +1764,17 @@ class DataFetcherManager:
         ttl = realtime_cache_ttl if realtime_cache_ttl is not None else 600
         setattr(quote, "stale_seconds", stale_seconds)
         setattr(quote, "is_stale", stale_seconds > int(ttl))
+        from data_provider.realtime_types import quote_field_records
+        from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+        records = quote_field_records(quote)
+        for field, record in records.items():
+            observed = self._parse_realtime_timestamp(record.get("observed_at"))
+            if observed is not None:
+                record["is_stale"] = (fetched_dt - observed).total_seconds() > int(ttl)
+                reading = reading_from_field_record(record.get("value"), record)
+                if reading is not None:
+                    records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
+        quote.field_meta = records
         return quote
 
     def get_realtime_quote(self, stock_code: str, *, log_final_failure: bool = True):
@@ -2088,11 +2102,23 @@ class DataFetcherManager:
         *primary* has None. Returns list of field names that were filled.
         """
         filled = []
+        from data_provider.realtime_types import quote_field_records
+        primary.field_meta = quote_field_records(primary)
+        secondary_meta = quote_field_records(secondary)
+        known_currencies = {record.get("currency") for key, record in primary.field_meta.items() if key in {"current_price", "total_mv", "circ_mv"} and record.get("currency")}
+        if getattr(primary, "currency", None):
+            known_currencies.add(primary.currency)
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
                 if val is not None:
+                    if f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"} and not (secondary_meta.get(f) or {}).get("rule_eligible"):
+                        continue
+                    if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
+                        continue
                     setattr(primary, f, val)
+                    if f in secondary_meta:
+                        primary.field_meta[f] = {**secondary_meta[f], "selection_reason": "quote_supplement"}
                     filled.append(f)
         return filled
 
@@ -2690,6 +2716,9 @@ class DataFetcherManager:
         timeout_value = max(0.0, timeout_seconds)
         if timeout_value <= 0:
             return None, f"{task_name} timeout", 0
+        from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+        eastmoney_patch(budget_only=True)
+        deadline = time.monotonic() + timeout_value
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
 
@@ -2701,17 +2730,19 @@ class DataFetcherManager:
             )
 
         def runner() -> None:
+            token = request_deadline.set(deadline)
             try:
                 result_holder["value"] = task()
             except Exception as exc:
                 error_holder["value"] = exc
             finally:
+                request_deadline.reset(token)
                 try:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
                     pass
 
-        worker = Thread(target=runner, daemon=True, name=f"fundamental-{task_name}")
+        worker = Thread(target=copy_context().run, args=(runner,), daemon=True, name=f"fundamental-{task_name}")
         try:
             worker.start()
         except Exception as exc:
@@ -2828,12 +2859,30 @@ class DataFetcherManager:
         source_chain: Optional[List[Dict[str, Any]]] = None,
         errors: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
+        data = dict(payload or {})
+        metadata = dict(data.pop("field_meta", {}) or {})
+        financial = data.get("financial_report")
+        if isinstance(financial, dict) and "field_meta" in financial:
+            financial = dict(financial)
+            metadata.update(financial.pop("field_meta") or {})
+            data["financial_report"] = financial
+        from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+        for field, record in list(metadata.items()):
+            reading = reading_from_field_record(record.get("value"), record)
+            if reading is not None:
+                if reading.period is not None and DataFetcherManager._detect_payload_staleness({"as_of": reading.period}):
+                    from dataclasses import replace
+                    reading = replace(reading, is_stale=True)
+                from data_provider.cross_source_validator import AnchorQuality
+                quality = AnchorQuality(status="conflict") if (record.get("quality") or {}).get("status") == "conflict" else None
+                metadata[field] = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
         return {
             "status": status,
             "coverage": {"status": status},
             "source_chain": source_chain or [],
             "errors": errors or [],
-            "data": payload or {},
+            "data": data,
+            "field_meta": metadata,
         }
 
     @staticmethod
@@ -2845,7 +2894,8 @@ class DataFetcherManager:
             return normalized not in ("", "-", "nan", "none", "null", "n/a", "na")
         if isinstance(payload, dict):
             return any(
-                DataFetcherManager._has_meaningful_payload(v) for v in payload.values()
+                DataFetcherManager._has_meaningful_payload(v)
+                for key, v in payload.items() if key not in {"report_date", "field_meta"}
             )
         if isinstance(payload, pd.DataFrame):
             if payload.empty:
@@ -2987,46 +3037,54 @@ class DataFetcherManager:
     def _derive_as_of_date(
         result_ctx: Dict[str, Any],
     ) -> Optional[str]:
-        """Compute the as-of date (``YYYY-MM-DD``) for a result context.
+        """Latest confirmed response period, without inferring dates from unrelated text."""
+        from .cross_source_validator import normalize_report_period, report_period_from_fields
 
-        The result context may carry an explicit ``as_of`` (set by the
-        iFinD / Tushare fallback adapter) which we normalise to
-        ``YYYY-MM-DD`` (the adapter emits ``YYYY1231``). When that is
-        missing we scan the block payloads for the most recent 4-digit
-        year and anchor it to ``YYYY-12-31``. Returns ``None`` when no
-        year can be derived at all.
-        """
-        explicit = result_ctx.get("as_of") if isinstance(result_ctx, dict) else None
-        if isinstance(explicit, str) and explicit:
-            text = explicit.strip()
-            if len(text) == 8 and text.isdigit():
-                # ``YYYYMMDD`` -> ``YYYY-MM-DD``
-                return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
-            if len(text) >= 7 and text[4:5] == "-" and text[6:7].isdigit():
-                return text[:10]
-        latest_year: Optional[int] = None
+        explicit, _basis = normalize_report_period(result_ctx.get("as_of"))
+        if explicit is not None:
+            return explicit
+        actual_dates: list[str] = []
         for block_name in ("earnings", "growth", "institution", "valuation"):
             block = result_ctx.get(block_name) if isinstance(result_ctx, dict) else None
             if not isinstance(block, dict):
                 continue
             data = block.get("data")
             if isinstance(data, dict) and data:
-                year = DataFetcherManager._scan_latest_year(data)
-                if year is not None and (latest_year is None or year > latest_year):
-                    latest_year = year
-        if latest_year is None:
-            return None
-        return f"{latest_year}-12-31"
+                actual, _basis = report_period_from_fields(data)
+                if actual is not None:
+                    actual_dates.append(actual)
+                report = data.get("financial_report")
+                if isinstance(report, dict):
+                    actual, _basis = report_period_from_fields(report)
+                    if actual is not None:
+                        actual_dates.append(actual)
+        return max(actual_dates) if actual_dates else None
 
     @staticmethod
     def _is_growth_block_thin(payload: Dict[str, Any]) -> bool:
-        """A growth block is "thin" when all four anchor fields are missing
-        or None. We only fall back to Tushare / iFinD in that case.
+        """A growth block needs fallback when any required anchor is missing.
         """
         if not isinstance(payload, dict):
             return True
         keys = ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin")
-        return all(payload.get(k) is None for k in keys)
+        return any(payload.get(k) is None for k in keys)
+
+    @classmethod
+    def _fill_growth_fields(cls, growth: Dict[str, Any], candidate: Dict[str, Any], reason: str) -> None:
+        """Fill only missing individual fields from already acquired valid readings."""
+        from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
+        for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
+            if growth.get(field) is not None:
+                continue
+            metadata = (candidate.get("field_meta") or {}).get(field) or {}
+            reading = reading_from_field_record(candidate.get(field), metadata)
+            if reading is None or (reading.period and cls._detect_payload_staleness({"as_of": reading.period})):
+                continue
+            quality = AnchorQuality(status="conflict") if (metadata.get("quality") or {}).get("status") == "conflict" else None
+            record = adopted_field_record(field, reading, quality, selection_reason=reason)
+            if record["rule_eligible"]:
+                growth[field] = record["value"]
+                growth.setdefault("field_meta", {})[field] = record
 
     @staticmethod
     def _is_earnings_block_thin(payload: Dict[str, Any]) -> bool:
@@ -3288,6 +3346,9 @@ class DataFetcherManager:
             if quote_payload
             else None,
         }
+        if quote_payload is not None:
+            from data_provider.realtime_types import quote_field_records
+            valuation_payload["field_meta"] = quote_field_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -3539,7 +3600,9 @@ class DataFetcherManager:
             0, int(getattr(config, "fundamental_cache_max_entries", 256))
         )
         cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
-        if cache_ttl > 0:
+        from .mx_data_adapter import financial_refresh
+        refresh = financial_refresh.get()
+        if cache_ttl > 0 and not (refresh and refresh[0] == stock_code):
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
             with self._fundamental_cache_lock:
                 cache_item = self._fundamental_cache.get(cache_key)
@@ -3549,6 +3612,7 @@ class DataFetcherManager:
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         remaining_seconds = stage_timeout
+        stage_deadline = time.monotonic() + stage_timeout
         result_ctx: Dict[str, Any] = {
             "market": market,
             "valuation": {},
@@ -3567,7 +3631,7 @@ class DataFetcherManager:
 
         def _consume_budget(consumed_ms: int) -> None:
             nonlocal remaining_seconds
-            remaining_seconds = max(0.0, remaining_seconds - consumed_ms / 1000.0)
+            remaining_seconds = max(0.0, min(remaining_seconds - consumed_ms / 1000.0, stage_deadline - time.monotonic()))
 
         valuation_timeout = min(fetch_timeout, remaining_seconds)
         if valuation_timeout > 0:
@@ -3598,6 +3662,9 @@ class DataFetcherManager:
             if quote_payload
             else None,
         }
+        if quote_payload is not None:
+            from data_provider.realtime_types import quote_field_records
+            valuation_payload["field_meta"] = quote_field_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -3694,6 +3761,8 @@ class DataFetcherManager:
         else:
             institution_payload = dict(institution_payload)
 
+        self._fill_growth_fields(growth_payload, earnings_payload.get("financial_report") or {}, "primary_earnings")
+
         # Fallback to Tushare / iFinD when the AkShare bundle came back empty
         # or stale. We only fill in fields that are missing on the primary
         # path; if AkShare already returned a value we trust it. The fallback
@@ -3712,15 +3781,16 @@ class DataFetcherManager:
             # fans out across anchors inside that budget. ``remaining_seconds``
             # is decremented so subsequent stages (capital_flow, etc.)
             # still get a slice.
-            fallback_budget = max(
-                min(8.0, fetch_timeout),
-                max(remaining_seconds - 4.0, 0.0),
-            )
+            _consume_budget(0)
+            fallback_budget = min(fetch_timeout, remaining_seconds)
             if fallback_budget > 0:
                 _fallback_start = time.time()
                 fallback_bundle, _fallback_err, _fallback_ms = self._run_with_retry(
                     lambda: self._tushare_ifind_adapter.get_fundamental_bundle(
-                        stock_code
+                        stock_code,
+                        fields=tuple(field for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin") if growth_payload.get(field) is None),
+                        include_institution=self._is_institution_block_thin(institution_payload),
+                        deadline=min(stage_deadline, time.monotonic() + fallback_budget),
                     ),
                     fallback_budget,
                     "fundamental_fallback_tushare_ifind",
@@ -3748,10 +3818,11 @@ class DataFetcherManager:
                         str(fallback_bundle.get("status", "not_supported")),
                         _fallback_ms,
                     )
-                    for key, value in fb_growth.items():
-                        if value is not None and growth_payload.get(key) is None:
-                            growth_payload[key] = value
+                    self._fill_growth_fields(growth_payload, fb_growth, "fallback")
+                    self._fill_growth_fields(growth_payload, fb_earnings.get("financial_report") or {}, "fallback_earnings")
                     for key, value in fb_earnings.items():
+                        if key == "field_meta":
+                            continue
                         if value is not None and earnings_payload.get(key) is None:
                             earnings_payload[key] = value
                     for key, value in fb_institution.items():
@@ -3768,10 +3839,7 @@ class DataFetcherManager:
                     if isinstance(bundle_chain, list):
                         bundle_chain.extend(fallback_chain)
                     fb_errors = fallback_bundle.get("errors", []) or []
-                    if fb_errors:
-                        # Surface fallback failures as non-fatal hints; do not
-                        # trip the bundle into "failed" status.
-                        pass
+                    bundle_errors.extend(fb_errors)
 
 # MX fallback for growth fields still missing after primary + Tushare/iFinD.
         # MX is an official API (东方财富妙想 Skills Hub) that is more stable than
@@ -3781,56 +3849,36 @@ class DataFetcherManager:
         # Strategy: do ONE batch query (query_financials) so we get both the
         # latest report期 from ``headName[0]`` AND the financial values in a
         # single HTTP call (控配额). Per-field read() is fallback for retries.
+        _consume_budget(0)
         if self._mx_source.available and self._is_growth_block_thin(growth_payload):
-            mx_budget = max(0.0, min(6.0, remaining_seconds - 2.0))
+            mx_budget = min(fetch_timeout, remaining_seconds)
             if mx_budget > 0:
-                _mx_start = time.time()
+                _mx_start = time.monotonic()
+                mx_deadline = min(stage_deadline, _mx_start + mx_budget)
                 _mx_filled = False
                 _mx_period_raw: Optional[str] = None
                 _mx_bundle: Optional[Dict[str, Any]] = None
                 # Batch query (capped at 1 HTTP for budget discipline)
                 try:
-                    _mx_bundle = self._mx_source._client.query_financials(  # type: ignore[attr-defined]
-                        stock_code, None
+                    _mx_payload, _mx_error, _ = self._run_with_timeout(
+                        lambda: self._mx_source._client.query_financials(stock_code, None, deadline=mx_deadline),
+                        max(0.0, mx_deadline - time.monotonic()), "fundamental_mx_batch",
                     )
+                    _mx_bundle = _mx_payload if isinstance(_mx_payload, dict) else None
+                    if _mx_error:
+                        bundle_errors.append(_mx_error)
                     if isinstance(_mx_bundle, dict):
                         _mx_period_raw = _mx_bundle.get("_mx_period")
-                        # Direct field mapping: growth anchors → MX label keywords
-                        # MX labels carry both absolute (营业收入) and 同比增长率 columns.
-                        # Use _pick_growth_value for 同比 fields, _pick_value for absolute.
-                        from data_provider.mx_data_adapter import (
-                            _pick_value as _mx_pick_value,
-                            _pick_growth_value as _mx_pick_growth,
-                        )
-
-                        for _dst_field, _keywords, _picker in (
-                            (
-                                "revenue_yoy",
-                                ["营业收入", "营业总收入", "营收"],
-                                _mx_pick_growth,
-                            ),
-                            (
-                                "net_profit_yoy",
-                                ["归属母公司股东的净利润", "归母净利润", "净利润"],
-                                _mx_pick_growth,
-                            ),
-                            (
-                                "roe",
-                                ["净资产收益率ROE(加权)", "净资产收益率", "ROE"],
-                                _mx_pick_value,
-                            ),
-                            (
-                                "gross_margin",
-                                ["毛利率", "销售毛利率"],
-                                _mx_pick_value,
-                            ),
-                        ):
-                            if growth_payload.get(_dst_field) is not None:
+                        from data_provider.cross_source_validator import adopted_field_record
+                        for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
+                            if growth_payload.get(field) is not None:
                                 continue
-                            _v = _picker(_mx_bundle, _keywords)
-                            if _v is not None:
-                                growth_payload[_dst_field] = _v
-                                _mx_filled = True
+                            reading = self._mx_source.read_bundle(_mx_bundle, field)
+                            if reading is None:
+                                continue
+                            record = adopted_field_record(field, reading, selection_reason="fallback")
+                            self._fill_growth_fields(growth_payload, {field: record["value"], "field_meta": {field: record}}, "fallback_mx")
+                            _mx_filled = _mx_filled or growth_payload.get(field) is not None
                 except Exception:  # noqa: BLE001 — fail-open
                     _mx_bundle = None
 
@@ -3843,16 +3891,24 @@ class DataFetcherManager:
                 ):
                     if growth_payload.get(_mx_field) is None:
                         try:
-                            _mx_ar = self._mx_source.read(stock_code, _mx_field)
+                            _mx_ar, _mx_error, _ = self._run_with_timeout(
+                                lambda field=_mx_field: self._mx_source.read(stock_code, field, deadline=mx_deadline),
+                                max(0.0, mx_deadline - time.monotonic()), f"fundamental_mx_{_mx_field}",
+                            )
+                            if _mx_error:
+                                bundle_errors.append(_mx_error)
                             if _mx_ar is not None and _mx_ar.value is not None:
-                                growth_payload[_mx_field] = _mx_ar.value
-                                _mx_filled = True
-                                if _mx_ar.period and not _mx_period_raw:
-                                    _mx_period_raw = _mx_ar.period
+                                from data_provider.cross_source_validator import adopted_field_record
+                                _record = adopted_field_record(_mx_field, _mx_ar, selection_reason="fallback")
+                                self._fill_growth_fields(growth_payload, {_mx_field: _record["value"], "field_meta": {_mx_field: _record}}, "fallback_mx")
+                                if growth_payload.get(_mx_field) is not None:
+                                    _mx_filled = True
+                                    if _mx_ar.period and not _mx_period_raw:
+                                        _mx_period_raw = _mx_ar.period
                         except Exception:  # noqa: BLE001 — fail-open
                             pass
 
-                _mx_ms = int((time.time() - _mx_start) * 1000)
+                _mx_ms = int((time.monotonic() - _mx_start) * 1000)
                 _consume_budget(_mx_ms)
                 if _mx_filled:
                     if isinstance(bundle_chain, list):
@@ -4127,7 +4183,7 @@ class DataFetcherManager:
         sector_rankings = payload.get("sector_rankings") or {}
         has_stock_flow = False
         if isinstance(stock_flow, dict):
-            has_stock_flow = any(v is not None for v in stock_flow.values())
+            has_stock_flow = self._has_meaningful_payload(stock_flow)
         has_sector_rankings = bool(sector_rankings.get("top")) or bool(
             sector_rankings.get("bottom")
         )

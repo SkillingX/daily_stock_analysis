@@ -3098,6 +3098,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                         stock_name=record.get("stock_name"),
                         md_path=str(record.get("md_path") or ""),
                         dims_json=record.get("dims_json"),
+                        created_at=record.get("created_at", datetime.now()),
                     )
                 )
                 db.commit()
@@ -3131,7 +3132,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
     def list_fundamentals_reports(
         self, stock_code: Optional[str] = None, limit: int = 50, offset: int = 0
-    ) -> tuple[list, int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         session_local = self._SessionLocal
         if session_local is None:
             return [], 0
@@ -3143,7 +3144,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     query = query.filter(FundamentalsReport.stock_code == stock_code)
                 total = query.count()
                 rows = (
-                    query.order_by(FundamentalsReport.created_at.desc())
+                    query.order_by(FundamentalsReport.created_at.desc(), FundamentalsReport.id.desc())
                     .offset(offset).limit(limit).all()
                 )
                 return [

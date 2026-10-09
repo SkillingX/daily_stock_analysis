@@ -1061,9 +1061,13 @@ class AkshareFetcher(BaseFetcher):
 
         try:
             # 检查缓存
+            from .mx_data_adapter import financial_refresh
+            refresh = financial_refresh.get()
+            refresh_this_stock = refresh is not None and refresh[0] == stock_code
             current_time = time.time()
             if (
-                _realtime_cache["data"] is not None
+                not refresh_this_stock
+                and _realtime_cache["data"] is not None
                 and current_time - _realtime_cache["timestamp"] < _realtime_cache["ttl"]
             ):
                 df = _realtime_cache["data"]
@@ -1111,11 +1115,12 @@ class AkshareFetcher(BaseFetcher):
                     )
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
-                _realtime_cache["data"] = df
-                _realtime_cache["timestamp"] = current_time
-                logger.info(
-                    f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s"
-                )
+                if not refresh_this_stock:
+                    _realtime_cache["data"] = df
+                    _realtime_cache["timestamp"] = current_time
+                    logger.info(
+                        f"[缓存更新] A股实时行情(东财) 缓存已刷新，TTL={_realtime_cache['ttl']}s"
+                    )
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
@@ -1134,6 +1139,8 @@ class AkshareFetcher(BaseFetcher):
                 code=stock_code,
                 name=str(row.get("名称", "")),
                 source=RealtimeSource.AKSHARE_EM,
+                currency="CNY",
+                field_meta={"pe_ratio": {"caliber": "dynamic_pe", "raw_label": "市盈率-动态"}, "pb_ratio": {"raw_label": "市净率"}},
                 price=safe_float(row.get("最新价")),
                 change_pct=safe_float(row.get("涨跌幅")),
                 change_amount=safe_float(row.get("涨跌额")),
@@ -1505,9 +1512,13 @@ class AkshareFetcher(BaseFetcher):
 
         try:
             # 检查缓存
+            from .mx_data_adapter import financial_refresh
+            refresh = financial_refresh.get()
+            refresh_this_stock = refresh is not None and refresh[0] == stock_code
             current_time = time.time()
             if (
-                _etf_realtime_cache["data"] is not None
+                not refresh_this_stock
+                and _etf_realtime_cache["data"] is not None
                 and current_time - _etf_realtime_cache["timestamp"]
                 < _etf_realtime_cache["ttl"]
             ):
@@ -1548,8 +1559,9 @@ class AkshareFetcher(BaseFetcher):
                     logger.info(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
                     circuit_breaker.record_failure(source_key, str(last_error))
                     df = pd.DataFrame()
-                _etf_realtime_cache["data"] = df
-                _etf_realtime_cache["timestamp"] = current_time
+                if not refresh_this_stock:
+                    _etf_realtime_cache["data"] = df
+                    _etf_realtime_cache["timestamp"] = current_time
 
             if df is None or df.empty:
                 logger.info(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")

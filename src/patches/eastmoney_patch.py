@@ -7,10 +7,15 @@ import requests
 import json
 import uuid
 import logging
+from contextvars import ContextVar
+from typing import Any, Optional
 from fake_useragent import UserAgent
 
 logger = logging.getLogger(__name__)
 
+request_deadline: ContextVar[Optional[float]] = ContextVar("fundamental_request_deadline", default=None)
+_auth_patch_enabled = False
+_patch_lock = threading.Lock()
 original_request = requests.Session.request
 
 ua = UserAgent()
@@ -152,36 +157,44 @@ def _get_nid(user_agent):
             return None
 
 
-def eastmoney_patch():
-    if _patch_sign.is_patched():
-        return
+def eastmoney_patch(*, budget_only: bool = False) -> None:
+    """Keep optional authentication behavior while enforcing task-local HTTP budgets."""
+    global _auth_patch_enabled, original_request
+    with _patch_lock:
+        if not budget_only:
+            _auth_patch_enabled = True
+        if _patch_sign.is_patched():
+            return
+        original_request = requests.Session.request
+        request_before_patch = original_request
 
-    def patched_request(self, method, url, **kwargs):
-        # 排除非目标域名
-        is_target = any(
-            d in (url or "")
-            for d in [
-                "fund.eastmoney.com",
-                "push2.eastmoney.com",
-                "push2his.eastmoney.com",
-            ]
-        )
-        if not is_target:
-            return original_request(self, method, url, **kwargs)
-        # 获取一个随机的 User-Agent
-        user_agent = ua.random
-        # 处理 Headers：确保不破坏业务代码传入的 headers
-        headers = kwargs.get("headers", {})
-        headers["User-Agent"] = user_agent
-        nid = _get_nid(user_agent)
-        if nid:
-            headers["Cookie"] = f"nid18={nid}"
-        kwargs["headers"] = headers
-        # 随机休眠，降低被封风险
-        sleep_time = random.uniform(1, 4)
-        time.sleep(sleep_time)
-        return original_request(self, method, url, **kwargs)
+        def patched_request(self: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:
+            deadline = request_deadline.get()
+            if deadline is not None and deadline <= time.monotonic():
+                raise requests.Timeout("fundamental request deadline exhausted")
+            is_target = any(d in (url or "") for d in ("fund.eastmoney.com", "push2.eastmoney.com", "push2his.eastmoney.com"))
+            if _auth_patch_enabled and is_target:
+                user_agent = ua.random
+                headers = kwargs.get("headers", {})
+                headers["User-Agent"] = user_agent
+                nid = _get_nid(user_agent)
+                if nid:
+                    headers["Cookie"] = f"nid18={nid}"
+                kwargs["headers"] = headers
+                pause = random.uniform(1, 4)
+                if deadline is not None and deadline - time.monotonic() <= pause:
+                    raise requests.Timeout("fundamental request deadline exhausted")
+                time.sleep(pause)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise requests.Timeout("fundamental request deadline exhausted")
+                configured = kwargs.get("timeout")
+                if isinstance(configured, tuple):
+                    kwargs["timeout"] = tuple(min(float(value), remaining) if value is not None else remaining for value in configured)
+                else:
+                    kwargs["timeout"] = min(float(configured), remaining) if isinstance(configured, (int, float)) else remaining
+            return request_before_patch(self, method, url, **kwargs)
 
-    # 全局替换 Session 的 request 入口
-    requests.Session.request = patched_request  # type: ignore[assignment]
-    _patch_sign.set_patch(True)
+        requests.Session.request = patched_request  # type: ignore[assignment]
+        _patch_sign.set_patch(True)

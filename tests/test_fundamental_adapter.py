@@ -3,7 +3,6 @@
 Tests for fundamental adapter helpers.
 """
 
-import pytest
 import os
 import sys
 import unittest
@@ -74,7 +73,6 @@ class TestFundamentalAdapter(unittest.TestCase):
         self.assertTrue(result["is_on_list"])
         self.assertGreaterEqual(result["recent_count"], 1)
 
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
     def test_fundamental_bundle_includes_financial_report_and_dividend_payload(self) -> None:
         adapter = AkshareFundamentalAdapter()
         now = datetime.now()

@@ -114,6 +114,14 @@ class TestGetValidatorConfigGate(unittest.TestCase):
             v2 = h._get_validator()  # 缓存命中（不再重建）
             self.assertIs(v1, v2)
 
+    def test_warm_validator_is_not_used_after_switch_is_disabled(self):
+        with patch("src.config.get_config") as gc, patch.object(h, "_build_sources", return_value=[object()]):
+            gc.return_value.deep_research_cross_validate = True
+            self.assertIsNotNone(h._get_validator())
+            gc.return_value.deep_research_cross_validate = False
+            self.assertIsNone(h._get_validator())
+            self.assertIsNone(build_cross_validation_block("600519", ["pe_ratio"]))
+
     def test_get_validator_none_when_no_sources(self):
         with patch("src.config.get_config") as gc, \
              patch.object(h, "_build_sources", return_value=[]):

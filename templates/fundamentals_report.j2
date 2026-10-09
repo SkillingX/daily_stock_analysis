@@ -107,11 +107,13 @@
 
 ## 四、财务体检
 
+{% include "fundamental_quality.j2" %}
+
 {{ degraded_note(financial) }}
 {% if financial.profitability %}
 **要点**
-1. 🔴 **盈利质量**：ROE {{ financial.profitability.roe.value or '缺失' }}（{{ financial.profitability.roe.label }}）｜ 毛利率 {{ financial.profitability.gross_margin.value or '缺失' }}（{{ financial.profitability.gross_margin.label }}）
-2. **成长质量**：营收同比 {{ financial.growth_quality.revenue_yoy.value or '缺失' }}（{{ financial.growth_quality.revenue_yoy.label }}）｜ 净利同比 {{ financial.growth_quality.net_profit_yoy.value or '缺失' }}（{{ financial.growth_quality.net_profit_yoy.label }}）
+1. 🔴 **盈利质量**：ROE {{ financial.profitability.roe.value if financial.profitability.roe.value is not none else '缺失' }}（{{ financial.profitability.roe.label }}）｜ 毛利率 {{ financial.profitability.gross_margin.value if financial.profitability.gross_margin.value is not none else '缺失' }}（{{ financial.profitability.gross_margin.label }}）
+2. **成长质量**：营收同比 {{ financial.growth_quality.revenue_yoy.value if financial.growth_quality.revenue_yoy.value is not none else '缺失' }}（{{ financial.growth_quality.revenue_yoy.label }}）｜ 净利同比 {{ financial.growth_quality.net_profit_yoy.value if financial.growth_quality.net_profit_yoy.value is not none else '缺失' }}（{{ financial.growth_quality.net_profit_yoy.label }}）
 3. **估值**：{{ financial.valuation_detail.assessment }}
 {% if financial.data_gaps %}
 - 数据缺口：{{ financial.data_gaps|join('、') }}

@@ -22,15 +22,19 @@ Phase 0 探测结果（2026-06-25）：
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from inspect import signature
+from functools import partial
+from time import monotonic
 import json
 import logging
 import os
 import re
 import threading
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -126,23 +130,16 @@ _PERIOD_FIELDS = {
     "revenue_yoy",
     "net_profit_yoy",
 }
-# iFinD PE/PB 口径
-_CALIBERS: Dict[str, Optional[str]] = {
-    "pe_ratio": "TTM",
-    "pb_ratio": "TTM",
-}
-
-
 # ------------------------------------------------------------------
 # 解析（纯函数，100% 可单测）
 # ------------------------------------------------------------------
 
 
-def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
+def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """从 iFinD ``data.answer`` Markdown 表格中提取「表头: 值」映射。
 
     表格格式（Phase 0 实测）：``|表头1|表头2|...|\n|---|---|---|\n|值1|值2|...|``
-    仅解析第一行数据（最新值），忽略参数信息段。
+    指期优先，否则选已确认最新期；没有期间证据时保留首个独立观测且不推断日期。
     """
     lines = text.strip().splitlines()
     if not lines:
@@ -155,10 +152,12 @@ def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
             break
     if sep_idx < 0:
         return {}
-    headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-    result: Dict[str, str] = {}
+    headers = [h.strip() for h in lines[sep_idx - 1].strip().strip("|").split("|")]
+    rows: List[Dict[str, str]] = []
     for row in lines[sep_idx + 1 :]:
-        cells = [c.strip() for c in row.split("|") if c.strip()]
+        if not row.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
         if not cells or cells[0] in (
             "# 指标参数信息",
             "# 行情衍生指标日期提示",
@@ -166,11 +165,11 @@ def _parse_ifind_markdown_table(text: str) -> Dict[str, str]:
             "",
         ):
             continue  # pragma: no cover — Phase 0 响应参数段在表格外，数据行先触发 break
-        for i, cell in enumerate(cells):
-            if i < len(headers):
-                result[headers[i]] = cell
-        break  # 只取第一行数据
-    return result
+        rows.append(dict(zip(headers, cells)))
+    if keywords is not None:
+        rows = [row for row in rows if _extract_ifind_value(row, keywords, field=field)[0] is not None]
+    selected = select_report_period([report_period_from_fields(row) for row in rows], period)
+    return rows[selected if selected is not None else 0] if rows else {}
 
 
 def _parse_ifind_markdown_series(
@@ -256,20 +255,27 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _extract_ifind_value(
-    table: Dict[str, str], keywords: List[str]
+    table: Dict[str, str], keywords: List[str], field: Optional[str] = None
 ) -> Tuple[Optional[float], str]:
     """从解析后的表中按关键词取数值。
 
     返回 (value, used_column)。找不到关键词 → (None, "")。
     中文金额单位（万亿/亿/万）由 ``_safe_float`` 统一换算。
     """
+    fallback: Tuple[Optional[float], str] = (None, "")
     for kw in keywords:
         for col, val in table.items():
             if kw in col:
-                v = _safe_float(val)
+                v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
-                    return v, col
-    return None, ""
+                    if field is None:
+                        return v, col
+                    _, unit, currency, error = normalize_anchor_value(field, val, col, unit=table.get("unit"), currency=table.get("currency"))
+                    if not reading_input_reasons(AnchorReading("ifind", v, caliber=caliber_from_label(field, col), unit=unit, currency=currency, normalization_error=error), field):
+                        return v, col
+                    if fallback[0] is None:
+                        fallback = (v, col)
+    return fallback
 
 
 def _parse_ifind_response(
@@ -291,23 +297,45 @@ def _parse_ifind_response(
         if isinstance(resp_json, dict)
         else str(raw_text)
     )
-    table = _parse_ifind_markdown_table(answer)
+    table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords, field=field)
     if not table:
         return None
-    value, _col = _extract_ifind_value(table, keywords)
+    value, col = _extract_ifind_value(table, keywords, field=field)
+    if value is None:
+        return None
+    actual, basis = report_period_from_fields(table, col)
+    value, unit, currency, error = normalize_anchor_value(field, table[col], col, unit=table.get("unit"), currency=table.get("currency"))
     if value is None:
         return None
     return AnchorReading(
         source="ifind",
         value=value,
-        caliber=_CALIBERS.get(field),
-        period=period if field in _PERIOD_FIELDS else None,
+        caliber=caliber_from_label(field, col),
+        period=actual if field in _PERIOD_FIELDS else None,
+        period_basis=basis if field in _PERIOD_FIELDS else "unknown",
+        requested_period=period if field in _PERIOD_FIELDS else None,
+        observed_at=observation_time_from_fields(table), fetched_at=table.get("fetched_at"),
+        unit=unit, currency=currency, raw_value=table[col], raw_label=col, normalization_error=error,
+        raw_unit=table.get("unit"), raw_currency=table.get("currency"),
     )
 
 
 # ------------------------------------------------------------------
 # IfindFetcher —— async MCP client（单例）
 # ------------------------------------------------------------------
+
+
+async def _apply_mcp_request_deadline(request: Any, *, deadline: float) -> None:
+    """SDK hook: reject expired wire calls and cap each request's own timeout."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError("financial MCP deadline exhausted")
+    configured = request.extensions.get("timeout") or {}
+    request.extensions["timeout"] = {
+        part: min(value, remaining) if isinstance(value, (int, float)) else remaining
+        for part in ("connect", "read", "write", "pool")
+        for value in [configured.get(part)]
+    }
 
 
 class IfindFetcher:
@@ -413,7 +441,7 @@ class IfindFetcher:
             return None
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取（封装 async MCP）。无 token/失败 → None。
 
@@ -425,14 +453,18 @@ class IfindFetcher:
         """
         if not self.available:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:
-            return asyncio.run(self._async_fetch(code, field, period))
+            call = self._async_fetch(code, field, period, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindFetcher] fetch %s/%s failed: %s", code, field, exc)
             return None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，Phase 1 已验证连通性
-        self, code: str, field: str, period: Optional[str]
+        self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """Execute one iFinD MCP call.
 
@@ -451,19 +483,32 @@ class IfindFetcher:
             return None
         tool, query_tpl, keywords = _IFIND_ANCHOR_QUERIES[field]
         query = query_tpl.format(code=code, period=period or "")
-        from mcp import ClientSession  # type: ignore
-        from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         headers = {"Authorization": self._token}
         last_error: Optional[str] = None
         for attempt in range(2):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+            if timeout <= 0:
+                return None
             try:
-                async with streamablehttp_client(
-                    self._endpoint, headers=headers, timeout=self._timeout
-                ) as (read, write, _):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
-                        result = await session.call_tool(tool, {"query": query})
+                async with AsyncExitStack() as stack:
+                    close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+                    if "http_client" in signature(transport).parameters:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+                        client = create_mcp_http_client(headers=headers)
+                        client.timeout = timeout
+                        if deadline is not None:
+                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                        await stack.enter_async_context(client)
+                        streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+                    else:
+                        streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+                    await session.initialize()
+                    result = await session.call_tool(tool, {"query": query})
                 # Parsing happens after the context manager closes so
                 # we are not holding a connection while doing regex work.
                 content = getattr(result, "content", None) or []
@@ -536,7 +581,7 @@ class IfindFetcher:
                 self._session_context = None
 
     def fetch_main_inflow_series(
-        self, code: str, days: int = 12
+        self, code: str, days: int = 12, *, deadline: Optional[float] = None
     ) -> Optional[List[Tuple[str, float]]]:
         """取近 ``days`` 日主力净流入额序列（最新在前）。无 token/失败 → None。
 
@@ -548,31 +593,46 @@ class IfindFetcher:
         """
         if not self.available:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:  # pragma: no cover — 真实 MCP 调用（已实测连通）
-            return asyncio.run(self._async_fetch_series(code, days))
+            call = self._async_fetch_series(code, days, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # pragma: no cover  # noqa: BLE001 — fail-open
             logger.debug("[IfindFetcher] series %s failed: %s", code, exc)
             return None
 
     async def _async_fetch_series(  # pragma: no cover — 真实 MCP 调用
-        self, code: str, days: int
+        self, code: str, days: int, *, deadline: Optional[float] = None
     ) -> Optional[List[Tuple[str, float]]]:
         """执行一次 iFinD MCP 调用，解析多行序列。"""
-        from mcp import ClientSession  # type: ignore
-        from mcp.client.streamable_http import streamablehttp_client  # type: ignore
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         # Phase 0 实测：「近{days}日主力净流入额」会被 iFinD 折叠为「最新」单值；
         # 改用「近{days}个交易日」措辞才返回多行每日序列（实测近10个交易日→11行）。
         query = f"{code} 近{days}个交易日主力净流入额"
         headers = {"Authorization": self._token}
-        async with streamablehttp_client(
-            self._endpoint, headers=headers, timeout=self._timeout
-        ) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                result = await session.call_tool(
-                    "get_stock_performance", {"query": query}
-                )
+        timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+        if timeout <= 0:
+            return None
+        async with AsyncExitStack() as stack:
+            close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+            if "http_client" in signature(transport).parameters:
+                from mcp.shared._httpx_utils import create_mcp_http_client
+                client = create_mcp_http_client(headers=headers)
+                client.timeout = timeout
+                if deadline is not None:
+                    client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                await stack.enter_async_context(client)
+                streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+            else:
+                streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await session.initialize()
+            result = await session.call_tool("get_stock_performance", {"query": query})
         content = getattr(result, "content", None) or []
         raw_text = next(
             (getattr(b, "text", "") for b in content if getattr(b, "text", None)), ""
@@ -611,7 +671,7 @@ class IfindSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
@@ -619,15 +679,10 @@ class IfindSource:
         if field not in _IFIND_ANCHOR_QUERIES:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindSource] read %s/%s failed: %s", code, field, exc)
             return None
         if reading is None:
             return None
-        return AnchorReading(
-            source="ifind",
-            value=reading.value,
-            caliber=_CALIBERS.get(field, reading.caliber),
-            period=period if field in _PERIOD_FIELDS else reading.period,
-        )
+        return replace(reading, source="ifind", requested_period=reading.requested_period if reading.requested_period is not None else period if field in _PERIOD_FIELDS else None)
