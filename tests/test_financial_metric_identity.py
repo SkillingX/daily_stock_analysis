@@ -50,6 +50,10 @@ def parse_metric(source: str, field: str, values: dict[str, float]) -> AnchorRea
     ("net_profit_yoy", "归母净利润3年复合增长率(%)"),
     ("revenue_yoy", "营业收入增长率(%)"),
     ("roe", "净资产收益率ROE(非加权)(%)"),
+    ("gross_margin", "销售毛利率比上年同期增减(百分点)"),
+    ("roe", "净资产收益率ROE(加权)比上年同期增减(百分点)"),
+    ("roe", "净资产收益率ROE(未加权)(%)"),
+    ("roe", "净资产收益率ROE(non weighted)(%)"),
 ])
 def test_transformed_or_undefined_metric_is_not_a_rule_input(source: str, field: str, label: str) -> None:
     reading = parse_metric(source, field, {label: 2.0})
@@ -62,6 +66,8 @@ def test_transformed_or_undefined_metric_is_not_a_rule_input(source: str, field:
     ("roe", "净资产收益率ROE(加权)同比(%)", "净资产收益率ROE(加权)(%)", 18.0),
     ("revenue_yoy", "营业收入3年复合增长率(%)", "营业收入同比增长率(%)", -20.0),
     ("net_profit_yoy", "归母净利润3年复合增长率(%)", "归母净利润同比增长率(%)", 0.0),
+    ("gross_margin", "销售毛利率比上年同期增减(百分点)", "销售毛利率(%)", 40.0),
+    ("roe", "净资产收益率ROE(加权)比上年同期增减(百分点)", "净资产收益率ROE(加权)(%)", 18.0),
 ])
 def test_real_metric_survives_an_adjacent_transformed_column(source: str, field: str, bad_label: str, valid_label: str, expected: float) -> None:
     reading = parse_metric(source, field, {bad_label: 2.0, valid_label: expected})
@@ -87,6 +93,24 @@ def test_agreeing_margin_changes_do_not_verify_or_score_as_margin() -> None:
         validator._pool.shutdown(wait=False, cancel_futures=True)
 
 
+@pytest.mark.parametrize("source", ["mx", "ifind", "choice"])
+@pytest.mark.parametrize("field,label,caliber", [
+    ("revenue", "营业收入（亿美元）", "operating_revenue"),
+    ("net_profit", "归母净利润（亿港元）", "parent_net_profit"),
+])
+def test_currency_annotation_preserves_financial_amount_identity(source: str, field: str, label: str, caliber: str) -> None:
+    if source == "mx":
+        reading = MXSource().read_bundle({"_mx_period": "2025年报", label: 2.0}, field)
+    elif source == "ifind":
+        answer = f"|报告期|{label}|\n|---|---|\n|2025年报|2|"
+        reading = _parse_ifind_response(json.dumps({"data": {"answer": answer}}), ["营业收入", "归母净利润"], field, None)
+    else:
+        payload = {"data": [{"columns": ["指标", "2025年报"], "items": [[label, 2]]}]}
+        reading = _parse_mx_mcp_response(json.dumps(payload), ["营业收入", "归母净利润"], field, None)
+    assert reading is not None and reading.value == 200_000_000.0
+    assert reading.caliber == caliber and adopted_field_record(field, reading)["rule_eligible"]
+
+
 def test_manager_to_f1_uses_actual_yoy_instead_of_cagr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from tests.test_financial_missing_fields import manager
     from src.agent.tools import data_tools
@@ -108,3 +132,26 @@ def test_manager_to_f1_uses_actual_yoy_instead_of_cagr(monkeypatch: pytest.Monke
     dim = build_fundamental_dim(ctx)
     assert dim.growth_quality["revenue_yoy"]["value"] == -20.0
     assert dim.health_score == 35.0
+
+
+@pytest.mark.parametrize("label", ["营业收入同比(%)", "营业收入YoY(%)"])
+def test_mx_explicit_yoy_without_growth_rate_suffix_reaches_f1(label: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from tests.test_financial_missing_fields import manager
+    from src.agent.tools import data_tools
+    from src.deep_research_dims import dim_cache
+    from src.deep_research_dims.context import _safe_fundamental
+
+    mgr = manager(monkeypatch, {})
+    response = {"status": 0, "data": {"data": {"searchDataResultDTO": {"dataTableDTOList": [{
+        "table": {"headName": ["2025年报"], "value": [10]}, "nameMap": {"value": label},
+    }]}}}}
+    client = MXClient(api_key="offline-fixture")
+    monkeypatch.setattr(client, "query", lambda *args, **kwargs: response)
+    mgr._mx_source = MXSource(client)
+    monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: mgr)
+    monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+    ctx = SharedContext("600519", "样本", "2026-10-10")
+    ctx.fundamental = _safe_fundamental("600519", ctx)
+    dim = build_fundamental_dim(ctx)
+    assert dim.growth_quality["revenue_yoy"]["value"] == 10.0
+    assert dim.health_score == 65.0

@@ -132,7 +132,7 @@ def _pick_value(bundle: Dict[str, Any], keywords: List[str], field: Optional[str
 
 
 # 同比增长类列标记：_pick_value 跳过这些列取绝对值，_pick_growth_value 专门取这些列。
-_GROWTH_MARKERS = ("同比增长", "增长率", "环比")
+_GROWTH_MARKERS = ("同比", "yoy", "增长率", "环比")
 
 
 def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str], field: Optional[str] = None) -> Optional[float]:
@@ -146,7 +146,7 @@ def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str], field: Optio
     for label, raw in bundle.items():
         label_s = str(label)
         if any(kw in label_s for kw in keywords) and any(
-            m in label_s for m in _GROWTH_MARKERS
+            m in label_s.lower() for m in _GROWTH_MARKERS
         ):
             val = normalize_anchor_value(field, raw, label_s)[0] if field is not None else _safe_float(raw)
             if val is not None:

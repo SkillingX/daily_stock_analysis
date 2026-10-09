@@ -92,6 +92,9 @@ def test_equivalent_foreign_amounts_agree_through_real_source_parsers() -> None:
     ("2", "总市值（亿未知元）", None),
     ("2", "总市值", "亿未知元"),
     ("2美元", "总市值（亿美元）", None),
+    ("2", "总市值（十万人民币元）", None),
+    ("2", "总市值（十万日元）", None),
+    ("2", "总市值一百万人民币元", None),
 ])
 def test_unrecognized_or_contradictory_scale_is_not_valid_money(raw: str, label: str, unit: str | None) -> None:
     _, canonical, _, error = normalize_anchor_value("total_mv", raw, label, unit=unit, currency="USD")

@@ -82,6 +82,12 @@ def normalize_anchor_value(
             return "percentage_point", Decimal(1)
         if "倍" in text:
             return "multiple", Decimal(1)
+        if not standalone:
+            annotations = [part for part in re.findall(r"[（(]([^（）()]*)[）)]", text)
+                           if re.search(r"元|股|英镑|法郎", part)]
+            if annotations:
+                declared_units = [declared(part, standalone=True) for part in annotations]
+                return declared_units[0] if all(item == declared_units[0] for item in declared_units) else (None, Decimal(1))
         currency_names = "|".join(re.escape(marker) for markers in _CURRENCY_MARKERS.values() for marker in markers)
         money_units = "|".join(
             re.escape(marker) for marker in (
@@ -90,13 +96,14 @@ def normalize_anchor_value(
             )
         )
         pattern = (
-            rf"(?:(?:{currency_names})\s*)?(万亿|千亿|百亿|十亿|百万|亿|万|千)?"
-            rf"\s*({money_units}|元|股)(?:\s*[,，]?\s*(?:{currency_names}))?"
+            rf"(?:(?:单位|单季|累计|公布值)[\s,:：，]*)*(?:(?:{currency_names})\s*)?"
+            rf"(万亿|千亿|百亿|十亿|百万|亿|万|千)?\s*({money_units}|元|股)"
+            rf"(?:[\s,，]*(?:{currency_names}|单季|累计|公布值))*"
         )
         match = re.fullmatch(pattern, text.strip(), re.IGNORECASE) if standalone else re.search(pattern, text, re.IGNORECASE)
         if match:
             if not standalone and re.search(
-                r"(?:万亿|千亿|百亿|十亿|百万|亿|万|千|million|billion|trillion|thousand)\s*[^()（）,，:：\s]*$",
+                r"(?:[一二三四五六七八九零十百\d]|万亿|千亿|百亿|十亿|百万|亿|万|千|million|billion|trillion|thousand)\s*[^()（）,，:：\s]*$",
                 text[:match.start()], re.IGNORECASE,
             ):
                 return None, Decimal(1)
@@ -221,34 +228,30 @@ def select_report_period(periods: Sequence[tuple[Optional[str], PeriodBasis]], r
 
 def caliber_from_label(field: str, label: str) -> Optional[str]:
     """Use the returned field identity, never the natural-language request."""
-    text = label.lower()
-    if field.endswith("_yoy"):
-        if not ("同比" in text or re.search(r"(?<![a-z])yoy(?![a-z])", text)):
-            return None
-        if any(marker in text for marker in ("环比", "qoq", "复合", "cagr", "年均")):
-            return None
-    elif field in FINANCIAL_ANCHORS | {"pe_ratio", "pb_ratio"}:
-        if any(marker in text for marker in ("同比", "yoy", "环比", "qoq", "增长", "增速", "增幅", "变化", "变动", "复合", "cagr")):
-            return None
+    text = re.sub(r"[\s()（）,，:：]", "", label.rsplit(".", 1)[-1]).lower()
+    currencies = "|".join(re.escape(marker.lower()) for markers in _CURRENCY_MARKERS.values() for marker in markers)
+    text = re.sub(currencies, "", text)
+    text = re.sub(
+        r"单位|公布值|单季|累计|年度|全年|annual|ytd|single_quarter|percentage_point|ratio|百分点|[%％]|倍|"
+        r"万亿|千亿|百亿|十亿|百万|亿|万|千|元", "", text,
+    )
     if field == "pe_ratio":
-        return "TTM" if any(marker in label.upper() for marker in ("TTM", "滚动")) else None
+        return "TTM" if re.fullmatch(r"(?:市盈率(?:pe)?|市盈|pe)(?:ttm|滚动)|(?:ttm|滚动)(?:市盈率|pe)|pe_ttm", text) else None
     if field == "pb_ratio":
-        return "MRQ" if "MRQ" in label.upper() else None
+        return "MRQ" if re.fullmatch(r"(?:市净率(?:pb)?|市净|pb)mrq|mrq(?:市净率|pb)|pb_mrq", text) else None
+    suffix = r"(?:同比|yoy)(?:增长率|增长|增速|变化率)?" if field.endswith("_yoy") else ""
     if field in {"net_profit", "net_profit_yoy"}:
-        if any(marker in label for marker in ("扣非", "扣除")):
-            return None
-        if any(marker in label for marker in ("归母", "归属母公司", "归属于母公司", "母公司股东", "母公司所有者", "parent_holder")):
+        parent_profit = r"(?:归母净利润|归属(?:于)?母公司(?:股东|所有者)?的?净利润|母公司(?:股东|所有者)净利润|parent_holder_net_profit)"
+        if re.fullmatch(parent_profit + suffix, text):
             return "parent_net_profit_yoy" if field.endswith("yoy") else "parent_net_profit"
         return None
     if field == "roe":
-        if any(marker in text for marker in ("非加权", "不加权", "unweighted", "non-weighted")):
-            return None
-        return "weighted_roe" if "加权" in text or re.search(r"\bweighted\b", text) else None
+        return "weighted_roe" if re.fullmatch(r"(?:净资产收益率(?:roe)?|roe)(?:加权(?:平均)?|weighted)|(?:加权(?:平均)?|weighted)(?:净资产收益率(?:roe)?|roe)|weighted_roe", text) else None
     if field == "gross_margin":
-        return "gross_margin" if "毛利率" in label or label == "gross_margin" else None
+        return "gross_margin" if re.fullmatch(r"(?:销售)?毛利率|gross_margin", text) else None
     if field in {"revenue", "revenue_yoy"}:
-        if any(marker in label for marker in ("营业总收入", "营业收入", "营收")):
-            stem = "total_operating_revenue" if "营业总收入" in label else "operating_revenue"
+        if re.fullmatch(r"(?:营业总收入|营业收入|营收)" + suffix, text):
+            stem = "total_operating_revenue" if text.startswith("营业总收入") else "operating_revenue"
             return stem + "_yoy" if field.endswith("yoy") else stem
     return None
 
