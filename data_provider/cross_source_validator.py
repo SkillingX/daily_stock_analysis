@@ -57,6 +57,7 @@ class AnchorQuality(BaseModel):
 
 
 @ensure(lambda result: result[0] is None or math.isfinite(result[0]), "JSON numeric values must be finite")
+@ensure(lambda result: result[3] is None or result[1] is None, "Invalid normalization cannot declare a canonical unit")
 def normalize_anchor_value(
     field: str, raw: object, label: str = "", *, unit: Optional[str] = None,
     currency: Optional[str] = None,
@@ -72,7 +73,7 @@ def normalize_anchor_value(
         return None, None, currency, "invalid_value"
     scales = {"": Decimal(1), "千": Decimal(1000), "万": Decimal(10000), "百万": Decimal(1000000), "亿": Decimal(100000000), "十亿": Decimal(1000000000), "百亿": Decimal(10000000000), "千亿": Decimal(100000000000), "万亿": Decimal(1000000000000)}
 
-    def declared(text: str) -> tuple[Optional[Unit], Decimal]:
+    def declared(text: str, *, standalone: bool = False) -> tuple[Optional[Unit], Decimal]:
         if text in ("currency_base", "percentage_point", "multiple", "shares"):
             return text, Decimal(1)  # type: ignore[return-value]
         if "ratio" in text.lower() or "比例" in text:
@@ -81,16 +82,32 @@ def normalize_anchor_value(
             return "percentage_point", Decimal(1)
         if "倍" in text:
             return "multiple", Decimal(1)
-        match = re.search(r"(万亿|千亿|百亿|十亿|百万|亿|万|千)?(元|股)", text)
+        currency_names = "|".join(re.escape(marker) for markers in _CURRENCY_MARKERS.values() for marker in markers)
+        money_units = "|".join(
+            re.escape(marker) for marker in (
+                "人民币元", *(marker for markers in _CURRENCY_MARKERS.values() for marker in markers
+                            if not marker.isascii() and marker not in {"人民币", "港币"})
+            )
+        )
+        pattern = (
+            rf"(?:(?:{currency_names})\s*)?(万亿|千亿|百亿|十亿|百万|亿|万|千)?"
+            rf"\s*({money_units}|元|股)(?:\s*[,，]?\s*(?:{currency_names}))?"
+        )
+        match = re.fullmatch(pattern, text.strip(), re.IGNORECASE) if standalone else re.search(pattern, text, re.IGNORECASE)
         if match:
-            return ("currency_base" if match[2] == "元" else "shares"), scales[match[1] or ""]
+            if not standalone and re.search(
+                r"(?:万亿|千亿|百亿|十亿|百万|亿|万|千|million|billion|trillion|thousand)\s*[^()（）,，:：\s]*$",
+                text[:match.start()], re.IGNORECASE,
+            ):
+                return None, Decimal(1)
+            return ("shares" if match[2] == "股" else "currency_base"), scales[match[1] or ""]
         if text.strip() in scales and text.strip():
             return "currency_base", scales[text.strip()]
         return None, Decimal(1)
 
     header = declared(label)
-    explicit = declared(unit) if unit is not None else header
-    cell = declared(number[2])
+    explicit = declared(unit, standalone=True) if unit is not None else header
+    cell = declared(number[2], standalone=True)
     currencies = {code for code, markers in _CURRENCY_MARKERS.items() if any(marker in f"{label} {number[2]} {unit or ''}".upper() for marker in markers)}
     error: Optional[str] = None
     if currency is not None:
