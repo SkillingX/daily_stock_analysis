@@ -75,6 +75,18 @@ def test_real_metric_survives_an_adjacent_transformed_column(source: str, field:
     assert adopted_field_record(field, reading)["rule_eligible"]
 
 
+@pytest.mark.parametrize("source", ["mx", "ifind", "choice", "akshare"])
+@pytest.mark.parametrize("field,label,value", [
+    ("revenue_yoy", "营业收入YoY(%)", -20.0),
+    ("net_profit_yoy", "归母净利润YoY(%)", 0.0),
+    ("net_profit_yoy", "归母净利润同比(%)", -20.0),
+])
+def test_explicit_yoy_identity_survives_source_prefilters(source: str, field: str, label: str, value: float) -> None:
+    reading = parse_metric(source, field, {label: value})
+    assert reading is not None and reading.value == value
+    assert adopted_field_record(field, reading)["rule_eligible"]
+
+
 def test_agreeing_margin_changes_do_not_verify_or_score_as_margin() -> None:
     sources = [SimpleNamespace(name=name, read=lambda code, field, period=None, name=name: parse_metric(name, field, {"销售毛利率同比(%)": 2.0})) for name in ("mx", "ifind")]
     validator = CrossSourceValidator(sources)
@@ -155,3 +167,28 @@ def test_mx_explicit_yoy_without_growth_rate_suffix_reaches_f1(label: str, monke
     dim = build_fundamental_dim(ctx)
     assert dim.growth_quality["revenue_yoy"]["value"] == 10.0
     assert dim.health_score == 65.0
+
+
+@pytest.mark.parametrize("label", ["归母净利润YoY(%)", "归母净利润同比(%)", "归属于母公司所有者的净利润YoY(%)"])
+@pytest.mark.parametrize("profit,expected", [(0.0, 57.5), (-20.0, 50.0)])
+def test_mx_parent_profit_yoy_reaches_f1(label: str, profit: float, expected: float, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from tests.test_financial_missing_fields import manager
+    from src.agent.tools import data_tools
+    from src.deep_research_dims import dim_cache
+    from src.deep_research_dims.context import _safe_fundamental
+
+    mgr = manager(monkeypatch, {})
+    response = {"status": 0, "data": {"data": {"searchDataResultDTO": {"dataTableDTOList": [{
+        "table": {"headName": ["2025年报"], "r": [10], "p": [profit]},
+        "nameMap": {"r": "营业收入YoY(%)", "p": label},
+    }]}}}}
+    client = MXClient(api_key="offline-fixture")
+    monkeypatch.setattr(client, "query", lambda *args, **kwargs: response)
+    mgr._mx_source = MXSource(client)
+    monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: mgr)
+    monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
+    ctx = SharedContext("600519", "样本", "2026-10-10")
+    ctx.fundamental = _safe_fundamental("600519", ctx)
+    dim = build_fundamental_dim(ctx)
+    assert dim.growth_quality["net_profit_yoy"]["value"] == profit
+    assert dim.health_score == expected

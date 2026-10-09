@@ -138,15 +138,14 @@ _GROWTH_MARKERS = ("同比", "yoy", "增长率", "环比")
 def _pick_growth_value(bundle: Dict[str, Any], keywords: List[str], field: Optional[str] = None) -> Optional[float]:
     """取「同比增长率」类数值，与 :func:`_pick_value` 互补。
 
-    仅命中**同时**含关键词**和**增长率标记（同比/增长率/环比）的列，用于 ``revenue_yoy``。
-    ``_pick_value`` 取绝对值、本函数取增长率，两者并列、各司其职（高内聚）。
+    已确认的同比身份复用集中口径判定；旧关键词候选仍保留原始证据。
     """
     if not isinstance(bundle, dict) or not bundle:
         return None
     for label, raw in bundle.items():
         label_s = str(label)
-        if any(kw in label_s for kw in keywords) and any(
-            m in label_s.lower() for m in _GROWTH_MARKERS
+        if (field is not None and caliber_from_label(field, label_s) is not None) or (
+            any(kw in label_s for kw in keywords) and any(m in label_s.lower() for m in _GROWTH_MARKERS)
         ):
             val = normalize_anchor_value(field, raw, label_s)[0] if field is not None else _safe_float(raw)
             if val is not None:

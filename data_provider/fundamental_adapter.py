@@ -123,7 +123,9 @@ def _pick_financial_value(row: pd.Series, keywords: List[str], errors: List[str]
             break  # 金额只接受确证身份，不能借利润率、扣非或每股指标
         for keyword in keywords:
             for label in dict.fromkeys(labels.values()):
-                if not (label == keyword if exact else keyword in label):
+                if not ((label == keyword if exact else keyword in label) or (
+                    not exact and field in {"revenue_yoy", "net_profit_yoy"} and caliber_from_label(field, label) is not None
+                )):
                     continue
                 values: set[float] = set()
                 candidates: list[AnchorReading] = []
