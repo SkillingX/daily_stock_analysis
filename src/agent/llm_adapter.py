@@ -92,6 +92,7 @@ class LLMResponse:
         ""  # full model name used (e.g. gemini/gemini-2.0-flash), for report meta
     )
     raw: Any = None  # raw provider response for debugging
+    finish_reason: Optional[str] = None
 
 
 # Models that auto-return reasoning_content; do NOT send extra_body (may cause 400).
@@ -516,16 +517,16 @@ class LLMToolAdapter:
             )
             logger.error(error_msg)
             return LLMResponse(content=error_msg, provider="error")
-        started_at = time.time()
+        started_at = time.monotonic()
         providers = [self._get_model_provider(model) for model in models_to_try]
 
         last_error: Optional[Exception] = None
         hit_rate_limit = False
         for idx, model in enumerate(models_to_try):
             remaining_timeout = timeout
-            if timeout is not None and timeout > 0:
+            if timeout is not None:
                 remaining_timeout = max(
-                    0.0, float(timeout) - (time.time() - started_at)
+                    0.0, float(timeout) - (time.monotonic() - started_at)
                 )
                 if remaining_timeout <= 0:
                     last_error = TimeoutError(
@@ -554,10 +555,10 @@ class LLMToolAdapter:
                         and providers[idx] == providers[idx + 1]
                     )
                     if should_backoff:
-                        backoff_sleep = min(2.0, (time.time() - started_at) * 0.1 + 0.5)
-                        if timeout is not None and timeout > 0:
+                        backoff_sleep = min(2.0, (time.monotonic() - started_at) * 0.1 + 0.5)
+                        if timeout is not None:
                             remaining_timeout = max(
-                                0.0, float(timeout) - (time.time() - started_at)
+                                0.0, float(timeout) - (time.monotonic() - started_at)
                             )
                             if remaining_timeout > 0:
                                 time.sleep(min(backoff_sleep, remaining_timeout))
@@ -613,6 +614,10 @@ class LLMToolAdapter:
             call_kwargs["max_tokens"] = max_tokens
         if timeout is not None:
             call_kwargs["timeout"] = timeout
+            # The caller owns the deadline; nested Router/SDK retries reset it.
+            call_kwargs["num_retries"] = 0
+            call_kwargs["max_retries"] = 0
+            call_kwargs["disable_fallbacks"] = True
 
         if extra:
             call_kwargs["extra_body"] = extra
@@ -853,6 +858,7 @@ class LLMToolAdapter:
             provider=provider_name,
             model=model,
             raw=response,
+            finish_reason=getattr(choice, "finish_reason", None),
         )
 
 

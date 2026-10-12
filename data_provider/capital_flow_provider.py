@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ def compute_cumulative(
 
 
 def get_main_inflow_cumulative(
-    code: str, days: int = _DEFAULT_FETCH_DAYS
+    code: str, days: int = _DEFAULT_FETCH_DAYS, *, deadline: Optional[float] = None
 ) -> Dict[str, Any]:
     """用 iFinD 多日序列算主力净流入 today/5d/10d（稳定源，akshare 不可达时兜底）。
 
@@ -51,15 +52,19 @@ def get_main_inflow_cumulative(
     from data_provider.ifind_fundamental_adapter import IfindFetcher
 
     fetcher = IfindFetcher.get_instance()
-    if not fetcher.available:
+    if not fetcher.available or (deadline is not None and deadline <= monotonic()):
         return {}
-    series = fetcher.fetch_main_inflow_series(code, days)
+    series = fetcher.fetch_main_inflow_series(code, days, **({"deadline": deadline} if deadline is not None else {}))
     if not series:
         return {}
+    from data_provider.cross_source_validator import AnchorReading, adopted_field_record
+    # Legacy series contain scalar values only; they do not prove unit/currency.
+    reading = AnchorReading("ifind", series[0][1], observed_at=series[0][0])
     return {
         "main_net_inflow": series[0][1],  # 最新日
         "inflow_5d": compute_cumulative(series, _WINDOW_5D),
         "inflow_10d": compute_cumulative(series, _WINDOW_10D),
         "daily_series": [{"date": d, "value": v} for d, v in series],
         "source": "ifind",
+        "field_meta": {"main_inflow": adopted_field_record("main_inflow", reading, selection_reason="fallback")},
     }

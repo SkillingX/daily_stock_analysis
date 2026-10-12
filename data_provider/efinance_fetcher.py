@@ -21,6 +21,8 @@ EfinanceFetcher - 优先数据源 (Priority 0)
 """
 
 import logging
+from contextvars import copy_context
+from threading import BoundedSemaphore
 import os
 import random
 import re
@@ -194,27 +196,30 @@ def _is_us_code(stock_code: str) -> bool:
     return bool(re.match(r"^[A-Z]{1,5}(\.[A-Z])?$", code))
 
 
-def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
-    """Run an efinance library call in a thread with a timeout.
+_EF_POOL = ThreadPoolExecutor(max_workers=4)
+_EF_SLOTS = BoundedSemaphore(4)
 
-    efinance internally uses requests/urllib3 with no timeout, so when
-    eastmoney hosts are unreachable the call can hang for many minutes.
-    This helper caps the *calling thread's* wait time.  Note: Python threads
-    cannot be forcibly killed, so the worker thread may continue running in
-    the background until the OS-level TCP timeout fires or the process exits.
-    This is acceptable — the calling thread returns promptly on timeout.
-    """
-    if timeout is None:
-        timeout = _EF_CALL_TIMEOUT
-    # Do NOT use 'with ThreadPoolExecutor(...)' here: the context manager calls
-    # shutdown(wait=True) on __exit__, which would re-block on the hung thread.
-    executor = ThreadPoolExecutor(max_workers=1)
+
+def _ef_call_with_timeout(func, *args, timeout=None, **kwargs):
+    """Bound worker resources and propagate the current financial HTTP deadline."""
+    from src.patches.eastmoney_patch import request_deadline
+    timeout = _EF_CALL_TIMEOUT if timeout is None else timeout
+    deadline = request_deadline.get()
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+    if timeout <= 0 or not _EF_SLOTS.acquire(blocking=False):
+        raise FuturesTimeoutError("efinance deadline or worker limit exhausted")
     try:
-        future = executor.submit(func, *args, **kwargs)
+        future = _EF_POOL.submit(copy_context().run, func, *args, **kwargs)
+    except Exception:
+        _EF_SLOTS.release()
+        raise
+    future.add_done_callback(lambda _: _EF_SLOTS.release())
+    try:
         return future.result(timeout=timeout)
-    finally:
-        # wait=False: calling thread returns immediately; worker cleans up later
-        executor.shutdown(wait=False)
+    except FuturesTimeoutError:
+        future.cancel()
+        raise
 
 
 def _classify_eastmoney_error(exc: Exception) -> Tuple[str, str]:
@@ -636,9 +641,13 @@ class EfinanceFetcher(BaseFetcher):
 
         try:
             # 检查缓存
+            from .mx_data_adapter import financial_refresh
+            refresh = financial_refresh.get()
+            refresh_this_stock = refresh is not None and refresh[0] == stock_code
             current_time = time.time()
             if (
-                _realtime_cache["data"] is not None
+                not refresh_this_stock
+                and _realtime_cache["data"] is not None
                 and current_time - _realtime_cache["timestamp"] < _realtime_cache["ttl"]
             ):
                 df = _realtime_cache["data"]
@@ -668,11 +677,12 @@ class EfinanceFetcher(BaseFetcher):
                 circuit_breaker.record_success(source_key)
 
                 # 更新缓存
-                _realtime_cache["data"] = df
-                _realtime_cache["timestamp"] = current_time
-                logger.info(
-                    f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={_realtime_cache['ttl']}s"
-                )
+                if not refresh_this_stock:
+                    _realtime_cache["data"] = df
+                    _realtime_cache["timestamp"] = current_time
+                    logger.info(
+                        f"[缓存更新] 实时行情(efinance) 缓存已刷新，TTL={_realtime_cache['ttl']}s"
+                    )
 
             # 查找指定股票
             # efinance 返回的列名可能是 '股票代码' 或 'code'
@@ -707,6 +717,8 @@ class EfinanceFetcher(BaseFetcher):
                 code=stock_code,
                 name=str(row.get(name_col, "")),
                 source=RealtimeSource.EFINANCE,
+                currency="CNY",
+                field_meta={"pe_ratio": {"raw_label": pe_col}},
                 price=safe_float(row.get(price_col)),
                 change_pct=safe_float(row.get(pct_col)),
                 change_amount=safe_float(row.get(chg_col)),
@@ -758,9 +770,13 @@ class EfinanceFetcher(BaseFetcher):
             return None
 
         try:
+            from .mx_data_adapter import financial_refresh
+            refresh = financial_refresh.get()
+            refresh_this_stock = refresh is not None and refresh[0] == stock_code
             current_time = time.time()
             if (
-                _etf_realtime_cache["data"] is not None
+                not refresh_this_stock
+                and _etf_realtime_cache["data"] is not None
                 and current_time - _etf_realtime_cache["timestamp"]
                 < _etf_realtime_cache["ttl"]
             ):
@@ -791,8 +807,9 @@ class EfinanceFetcher(BaseFetcher):
                     logger.info(f"[API返回] ETF 实时行情为空, 耗时 {api_elapsed:.2f}s")
                     df = pd.DataFrame()
 
-                _etf_realtime_cache["data"] = df
-                _etf_realtime_cache["timestamp"] = current_time
+                if not refresh_this_stock:
+                    _etf_realtime_cache["data"] = df
+                    _etf_realtime_cache["timestamp"] = current_time
 
             if df is None or df.empty:
                 logger.info(

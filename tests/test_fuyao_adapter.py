@@ -223,7 +223,7 @@ class ParseFuyaoResponseTests(unittest.TestCase):
         self.assertIsNotNone(r)
         assert r is not None
         self.assertAlmostEqual(r.value, 1.7e11)
-        self.assertEqual(r.period, "2024年报")
+        self.assertEqual(r.period, "2024-12-31")
         self.assertIsNone(r.caliber)
 
     def test_period_field_without_period_is_none(self) -> None:
@@ -399,7 +399,7 @@ class FuyaoFetcherTests(unittest.TestCase):
 
     def test_fetch_returns_none_for_unparseable_code(self) -> None:
         f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("xyz", "pe_ratio"))
+        self.assertIsNone(f.fetch("bad/code", "pe_ratio"))
 
     def test_fetch_returns_none_for_period_field_without_period(self) -> None:
         f = FuyaoFetcher(endpoint="https://x", api_key="k")
@@ -439,7 +439,7 @@ class FuyaoFetcherTests(unittest.TestCase):
         self.assertIsNotNone(r)
         assert r is not None
         self.assertAlmostEqual(r.value, 1.7e11)
-        self.assertEqual(r.period, "2024年报")
+        self.assertEqual(r.period, "2024-12-31")
         called = fake_session.post.call_args
         self.assertEqual(
             called.kwargs["json"], {"thscode": "600519.SH", "report": "2024-4"}

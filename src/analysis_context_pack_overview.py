@@ -68,6 +68,7 @@ def render_analysis_context_pack_overview(
                     ),
                     "warnings": _list_strings(block.get("warnings")),
                     "missing_reasons": _item_missing_reasons(block.get("items")),
+                    **({"financial_quality": _sanitize_financial_quality(_nested(block, "metadata", "financial_quality"))} if key == "fundamentals" else {}),
                 }
             )
 
@@ -176,6 +177,7 @@ def _sanitize_persisted_overview(
                 "source": _safe_text(block.get("source")) or None,
                 "warnings": _list_strings(block.get("warnings")),
                 "missing_reasons": _list_strings(block.get("missing_reasons"), limit=3),
+                **({"financial_quality": _sanitize_financial_quality(block.get("financial_quality"))} if key == "fundamentals" else {}),
             }
         )
 
@@ -214,6 +216,24 @@ def _sanitize_data_quality(value: Any) -> Optional[Dict[str, Any]]:
         "block_scores": _safe_block_scores(value.get("block_scores")),
         "limitations": _list_strings(value.get("limitations"), limit=5),
     }
+
+
+def _sanitize_financial_quality(value: Any) -> Dict[str, Dict[str, Any]]:
+    """Pass through bounded field evidence only; never expose raw responses or values."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for field in ("pe_ratio", "pb_ratio", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        record = value.get(field)
+        if not isinstance(record, Mapping):
+            continue
+        status = _nested(record, "quality", "status") or record.get("status")
+        result[field] = {
+            "status": status if isinstance(status, str) and status in {"missing", "unverified", "single_source", "not_comparable", "verified", "conflict"} else "unverified",
+            "rule_eligible": record.get("rule_eligible") is True,
+            **{key: (_safe_text(record.get(key))[:100] or None) for key in ("source", "period", "period_basis", "caliber", "unit", "currency")},
+        }
+    return result
 
 
 def _safe_status(value: Any) -> Optional[str]:

@@ -7,10 +7,11 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.services import fundamentals_service
 from src.storage import get_db
@@ -28,12 +29,23 @@ def _validate_id(report_id: str) -> str:
     return report_id
 
 
-@router.post("/generate")
-async def generate(stock_code: str, stock_name: Optional[str] = None):
-    """同步生成基本面专项报告（研究员并行+缓存，约 1-2 分钟）。"""
+class FundamentalsGenerateResponse(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+
+    report_id: Annotated[str, Field(pattern=r"^fd_\d{12}(_\d+)?$")] | None
+    stock_code: Annotated[str, Field(pattern=r"^\d{6}$")]
+    stock_name: str
+    status: Literal["success", "partial", "failed", "already_exists"]
+    markdown: str
+    dims: dict[str, Any]
+
+
+@router.post("/generate", response_model=FundamentalsGenerateResponse)
+async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false") -> dict[str, Any]:
+    """同步生成基本面专项报告；在配置时限内研究，未完成章节显式降级。"""
     try:
         return await asyncio.to_thread(
-            fundamentals_service.generate_fundamentals_report, stock_code, stock_name
+            fundamentals_service.generate_fundamentals_report, stock_code, stock_name, force_refresh == "true"
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -60,10 +72,7 @@ async def get_report(report_id: str):
     record = await asyncio.to_thread(get_db().get_fundamentals_report, report_id)
     if record is None:
         raise HTTPException(status_code=404, detail="报告不存在")
-    try:
-        record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
-    except OSError:
-        record["markdown"] = ""
+    record["markdown"] = fundamentals_service.report_markdown(record)
     return {"success": True, "data": record}
 
 
@@ -76,10 +85,10 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
-    kwargs = {"media_type": "text/markdown; charset=utf-8"}
-    if download:
-        kwargs["filename"] = f"{report_id}.md"
-    return FileResponse(str(path), **kwargs)
+    return PlainTextResponse(
+        fundamentals_service.report_markdown(record), media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{report_id}.md"'} if download else None,
+    )
 
 
 @router.delete("/reports/{report_id}")

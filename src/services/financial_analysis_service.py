@@ -415,4 +415,4 @@ def _render(name: str, code: str, as_of: str, rid: str, a: Dict[str, Any]) -> st
     import re as _re
     md = _re.sub(r"(?<=[\u4e00-\u9fff])(?=[A-Za-z0-9])", " ", md)
     md = _re.sub(r"(?<=[A-Za-z0-9%])(?=[\u4e00-\u9fff])", " ", md)
-    return _re.sub(r"🔴 \*\*([^*:\n]+)\*\*", r'<font color="#e03131">🔴 **\1**</font>', md)
+    return md

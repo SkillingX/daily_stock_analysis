@@ -171,7 +171,9 @@ class TestValuationBasis:
         assert dim.valuation_basis == "PB"
 
     def test_profit_maker_uses_pe(self):
-        dim = build_scenarios_dim(_ctx(), current_price=13.0)
+        ctx = _ctx()
+        ctx.fundamental["field_meta"] = {"pe_ratio": {"source": "mx", "value": ctx.fundamental["pe_ttm"], "caliber": "TTM", "unit": "multiple"}}
+        dim = build_scenarios_dim(ctx, current_price=13.0)
         assert dim.valuation_basis == "PE_TTM"
         assert dim.probability_sum == pytest.approx(1.0)
 
@@ -583,7 +585,7 @@ class TestSnapshotCache:
         monkeypatch.delenv("FUYAO_API_KEY", raising=False)
 
         class _Fund:
-            def get_fundamental_context(self, code):
+            def get_fundamental_context(self, code, budget_seconds=None):
                 return {"valuation": {"data": {}}, "financial": {"data": {}}}
 
         monkeypatch.setattr(
@@ -604,7 +606,7 @@ class TestSnapshotCache:
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
-        dim_cache.save_snapshot("stage0_fund_600519", {"pe_ttm": 19.09})
+        dim_cache.save_snapshot(f"stage0_fund_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {"pe_ttm": 19.09})
 
         def _boom(*a, **k):
             raise AssertionError("命中快照不应调用 fetcher")

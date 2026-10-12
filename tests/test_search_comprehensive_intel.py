@@ -4,7 +4,7 @@ Tests for SearchService.search_comprehensive_intel behavior.
 
 Covers:
 - Dimension result presence and max_searches limiting
-- Provider rotation across dimensions
+- Configured provider preference and per-dimension fallback
 - Per-dimension failure isolation
 - Elapsed time baseline for future parallelization work
 """
@@ -111,7 +111,7 @@ class TestSearchComprehensiveIntel(unittest.TestCase):
         self.assertEqual(len(results), 3)
         self.assertEqual(len(provider.calls), 3)
 
-    def test_provider_rotation_across_dimensions(self):
+    def test_healthy_first_provider_serves_all_dimensions(self):
         p1 = _DummyProvider("P1")
         p2 = _DummyProvider("P2")
         service = self._build_service([p1, p2])
@@ -122,14 +122,14 @@ class TestSearchComprehensiveIntel(unittest.TestCase):
             max_searches=4,
         )
 
-        # Round-robin: dimensions 0,2 -> P1; dimensions 1,3 -> P2
-        self.assertEqual(len(p1.calls), 2)
-        self.assertEqual(len(p2.calls), 2)
+        # A healthy configured provider avoids unnecessary fallback calls.
+        self.assertEqual(len(p1.calls), 4)
+        self.assertEqual(len(p2.calls), 0)
 
     def test_single_dimension_failure_does_not_break_others(self):
         working = _DummyProvider("Working")
         failing = _FailingProvider("Failing")
-        service = self._build_service([working, failing])
+        service = self._build_service([failing, working])
 
         results = service.search_comprehensive_intel(
             stock_code="600519",
@@ -137,10 +137,10 @@ class TestSearchComprehensiveIntel(unittest.TestCase):
             max_searches=3,
         )
 
-        # Round-robin: dim 0,2 use working provider; dim 1 uses failing provider
+        # Failure in the first provider is repaired for each dimension
         dim_names = list(results.keys())
         self.assertTrue(results[dim_names[0]].success)
-        self.assertFalse(results[dim_names[1]].success)
+        self.assertTrue(results[dim_names[1]].success)
         self.assertTrue(results[dim_names[2]].success)
 
     def test_strict_freshness_filtering_is_applied(self):
@@ -205,3 +205,38 @@ class TestSearchComprehensiveIntelBenchmark(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_keyless_html_provider_enters_scraper(monkeypatch):
+    from src.services import html_scrape_news
+    calls = []
+    def fetch(code, days):
+        calls.append(code)
+        return []
+    monkeypatch.setattr(html_scrape_news, '_fetch_eastmoney_announcements', fetch)
+    provider = html_scrape_news.HTMLScrapeNewsProvider()
+    assert provider.is_available
+    response = provider.search('300260 公告')
+    assert calls == ['300260']
+    assert response.error_message != 'html_scrape 未配置 API Key'
+
+
+def test_public_fallback_not_used_while_configured_provider_works():
+    public = _DummyProvider('html_scrape')
+    configured = _DummyProvider('Configured')
+    service = TestSearchComprehensiveIntel()._build_service([public, configured])
+    with patch('src.search_service.time.sleep'):
+        results = service.search_comprehensive_intel('300260', '新莱应材', max_searches=4)
+    assert len(results) == 4 and len(configured.calls) == 4 and not public.calls
+
+
+def test_expired_tool_deadline_stops_further_searches():
+    from src.patches.eastmoney_patch import request_deadline
+    provider = _DummyProvider()
+    service = TestSearchComprehensiveIntel()._build_service([provider])
+    token = request_deadline.set(time.monotonic() - 1)
+    try:
+        assert service.search_comprehensive_intel('300260', '新莱应材') == {}
+        assert not provider.calls
+    finally:
+        request_deadline.reset(token)

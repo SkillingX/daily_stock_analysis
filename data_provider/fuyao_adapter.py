@@ -8,7 +8,7 @@
 设计（与 :class:`MxMcpSource` 同范式）：
 - :class:`FuyaoSource` 实现 :class:`SourceAdapter`，依赖注入 fetcher 解耦，
   字段映射 / 解析是纯同步代码，**100% 可单测**。
-- :class:`FuyaoFetcher` 封装真实 HTTP 调用（``requests.Session`` + retry adapter），
+- :class:`FuyaoFetcher` 封装真实 HTTP 调用（``requests.Session`` + 显式预算重试），
   同步阻塞；fuyao 是 REST + 同步范式（与 iFinD/MCP 的 async 范式不同）。
 - fail-open：无 key / 抓取异常 / 超时 / 业务错误 → ``None``，不阻塞其他源。
 
@@ -23,18 +23,16 @@
 from __future__ import annotations
 
 import logging
+import time
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-from .cross_source_validator import AnchorReading
-from .ifind_fundamental_adapter import _safe_float
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +45,10 @@ logger = logging.getLogger(__name__)
 class FuyaoItem(BaseModel):
     """单条 fuyao 数据点。``fields`` 承载指标值（Any 以容忍 string/int/float/null）；
 
-    缺失字段让 AnchorReading 走 None；数值统一由 :func:`_safe_float` 转 float。
+    缺失字段让 AnchorReading 走 None；数值按返回单位规范化。
     """
 
-    model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, extra="ignore")
 
     thscode: str = Field(..., description="带交易所后缀的标的符号")
     report: Optional[str] = Field(default=None, description="fuyao YYYY-N 期间编码")
@@ -64,7 +62,7 @@ class FuyaoResponse(BaseModel):
     对 API 后续新增字段（如 ``timestamp``）保持容忍。
     """
 
-    model_config = ConfigDict(strict=True, frozen=True, extra="ignore")
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, extra="ignore")
 
     code: int = Field(..., description="业务状态码；0 = success")
     message: str = Field(default="")
@@ -110,7 +108,7 @@ _ENDPOINT_BY_FIELD: Dict[str, _EndpointSpec] = {
 
 _CALIBERS: Dict[str, Optional[str]] = {
     "pe_ratio": "TTM",
-    "pb_ratio": "TTM",
+    "pb_ratio": "MRQ",
 }
 
 
@@ -223,21 +221,37 @@ def _parse_fuyao_response(
     spec = _endpoint_for(field)
     if spec is None:
         return None
+    readings: list[AnchorReading] = []
     for raw in items_raw:
         try:
             item = FuyaoItem.model_validate(raw)
         except Exception:  # noqa: BLE001 — 跳过畸形 item
             continue
-        value = _safe_float(item.fields.get(spec.item_key))
+        value = normalize_anchor_value(field, item.fields.get(spec.item_key), spec.item_key)[0]
         if value is None:
             continue
-        return AnchorReading(
+        period_fields = dict(item.fields)
+        if item.report is not None:
+            encoded = re.fullmatch(r"(\d{4})-([1-4])", item.report)
+            report_label = f"{encoded[1]}{('一季报', '中报', '三季报', '年报')[int(encoded[2]) - 1]}" if encoded else item.report
+            period_fields.setdefault("report_period", report_label)
+        actual, basis = report_period_from_fields(period_fields, spec.item_key)
+        value, unit, currency, error = normalize_anchor_value(field, item.fields[spec.item_key], spec.item_key, unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), currency=item.fields.get("currency"))
+        if value is None:
+            continue
+        readings.append(AnchorReading(
             source="fuyao",
             value=value,
-            caliber=_CALIBERS.get(field),
-            period=period if spec.needs_period else None,
-        )
-    return None
+            caliber=_CALIBERS.get(field) or caliber_from_label(field, spec.item_key),
+            period=actual if spec.needs_period else None,
+            period_basis=basis if spec.needs_period else "unknown",
+            requested_period=period if spec.needs_period else None,
+            observed_at=observation_time_from_fields(item.fields), fetched_at=item.fields.get("fetched_at"),
+            unit=unit, currency=currency, raw_value=str(item.fields[spec.item_key]), raw_label=spec.item_key, normalization_error=error,
+            raw_unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), raw_currency=item.fields.get("currency"),
+        ))
+    selected = select_report_period([(reading.period, reading.period_basis) for reading in readings], period)
+    return readings[selected if selected is not None else 0] if readings else None
 
 
 # ------------------------------------------------------------------
@@ -272,25 +286,15 @@ class FuyaoFetcher:
 
     @staticmethod
     def _build_session() -> requests.Session:
-        """构造带 retry adapter 的 requests.Session（仅对幂等状态码重试）。"""
-        sess = requests.Session()
-        retry = Retry(
-            total=2,
-            backoff_factor=0.3,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset(["POST", "GET"]),
-            raise_on_status=False,
-        )
-        sess.mount("https://", HTTPAdapter(max_retries=retry))
-        sess.mount("http://", HTTPAdapter(max_retries=retry))
-        return sess
+        """构造无隐藏重试的会话；fetch 按剩余预算显式重试。"""
+        return requests.Session()
 
     @property
     def available(self) -> bool:
         return bool(self._endpoint and self._api_key)
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取。无 token / 失败 → None。"""
         if not self.available:
@@ -314,21 +318,25 @@ class FuyaoFetcher:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        try:
-            resp = self._session.post(url, json=payload, headers=headers, timeout=self._timeout)
-        except requests.RequestException as exc:  # noqa: BLE001 — fail-open
-            logger.debug(
-                "[FuyaoFetcher] POST %s failed for %s/%s: %s",
-                spec.path, code, field, exc,
-            )
-            return None
-        if resp.status_code != 200:
-            logger.debug(
-                "[FuyaoFetcher] non-200 for %s/%s: status=%s body=%s",
-                code, field, resp.status_code, (resp.text or "")[:80],
-            )
-            return None
-        return _parse_fuyao_response(resp.text, field, period)
+        for attempt in range(3):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - time.monotonic())
+            if timeout <= 0:
+                return None
+            try:
+                resp = self._session.post(url, json=payload, headers=headers, timeout=timeout)
+            except requests.RequestException as exc:
+                logger.debug("[FuyaoFetcher] POST %s failed: %s", spec.path, type(exc).__name__)
+                return None
+            if resp.status_code == 200:
+                return _parse_fuyao_response(resp.text, field, period)
+            if resp.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
+                logger.debug("[FuyaoFetcher] non-200 for %s/%s: status=%s", code, field, resp.status_code)
+                return None
+            pause = 0.3 * (2 ** attempt)
+            if deadline is not None and deadline - time.monotonic() <= pause:
+                return None
+            time.sleep(pause)
+        return None
 
 
 # ------------------------------------------------------------------
@@ -354,21 +362,16 @@ class FuyaoSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：单源异常不影响其他源
             logger.debug("[FuyaoSource] read %s/%s failed: %s", code, field, exc)
             return None
         if reading is None:
             return None
-        return AnchorReading(
-            source=self.name,
-            value=reading.value,
-            caliber=reading.caliber,
-            period=reading.period,
-        )
+        return replace(reading, source=self.name, requested_period=reading.requested_period if reading.requested_period is not None else period if field in _ENDPOINT_BY_FIELD and _ENDPOINT_BY_FIELD[field].needs_period else None)

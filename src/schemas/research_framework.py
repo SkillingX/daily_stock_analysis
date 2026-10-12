@@ -20,6 +20,7 @@ class IndicatorScore(BaseModel):
         None, description="Data confidence"
     )
     summary: Optional[str] = Field(None, description="Score reasoning")
+    data_gap: bool = Field(False, strict=True, description="Missing or ineligible inputs use the neutral placeholder")
 
 
 class DimensionScore(BaseModel):

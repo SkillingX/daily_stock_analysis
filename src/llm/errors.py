@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional
 
 from src.llm.generation_params import (
@@ -123,6 +124,7 @@ def call_litellm_with_param_recovery(
     log_label: str = "[LiteLLM]",
 ) -> Any:
     """Call LiteLLM once, then retry once for explicit generation-parameter errors."""
+    started_at = monotonic()
     effective_kwargs = dict(call_kwargs)
     try:
         return call(effective_kwargs)
@@ -140,6 +142,12 @@ def call_litellm_with_param_recovery(
                 model,
                 recovery.reason,
             )
+        timeout = effective_kwargs.get("timeout")
+        if isinstance(timeout, (int, float)):
+            remaining = timeout - (monotonic() - started_at)
+            if remaining <= 0:
+                raise TimeoutError("LLM deadline exhausted before parameter recovery") from exc
+            retry_kwargs["timeout"] = remaining
         response = call(retry_kwargs)
         if cache_recovery:
             remember_litellm_generation_param_recovery(
