@@ -100,7 +100,8 @@ def normalize_anchor_value(
             rf"(万亿|千亿|百亿|十亿|百万|亿|万|千)?\s*({money_units}|元|股)"
             rf"(?:[\s,，]*(?:{currency_names}|单季|累计|公布值))*"
         )
-        match = re.fullmatch(pattern, text.strip(), re.IGNORECASE) if standalone else re.search(pattern, text, re.IGNORECASE)
+        # A unit may end a label, but 股 in 股东/股本 is part of the metric name.
+        match = re.fullmatch(pattern, text.strip(), re.IGNORECASE) if standalone else re.search(pattern + r"(?!\w)", text, re.IGNORECASE)
         if match:
             if not standalone and re.search(
                 r"(?:[一二三四五六七八九零十百\d]|万亿|千亿|百亿|十亿|百万|亿|万|千|million|billion|trillion|thousand)\s*[^()（）,，:：\s]*$",

@@ -99,3 +99,14 @@ def test_equivalent_foreign_amounts_agree_through_real_source_parsers() -> None:
 def test_unrecognized_or_contradictory_scale_is_not_valid_money(raw: str, label: str, unit: str | None) -> None:
     _, canonical, _, error = normalize_anchor_value("total_mv", raw, label, unit=unit, currency="USD")
     assert canonical is None and error is not None
+
+
+@pytest.mark.parametrize("raw,expected", [("-7.518%", -7.518), ("0%", 0.0), ("8.5%", 8.5)])
+def test_shareholder_metric_name_is_not_a_share_unit(raw: str, expected: float) -> None:
+    reading = MXSource().read_bundle({
+        "归属母公司股东的净利润同比增长率": raw,
+        "报告期": "2026-06-30", "period_basis": "YTD",
+    }, "net_profit_yoy")
+    assert reading is not None and reading.value == expected
+    assert reading.unit == "percentage_point" and reading.normalization_error is None
+    assert adopted_field_record("net_profit_yoy", reading)["rule_eligible"]

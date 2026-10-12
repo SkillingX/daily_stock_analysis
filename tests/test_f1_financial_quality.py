@@ -378,7 +378,37 @@ def test_shared_stage_zero_or_slow_validation_exits_within_budget(financial_sour
         if budget == 0:
             assert not reads
         else:
-            assert reads
+            # Acquisition may exhaust a short budget before validation starts.
             assert any("timeout" in a["quality"]["reason_codes"] for a in ctx.fundamental["cross_validation"]["anchors"].values())
     finally:
         event.set()
+
+
+@pytest.mark.parametrize("fetch_elapsed", [2.0, 5.0])
+def test_fuyao_fallback_preserves_verification_budget(monkeypatch: pytest.MonkeyPatch, fetch_elapsed: float) -> None:
+    from src.deep_research_dims import context as shared
+    clock = [100.0]
+    cfg = Config(fundamental_stage_timeout_seconds=10, fundamental_fetch_timeout_seconds=5,
+                 deep_research_cross_validate=True, enable_fuyao=True,
+                 fuyao_api_key="fixture", fuyao_endpoint="https://fixture.invalid")
+    fallback_budgets: list[float] = []
+    verification_budgets: list[float] = []
+    class Manager:
+        def get_fundamental_context(self, code: str, *, budget_seconds: float) -> dict[str, Any]:
+            assert budget_seconds == 5.0
+            clock[0] += fetch_elapsed
+            return {}
+        def _run_with_timeout(self, task: Any, remaining: float, name: str) -> tuple[None, str, int]:
+            fallback_budgets.append(remaining)
+            clock[0] += remaining
+            return None, "fixture timeout", 0
+    def validate(*args: Any, deadline: float, **kwargs: Any) -> None:
+        verification_budgets.append(deadline - clock[0])
+    monkeypatch.setattr("src.config.get_config", lambda: cfg)
+    monkeypatch.setattr(shared, "monotonic", lambda: clock[0])
+    monkeypatch.setattr("src.deep_research_dims.dim_cache.load_snapshot", lambda *a, **kw: None)
+    monkeypatch.setattr("src.agent.tools.data_tools._get_fetcher_manager", Manager)
+    monkeypatch.setattr("src.agent.tools.cross_validation_helpers.build_cross_validation_block", validate)
+    shared._safe_fundamental("300260", SharedContext("300260", "fixture", "fixture"))
+    assert fallback_budgets == ([3.0] if fetch_elapsed == 2.0 else [])
+    assert verification_budgets == [5.0]

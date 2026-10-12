@@ -23,13 +23,19 @@ _AGENTS_DIR = os.path.join(
 
 
 def load_dim_prompt(dim_id: str) -> str:
-    """读取维度 prompt（缺失时返回空串，调用方走模板默认句）。"""
-    path = os.path.join(_AGENTS_DIR, f"{dim_id}.md")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+    """Prefer local prompt overrides; ship mandatory business rules with the code."""
+    paths = [os.path.join(_AGENTS_DIR, f"{dim_id}.md")]
+    if dim_id == "business":
+        paths.append(os.path.join(os.path.dirname(__file__), "prompts", "business.md"))
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                prompt = fh.read()
+            if prompt.strip():
+                return prompt
+        except OSError:
+            continue
+    return ""
 
 
 def load_constitution() -> str:

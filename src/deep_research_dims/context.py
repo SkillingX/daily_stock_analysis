@@ -114,7 +114,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         remaining = max(0.0, deadline - monotonic())
         # Verification needs its own share of the same stage budget, not leftover zero.
         verification_budget = min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else 0.0
-        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, remaining - verification_budget))
+        fetch_deadline = deadline - verification_budget
+        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, fetch_deadline - monotonic()))
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
@@ -165,7 +166,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             from data_provider.fuyao_adapter import _to_thscode
 
             def fetch(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-                remaining = min(config.fundamental_fetch_timeout_seconds, deadline - monotonic())
+                remaining = min(config.fundamental_fetch_timeout_seconds, fetch_deadline - monotonic())
                 if remaining <= 0:
                     return {}
                 def request_body() -> Any:

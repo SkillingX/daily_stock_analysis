@@ -103,6 +103,8 @@ jobs:
           from src.patches.eastmoney_patch import eastmoney_patch; print('patch OK')
           from bot.dispatcher import CommandDispatcher; print('bot OK')
           from api.app import app; print('api OK')
+          from src.deep_research_dims.narrate import load_dim_prompt
+          assert 'data_gaps' in load_dim_prompt('business'), 'Business prompt missing from image'
           print('All Docker imports OK')
           "
 

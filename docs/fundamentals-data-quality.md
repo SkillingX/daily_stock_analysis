@@ -107,13 +107,15 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 
 综合情报按每个维度尝试配置好的来源；失败或过滤后无有效结果时，才尝试下一个来源，公共 SearXNG 和 HTML 抓取放在后备位置。一次维度内每个来源最多尝试一次（供应商内部原有重试不变）；Agent 工具截止时间到达后不再启动新的维度或来源。HTML 公告抓取无需 API Key，已从基类凭据检查中豁免。
 
-阶段零财务取数与交叉核验仍共用 `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS`：启用核验时为核验预留不超过单源超时且不超过总预算一半的时间。manager 在已配置 MX 时，为其保留不超过单源超时且不超过 manager 预算三分之一的时间。MX 只补缺失财务及 PE/PB 字段，复用既有批量查询缓存，不覆盖已有零值；财务批次已足够时不再发财务查询。
+阶段零财务取数与交叉核验仍共用 `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS`：启用核验时为核验预留不超过单源超时且不超过总预算一半的时间。manager 和后续 Fuyao 补值共用扣除预留后的取数截止时间；取数耗尽后直接进入核验，不允许补值占用预留时间。manager 在已配置 MX 时，为其保留不超过单源超时且不超过 manager 预算三分之一的时间。MX 只补缺失财务及 PE/PB 字段，复用既有批量查询缓存，不覆盖已有零值；财务批次已足够时不再发财务查询。
 
 新浪 `stock_financial_abstract` 的已核实标签 `净资产收益率(ROE)`、`毛利率`、`营业总收入增长率`、`归属母公司净利润增长率` 恢复百分比百分点单位，ROE 明确为加权，来源家族为 sina；该接口报告期序列的年末为 annual、季末为累计 YTD。依据为 [AKShare 关键指标接口说明](https://akshare.akfamily.xyz/data/stock/stock.html)、安装包对新浪 `CompanyFinanceService.getFinanceReport2022` 的调用及 2026-10-12 原始响应的 `ROEWEIGHTED`、`SGPMARGIN`、`TAGRT`、`NPGRT` 字段。仅恢复这四个精确标签的接口契约；其他接口、未知标签和金额单位仍保留 unknown。元数据完整不自动升级为跨源 verified，必须经过实际独立来源比对。
 
 回归：`python -m pytest tests/test_fundamentals_generation_budget.py tests/test_search_comprehensive_intel.py tests/test_fundamentals_data_quality.py tests/test_fundamentals_refresh.py`。包含本机 HTTP 服务拖延响应、真实 LiteLLM Router/SDK 无叠加重试、报告 API 部分结果保存与重开、慢行情不挤占 MX、无 Key 抓取器进入真实抓取入口的受控验证。没有配对英文专题，无需同步 README；无数据库迁移，回滚对应源码并重启即可恢复原行为。
 
 ### 业务画像的资料边界
+
+业务画像默认 prompt 随源码存放在 `src/deep_research_dims/prompts/business.md`，Docker 镜像同样包含，独立空 data 卷不影响加载。非空 `data/deep_research/agents/business.md` 可覆盖默认内容；默认文件和覆盖均不可用时明确降级，不发无约束模型请求。
 
 业务画像采用独立 prompt，只研究主营、产品和竞争地位，显式提供分析日期；不继承终稿强制评级/目标价要求。使用现有综合搜索的 business profile，围绕三个业务问题查找资料，省去重复最新新闻和缺乏同口径依据的大盘查询。其他调用默认仍走原综合情报路径。
 
@@ -138,3 +140,11 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 基本面业务对象复用中文格式化，value 按业务说明展示，嵌套对象和列表保留独立条目。历史基本面文件存在旧 font 包装且保存了完整的三个维度对象及报告日期时，仅根据保存的维度重新排版；日期、证据和缺口继续来自历史快照，不重新取数、调用模型或覆盖原文件。详情、当天复用和 Markdown 下载返回一致的排版结果。缺少历史结构化快照时保留原文，由 Web 兼容字体包装；旧的原始文件不做批量迁移。
 
 回归：`python -m pytest tests/test_report_formatting.py`；Web 执行 `npm run test -- src/components/report/__tests__/ReportMarkdownBody.test.tsx`。覆盖新报告、历史详情/下载一致性、文件不变、列表/链接/表格与 HTML 安全边界。本专题无英文配对文档；未改 README。回滚对应源码并重启即可，数据库与历史文件无需恢复。
+
+### 合并前反例回归
+
+单位识别只接受独立或词尾的单位声明，不把“股东”等指标词误认成“股”；`归属母公司股东的净利润同比增长率=-7.518%` 保留负值与百分点单位。财务缓存映射版本更新，旧的误判资格不复用；已保存报告仍是历史快照，需刷新生成新版本。
+
+有任务 deadline 的 requests 响应在每次底层 socket 读取前重算剩余时间，覆盖持续慢响应头、正文、chunk 头及 gzip 数据；超时由 requests 清理连接，工具线程退出。该实现复用 CPython HTTP/HTTPS 的 `SocketIO`，无 deadline 的调用不变，保留 Session、Cookie、重定向和流式消费。此边界不保证中断 DNS 解析、非 makefile 客户端、CPU 运算或第三方 SDK 自建线程；不能据此声称任何外部 IO 都可强制取消。
+
+回归执行：`python -m pytest tests/test_fundamental_units_contract.py tests/test_f1_financial_quality.py tests/test_fundamentals_generation_budget.py`。慢流测试包含本机 HTTPS（需要 `openssl` 命令），不使用外部凭据；Docker CI 额外验证默认业务提示词可读。本专题没有英文配对文件。

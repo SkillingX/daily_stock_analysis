@@ -1,6 +1,7 @@
 import hashlib
 import random
 import secrets
+import socket
 import threading
 import time
 import requests
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 request_deadline: ContextVar[Optional[float]] = ContextVar("fundamental_request_deadline", default=None)
 _auth_patch_enabled = False
+_read_budget_installed = False
 _patch_lock = threading.Lock()
 original_request = requests.Session.request
 
@@ -159,8 +161,31 @@ def _get_nid(user_agent):
 
 def eastmoney_patch(*, budget_only: bool = False) -> None:
     """Keep optional authentication behavior while enforcing task-local HTTP budgets."""
-    global _auth_patch_enabled, original_request
+    global _auth_patch_enabled, _read_budget_installed, original_request
     with _patch_lock:
+        if not _read_budget_installed:
+            original_readinto = socket.SocketIO.readinto
+
+            def readinto(self: socket.SocketIO, buffer: Any) -> Optional[int]:
+                deadline = request_deadline.get()
+                if deadline is None:
+                    return original_readinto(self, buffer)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("fundamental request deadline exhausted")
+                # CPython HTTP and HTTPS makefile reads share SocketIO._sock.
+                # Re-budget every recv, including partial headers/chunks; requests'
+                # inactivity timeout alone never expires for a continuously slow peer.
+                sock = self._sock
+                configured = sock.gettimeout()
+                sock.settimeout(min(configured, remaining) if configured is not None else remaining)
+                try:
+                    return original_readinto(self, buffer)
+                finally:
+                    sock.settimeout(configured)
+
+            socket.SocketIO.readinto = readinto
+            _read_budget_installed = True
         if not budget_only:
             _auth_patch_enabled = True
         if _patch_sign.is_patched():

@@ -28,3 +28,6 @@ test_*.py
 # 忽略文档
 *.md
 !README.md
+
+# Required runtime prompt, kept outside the mutable data volume
+!src/deep_research_dims/prompts/business.md

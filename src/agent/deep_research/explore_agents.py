@@ -78,10 +78,13 @@ def _run_explore(
 ) -> Dict[str, Any]:
     """在共同截止时间内研究；仅成功响应的 JSON 格式错误允许修复。"""
     deadline = deadline if deadline is not None else monotonic() + 480.0
+    prompt = load_dim_prompt(dim_id)
+    if dim_id == "business" and not prompt.strip():
+        return {"ok": False, "error": "业务画像提示词缺失，无法执行研究"}
     system = (
         ("" if dim_id == "business" else load_constitution())
         + "\n\n"
-        + load_dim_prompt(dim_id)
+        + prompt
         + "\n\n最终回答必须是且仅是一个 JSON 对象（不要 Markdown 代码围栏外的任何文字）。"
     )
     if dim_id == "business":

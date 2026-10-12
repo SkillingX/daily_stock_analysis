@@ -24,7 +24,7 @@ from tests.test_fundamentals_data_quality import financial_sources  # noqa: F401
 def exploration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(explore_agents, '_registry_source', ToolRegistry)
     monkeypatch.setattr(explore_agents, 'load_constitution', lambda: '')
-    monkeypatch.setattr(explore_agents, 'load_dim_prompt', lambda _: '')
+    monkeypatch.setattr(explore_agents, 'load_dim_prompt', lambda _: 'fixture business rules')
     monkeypatch.setattr(explore_agents, '_llm_semaphore', lambda: Semaphore(1))
 
 
@@ -360,3 +360,143 @@ def test_missing_business_evidence_is_partial_and_not_cached(payload: dict[str, 
             assert saved['data']['markdown'] == out['markdown']
         finally:
             if out.get('report_id'): get_db().delete_fundamentals_report(out['report_id'])
+
+
+@pytest.mark.parametrize('data_state', ['absent', 'empty', 'override'])
+def test_business_prompt_survives_an_empty_data_volume(monkeypatch: pytest.MonkeyPatch, tmp_path: Any, data_state: str) -> None:
+    from src.deep_research_dims import narrate
+    monkeypatch.setattr(narrate, '_AGENTS_DIR', str(tmp_path))
+    if data_state != 'absent':
+        (tmp_path / 'business.md').write_text('custom business rules' if data_state == 'override' else '')
+    captured: list[str] = []
+    class Model:
+        def call_with_tools(self, messages: Any, tools: Any, **kwargs: Any) -> LLMResponse:
+            captured.append(messages[0]['content'])
+            return LLMResponse(provider='fixture', content='{"narrative":"fixture"}')
+    monkeypatch.setattr(explore_agents, '_registry_source', ToolRegistry)
+    out = explore_agents.run_business_agent('300260', '样本', Model())
+    assert out['ok'] and captured
+    assert ('custom business rules' if data_state == 'override' else '禁止编造数字') in captured[0]
+
+
+def test_missing_business_prompt_fails_before_model_call(exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(explore_agents, 'load_dim_prompt', lambda _: '')
+    out = explore_agents.run_business_agent('300260', '样本', object())
+    assert not out['ok'] and '提示词缺失' in out['error']
+
+
+@pytest.mark.parametrize('tls', [False, True])
+@pytest.mark.parametrize('response_part', ['headers', 'body', 'chunk_header', 'gzip'])
+def test_dripping_tool_response_ends_worker_and_closes_connection(response_part: str, tls: bool, tmp_path: Any) -> None:
+    import requests
+    from src.agent.runner import _execute_tools
+    from src.agent.llm_adapter import ToolCall
+    from src.agent.tools.registry import ToolDefinition
+    release, disconnected, stopped = Event(), Event(), Event()
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            try:
+                if response_part == 'headers':
+                    self.wfile.write(b'HTTP/1.1 200 OK\r\nX-Slow: ')
+                else:
+                    self.send_response(200)
+                    if response_part == 'chunk_header':
+                        self.send_header('Transfer-Encoding', 'chunked')
+                    else:
+                        self.send_header('Content-Length', '100000')
+                    if response_part == 'gzip':
+                        self.send_header('Content-Encoding', 'gzip')
+                    self.end_headers()
+                    if response_part == 'gzip':
+                        # Valid gzip header with a slowly delivered optional filename.
+                        self.wfile.write(b'\x1f\x8b\x08\x08\x00\x00\x00\x00\x00\x03')
+                while not release.wait(0.025):
+                    self.wfile.write(b'0' if response_part == 'chunk_header' else b'x')
+                    self.wfile.flush()
+            except OSError:
+                disconnected.set()
+        def log_message(self, *_args: Any) -> None:
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    if tls:
+        import ssl
+        import subprocess
+        cert, key = tmp_path / 'cert.pem', tmp_path / 'key.pem'
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                        '-keyout', str(key), '-out', str(cert), '-days', '1',
+                        '-subj', '/CN=localhost'], check=True, capture_output=True)
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(cert, key)
+        server.socket = tls_context.wrap_socket(server.socket, server_side=True)
+    server.daemon_threads = True
+    worker = Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    def search() -> str:
+        try:
+            with requests.Session() as client:
+                client.trust_env = False
+                return client.get(f"{'https' if tls else 'http'}://127.0.0.1:{server.server_port}", verify=False).text
+        finally:
+            stopped.set()
+    registry = ToolRegistry()
+    registry.register(ToolDefinition('search', 'fixture', [], search))
+    try:
+        _execute_tools([ToolCall('s1', 'search', {})], registry, 1, None, [], tool_wait_timeout_seconds=0.15)
+        assert stopped.wait(0.5), 'Request worker remains alive after its deadline'
+        assert disconnected.wait(0.5), 'Timed out connection was not closed'
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=1)
+        assert stopped.wait(1)
+
+
+def test_http_budget_preserves_session_redirect_cookies_and_unbudgeted_reads() -> None:
+    import gzip
+    import requests
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        def do_GET(self) -> None:
+            if self.path == '/redirect':
+                self.send_response(302)
+                self.send_header('Set-Cookie', 'fixture=kept')
+                self.send_header('Location', '/json')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            body = gzip.compress(b'{"ok":true}')
+            if self.path == '/slow':
+                sleep(0.1)
+            self.send_response(200 if self.headers.get('Cookie') == 'fixture=kept' else 403)
+            self.send_header('Content-Encoding', 'gzip')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_args: Any) -> None:
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.daemon_threads = True
+    worker = Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    eastmoney_patch(budget_only=True)
+    try:
+        with requests.Session() as client:
+            client.trust_env = False
+            base = f'http://127.0.0.1:{server.server_port}'
+            token = request_deadline.set(monotonic() + 0.5)
+            try:
+                response = client.get(base + '/redirect', timeout=(1, 1))
+                assert response.status_code == 200 and response.json() == {'ok': True}
+                with client.get(base + '/json', stream=True) as streamed:
+                    assert streamed.json() == {'ok': True}
+            finally:
+                request_deadline.reset(token)
+            # Same pool, after the old deadline; no stale budget may affect it.
+            sleep(0.5)
+            assert client.get(base + '/slow', timeout=1).json() == {'ok': True}
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=1)
