@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.services import fundamentals_service
@@ -85,14 +85,10 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
-    import json
-    dims = json.loads(record.get("dims_json") or "{}")
-    if not (dims.get("financial") or {}).get("data_quality"):
-        return PlainTextResponse(fundamentals_service.report_markdown(record), media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{report_id}.md"'} if download else None)
-    kwargs = {"media_type": "text/markdown; charset=utf-8"}
-    if download:
-        kwargs["filename"] = f"{report_id}.md"
-    return FileResponse(str(path), **kwargs)
+    return PlainTextResponse(
+        fundamentals_service.report_markdown(record), media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{report_id}.md"'} if download else None,
+    )
 
 
 @router.delete("/reports/{report_id}")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
@@ -130,6 +131,19 @@ def report_markdown(record: Dict[str, Any]) -> str:
     except OSError:
         markdown = ""
     dims = json.loads(record.get("dims_json") or "{}")
+    # Re-present old structured snapshots without recomputing or rewriting them.
+    snapshot_fields = {
+        "business": {"business_model", "main_products", "competitive_position", "vs_market_leader", "narrative", "data_gaps"},
+        "sector": {"narrative", "data_gaps"},
+        "financial": {"profitability", "growth_quality", "valuation_detail", "narrative", "data_gaps"},
+    }
+    report_date = re.search(r"(?m)^> 报告日期：(.+?) ｜", markdown)
+    if ('<font color="#e03131">' in markdown and report_date
+            and all(isinstance(dims.get(key), dict) and fields <= dims[key].keys()
+                    for key, fields in snapshot_fields.items())
+            and any(dims["business"].get(key) for key in snapshot_fields["business"])):
+        markdown = _render_markdown(record["stock_name"], record["stock_code"],
+                                    report_date.group(1), dims, record["id"])
     if not (dims.get("financial") or {}).get("data_quality"):
         markdown = "> 财务数据未核验：历史报告没有字段质量证据，不能认定已验证。\n\n" + markdown
     return markdown
@@ -230,26 +244,23 @@ def _pangu_spacing(text: str) -> str:
 
 def _render_markdown(name: str, code: str, as_of: str, dims: Dict[str, Any], report_id: str = "") -> str:
     from jinja2 import Environment, FileSystemLoader
+    from functools import partial
+    from src.deep_research_dims.render import KEY_ZH_MAP, _format_cn
 
     env = Environment(
         loader=FileSystemLoader(Path(__file__).parent.parent.parent / "templates"),
         autoescape=False, trim_blocks=True, lstrip_blocks=True,
     )
+    env.filters["cn"] = partial(_format_cn, labels={
+        **KEY_ZH_MAP, "value": "说明", "industry_rank": "行业地位", "demand_backdrop": "需求背景",
+    })
     md = env.get_template("fundamentals_report.j2").render(
         stock_name=name, stock_code=code, as_of=as_of, report_id=report_id,
         business=dims.get("business") or {}, sector=dims.get("sector") or {},
         financial=dims.get("financial") or {},
         degraded_note=_degraded_note,
     )
-    md = _pangu_spacing(md)
-    # 红色双保险：🔴 加粗短语外包 <font color>（跨端显红，前缀保底）
-    import re as _re
-
-    return _re.sub(
-        r"🔴 \*\*([^*\n]+)\*\*",
-        r'<font color="#e03131">🔴 **\1**</font>',
-        md,
-    )
+    return _pangu_spacing(md)
 
 
 def _degraded_note(dim: Dict[str, Any]) -> str:

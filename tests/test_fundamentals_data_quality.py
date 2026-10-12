@@ -11,7 +11,6 @@ from unittest.mock import Mock
 
 import pandas as pd
 import pytest
-from jinja2 import Environment, FileSystemLoader
 
 from data_provider.base import DataFetcherManager
 from data_provider.realtime_types import RealtimeSource, UnifiedRealtimeQuote
@@ -81,11 +80,8 @@ def test_financial_values_reach_snapshot_f1_and_report(
     dim = build_fundamental_dim(ctx).model_dump()
     assert dim["profitability"]["roe"]["value"] == ratio
     assert dim["growth_quality"]["revenue_yoy"]["value"] == ratio
-    env = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "templates"))
-    md = env.get_template("fundamentals_report.j2").render(
-        stock_name="样本", stock_code="600519", financial=dim,
-        business={}, sector={}, degraded_note=lambda dim: "",
-    )
+    from src.services.fundamentals_service import _render_markdown
+    md = _render_markdown("样本", "600519", "fixture", {"financial": dim})
     expected = "缺失" if ratio is None else str(ratio)
     for label in ("ROE", "毛利率", "营收同比", "净利同比"):
         assert f"{label} {expected}" in md

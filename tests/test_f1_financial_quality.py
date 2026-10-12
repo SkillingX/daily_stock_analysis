@@ -11,7 +11,6 @@ import json
 from tests.test_fundamentals_data_quality import financial_sources
 
 import pytest
-from jinja2 import Environment, FileSystemLoader
 
 from data_provider.cross_source_validator import AnchorQuality, AnchorReading, adopted_field_record
 from src.config import Config
@@ -70,8 +69,8 @@ def test_full_acquisition_is_distinct_from_usable_components_and_verification() 
 
 def test_real_specialist_template_shows_counts_and_unverified_limitation() -> None:
     dim = build_fundamental_dim(context({"revenue_yoy": 10})).model_dump(mode="json")
-    env = Environment(loader=FileSystemLoader(Path(__file__).parents[1] / "templates"))
-    md = env.get_template("fundamentals_report.j2").render(stock_name="样本", stock_code="600519", financial=dim, business={}, sector={}, degraded_note=lambda value: "")
+    from src.services.fundamentals_service import _render_markdown
+    md = _render_markdown("样本", "600519", "fixture", {"financial": dim})
     assert "取得 1/6" in md and "规则可用 1/6" in md and "评分组件 1/5" in md
     assert "未核验" in md and "局部" in md
 

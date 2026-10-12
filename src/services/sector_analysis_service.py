@@ -751,7 +751,7 @@ def _render(name: str, code: str, as_of: str, rid: str, a: Dict[str, Any]) -> st
     md = env.get_template("sector_analysis_report.j2").render(
         stock_name=name, stock_code=code, as_of=as_of, report_id=rid, a=a,
     )
-    # 排版后处理：盘古空格（中英间）+ 红色双保险，对齐 financial-analysis 口径
+    # 排版后处理：盘古空格（中英间），保留标准 Markdown。
     md = re.sub(r"(?<=[\u4e00-\u9fff])(?=[A-Za-z0-9])", " ", md)
     md = re.sub(r"(?<=[A-Za-z0-9%])(?=[\u4e00-\u9fff])", " ", md)
-    return re.sub(r"🔴 \*\*([^*\n]+)\*\*", r'<font color="#e03131">🔴 **\1**</font>', md)
+    return md

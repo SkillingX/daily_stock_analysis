@@ -130,3 +130,11 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 模型的 length/content_filter 结束原因不作为完整报告成功；`force_refresh=true` 同时绕过业务维度缓存和当天报告复用，旧记录仍保留。资料缺失或不适用规则的财务字段继续显示 partial/degraded，不因 GLM 正常结束而改成全绿。
 
 可复跑本机 API 验收：`python scripts/smoke_fundamentals.py --base-url http://localhost:8000 --stock-code 300260 --stock-name 新莱应材 --output <私有证据文件>`。该操作消耗数据源/模型额度并保存一个新报告，随后核对重新读取的 Markdown；退出 0 为完整 success，退出 2 表示已保存可重读的 partial，其他错误非零退出。页面打开历史列表可查看新版本。只对本机测试服务使用；不要把 partial 当成所有财务数据都已核验。
+
+### 报告排版与历史兼容
+
+基本面、个股财务和个股板块的新报告统一使用标准 Markdown（红点与加粗），不再加入 font 标签。Web 共用渲染组件仅移除旧报告中既定红色 font 包装，不开放任意 HTML；代码块和行内代码保持原文。
+
+基本面业务对象复用中文格式化，value 按业务说明展示，嵌套对象和列表保留独立条目。历史基本面文件存在旧 font 包装且保存了完整的三个维度对象及报告日期时，仅根据保存的维度重新排版；日期、证据和缺口继续来自历史快照，不重新取数、调用模型或覆盖原文件。详情、当天复用和 Markdown 下载返回一致的排版结果。缺少历史结构化快照时保留原文，由 Web 兼容字体包装；旧的原始文件不做批量迁移。
+
+回归：`python -m pytest tests/test_report_formatting.py`；Web 执行 `npm run test -- src/components/report/__tests__/ReportMarkdownBody.test.tsx`。覆盖新报告、历史详情/下载一致性、文件不变、列表/链接/表格与 HTML 安全边界。本专题无英文配对文档；未改 README。回滚对应源码并重启即可，数据库与历史文件无需恢复。

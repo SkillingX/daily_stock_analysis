@@ -1,14 +1,3 @@
-{%- macro red(t) -%}
-<font color="#e03131">**{{ t }}**</font>
-{%- endmacro -%}
-{%- macro kv_list(d) -%}
-{% if d %}
-{% for k, v in d.items() %}
-- 🔴 **{{ k }}**：{% if v is string %}{{ v }}{% else %}{{ v }}{% endif %}
-{% endfor %}
-{% endif %}
-{%- endmacro -%}
-
 # 【{{ stock_name }}】（{{ stock_code }}）基本面分析报告
 
 > 报告日期：{{ as_of }} ｜ AI 生成，不构成投资建议
@@ -25,53 +14,22 @@
 {% if business.data_gaps %}
 - 业务资料缺口：{{ business.data_gaps|join("、") }}
 {% endif %}
-{% if business.business_model is mapping %}
+{% if business.business_model %}
 **要点**
-{% for k, v in business.business_model.items() %}
-{% if v is string %}
-{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v }}
-{% elif v is mapping %}
-{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
-{% else %}
-{{ loop.index }}. {% if "模式" in k or "model" in k.lower() %}🔴 {% endif %}**{{ k }}**：{{ v }}
-{% endif %}
-{% endfor %}
+
+{{ business.business_model|cn }}
 {% endif %}
 {% if business.main_products %}
 **主营产品与收入结构**
-{% set mp = business['main_products'] if business['main_products'] is defined else {} %}
-{% if mp.业务板块 is defined and mp.业务板块 is sequence %}
-{% for item in mp.业务板块 %}
-- 🔴 **{{ item.name }}**：{{ item.desc }}（{{ item.level or 'inferred' }}）
-{% endfor %}
-{% if mp.收入结构 is defined %}
-{% set ysjg = mp.收入结构 %}
-{% if ysjg is string %}
-*收入结构：{{ ysjg }}*
-{% elif ysjg is mapping %}
-*收入结构：{% for k, v in ysjg.items() %}{{ k }}={{ v }}{% if not loop.last %}；{% endif %}{% endfor %}*
-{% endif %}
-{% endif %}
-{% elif mp is mapping %}
-{% for k, v in mp.items() %}
-{% if v is string %}
-- **{{ k }}**：{{ v }}
-{% elif v is mapping %}
-- **{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
-{% else %}
-- **{{ k }}**：{{ v }}
-{% endif %}
-{% endfor %}
-{% else %}
-- {{ mp }}
-{% endif %}
+
+{{ business.main_products|cn }}
 {% endif %}
 
 ## 二、行业地位与竞争格局
 
 {{ degraded_note(business) }}
 {% if business.competitive_position is mapping %}
-{{ kv_list(business.competitive_position) }}
+{{ business.competitive_position|cn }}
 {% endif %}
 {% if sector.narrative %}{{ sector.narrative }}
 
@@ -93,15 +51,7 @@
 | {{ row.metric }} | {{ row[stock_name] if row[stock_name] is defined else row.get('本公司', '数据缺失') }} | {{ row['板块龙头'] if row['板块龙头'] is defined else row.get('leader', '') }} | {{ row.level or '' }} |
 {% endfor %}
 {% elif vs is mapping %}
-{% for k, v in vs.items() %}
-{% if v is string %}
-{{ loop.index }}. 🔴 **{{ k }}**：{{ v }}
-{% elif v is mapping %}
-{{ loop.index }}. 🔴 **{{ k }}**：{% for kk, vv in v.items() %}{{ kk }}={{ vv }}{% if not loop.last %}；{% endif %}{% endfor %}
-{% else %}
-{{ loop.index }}. 🔴 **{{ k }}**：{{ v }}
-{% endif %}
-{% endfor %}
+{{ vs|cn }}
 {% elif vs %}
 {{ vs }}
 {% else %}
