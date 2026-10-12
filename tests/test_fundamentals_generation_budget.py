@@ -69,14 +69,22 @@ def test_param_recovery_subtracts_elapsed_time(monkeypatch: pytest.MonkeyPatch) 
 @pytest.mark.parametrize('channel', [True, False])
 def test_real_router_and_sdk_do_not_retry_slow_http(channel: bool) -> None:
     calls: list[str] = []
-    release = Event()
+    disconnected = Event()
+    read_durations: list[float] = []
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             calls.append(self.path)
             self.rfile.read(int(self.headers['Content-Length']))
-            release.wait(2)
-            self.send_response(200)
-            self.end_headers()
+            started = monotonic()
+            self.connection.settimeout(2)
+            # EOF proves that the real SDK closed its timed-out HTTP request.
+            # SDK cold-start and error mapping are outside the network boundary.
+            try:
+                if self.rfile.read(1) == b'':
+                    read_durations.append(monotonic() - started)
+                    disconnected.set()
+            except TimeoutError:
+                pass
         def log_message(self, *_args: Any) -> None:
             pass
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -92,13 +100,14 @@ def test_real_router_and_sdk_do_not_retry_slow_http(channel: bool) -> None:
     if not channel:
         adapter._router = None  # exercise the direct provider branch too
     try:
-        started = monotonic()
+        call_started = monotonic()
         out = adapter.call_with_tools([{'role': 'user', 'content': 'fixture'}], [], timeout=0.3)
+        timing = {'total_seconds': monotonic() - call_started, 'http_seconds': read_durations}
         assert out.provider == 'error'
         assert calls == ['/v1/chat/completions']
-        assert monotonic() - started < 1.5
+        assert disconnected.wait(0.5), f'SDK left the timed-out connection open: {timing}'
+        assert len(read_durations) == 1 and read_durations[0] < 1.5, timing
     finally:
-        release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)
