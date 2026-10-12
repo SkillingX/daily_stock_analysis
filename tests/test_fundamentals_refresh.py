@@ -52,7 +52,7 @@ def refresh_inputs(financial_sources: dict[str, Any], monkeypatch: pytest.Monkey
         return SimpleNamespace(status_code=200, json=lambda: payload)
     monkeypatch.setattr(requests, "post", post)
     for code in ("600519", "000001"):
-        dim_cache.save_cached_dim(code, "business", {"dim": "business", "status": "ok", "narrative": "cached业务画像"})
+        dim_cache.save_cached_dim(code, "business", {"dim": "business", "status": "ok", "business_model": {"说明": "cached业务画像"}, "narrative": "cached业务画像"})
     yield state
     rows, _ = get_db().list_fundamentals_reports(limit=200)
     for record in rows:

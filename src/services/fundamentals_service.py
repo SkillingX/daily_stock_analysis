@@ -63,14 +63,14 @@ def _position_text(business_payload: Dict[str, Any]) -> str:
     return " ".join(parts)[:400]
 
 
-def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
+def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """跑一个研究员（带维度缓存），失败返回降级占位。"""
     from src.deep_research.researchers import REGISTRY, RUNNER_NAMES
     import src.agent.deep_research.orchestrator as orch
 
     from src.deep_research_dims.dim_cache import load_cached_dim, save_cached_dim
 
-    cached = load_cached_dim(code, dim_id)
+    cached = None if force_refresh else load_cached_dim(code, dim_id)
     if cached is not None:
         # 契约校验：旧 schema 缓存值（如 str 时代的 Dict 字段）非法即 miss 重算
         try:
@@ -91,7 +91,13 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
             if dim.status == "ok":
                 save_cached_dim(code, dim_id, payload)
             return cast(Dict[str, Any], payload)
-        reason = "研究时限耗尽，业务画像未完成" if "时限" in str(out.get("error") or "") else "模型未成功完成研究，业务画像未完成"
+        error = str(out.get("error") or "")
+        reason = "模型未成功完成研究，业务画像未完成"
+        for marker, explanation in (("时限", "研究时限耗尽"), ("length", "模型输出被截断"),
+                                    ("content_filter", "模型输出被服务商过滤"), ("JSON", "模型输出格式无效")):
+            if marker in error:
+                reason = explanation + "，业务画像未完成"
+                break
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
     return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": reason})
@@ -172,7 +178,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     if name == code and ctx.quote.get("name"):
         name = str(ctx.quote["name"])
         ctx.stock_name = name
-    business = _research_dim("business", code, name, deadline=deadline)
+    business = _research_dim("business", code, name, deadline=deadline, force_refresh=force_refresh)
     dims = {
         "business": business,
         "sector": _rule_dim("sector", code, name, ctx, _position_text(business)),

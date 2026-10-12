@@ -54,12 +54,13 @@ def test_business_evidence_survives_model_context_report_and_reopen(financial_so
             assert '目标价' not in messages[0]['content'] or '不要求评级或目标价' in messages[0]['content']
             assert '结论必须带评级' not in messages[0]['content']
             names = {t['function']['name'] for t in tools}
-            assert names == {'search_comprehensive_intel'}
-            if messages[-1]['role'] != 'tool':
+            tool_messages = [m for m in messages if m['role']=='tool']
+            assert names == (set() if tool_messages else {'search_comprehensive_intel'})
+            if not tool_messages:
                 return LLMResponse(provider='fixture',tool_calls=[ToolCall('call1','search_comprehensive_intel',{'stock_code':'600519','stock_name':'样本'})])
-            data = json.loads(messages[-1]['content'])
+            data = json.loads(tool_messages[-1]['content'])
             assert 'report' not in data
-            assert messages[-1]['content'].count('https://example.org/disclosure') == 1
+            assert tool_messages[-1]['content'].count('https://example.org/disclosure') == 1
             record = data['dimensions']['business']['results'][0]
             assert record['url']=='https://example.org/disclosure'
             assert record['published_date'] is None
@@ -71,7 +72,8 @@ def test_business_evidence_survives_model_context_report_and_reopen(financial_so
     with TestClient(app) as client:
         out = client.post('/api/v1/fundamentals/generate',params={'stock_code':'600519','stock_name':'样本','force_refresh':True}).json()
         try:
-            assert out['dims']['business']['status']=='ok'
+            assert out['dims']['business']['status']=='degraded'
+            assert out['status']=='partial'
             assert 'https://example.org/disclosure' in out['markdown']
             assert '收入结构缺失' in out['markdown']
             assert len(provider.queries)==3

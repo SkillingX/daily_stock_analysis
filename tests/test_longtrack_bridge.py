@@ -480,16 +480,17 @@ class TestSkipNarrationsPropagation:
             for i in range(40)
         ]
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
-        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中性", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
-        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        monkeypatch.setattr(orch, "run_intel_agent", lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中性", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1})
+        monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
         for _name in (
             "run_technical_agent", "run_capital_agent", "run_sentiment_agent",
-            "run_ownership_agent", "run_us_china_agent", "run_business_agent",
+            "run_ownership_agent", "run_us_china_agent",
         ):
-            setattr(
+            monkeypatch.setattr(
                 orch, _name,
                 lambda *a, **k: {"ok": True, "data": {"score": 55, "narrative": "测试"}, "steps": 1},
             )
+        monkeypatch.setattr(orch, "run_business_agent", lambda *a, **k: {"ok": True, "data": {"business_model": {"说明": "测试业务"}, "score": 55, "narrative": "测试"}, "steps": 1})
 
         # narrate 被调用即失败（证明 skip 生效）
         def _forbidden_narrate(*a, **k):

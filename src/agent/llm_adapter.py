@@ -92,6 +92,7 @@ class LLMResponse:
         ""  # full model name used (e.g. gemini/gemini-2.0-flash), for report meta
     )
     raw: Any = None  # raw provider response for debugging
+    finish_reason: Optional[str] = None
 
 
 # Models that auto-return reasoning_content; do NOT send extra_body (may cause 400).
@@ -857,6 +858,7 @@ class LLMToolAdapter:
             provider=provider_name,
             model=model,
             raw=response,
+            finish_reason=getattr(choice, "finish_reason", None),
         )
 
 

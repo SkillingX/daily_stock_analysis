@@ -181,3 +181,182 @@ def test_code_only_resolved_name_reaches_sector_rules(monkeypatch: pytest.Monkey
     finally:
         if out['report_id']:
             get_db().delete_fundamentals_report(out['report_id'])
+
+
+def test_research_deadline_is_shared_across_tools_and_reserves_final_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.agent import runner
+    from src.agent.llm_adapter import ToolCall
+    from src.agent.tools.registry import ToolDefinition
+    from src.patches.eastmoney_patch import request_deadline
+    clock = [100.0]
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
+    executions: list[float] = []
+    calls: list[tuple[int, float]] = []
+    registry = ToolRegistry()
+    def slow_search() -> dict[str, bool]:
+        deadline = request_deadline.get()
+        assert deadline is not None
+        executions.append(deadline)
+        clock[0] = min(clock[0] + 15, deadline)
+        return {'timeout': clock[0] >= deadline}
+    registry.register(ToolDefinition('search','fixture',[],slow_search))
+    class Model:
+        def call_with_tools(self, messages: Any, tools: Any, timeout: float | None = None) -> LLMResponse:
+            assert timeout is not None
+            calls.append((len(tools),timeout))
+            clock[0] += 2
+            if tools:
+                return LLMResponse(provider='fixture',tool_calls=[ToolCall(str(len(calls)),'search',{})])
+            return LLMResponse(provider='fixture',content='{"narrative":"资料不足"}')
+    out = runner.run_agent_loop(messages=[{'role':'user','content':'fixture'}],tool_registry=registry,llm_adapter=Model(),max_wall_clock_seconds=120,research_deadline=130)
+    assert out.success
+    assert executions == [130,130]
+    assert calls == [(1,30),(1,13),(0,90)]
+    assert clock[0] == 132
+
+
+def test_closing_round_never_executes_returned_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.agent import runner
+    from src.agent.llm_adapter import ToolCall
+    from src.agent.tools.registry import ToolDefinition
+    registry = ToolRegistry()
+    def forbidden() -> dict[str, str]:
+        pytest.fail('Tools executed during final generation')
+    registry.register(ToolDefinition('search','fixture',[],forbidden))
+    class Model:
+        def call_with_tools(self, messages: Any, tools: Any, **kwargs: Any) -> LLMResponse:
+            assert tools == []
+            return LLMResponse(provider='fixture',tool_calls=[ToolCall('1','search',{})])
+    out = runner.run_agent_loop(messages=[{'role':'user','content':'fixture'}],tool_registry=registry,llm_adapter=Model(),max_wall_clock_seconds=30,research_deadline=monotonic()-1)
+    assert not out.success and 'tool' in out.error.lower()
+
+
+def test_truncated_json_is_not_a_successful_agent_report() -> None:
+    from src.agent.runner import run_agent_loop
+    class Model:
+        def call_with_tools(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            return LLMResponse(provider='fixture',content='{"narrative":"incomplete"}',finish_reason='length')
+    out = run_agent_loop(messages=[{'role':'user','content':'fixture'}],tool_registry=ToolRegistry(),llm_adapter=Model())
+    assert not out.success and 'length' in out.error
+
+
+def test_slow_tool_http_stops_with_research_budget() -> None:
+    import requests
+    from src.agent.runner import run_agent_loop
+    from src.agent.llm_adapter import ToolCall
+    from src.agent.tools.registry import ToolDefinition
+    release = Event()
+    stopped = Event()
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            release.wait(2)
+        def log_message(self, *_args: Any) -> None:
+            pass
+    server = ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    server.daemon_threads = True
+    worker = Thread(target=server.serve_forever,daemon=True)
+    worker.start()
+    def search() -> dict[str, bool]:
+        try:
+            with requests.Session() as client:
+                client.trust_env = False
+                client.get(f'http://127.0.0.1:{server.server_port}')
+            return {'ok':True}
+        finally:
+            stopped.set()
+    registry = ToolRegistry()
+    registry.register(ToolDefinition('search','fixture',[],search))
+    class Model:
+        def call_with_tools(self, messages: Any, tools: Any, **kwargs: Any) -> LLMResponse:
+            if tools:
+                return LLMResponse(provider='fixture',tool_calls=[ToolCall('1','search',{})])
+            return LLMResponse(provider='fixture',content='{"data_gaps":["搜索超时"]}')
+    try:
+        start = monotonic()
+        out = run_agent_loop(messages=[{'role':'user','content':'fixture'}],tool_registry=registry,llm_adapter=Model(),max_steps=2,max_wall_clock_seconds=30,research_deadline=start+0.1)
+        assert out.success and '搜索超时' in out.content
+        assert stopped.wait(0.5), 'Underlying request still running after deadline'
+        assert monotonic()-start < 1
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=1)
+
+
+def test_refresh_reruns_business_instead_of_reusing_dimension_cache(financial_sources: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    from src.services import fundamentals_service as service
+    from src.storage import get_db
+    calls: list[int] = []
+    class Model:
+        def call_with_tools(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            calls.append(1)
+            return LLMResponse(provider='fixture',content='{"business_model":{"value":"已获取主营资料"},"narrative":"fixture"}')
+    monkeypatch.setattr('src.services.deep_research_service._get_dual_track_adapter',Model)
+    monkeypatch.setattr(service,'_REPORT_DIR',tmp_path/'reports')
+    ids: list[str] = []
+    try:
+        for _ in range(2):
+            result = service.generate_fundamentals_report('600519','样本',force_refresh=True)
+            assert result['report_id'] and result['dims']['business']['status']=='ok'
+            ids.append(result['report_id'])
+        assert len(calls)==2 and ids[0]!=ids[1]
+        assert all(get_db().get_fundamentals_report(rid) is not None for rid in ids)
+    finally:
+        for rid in ids:get_db().delete_fundamentals_report(rid)
+
+
+def test_json_repair_keeps_business_tools_closed(exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.agent.llm_adapter import ToolCall
+    from src.agent.tools.registry import ToolDefinition
+    registry = ToolRegistry()
+    searches: list[int] = []
+    def search(**kwargs: Any) -> dict[str, str]:
+        searches.append(1)
+        return {'evidence': 'fixture'}
+    registry.register(ToolDefinition('search_comprehensive_intel', 'fixture', [], search))
+    monkeypatch.setattr(explore_agents, '_registry_source', lambda: registry)
+    enabled: list[bool] = []
+    class Model:
+        def call_with_tools(self, messages: Any, tools: Any, **kwargs: Any) -> LLMResponse:
+            enabled.append(bool(tools))
+            if tools:
+                return LLMResponse(provider='fixture', tool_calls=[ToolCall('s1', 'search_comprehensive_intel', {})])
+            return LLMResponse(provider='fixture', content='not-json' if len(enabled) == 2 else '{"narrative":"fixture"}')
+    out = explore_agents._run_explore('business', {'search_comprehensive_intel'}, 'fixture', Model(), deadline=monotonic()+30)
+    assert out['ok']
+    assert enabled == [True, False, False]
+    assert searches == [1]
+
+
+@pytest.mark.parametrize('payload', [
+    {'business_model': {}, 'main_products': {}, 'competitive_position': {}, 'vs_market_leader': {}, 'score': None, 'narrative': '无法取得业务资料'},
+    {'business_model': {'说明': '已取得部分主营资料'}, 'data_gaps': ['收入结构缺失'], 'narrative': '仅部分资料可用'},
+])
+def test_missing_business_evidence_is_partial_and_not_cached(payload: dict[str, Any], financial_sources: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    import json
+    from api.v1.endpoints.fundamentals import router
+    from src.deep_research_dims.dim_cache import load_cached_dim, save_cached_dim
+    from src.services import fundamentals_service as service
+    from src.storage import get_db
+    class Model:
+        def call_with_tools(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            return LLMResponse(provider='fixture', content=json.dumps(payload))
+    monkeypatch.setattr('src.services.deep_research_service._get_dual_track_adapter', Model)
+    monkeypatch.setattr(service, '_REPORT_DIR', tmp_path/'reports')
+    # Old caches must not turn missing evidence into a successful dimension.
+    save_cached_dim('600519', 'business', dict(payload, status='ok'))
+    assert load_cached_dim('600519', 'business') is None
+    app = FastAPI()
+    app.include_router(router, prefix='/api/v1/fundamentals')
+    with TestClient(app) as client:
+        out = client.post('/api/v1/fundamentals/generate', params={'stock_code': '600519', 'stock_name': '样本', 'force_refresh': True}).json()
+        try:
+            assert out['status'] == 'partial'
+            assert out['dims']['business']['status'] == 'degraded'
+            assert payload['narrative'] in out['markdown']
+            assert load_cached_dim('600519', 'business') is None
+            saved = client.get('/api/v1/fundamentals/reports/'+out['report_id']).json()
+            assert saved['data']['markdown'] == out['markdown']
+        finally:
+            if out.get('report_id'): get_db().delete_fundamentals_report(out['report_id'])

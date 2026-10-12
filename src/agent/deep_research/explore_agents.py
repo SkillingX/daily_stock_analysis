@@ -97,8 +97,12 @@ def _run_explore(
             registry.register(replace(tool, handler=partial(tool.handler, profile="business"),
                                       description="Search company business, products and competitors; returns evidence with URLs and dates."))
 
+    # Reserve two thirds for the substantive response; never reset on JSON repair.
+    research_deadline = monotonic() + max(0.0, deadline - monotonic()) / 3 if dim_id == "business" else None
     last_error = ""
     for attempt in range(retry + 1):
+        if attempt and research_deadline is not None:
+            research_deadline = min(research_deadline, monotonic())
         remaining = deadline - monotonic()
         semaphore = _llm_semaphore()
         if remaining <= 0 or not semaphore.acquire(timeout=remaining):
@@ -111,7 +115,8 @@ def _run_explore(
                 messages=messages,
                 tool_registry=registry,
                 llm_adapter=llm_adapter,
-                max_steps=max_steps,
+                max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
+                **({"research_deadline": research_deadline} if research_deadline is not None else {}),
                 progress_callback=progress_callback,
                 max_wall_clock_seconds=remaining,
                 stock_scope=None,
@@ -121,9 +126,14 @@ def _run_explore(
         # Only a successful response with malformed JSON warrants format repair.
         if not loop.success:
             timeout = any(marker in (loop.error or "").lower() for marker in ("timeout", "timed out", "时限"))
-            return {"ok": False, "error": "研究时限耗尽" if timeout else "模型调用失败或研究步数耗尽", "steps": loop.total_steps}
+            error = "研究时限耗尽" if timeout else "模型调用失败或研究步数耗尽"
+            if "length" in (loop.error or ""):
+                error = "模型输出被截断（length）"
+            elif "content_filter" in (loop.error or ""):
+                error = "模型输出被服务商过滤（content_filter）"
+            return {"ok": False, "error": error, "steps": loop.total_steps}
         parsed = _extract_json(loop.content)
-        if parsed is not None:
+        if parsed:
             return {"ok": True, "data": parsed, "steps": loop.total_steps}
         last_error = loop.error or "LLM 未输出可解析 JSON"
         messages.append(

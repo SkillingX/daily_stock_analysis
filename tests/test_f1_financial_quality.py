@@ -219,11 +219,12 @@ def test_quality_json_round_trip_and_financial_cache_isolation(financial_sources
     dim_cache.save_cached_dim("600519", "fundamental", original.model_dump(mode="json"))
     cached = dim_cache.load_cached_dim("600519", "fundamental")
     assert parse_dim("fundamental", cached) == original
-    dim_cache.save_cached_dim("600519", "business", {"narrative": "保留"})
+    business = {"business_model": {"说明": "保留"}, "narrative": "保留"}
+    dim_cache.save_cached_dim("600519", "business", business)
     cfg = Config(deep_research_cross_validate=True)
     monkeypatch.setattr("src.config.get_config", lambda: cfg)
     assert dim_cache.load_cached_dim("600519", "fundamental") is None
-    assert dim_cache.load_cached_dim("600519", "business") == {"narrative": "保留"}
+    assert dim_cache.load_cached_dim("600519", "business") == business
 
 
 def test_shared_context_warm_mode_switch_and_unknown_family_outlier(financial_sources: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:

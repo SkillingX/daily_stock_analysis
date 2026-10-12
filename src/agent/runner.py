@@ -516,6 +516,7 @@ def run_agent_loop(
     max_wall_clock_seconds: Optional[float] = None,
     tool_call_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
+    research_deadline: Optional[float] = None,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -533,6 +534,8 @@ def run_agent_loop(
         thinking_labels: Override map of tool_name → friendly label.
         max_wall_clock_seconds: Optional overall timeout budget for the loop.
         tool_call_timeout_seconds: Optional timeout for one parallel tool batch.
+        research_deadline: Absolute monotonic deadline for planning/tools; the last
+            round uses remaining report time without tools. None preserves existing behavior.
 
     Returns:
         A :class:`RunLoopResult` with the final content, stats, and the
@@ -618,12 +621,21 @@ def run_agent_loop(
             )
 
         # --- LLM call ---
+        finalizing = research_deadline is not None and (
+            time.monotonic() >= research_deadline or step == max_steps - 1
+        )
+        call_timeout = remaining_timeout
+        if finalizing:
+            messages.append({"role": "user", "content": "资料阶段已结束。仅用已有证据输出最终结果，缺失信息如实注明，不再调用工具。"})
+        elif research_deadline is not None:
+            research_remaining = max(0.0, research_deadline - time.monotonic())
+            call_timeout = min(call_timeout, research_remaining) if call_timeout is not None else research_remaining
         llm_started = time.monotonic()
         logger.info("Agent LLM step %d started, remaining=%.2fs", step + 1, remaining_timeout if remaining_timeout is not None else -1.0)
         response = llm_adapter.call_with_tools(
             messages,
-            tool_decls,
-            timeout=remaining_timeout,
+            [] if finalizing else tool_decls,
+            timeout=call_timeout,
         )
         logger.info("Agent LLM step %d finished in %.2fs, provider=%s", step + 1, time.monotonic() - llm_started, response.provider)
         provider_used = response.provider
@@ -657,7 +669,13 @@ def run_agent_loop(
                 messages=messages,
             )
 
+        finish_reason = getattr(response, "finish_reason", None)
+        if finish_reason in {"length", "content_filter"}:
+            return RunLoopResult(success=False, error=f"Model response incomplete: {finish_reason}",
+                                 messages=messages, total_steps=step + 1, tool_calls_log=tool_calls_log)
         if response.tool_calls:
+            if finalizing:
+                return RunLoopResult(success=False, error="Model requested tools after research closed", messages=messages, total_steps=step + 1)
             # ---- tool execution branch ----
             logger.info(
                 "Agent requesting %d tool call(s): %s",
@@ -705,16 +723,25 @@ def run_agent_loop(
                     if tool_call_timeout_seconds and tool_call_timeout_seconds > 0
                     else remaining_timeout,
                 )
-            tool_results = _execute_tools(
-                response.tool_calls,
-                tool_registry,
-                step + 1,
-                progress_callback,
-                tool_calls_log,
-                non_retriable_tool_results,
-                tool_wait_timeout_seconds=effective_tool_timeout,
-                stock_scope=stock_scope,
-            )
+            if research_deadline is not None:
+                research_remaining = max(0.0, research_deadline - time.monotonic())
+                effective_tool_timeout = min(effective_tool_timeout, research_remaining) if effective_tool_timeout is not None else research_remaining
+            if effective_tool_timeout is not None and effective_tool_timeout <= 0:
+                tool_results = [
+                    {"tc": tc, "result_str": json.dumps({"error": "Research budget exhausted", "timeout": True})}
+                    for tc in response.tool_calls
+                ]
+            else:
+                tool_results = _execute_tools(
+                    response.tool_calls,
+                    tool_registry,
+                    step + 1,
+                    progress_callback,
+                    tool_calls_log,
+                    non_retriable_tool_results,
+                    tool_wait_timeout_seconds=effective_tool_timeout,
+                    stock_scope=stock_scope,
+                )
 
             # Append tool results preserving original call order
             tc_order = {tc.id: i for i, tc in enumerate(response.tool_calls)}

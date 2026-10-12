@@ -84,6 +84,14 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return None
+    if dim == "business":
+        from src.deep_research.researchers.business import parse
+        try:
+            business, _ = parse(payload, 0)
+        except (ValueError, TypeError):
+            return None
+        if business.status != "ok":
+            return None
     try:
         saved_time = datetime.fromisoformat(saved_at)
     except ValueError:

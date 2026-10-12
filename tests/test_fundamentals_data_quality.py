@@ -30,6 +30,9 @@ def financial_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[s
     def forbidden_request(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("Regression tests must not contact a live provider")
 
+    # The HTTP guard and its installation flag must be restored together.
+    from src.patches.eastmoney_patch import _patch_sign
+    monkeypatch.setattr(_patch_sign, "patched", False)
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden_request)
 
     values: dict[str, Any] = {"ratio": 0.0, "market_cap": 100_000_000_000.0}
@@ -108,13 +111,14 @@ def test_legacy_financial_cache_misses_without_invalidating_other_dims(
     financial_sources: dict[str, Any], dim_id: str,
 ) -> None:
     dim_cache.save_cached_dim("600519", dim_id, {"market_cap": 100.0})
-    dim_cache.save_cached_dim("600519", "business", {"narrative": "保留"})
+    business = {"business_model": {"说明": "保留"}, "narrative": "保留"}
+    dim_cache.save_cached_dim("600519", "business", business)
     path = Path(dim_cache._CACHE_DIR) / f"600519_{dim_id}.json"
     record = json.loads(path.read_text())
     record["mapping_version"] = 2
     path.write_text(json.dumps(record))
     assert dim_cache.load_cached_dim("600519", dim_id) is None
-    assert dim_cache.load_cached_dim("600519", "business") == {"narrative": "保留"}
+    assert dim_cache.load_cached_dim("600519", "business") == business
     dim_cache.save_cached_dim("600519", dim_id, {"market_cap": 100.0})
     assert dim_cache.load_cached_dim("600519", dim_id) == {"market_cap": 100.0}
 
