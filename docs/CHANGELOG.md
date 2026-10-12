@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 基本面报告统一研究时限，关闭有预算模型请求的嵌套重试，保存并提示部分结果；搜索逐维度补查、无 Key 公告抓取恢复，财务取数为 MX/核验保留预算并补齐新浪已知指标元数据。
+
+- [修复] 将既有 `LLM_STREAM_RESPONSE_TIMEOUT` 应用到 Analyzer 的流式与非流式 LLM 请求；大盘上下文超时后使用模板回退并继续个股分析。
 - [chore] 现有 CI 与类型契约门禁增加手动候选验证入口；手动 CI 同样覆盖 Web 构建，保留原 PR/push 触发条件。
 - [测试] 财务报告集成回归固定报告时钟，保留完整品质、评分、API/历史序列化与 Markdown 断言，消除独立构建跨秒产生的误报。
 

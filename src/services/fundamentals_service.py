@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
 from uuid import uuid4
+from time import monotonic
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ def _position_text(business_payload: Dict[str, Any]) -> str:
     return " ".join(parts)[:400]
 
 
-def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
+def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
     """跑一个研究员（带维度缓存），失败返回降级占位。"""
     from src.deep_research.researchers import REGISTRY, RUNNER_NAMES
     import src.agent.deep_research.orchestrator as orch
@@ -79,18 +80,21 @@ def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
             return cached
         except Exception:  # noqa: BLE001
             pass
+    reason = "研究员不可用"
     try:
         runner = getattr(orch, RUNNER_NAMES[dim_id])
-        out = runner(code, name, orch._get_dual_track_adapter() if hasattr(orch, "_get_dual_track_adapter") else __import__("src.services.deep_research_service", fromlist=["_get_dual_track_adapter"])._get_dual_track_adapter(), None, 8)
+        from src.services.deep_research_service import _get_dual_track_adapter
+        out = runner(code, name, _get_dual_track_adapter(), None, 8, deadline=deadline)
         if out.get("ok"):
             dim, _ = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
             payload = dim.model_dump()
             if dim.status == "ok":
                 save_cached_dim(code, dim_id, payload)
             return cast(Dict[str, Any], payload)
+        reason = "研究时限耗尽，业务画像未完成" if "时限" in str(out.get("error") or "") else "模型未成功完成研究，业务画像未完成"
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
-    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": "研究员不可用"})
+    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": reason})
 
 
 def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
@@ -127,7 +131,8 @@ def report_markdown(record: Dict[str, Any]) -> str:
 
 def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """生成基本面专项报告（经营模式/主营产品/行业地位/龙头与大盘对比 + 财务体检）。"""
-    from src.agent.tools.data_tools import _get_fetcher_manager
+    from src.config import get_config
+    deadline = monotonic() + get_config().fundamentals_report_timeout_seconds
 
     # 归一化：兼容 300260.SZ / SH600519 / 文本中夹代码 等输入（与深度投研 normalize_a_share 同口径）
     from src.services.stock_code_utils import normalize_code
@@ -141,12 +146,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     # 名称里夹带代码后缀时剥掉（如"新莱应材 300260.SZ"）
     if name and code in name:
         name = name.replace(code, "").replace(".SZ", "").replace(".SH", "").strip()
-    if not name:
-        try:
-            quote = _get_fetcher_manager().get_realtime_quote(code)
-            name = str(getattr(quote, "name", "") or "").strip() or code
-        except Exception:  # noqa: BLE001
-            name = code
+    name = name or code
 
     # 当天已生成过则直接返回已有报告，避免重复
     existing = None if force_refresh else _same_day_dedup_report(code)
@@ -166,10 +166,13 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     from data_provider.mx_data_adapter import financial_refresh
     token = financial_refresh.set((code, uuid4().hex) if force_refresh else None)
     try:
-        ctx = build_shared_context(code, name)
+        ctx = build_shared_context(code, name, deadline=deadline)
     finally:
         financial_refresh.reset(token)
-    business = _research_dim("business", code, name)
+    if name == code and ctx.quote.get("name"):
+        name = str(ctx.quote["name"])
+        ctx.stock_name = name
+    business = _research_dim("business", code, name, deadline=deadline)
     dims = {
         "business": business,
         "sector": _rule_dim("sector", code, name, ctx, _position_text(business)),
@@ -199,7 +202,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     return {
         "report_id": rid if ok else None,
         "stock_code": code, "stock_name": name,
-        "status": "success" if ok else "failed",
+        "status": ("partial" if any(dim.get("status") != "ok" for dim in dims.values()) else "success") if ok else "failed",
         "markdown": md, "dims": dims,
     }
 

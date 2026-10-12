@@ -279,3 +279,30 @@ def test_row_fallback_uses_same_latest_financial_period(
     dim = build_fundamental_dim(ctx)
     assert dim.profitability["roe"]["value"] == 18.0
     assert dim.growth_quality["revenue_yoy"]["value"] == 12.0
+
+
+def test_sina_endpoint_metadata_reaches_rules_without_rewriting_values(financial_sources: dict[str, Any]) -> None:
+    financial_sources['frame'] = pd.DataFrame({
+        '指标': ['净资产收益率(ROE)', '毛利率', '营业总收入增长率', '归属母公司净利润增长率'],
+        '20260630': [4.56, 23.419587, 9.687095, -7.517906],
+    })
+    ctx = context.build_shared_context('600519', '样本')
+    for field in ('roe', 'gross_margin', 'revenue_yoy', 'net_profit_yoy'):
+        record = ctx.fundamental['field_meta'][field]
+        assert record['rule_eligible'] is True
+        assert record['unit'] == 'percentage_point'
+        assert record['period_basis'] == 'YTD'
+        assert record['source_family'] == 'sina'
+        assert record['quality']['status'] != 'verified'
+    assert ctx.fundamental['roe'] == 4.56
+    assert ctx.fundamental['net_profit_yoy'] == -7.517906
+
+
+def test_sina_contract_does_not_apply_to_unknown_interface() -> None:
+    from data_provider.fundamental_adapter import _pick_financial_value
+    records: dict[str, Any] = {}
+    assert _pick_financial_value(pd.Series({'毛利率': 23.4}), ['毛利率'], [], field='gross_margin', source='unknown_api', period='20260630', field_meta=records) == 23.4
+    record = records['gross_margin']
+    assert record['rule_eligible'] is False
+    assert record['unit'] is None
+    assert record['period_basis'] == 'unknown'

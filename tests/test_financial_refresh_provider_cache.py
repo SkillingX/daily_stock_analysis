@@ -53,7 +53,7 @@ def provider_cache(refresh_inputs: dict[str, Any], request: pytest.FixtureReques
     manager._mx_source = refresh_inputs["manager"]._mx_source
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", manager)
     monkeypatch.setattr(manager, "get_chip_distribution", lambda code: None)
-    monkeypatch.setattr(service, "_research_dim", lambda *args: {"status": "degraded"})
+    monkeypatch.setattr(service, "_research_dim", lambda *args, **kwargs: {"status": "degraded"})
     state["fetcher"] = fetcher
     return state
 
@@ -82,7 +82,7 @@ def test_target_refresh_preserves_other_and_ordinary_native_cache(provider_cache
 def test_specialist_refresh_saves_recovered_native_pe(provider_cache: dict[str, Any]) -> None:
     state = provider_cache
     first = service.generate_fundamentals_report("600519", "样本")
-    assert first["status"] == "success"
+    assert first["status"] == "partial"
     assert first["dims"]["financial"]["valuation_detail"]["pe_ttm"] == 30.0
     before = state["calls"]
     cached = deepcopy(state["module"]._realtime_cache["data"])
@@ -91,7 +91,7 @@ def test_specialist_refresh_saves_recovered_native_pe(provider_cache: dict[str, 
     assert reused["status"] == "already_exists" and reused["report_id"] == first["report_id"]
     assert state["calls"] == before
     second = service.generate_fundamentals_report("600519", "样本", force_refresh=True)
-    assert second["status"] == "success" and second["report_id"] != first["report_id"]
+    assert second["status"] == "partial" and second["report_id"] != first["report_id"]
     assert second["dims"]["financial"]["valuation_detail"]["pe_ttm"] == 18.0
     assert get_db().get_fundamentals_report(first["report_id"]) is not None
     assert state["calls"] > before

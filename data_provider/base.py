@@ -3633,7 +3633,8 @@ class DataFetcherManager:
             nonlocal remaining_seconds
             remaining_seconds = max(0.0, min(remaining_seconds - consumed_ms / 1000.0, stage_deadline - time.monotonic()))
 
-        valuation_timeout = min(fetch_timeout, remaining_seconds)
+        mx_reserved = min(fetch_timeout, stage_timeout / 3) if self._mx_source.available else 0.0
+        valuation_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -3648,7 +3649,7 @@ class DataFetcherManager:
                 0,
             )
 
-        valuation_payload = {
+        valuation_payload: Dict[str, Any] = {
             "pe_ratio": getattr(quote_payload, "pe_ratio", None)
             if quote_payload
             else None,
@@ -3703,7 +3704,7 @@ class DataFetcherManager:
             bundle_errors = ["fundamental stage timeout"]
             bundle_ms = 0
         else:
-            bundle_timeout = min(fetch_timeout, remaining_seconds)
+            bundle_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
                 lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
                 bundle_timeout,
@@ -3782,7 +3783,7 @@ class DataFetcherManager:
             # is decremented so subsequent stages (capital_flow, etc.)
             # still get a slice.
             _consume_budget(0)
-            fallback_budget = min(fetch_timeout, remaining_seconds)
+            fallback_budget = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
             if fallback_budget > 0:
                 _fallback_start = time.time()
                 fallback_bundle, _fallback_err, _fallback_ms = self._run_with_retry(
@@ -3841,16 +3842,10 @@ class DataFetcherManager:
                     fb_errors = fallback_bundle.get("errors", []) or []
                     bundle_errors.extend(fb_errors)
 
-# MX fallback for growth fields still missing after primary + Tushare/iFinD.
-        # MX is an official API (东方财富妙想 Skills Hub) that is more stable than
-        # AkShare scraping. We only query when growth is still thin because MX
-        # does not carry text summaries or institution holdings.
-        #
-        # Strategy: do ONE batch query (query_financials) so we get both the
-        # latest report期 from ``headName[0]`` AND the financial values in a
-        # single HTTP call (控配额). Per-field read() is fallback for retries.
+        # Reserve time for configured MX, filling only missing financial/valuation fields.
+        # Shared client caches coalesce financial fields into one batch query.
         _consume_budget(0)
-        if self._mx_source.available and self._is_growth_block_thin(growth_payload):
+        if self._mx_source.available and (self._is_growth_block_thin(growth_payload) or any(valuation_payload.get(field) is None for field in ("pe_ratio", "pb_ratio"))):
             mx_budget = min(fetch_timeout, remaining_seconds)
             if mx_budget > 0:
                 _mx_start = time.monotonic()
@@ -3860,10 +3855,12 @@ class DataFetcherManager:
                 _mx_bundle: Optional[Dict[str, Any]] = None
                 # Batch query (capped at 1 HTTP for budget discipline)
                 try:
-                    _mx_payload, _mx_error, _ = self._run_with_timeout(
-                        lambda: self._mx_source._client.query_financials(stock_code, None, deadline=mx_deadline),
-                        max(0.0, mx_deadline - time.monotonic()), "fundamental_mx_batch",
-                    )
+                    _mx_payload, _mx_error, _ = (None, None, 0)
+                    if self._is_growth_block_thin(growth_payload):
+                        _mx_payload, _mx_error, _ = self._run_with_timeout(
+                            lambda: self._mx_source._client.query_financials(stock_code, None, deadline=mx_deadline),
+                            max(0.0, mx_deadline - time.monotonic()), "fundamental_mx_batch",
+                        )
                     _mx_bundle = _mx_payload if isinstance(_mx_payload, dict) else None
                     if _mx_error:
                         bundle_errors.append(_mx_error)
@@ -3908,6 +3905,31 @@ class DataFetcherManager:
                         except Exception:  # noqa: BLE001 — fail-open
                             pass
 
+                mx_valuation_filled = False
+                for field in ("pe_ratio", "pb_ratio"):
+                    if valuation_payload.get(field) is not None or time.monotonic() >= mx_deadline:
+                        continue
+                    reading, error, _ = self._run_with_timeout(
+                        lambda field=field: self._mx_source.read(stock_code, field, deadline=mx_deadline),
+                        max(0.0, mx_deadline - time.monotonic()), f"fundamental_mx_{field}",
+                    )
+                    if error:
+                        result_ctx["valuation"]["errors"].append(error)
+                    if reading is not None:
+                        from data_provider.cross_source_validator import adopted_field_record
+                        record = adopted_field_record(field, reading, selection_reason="fallback_mx")
+                        valuation_payload[field] = record["value"]
+                        valuation_payload.setdefault("field_meta", {})[field] = record
+                        mx_valuation_filled = True
+                if mx_valuation_filled:
+                    valuation_chain = result_ctx["valuation"]["source_chain"] + [{
+                        "provider": "fundamental_fallback_mx", "result": "ok",
+                        "duration_ms": int((time.monotonic() - _mx_start) * 1000),
+                    }]
+                    result_ctx["valuation"] = self._build_fundamental_block(
+                        self._infer_block_status(valuation_payload, "partial"),
+                        valuation_payload, valuation_chain, result_ctx["valuation"]["errors"],
+                    )
                 _mx_ms = int((time.monotonic() - _mx_start) * 1000)
                 _consume_budget(_mx_ms)
                 if _mx_filled:

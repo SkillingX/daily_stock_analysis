@@ -48,4 +48,14 @@ describe('Fundamentals refresh intent', () => {
     expect(screen.getByText('已有报告')).toBeInTheDocument();
     expect(post).toHaveBeenCalledTimes(2);
   });
+  it('shows saved partial results without claiming the report is complete', async () => {
+    post.mockResolvedValue({ data: { report_id: 'fd_202610121800_1', status: 'partial', markdown: '业务画像未完成；财务数据已保留' } });
+    render(<FundamentalsPage />);
+    fireEvent.click(screen.getByText('选择样本'));
+    fireEvent.click(screen.getByRole('button', { name: '生成报告' }));
+    await screen.findByText(/已保存部分报告/);
+    expect(screen.getByText('业务画像未完成；财务数据已保留')).toBeInTheDocument();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
 });

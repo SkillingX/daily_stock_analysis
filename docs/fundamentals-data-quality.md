@@ -89,7 +89,7 @@ API dims 与两类 Markdown 展示每字段来源、实际期、口径、单位�
 
 基本面专项页面的“生成报告”默认复用当天最新保存成功版本。上游恢复后，选择股票并点击“刷新数据并生成新报告”，会绕过该股票本次财务查询的 MX 原响应缓存（包括旧缺项和错误响应）、manager 基本面缓存、阶段 0 财务快照和同日复用，并即时重算 F1。用于估值的 efinance/AkShare A股或ETF原行情响应缓存也按目标刷新标记绕过；本次新响应不覆盖全市场缓存，其他股票与普通请求仍按原 TTL 读取。业务画像、行业保持原缓存；不删除缓存或历史 financial 数据。同一刷新内部相同 MX 查询可复用本次新响应，不给每字段重复发相同请求。
 
-API 兼容增加 `POST /api/v1/fundamentals/generate?stock_code=600519&force_refresh=true`，省略或 `force_refresh=false` 保持复用；只接受小写 `true` / `false`，其他值返回 422。认证边界不变，响应保留 success、failed、already_exists；success 只说明报告已生成并保存，新版本仍可有缺口，品质以 dims / Markdown 说明为准。
+API 兼容增加 `POST /api/v1/fundamentals/generate?stock_code=600519&force_refresh=true`，省略或 `force_refresh=false` 保持复用；只接受小写 `true` / `false`，其他值返回 422。认证边界不变，响应保留 success、failed、already_exists，并追加 partial：报告已保存但至少一个研究维度未完成。success 表示各维度状态均为 ok，仍不代表字段完整或交叉核验通过，品质以 dims / Markdown 说明为准。
 
 每次明确刷新生成独立 ID、文件和记录。旧 ID 及新追加的数字后缀 ID 都保持原读取契约；两次并发刷新可保存两个版本。列表与默认复用统一按已有 created_at 降序、同时间按 ID 降序，created_at 在本次生成开始时记录，不按保存完成顺序重排。生成异常或保存失败保留旧成功版；保存失败的本次文件清理，不覆盖历史。前端同一在途操作防重复提交，POST 不自动重试，另一次点击表示新意图。连接超时不能证明服务未保存，可先刷新历史列表确认；不承诺 HTTP exactly-once。
 
@@ -98,3 +98,17 @@ API 兼容增加 `POST /api/v1/fundamentals/generate?stock_code=600519&force_ref
 ## 候选提交验证
 
 远端没有自动触发门禁时，可对同一候选分支手动执行现有验证流水线：`gh workflow run ci.yml --ref <candidate-branch>` 和 `gh workflow run type-safety.yml --ref <candidate-branch>`。手动 CI 执行治理、后端、Docker 和 Web 检查，类型流水线执行类型与契约检查；保留原有 PR / push 触发条件。用 `gh run list` 核对运行 head SHA，再用 `gh pr checks` 查看该候选的结论。检查尚未运行或尚未结束不能计为通过，这些检查也不替代真实供应商与生产验收。
+
+## 生成时限与取数补查
+
+基本面专项保持同步接口与原五章模板。`FUNDAMENTALS_REPORT_TIMEOUT_SECONDS` 默认 150 秒，允许 1–150 秒（超界按配置解析器限制）；页面等待 180 秒，留出渲染、SQLite 落库及传输时间。预算从服务入口开始，阶段零、业务画像、等待模型并发额度和 JSON 修复消耗同一单调时钟截止时间。未完成的业务画像按 degraded 记录原因，其余已取得数据仍可生成 partial 报告，历史版本保留。未提供名称时复用阶段零行情中的名称，并同步共享上下文供板块规则使用；仍缺失才以代码显示，避免预算之外另做行情查询。阶段零等待按自己的阶段截止时间结束，不借用后续研究预算；迟到的 IO 结果不再采纳。
+
+Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式 fallback；配置的模型 fallback 仍由 adapter 按剩余时间逐个尝试。模型调用失败、超时、步数耗尽不会按 JSON 格式错误整轮重跑；只有成功返回但 JSON 非法才在剩余预算内修复一次。日志记录模型轮次、调用预算和耗时，不记录凭据或完整提示词。这里约束同步调用与重试预算；底层同步供应商 IO 若不遵守超时，Python 无法强制中断其线程，已发出的供应商请求也无法承诺撤销或退费。超时的取数结果不回写已返回上下文，不再启动后续模型轮次。
+
+综合情报按每个维度尝试配置好的来源；失败或过滤后无有效结果时，才尝试下一个来源，公共 SearXNG 和 HTML 抓取放在后备位置。一次维度内每个来源最多尝试一次（供应商内部原有重试不变）；Agent 工具截止时间到达后不再启动新的维度或来源。HTML 公告抓取无需 API Key，已从基类凭据检查中豁免。
+
+阶段零财务取数与交叉核验仍共用 `FUNDAMENTAL_STAGE_TIMEOUT_SECONDS`：启用核验时为核验预留不超过单源超时且不超过总预算一半的时间。manager 在已配置 MX 时，为其保留不超过单源超时且不超过 manager 预算三分之一的时间。MX 只补缺失财务及 PE/PB 字段，复用既有批量查询缓存，不覆盖已有零值；财务批次已足够时不再发财务查询。
+
+新浪 `stock_financial_abstract` 的已核实标签 `净资产收益率(ROE)`、`毛利率`、`营业总收入增长率`、`归属母公司净利润增长率` 恢复百分比百分点单位，ROE 明确为加权，来源家族为 sina；该接口报告期序列的年末为 annual、季末为累计 YTD。依据为 [AKShare 关键指标接口说明](https://akshare.akfamily.xyz/data/stock/stock.html)、安装包对新浪 `CompanyFinanceService.getFinanceReport2022` 的调用及 2026-10-12 原始响应的 `ROEWEIGHTED`、`SGPMARGIN`、`TAGRT`、`NPGRT` 字段。仅恢复这四个精确标签的接口契约；其他接口、未知标签和金额单位仍保留 unknown。元数据完整不自动升级为跨源 verified，必须经过实际独立来源比对。
+
+回归：`python -m pytest tests/test_fundamentals_generation_budget.py tests/test_search_comprehensive_intel.py tests/test_fundamentals_data_quality.py tests/test_fundamentals_refresh.py`。包含本机 HTTP 服务拖延响应、真实 LiteLLM Router/SDK 无叠加重试、报告 API 部分结果保存与重开、慢行情不挤占 MX、无 Key 抓取器进入真实抓取入口的受控验证。没有配对英文专题，无需同步 README；无数据库迁移，回滚对应源码并重启即可恢复原行为。

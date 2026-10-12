@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 from typing import Any, Callable, Dict, Optional
 
 from src.agent.runner import run_agent_loop
@@ -70,8 +71,10 @@ def _run_explore(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     max_steps: int = 8,
     retry: int = 1,
+    deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """跑一轮探索循环，返回 LLM 最终 JSON dict；失败重试 retry 次。"""
+    """在共同截止时间内研究；仅成功响应的 JSON 格式错误允许修复。"""
+    deadline = deadline if deadline is not None else monotonic() + 480.0
     system = (
         load_constitution()
         + "\n\n"
@@ -86,16 +89,29 @@ def _run_explore(
 
     last_error = ""
     for attempt in range(retry + 1):
-        with _llm_semaphore():
+        remaining = deadline - monotonic()
+        semaphore = _llm_semaphore()
+        if remaining <= 0 or not semaphore.acquire(timeout=remaining):
+            return {"ok": False, "error": "研究时限耗尽（等待模型并发额度）"}
+        try:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return {"ok": False, "error": "研究时限耗尽"}
             loop = run_agent_loop(
                 messages=messages,
                 tool_registry=registry,
                 llm_adapter=llm_adapter,
                 max_steps=max_steps,
                 progress_callback=progress_callback,
-                max_wall_clock_seconds=480.0,
+                max_wall_clock_seconds=remaining,
                 stock_scope=None,
             )
+        finally:
+            semaphore.release()
+        # Only a successful response with malformed JSON warrants format repair.
+        if not loop.success:
+            timeout = any(marker in (loop.error or "").lower() for marker in ("timeout", "timed out", "时限"))
+            return {"ok": False, "error": "研究时限耗尽" if timeout else "模型调用失败或研究步数耗尽", "steps": loop.total_steps}
         parsed = _extract_json(loop.content)
         if parsed is not None:
             return {"ok": True, "data": parsed, "steps": loop.total_steps}
@@ -314,7 +330,11 @@ def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=No
 _BUSINESS_TOOLS = {"search_comprehensive_intel", "search_stock_news", "get_market_indices"}
 
 
-def run_business_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+def run_business_agent(
+    stock_code: str, stock_name: str, llm_adapter: Any,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    max_steps: int = 8, *, deadline: Optional[float] = None,
+) -> Dict[str, Any]:
     """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与龙头对比。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做业务画像与竞争地位分析并直接输出 JSON：\n"
@@ -324,4 +344,4 @@ def run_business_agent(stock_code, stock_name, llm_adapter, progress_callback=No
         "competitive_position(行业地位与护城河)、vs_market_leader(与板块龙头/大盘的对比，标注 inferred 或来源等级)、"
         "score(0-100 业务画像分，可 null)、data_gaps(取不到的数据项数组，禁止编造)、narrative(一段结论)。"
     )
-    return _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps)
+    return _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)

@@ -37,13 +37,14 @@ export default function FundamentalsPage() {
     inFlight.current = true;
     setError(null); setNotice(null); setGenerating(true); setRefreshing(forceRefresh);
     try {
-      const res = await apiClient.post<{ report_id: string | null; markdown: string }>(
+      const res = await apiClient.post<{ report_id: string | null; markdown: string; status: string }>(
         `/api/v1/fundamentals/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}&force_refresh=${forceRefresh}`,
         undefined, { timeout: 180000 },
       );
       if (res.data.report_id) {
         setDetail({ id: res.data.report_id, markdown: res.data.markdown });
-        if (forceRefresh) setNotice('新报告已保存，历史报告保留；数据完整度以财务品质说明为准。');
+        if (res.data.status === 'partial') setNotice('已保存部分报告，未完成章节及数据缺口请查看正文；本次不会自动重试。');
+        else if (forceRefresh) setNotice('新报告已保存，历史报告保留；数据完整度以财务品质说明为准。');
         await loadHistory();
       } else {
         setError('报告保存失败，已有报告保留。');
@@ -113,7 +114,7 @@ export default function FundamentalsPage() {
               className="inline-flex h-11 items-center gap-2 rounded-xl bg-cyan px-5 text-sm font-semibold text-black hover:bg-cyan/90 disabled:opacity-60"
             >
               {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              {generating ? '生成中（约1-2分钟）...' : '生成报告'}
+              {generating ? '生成中...' : '生成报告'}
             </button>
             <button
               onClick={() => void handleGenerate(true)}
@@ -133,7 +134,7 @@ export default function FundamentalsPage() {
           {generating && (
             <div className="flex items-center gap-3 py-16 text-secondary-text">
               <Loader2 className="h-5 w-5 animate-spin text-cyan" />
-              <span>业务画像/板块/财务三研究员并行分析中，请勿关闭页面...</span>
+              <span>正在取数并研究业务画像，随后生成板块与财务分析；未完成章节会标明原因。</span>
             </div>
           )}
           {!generating && !detail && (

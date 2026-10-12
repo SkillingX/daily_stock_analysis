@@ -136,10 +136,26 @@ def _pick_financial_value(row: pd.Series, keywords: List[str], errors: List[str]
                     entries = raw.tolist() if isinstance(raw, pd.Series) else [raw]
                     for value in entries:
                         if field is not None:
-                            number, unit, currency, error = normalize_anchor_value(field, value, str(col))
+                            # This endpoint strips the Sina percentage display metadata.
+                            # Keep the mapping exact; unknown interfaces/labels remain unknown.
+                            sina_labels = {
+                                "净资产收益率(ROE)": "weighted_roe",
+                                "毛利率": "gross_margin",
+                                "营业总收入增长率": "total_operating_revenue_yoy",
+                                "归属母公司净利润增长率": "parent_net_profit_yoy",
+                            }
+                            sina_metric = sina_labels.get(str(col)) if source == "akshare:stock_financial_abstract" else None
+                            number, unit, currency, error = normalize_anchor_value(
+                                field, value, str(col), unit="percentage_point" if sina_metric else None,
+                            )
                             actual, basis = report_period_from_fields({"report_date": period}, str(col))
+                            if sina_metric and actual and basis == "unknown":
+                                if actual.endswith("-12-31"):
+                                    basis = "annual"
+                                elif actual.endswith(("-03-31", "-06-30", "-09-30")):
+                                    basis = "YTD"
                             if number is not None:
-                                candidates.append(AnchorReading(source, number, caliber=caliber_from_label(field, str(col)), period=actual, period_basis=basis, unit=unit, currency=currency, raw_value=str(value), raw_label=str(col), normalization_error=error))
+                                candidates.append(AnchorReading(source, number, caliber=sina_metric or caliber_from_label(field, str(col)), period=actual, period_basis=basis, unit=unit, currency=currency, raw_value=str(value), raw_label=str(col), normalization_error=error))
                         else:
                             number = _safe_float(value)
                         if number is not None:

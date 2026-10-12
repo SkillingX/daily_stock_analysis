@@ -296,14 +296,14 @@ def test_service_api_history_preserve_quality_and_actual_markdown(monkeypatch: p
     monkeypatch.setattr("src.schemas.deep_research_dims.datetime", SimpleNamespace(now=lambda: datetime.fromisoformat(ctx.as_of)))
     # This seam replaces normalized transport facts; F1, rule consumers, service,
     # storage, actual template and HTTP serialization all execute unchanged.
-    monkeypatch.setattr(context_module, "build_shared_context", lambda *args: ctx)
-    monkeypatch.setattr(svc, "_research_dim", lambda *args: {"status": "degraded"})
+    monkeypatch.setattr(context_module, "build_shared_context", lambda *args, **kwargs: ctx)
+    monkeypatch.setattr(svc, "_research_dim", lambda *args, **kwargs: {"status": "degraded"})
     monkeypatch.setattr(svc, "_REPORT_DIR", tmp_path)
     app = FastAPI()
     app.include_router(router, prefix="/fundamentals")
     with TestClient(app) as client:
         out = client.post("/fundamentals/generate", params={"stock_code": "600519", "stock_name": "样本"}).json()
-        assert out["status"] == "success"
+        assert out["status"] == "partial"
         report_id = out["report_id"]
         try:
             expected = build_fundamental_dim(ctx).model_dump(mode="json")

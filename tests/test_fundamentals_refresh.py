@@ -74,7 +74,7 @@ def test_real_source_manager_snapshot_and_same_day_caches_are_bypassed(refresh_i
     other_cache = {key: deepcopy(value) for key, value in state["manager"]._fundamental_cache.items() if key.startswith("000001|")}
     dim_cache.save_snapshot("stage0_unrelated_000001", {"sentinel": True})
     first = svc.generate_fundamentals_report("600519", "样本")
-    assert first["status"] == "success" and first["dims"]["financial"]["profitability"]["roe"]["value"] is None
+    assert first["status"] == "partial" and first["dims"]["financial"]["profitability"]["roe"]["value"] is None
     assert state["manager"]._fundamental_cache
     before = len(state["calls"])
     business_file = Path(dim_cache._CACHE_DIR) / "600519_business.json"
@@ -84,7 +84,7 @@ def test_real_source_manager_snapshot_and_same_day_caches_are_bypassed(refresh_i
     assert ordinary["status"] == "already_exists" and ordinary["report_id"] == first["report_id"]
     assert len(state["calls"]) == before
     refreshed = svc.generate_fundamentals_report("600519", "样本", force_refresh=True)
-    assert refreshed["status"] == "success" and refreshed["report_id"] != first["report_id"]
+    assert refreshed["status"] == "partial" and refreshed["report_id"] != first["report_id"]
     assert refreshed["dims"]["financial"]["profitability"]["roe"]["value"] == 18
     assert refreshed["dims"]["financial"]["data_quality"]["fields"]["roe"]["reading"]["period"] == "2025-12-31"
     assert refreshed["dims"]["financial"]["data_quality"]["state"] == "partial"
@@ -113,7 +113,7 @@ def test_failed_refresh_does_not_replace_prior_saved_report(refresh_inputs: dict
     assert svc.generate_fundamentals_report("600519", "样本")["report_id"] == first["report_id"]
     import src.deep_research_dims.context as context_module
     with monkeypatch.context() as patch:
-        patch.setattr(context_module, "build_shared_context", lambda *args: (_ for _ in ()).throw(RuntimeError("fixture failure")))
+        patch.setattr(context_module, "build_shared_context", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fixture failure")))
         with pytest.raises(RuntimeError):
             svc.generate_fundamentals_report("600519", "样本", force_refresh=True)
     assert financial_refresh.get() is None
@@ -157,7 +157,7 @@ def test_two_concurrent_refreshes_keep_distinct_files_and_creation_order(refresh
         assert a_started.wait(5)
         b = pool.submit(svc.generate_fundamentals_report, "600519", "B", True)
         a_out, b_out = a.result(timeout=5), b.result(timeout=5)
-    assert a_out["status"] == b_out["status"] == "success"
+    assert a_out["status"] == b_out["status"] == "partial"
     assert a_out["report_id"] != b_out["report_id"]
     for out in (a_out, b_out):
         record = db.get_fundamentals_report(out["report_id"])
@@ -188,19 +188,41 @@ def test_api_refresh_validation_and_version_compatibility(refresh_inputs: dict[s
     with TestClient(app) as client:
         params = {"stock_code": "600519", "stock_name": "样本"}
         first = client.post("/fundamentals/generate", params=params).json()
-        assert first["status"] == "success"
+        assert first["status"] == "partial"
         for invalid in ("1", "yes", "garbage", "", "null"):
             response = client.post("/fundamentals/generate", params={**params, "force_refresh": invalid})
             assert response.status_code == 422
         normal = client.post("/fundamentals/generate", params={**params, "force_refresh": "false"}).json()
         assert normal["report_id"] == first["report_id"]
         refreshed = client.post("/fundamentals/generate", params={**params, "force_refresh": "true"}).json()
-        assert refreshed["status"] == "success" and refreshed["report_id"] != first["report_id"]
+        assert refreshed["status"] == "partial" and refreshed["report_id"] != first["report_id"]
         for report_id in (first["report_id"], refreshed["report_id"]):
             assert client.get(f"/fundamentals/reports/{report_id}").status_code == 200
             assert client.get(f"/fundamentals/reports/{report_id}/markdown").status_code == 200
         import src.deep_research_dims.context as context_module
-        monkeypatch.setattr(context_module, "build_shared_context", lambda *args: (_ for _ in ()).throw(RuntimeError("fixture failure")))
+        monkeypatch.setattr(context_module, "build_shared_context", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fixture failure")))
         failed = client.post("/fundamentals/generate", params={**params, "force_refresh": "true"})
         assert failed.status_code == 500
         assert client.get("/fundamentals/reports", params={"stock_code": "600519"}).json()["data"][0]["id"] == refreshed["report_id"]
+
+
+def test_slow_quote_cannot_starve_configured_mx(refresh_inputs: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    from time import monotonic
+    state = refresh_inputs
+    state['roe'] = 18.0
+    state['config'].fundamental_fetch_timeout_seconds = 0.12
+    release = Event()
+    def slow_quote(code: str) -> None:
+        release.wait(1)
+    monkeypatch.setattr(state['manager'], 'get_realtime_quote', slow_quote)
+    try:
+        started = monotonic()
+        report = state['manager'].get_fundamental_context('600519', budget_seconds=0.3)
+        assert monotonic() - started < 0.6
+        assert report['growth']['data']['roe'] == 18.0
+        assert report['valuation']['data']['pe_ratio'] == 30.0
+        assert report['valuation']['field_meta']['pe_ratio']['source'] == 'mx'
+        assert len([q for q in state['calls'] if '最新价' in q]) == 1
+        assert len([q for q in state['calls'] if '最新价' not in q]) == 1
+    finally:
+        release.set()

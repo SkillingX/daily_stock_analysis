@@ -362,7 +362,7 @@ def _remaining_timeout_seconds(
     """Return remaining wall-clock budget in seconds, or None when disabled."""
     if max_wall_clock_seconds is None or max_wall_clock_seconds <= 0:
         return None
-    return max(0.0, float(max_wall_clock_seconds) - (time.time() - start_time))
+    return max(0.0, float(max_wall_clock_seconds) - (time.monotonic() - start_time))
 
 
 def _build_timeout_result(
@@ -376,7 +376,7 @@ def _build_timeout_result(
     models_used: List[str],
     messages: List[Dict[str, Any]],
 ) -> RunLoopResult:
-    elapsed = time.time() - start_time
+    elapsed = time.monotonic() - start_time
     return RunLoopResult(
         success=False,
         content="",
@@ -402,7 +402,7 @@ def _build_budget_guard_result(
     remaining_timeout_s: float,
     min_step_budget_s: float,
 ) -> RunLoopResult:
-    elapsed = time.time() - start_time
+    elapsed = time.monotonic() - start_time
     return RunLoopResult(
         success=False,
         content="",
@@ -541,7 +541,7 @@ def run_agent_loop(
     labels = thinking_labels or _THINKING_TOOL_LABELS
     tool_decls = tool_registry.to_openai_tools()
 
-    start_time = time.time()
+    start_time = time.monotonic()
     tool_calls_log: List[Dict[str, Any]] = []
     non_retriable_tool_results: Dict[str, str] = {}
     total_tokens = 0
@@ -618,11 +618,14 @@ def run_agent_loop(
             )
 
         # --- LLM call ---
+        llm_started = time.monotonic()
+        logger.info("Agent LLM step %d started, remaining=%.2fs", step + 1, remaining_timeout if remaining_timeout is not None else -1.0)
         response = llm_adapter.call_with_tools(
             messages,
             tool_decls,
             timeout=remaining_timeout,
         )
+        logger.info("Agent LLM step %d finished in %.2fs, provider=%s", step + 1, time.monotonic() - llm_started, response.provider)
         provider_used = response.provider
         total_tokens += (response.usage or {}).get("total_tokens", 0)
         m = getattr(response, "model", "") or response.provider
@@ -751,7 +754,7 @@ def run_agent_loop(
             logger.info(
                 "Agent completed in %d steps (%.1fs, %d tokens)",
                 step + 1,
-                time.time() - start_time,
+                time.monotonic() - start_time,
                 total_tokens,
             )
             if progress_callback:
@@ -813,14 +816,20 @@ def _execute_tools(
     Single tools run inline; multiple tools run in parallel threads.
     """
 
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+
+    if tool_wait_timeout_seconds is not None:
+        eastmoney_patch(budget_only=True)
+    batch_deadline = time.monotonic() + tool_wait_timeout_seconds if tool_wait_timeout_seconds is not None else None
+
     def _exec_single(tc_item: Any) -> Any:
-        t0 = time.time()
+        t0 = time.monotonic()
         cache_key = _build_tool_cache_key(tc_item.name, tc_item.arguments)
         guard_result = _guard_tool_stock_scope(
             tool_registry, tc_item.name, tc_item.arguments, stock_scope
         )
         if guard_result is not None:
-            dur = round(time.time() - t0, 2)
+            dur = round(time.monotonic() - t0, 2)
             result_str = serialize_tool_result(guard_result)
             if cache_key and non_retriable_tool_results is not None:
                 non_retriable_tool_results[cache_key] = result_str
@@ -838,7 +847,7 @@ def _execute_tools(
             and non_retriable_tool_results is not None
             and cache_key in non_retriable_tool_results
         ):
-            dur = round(time.time() - t0, 2)
+            dur = round(time.monotonic() - t0, 2)
             logger.info(
                 "Tool '%s' skipped via non-retriable cache for arguments=%s",
                 tc_item.name,
@@ -854,7 +863,13 @@ def _execute_tools(
             )
 
         try:
-            res = tool_registry.execute(tc_item.name, **tc_item.arguments)
+            token = request_deadline.set(batch_deadline)
+            try:
+                if batch_deadline is not None and time.monotonic() >= batch_deadline:
+                    raise TimeoutError("Tool batch deadline exhausted")
+                res = tool_registry.execute(tc_item.name, **tc_item.arguments)
+            finally:
+                request_deadline.reset(token)
             res_str = serialize_tool_result(res)
             ok = True
             if (
@@ -867,7 +882,7 @@ def _execute_tools(
             res_str = json.dumps({"error": str(e)})
             ok = False
             logger.warning("Tool '%s' failed: %s", tc_item.name, e)
-        dur = round(time.time() - t0, 2)
+        dur = round(time.monotonic() - t0, 2)
         return tc_item, res_str, ok, dur, False, None
 
     results: List[Dict[str, Any]] = []

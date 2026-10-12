@@ -7,10 +7,11 @@ import asyncio
 import logging
 import re
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.services import fundamentals_service
 from src.storage import get_db
@@ -28,9 +29,20 @@ def _validate_id(report_id: str) -> str:
     return report_id
 
 
-@router.post("/generate")
+class FundamentalsGenerateResponse(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+
+    report_id: Annotated[str, Field(pattern=r"^fd_\d{12}(_\d+)?$")] | None
+    stock_code: Annotated[str, Field(pattern=r"^\d{6}$")]
+    stock_name: str
+    status: Literal["success", "partial", "failed", "already_exists"]
+    markdown: str
+    dims: dict[str, Any]
+
+
+@router.post("/generate", response_model=FundamentalsGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false") -> dict[str, Any]:
-    """同步生成基本面专项报告（研究员并行+缓存，约 1-2 分钟）。"""
+    """同步生成基本面专项报告；在配置时限内研究，未完成章节显式降级。"""
     try:
         return await asyncio.to_thread(
             fundamentals_service.generate_fundamentals_report, stock_code, stock_name, force_refresh == "true"

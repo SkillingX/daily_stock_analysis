@@ -45,7 +45,7 @@ _CURRENCY_MARKERS = {
     "SGD": ("SGD", "新加坡元"), "AUD": ("AUD", "澳元"),
     "CAD": ("CAD", "加元"), "CHF": ("CHF", "瑞士法郎"),
 }
-_SOURCE_FAMILIES = {"mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney"}
+_SOURCE_FAMILIES = {"mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney", "akshare:stock_financial_abstract": "sina"}
 QualityStatus = Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"]
 
 

@@ -93,7 +93,11 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     from src.config import get_config
 
     config = get_config()
+    from src.patches.eastmoney_patch import request_deadline
     deadline = monotonic() + config.fundamental_stage_timeout_seconds
+    outer_deadline = request_deadline.get()
+    if outer_deadline is not None:
+        deadline = min(deadline, outer_deadline)
     cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
@@ -107,7 +111,10 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         )
 
         manager = _get_fetcher_manager()
-        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, deadline - monotonic()))
+        remaining = max(0.0, deadline - monotonic())
+        # Verification needs its own share of the same stage budget, not leftover zero.
+        verification_budget = min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else 0.0
+        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, remaining - verification_budget))
         compact = _compact_fundamental_context(raw)
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
@@ -270,11 +277,11 @@ def _safe_history_reports(code: str, ctx: SharedContext) -> List[Dict[str, Any]]
         return []
 
 
-def build_shared_context(stock_code: str, stock_name: str) -> SharedContext:
+def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | None = None) -> SharedContext:
     """装配共享快照。设计原则：尽力装配、失败只记录不抛（阶段 0 之后才允许整票失败）。
 
-    性能：五个数据源的失败降级链都较慢（实测合计 ~35s），彼此无依赖，用线程池
-    并行取数，整体耗时 ≈ 最慢一路而非五路之和。
+    行情、日线和筹码在线程池运行，与本身已限时的财务装配并行。
+    各路共用阶段截止时间；超时保留可用数据及失败证据，不占用后续研究预算。
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -283,15 +290,39 @@ def build_shared_context(stock_code: str, stock_name: str) -> SharedContext:
         stock_name=stock_name,
         as_of=datetime.now().isoformat(timespec="seconds"),
     )
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        fut_quote = pool.submit(_safe_quote, stock_code, ctx)
-        fut_history = pool.submit(_safe_history, stock_code, 260, ctx)
-        fut_fund = pool.submit(copy_context().run, _safe_fundamental, stock_code, ctx)
-        fut_chip = pool.submit(_safe_chip, stock_code, ctx)
-        ctx.quote = fut_quote.result()
-        ctx.history = fut_history.result()
-        ctx.fundamental = fut_fund.result()
-        ctx.chip = fut_chip.result()
+    from concurrent.futures import wait
+    from src.config import get_config
+
+    stage_deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+    if deadline is not None:
+        stage_deadline = min(stage_deadline, deadline)
+    pool = ThreadPoolExecutor(max_workers=3)
+    # Each worker owns its limitations so late IO cannot mutate a returned context.
+    workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history", "chip")}
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+    eastmoney_patch(budget_only=True)
+    token = request_deadline.set(stage_deadline)
+    try:
+        futures = {
+            "quote": pool.submit(copy_context().run, _safe_quote, stock_code, workers["quote"]),
+            "history": pool.submit(copy_context().run, _safe_history, stock_code, 260, workers["history"]),
+            "chip": pool.submit(copy_context().run, _safe_chip, stock_code, workers["chip"]),
+        }
+        # Financial IO already has bounded workers/validation. Assemble its timeout
+        # evidence here instead of racing its summary against an identical outer timer.
+        ctx.fundamental = _safe_fundamental(stock_code, ctx)
+        wait(futures.values(), timeout=max(0.0, stage_deadline - monotonic()))
+        for key, future in futures.items():
+            if future.done():
+                setattr(ctx, key, future.result())
+                for limitation in workers[key].limitations:
+                    ctx.limitation(limitation)
+            else:
+                future.cancel()
+                ctx.limitation(f"{key} 装配超时，本次未采用")
+    finally:
+        request_deadline.reset(token)
+        pool.shutdown(wait=False, cancel_futures=True)
     ctx.history_reports = _safe_history_reports(stock_code, ctx)
     return ctx
 
