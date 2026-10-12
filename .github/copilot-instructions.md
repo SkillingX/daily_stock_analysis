@@ -20,6 +20,7 @@ If any instruction in this file conflicts with `AGENTS.md`, follow `AGENTS.md`.
 - Use `README.md` only for project positioning, high-level capabilities, quick start, main entrypoints, and sponsorship/cooperation information; avoid updating README unless the change is homepage-level.
 - Put detailed module behavior, page interaction, topic configuration, troubleshooting, field contracts, implementation semantics, and edge cases in the appropriate `docs/*.md` file instead of README.
 - When config semantics change, sync `.env.example` and assess impact on local runs, Docker, GitHub Actions, API, Web, and Desktop.
+- Local development secrets may live in the ignored, untracked repository-root `.env`; keep real values out of `.env.example`, logs, and commits. Use platform secret stores in CI and production. `AGENTS.md` is the canonical policy.
 
 ## Validation
 

@@ -61,8 +61,9 @@ class TestService:
         out = svc.generate_report("600519", "贵州茅台")
         assert out["report_id"] == "fa_test001"
         md = out["markdown"]
-        for kw in ["财务健康分", "盈利质量", "剪刀差", "资产负债率", "PB", "64.6", "e03131", "font color"]:
+        for kw in ["财务健康分", "盈利质量", "剪刀差", "资产负债率", "PB", "64.6", "🔴 **盈利质量**"]:
             assert kw in md, kw
+        assert "<font" not in md
         get_db().delete_financial_analysis_report("fa_test001")
 
     def test_non_a_share(self):

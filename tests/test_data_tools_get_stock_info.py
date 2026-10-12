@@ -12,6 +12,7 @@ import os
 import sys
 import unittest
 from datetime import date
+from typing import Any
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -21,6 +22,18 @@ from src.agent.tools.data_tools import (  # noqa: E402
     _handle_get_stock_info,
     _latest_annual_period,
 )
+
+
+def _cv_anchor(field: str, value: float) -> dict[str, Any]:
+    from data_provider.cross_source_validator import AnchorReading, CrossSourceValidator
+
+    calibers = {"roe": "weighted_roe", "gross_margin": "gross_margin", "revenue_yoy": "operating_revenue_yoy"}
+    return CrossSourceValidator([]).verify(
+        "600519", field, primary_reading=AnchorReading(
+            "mx", value, caliber=calibers[field], unit="percentage_point",
+            period="2025-12-31", period_basis="annual",
+        ),
+    ).to_compact()
 
 
 class _DummyManager:
@@ -124,7 +137,8 @@ class TestBackfillGrowthFromValidation(unittest.TestCase):
         growth = {"status": "not_supported", "data": {
             "revenue_yoy": None, "gross_margin": None, "roe": None, "net_profit_yoy": None}}
         cv = {"anchors": {
-            "gross_margin": {"v": 52.3}, "revenue_yoy": {"v": 18.5}, "roe": {"v": 10.2}}}
+            "gross_margin": _cv_anchor("gross_margin", 52.3),
+            "revenue_yoy": _cv_anchor("revenue_yoy", 18.5), "roe": _cv_anchor("roe", 10.2)}}
         out = _backfill_growth_from_validation(growth, cv)
         self.assertAlmostEqual(out["data"]["gross_margin"], 52.3)
         self.assertAlmostEqual(out["data"]["revenue_yoy"], 18.5)
@@ -134,7 +148,7 @@ class TestBackfillGrowthFromValidation(unittest.TestCase):
 
     def test_does_not_overwrite_existing_values(self):
         growth = {"status": "ok", "data": {"gross_margin": 50.0, "revenue_yoy": None}}
-        cv = {"anchors": {"gross_margin": {"v": 99.0}, "revenue_yoy": {"v": 18.5}}}
+        cv = {"anchors": {"gross_margin": _cv_anchor("gross_margin", 99.0), "revenue_yoy": _cv_anchor("revenue_yoy", 18.5)}}
         out = _backfill_growth_from_validation(growth, cv)
         self.assertEqual(out["data"]["gross_margin"], 50.0)  # 已有值不覆盖
         self.assertAlmostEqual(out["data"]["revenue_yoy"], 18.5)
@@ -155,7 +169,7 @@ class TestBackfillGrowthFromValidation(unittest.TestCase):
         self.assertEqual(out["status"], "not_supported")
 
     def test_none_growth_block(self):
-        cv = {"anchors": {"gross_margin": {"v": 52.3}}}
+        cv = {"anchors": {"gross_margin": _cv_anchor("gross_margin", 52.3)}}
         out = _backfill_growth_from_validation(None, cv)
         self.assertAlmostEqual(out["data"]["gross_margin"], 52.3)
         self.assertEqual(out["status"], "partial")
@@ -174,9 +188,9 @@ class TestGrowthBackfillE2E(unittest.TestCase):
         return {
             "enabled": True,
             "anchors": {
-                "gross_margin": {"v": 52.3, "conf": "medium", "src": ["mx"]},
-                "revenue_yoy": {"v": 18.5, "conf": "medium", "src": ["mx"]},
-                "roe": {"v": 10.2, "conf": "medium", "src": ["mx"]},
+                "gross_margin": _cv_anchor("gross_margin", 52.3),
+                "revenue_yoy": _cv_anchor("revenue_yoy", 18.5),
+                "roe": _cv_anchor("roe", 10.2),
             },
             "summary": "0/9 锚点双源验证通过",
         }

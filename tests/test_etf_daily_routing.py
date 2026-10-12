@@ -12,6 +12,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import BaseFetcher, DataFetchError, DataFetcherManager
 from data_provider.efinance_fetcher import EfinanceFetcher
+from data_provider.realtime_types import CircuitBreaker
+
+
+@pytest.fixture(autouse=True)
+def isolated_daily_source_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    health = DataFetcherManager._daily_source_health
+    monkeypatch.setattr(DataFetcherManager, "_daily_source_health", CircuitBreaker(
+        failure_threshold=health.failure_threshold, cooldown_seconds=health.cooldown_seconds,
+        half_open_max_calls=health.half_open_max_calls,
+    ))
 
 
 def _make_efinance_fetcher() -> EfinanceFetcher:

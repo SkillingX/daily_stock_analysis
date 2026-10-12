@@ -18,7 +18,7 @@ import logging
 import time
 from threading import RLock
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any
 from enum import Enum
 
 from icontract import require, ensure
@@ -135,6 +135,8 @@ class UnifiedRealtimeQuote:
     is_stale: Optional[bool] = None              # provider_timestamp 超过最小 TTL 阈值时为 True
     stale_seconds: Optional[int] = None          # provider_timestamp 距 fetched_at 的秒数
     fallback_from: Optional[str] = None          # 整源 fallback 的失败首选源 token
+    field_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    currency: Optional[str] = None
     
     # === 核心价格数据（几乎所有源都有）===
     price: Optional[float] = None           # 最新价
@@ -186,6 +188,10 @@ class UnifiedRealtimeQuote:
             val = getattr(self, f, None)
             if val is not None:
                 result[f] = val
+        if self.field_meta:
+            result["field_meta"] = self.field_meta
+        if self.currency is not None:
+            result["currency"] = self.currency
         return result
     
     def has_basic_data(self) -> bool:
@@ -292,6 +298,26 @@ class ChipDistribution:
                 status_parts.append(f"现价低于平均成本{abs(cost_diff):.1f}%")
         
         return "，".join(status_parts)
+
+
+def quote_field_records(quote: UnifiedRealtimeQuote) -> Dict[str, Dict[str, Any]]:
+    """Keep field provenance when a unified quote is merged or projected to a tool."""
+    from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+    records = dict(getattr(quote, "field_meta", {}) or {})
+    raw_source = getattr(quote, "source", "unknown")
+    source = raw_source.value if hasattr(raw_source, "value") else str(raw_source)
+    for anchor, attribute in {"current_price": "price", "pe_ratio": "pe_ratio", "pb_ratio": "pb_ratio", "total_mv": "total_mv", "circ_mv": "circ_mv"}.items():
+        value = getattr(quote, attribute, None)
+        metadata = records.get(anchor) or {}
+        reading = reading_from_field_record(value, {
+            "source": source, "unit": "multiple" if anchor in {"pe_ratio", "pb_ratio"} else "currency_base",
+            "currency": getattr(quote, "currency", None), "observed_at": getattr(quote, "provider_timestamp", None),
+            "fetched_at": getattr(quote, "fetched_at", None), "is_stale": getattr(quote, "is_stale", None), **metadata,
+        })
+        if reading is None:
+            continue
+        records[anchor] = adopted_field_record(anchor, reading, previous_record=metadata, selection_reason=str(metadata.get("selection_reason") or "primary"))
+    return records
 
 
 class CircuitBreaker:

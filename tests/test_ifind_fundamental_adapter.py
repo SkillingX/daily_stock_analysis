@@ -116,7 +116,8 @@ class TestParseIfindResponse(unittest.TestCase):
         )
         self.assertIsNotNone(r)
         self.assertAlmostEqual(r.value, 1.70899e11)
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
 
     def test_empty_raw_returns_none(self):
         self.assertIsNone(_parse_ifind_response("", ["x"], "pe_ratio", None))
@@ -202,16 +203,17 @@ class TestIfindSource(unittest.TestCase):
             source="ifind", value=1e10, period=None))
         src = IfindSource(fetcher=fake)
         r = src.read("600519", "revenue", period="2024年报")
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
         self.assertEqual(r.value, 1e10)
 
-    def test_read_caliber_ttm_overrides_none(self):
-        # iFinD PE 为 TTM 口径，IfindSource 强制覆盖 None
+    def test_read_does_not_infer_ttm_from_field_request(self):
+        # 缺少响应字段的口径证据，不能通过请求锚点强行补成 TTM。
         fake = _FakeFetcher(available=True, fetch_fn=lambda c, f, p: AnchorReading(
             source="ifind", value=30.0, caliber=None, period=None))
         src = IfindSource(fetcher=fake)
         r = src.read("600519", "pe_ratio")
-        self.assertEqual(r.caliber, "TTM")
+        self.assertIsNone(r.caliber)
 
 
 class TestIfindFetcher(unittest.TestCase):
@@ -251,7 +253,8 @@ class TestIfindGrowthAnchors(unittest.TestCase):
         r = src.read("688486", "gross_margin", period="2024年报")
         self.assertIsInstance(r, AnchorReading)
         self.assertAlmostEqual(r.value, 52.3)
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
 
     def test_read_revenue_yoy_carries_period(self):
         fake = _FakeFetcher(available=True, fetch_fn=lambda c, f, p: AnchorReading(
@@ -259,7 +262,8 @@ class TestIfindGrowthAnchors(unittest.TestCase):
         src = IfindSource(fetcher=fake)
         r = src.read("688486", "revenue_yoy", period="2024年报")
         self.assertAlmostEqual(r.value, 18.5)
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
 
     def test_parse_revenue_yoy_response(self):
         # iFinD Markdown 表格含「营业收入同比增长率」列 → 解析为 AnchorReading
@@ -271,7 +275,8 @@ class TestIfindGrowthAnchors(unittest.TestCase):
             "revenue_yoy", "2024年报")
         self.assertIsNotNone(r)
         self.assertAlmostEqual(r.value, 18.5)
-        self.assertEqual(r.period, "2024年报")
+        self.assertIsNone(r.period)
+        self.assertEqual(r.requested_period, "2024年报")
 
 
 class TestParseIfindMarkdownSeries(unittest.TestCase):

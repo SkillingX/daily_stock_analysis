@@ -24,13 +24,18 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from inspect import signature
+from functools import partial
+from time import monotonic
 import json
 import logging
 import os
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading
-from .ifind_fundamental_adapter import _safe_float
+from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
+from .ifind_fundamental_adapter import _apply_mcp_request_deadline, _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -133,13 +138,13 @@ _PERIOD_FIELDS = {
 # ------------------------------------------------------------------
 
 
-def _extract_key_value_pairs(payload: Any) -> Dict[str, str]:
+def _extract_key_value_pairs(payload: Any, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """从 Choice MCP 响应任意层级抽取 ``{指标名: 字符串值}`` 映射。
 
     支持形态（按发现顺序）：
     1. **Choice MCP 真实 shape**（生产）：
        ``{"data": [{"columns": [...], "items": [["指标名", 值, 值, ...]], ...}]}``
-       —— ``items[0][0]`` 是指标名、``items[0][1]`` 是最新期值（columns[1] 通常是最近日期 / 期间）。
+       —— 每个 items 行是一个指标，按 columns 的实际期选择对应列，不假设首列最新。
     2. 顶层 ``dict`` 含 ``response`` 键 → 递归（旧 fixture 兼容）。
     3. ``response``/顶层 ``dict`` 是 ``dict`` → 找形如 ``{key: value}`` 的所有键值对。
     4. ``response``/顶层是 ``str``（JSON 或 Markdown 表）→ 进一步 ``_parse_response_str``。
@@ -154,18 +159,24 @@ def _extract_key_value_pairs(payload: Any) -> Dict[str, str]:
                 if isinstance(elem, dict):
                     items = elem.get("items")
                     if isinstance(items, list) and items:
-                        first_row = items[0]
-                        if isinstance(first_row, list) and len(first_row) >= 2:
-                            metric = str(first_row[0]).strip()
-                            latest_value = str(first_row[1]).strip()
-                            if metric:
-                                return {metric: latest_value}
+                        columns = elem.get("columns") or []
+                        periods = [normalize_report_period(col) for col in columns[1:]]
+                        if keywords is not None:
+                            periods = [candidate if any(isinstance(row, list) and len(row) > pos + 1 and any(kw in str(row[0]) for kw in keywords) and (normalize_anchor_value(field, row[pos + 1], str(row[0]))[0] if field is not None else _safe_float(row[pos + 1])) is not None for row in items) else (None, "unknown") for pos, candidate in enumerate(periods)]
+                        selected = select_report_period(periods, period)
+                        position = selected + 1 if selected is not None else 1
+                        pairs = {str(row[0]).strip(): str(row[position]).strip() for row in items if isinstance(row, list) and len(row) > position}
+                        if position < len(columns):
+                            pairs["report_period"] = str(columns[position])
+                        return pairs
         # 2) {"response": ...} 包装（递归；iFind / 旧 fixture 兼容）
         if "response" in payload:
-            return _extract_key_value_pairs(payload["response"])
+            return _extract_key_value_pairs(payload["response"], period=period, keywords=keywords, field=field)
         # 3) 扁平 dict（含一层嵌套 → 父键.子键 前缀）
         out: Dict[str, str] = {}
         for k, v in payload.items():
+            if k in {"request", "query", "toolQuery", "params", "endpoint"}:
+                continue
             if isinstance(v, (str, int, float)) and not isinstance(v, bool):
                 out[str(k)] = str(v)
             elif isinstance(v, dict):
@@ -175,16 +186,16 @@ def _extract_key_value_pairs(payload: Any) -> Dict[str, str]:
         return out
     if isinstance(payload, list):
         for item in payload:
-            found = _extract_key_value_pairs(item)
+            found = _extract_key_value_pairs(item, period=period, keywords=keywords, field=field)
             if found:
                 return found
         return {}
     if isinstance(payload, str):
-        return _parse_response_str(payload)
+        return _parse_response_str(payload, period=period, keywords=keywords, field=field)
     return {}
 
 
-def _parse_response_str(text: str) -> Dict[str, str]:
+def _parse_response_str(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """解析 Choice MCP ``response`` 字符串字段。
 
     - 若 ``text`` 是合法 JSON → 走 ``_extract_key_value_pairs`` 递归抽取
@@ -200,51 +211,41 @@ def _parse_response_str(text: str) -> Dict[str, str]:
     except (json.JSONDecodeError, ValueError):
         parsed = None
     if parsed is not None:
-        return _extract_key_value_pairs(parsed)
+        return _extract_key_value_pairs(parsed, period=period, keywords=keywords, field=field)
     # 退化：Markdown 表（与 iFinD 形态类似，宽松匹配首行数据）
-    return _parse_markdown_first_row(text)
+    return _parse_markdown_first_row(text, period=period, keywords=keywords, field=field)
 
 
-def _parse_markdown_first_row(text: str) -> Dict[str, str]:
+def _parse_markdown_first_row(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
     """Markdown 表首行数据 → ``{header: value}``。
 
     仅在响应字段不是 JSON 时退化使用；找第一个 ``|---|`` 分隔行确定表头，
     取下一行数据。无分隔行 → ``{}``。
     """
-    lines = text.splitlines()
-    sep_idx = -1
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("|") and stripped.endswith("|") and "-" in stripped:
-            sep_idx = i
-            break
-    if sep_idx < 0:
-        return {}
-    headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-    result: Dict[str, str] = {}
-    for row in lines[sep_idx + 1 :]:
-        cells = [c.strip() for c in row.split("|") if c.strip()]
-        if not cells or cells[0].startswith("#"):
-            continue
-        for i, cell in enumerate(cells):
-            if i < len(headers):
-                result[headers[i]] = cell
-        break  # 只取首行数据
-    return result
+    from .ifind_fundamental_adapter import _parse_ifind_markdown_table
+
+    return _parse_ifind_markdown_table(text, period=period, keywords=keywords, field=field)
 
 
-def _pick_value(pairs: Dict[str, str], keywords: List[str]) -> Tuple[Optional[float], str]:
+def _pick_value(pairs: Dict[str, str], keywords: List[str], field: Optional[str] = None) -> Tuple[Optional[float], str]:
     """从 ``pairs`` 中按关键词模糊匹配取值。
 
     返回 ``(value, used_column)``。找不到 → ``(None, "")``。
     """
+    fallback: Tuple[Optional[float], str] = (None, "")
     for kw in keywords:
         for col, val in pairs.items():
             if kw in col:
-                v = _safe_float(val)
+                v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
-                    return v, col
-    return None, ""
+                    if field is None:
+                        return v, col
+                    _, unit, currency, error = normalize_anchor_value(field, val, col, unit=pairs.get("unit"), currency=pairs.get("currency"))
+                    if not reading_input_reasons(AnchorReading("mx_mcp", v, caliber=caliber_from_label(field, col), unit=unit, currency=currency, normalization_error=error), field):
+                        return v, col
+                    if fallback[0] is None:
+                        fallback = (v, col)
+    return fallback
 
 
 def _parse_mx_mcp_response(
@@ -260,7 +261,7 @@ def _parse_mx_mcp_response(
     """
     if not raw_text:
         return None
-    pairs = _extract_key_value_pairs(json.loads(raw_text) if raw_text.strip().startswith(("{", "[")) else raw_text)
+    pairs = _extract_key_value_pairs(json.loads(raw_text) if raw_text.strip().startswith(("{", "[")) else raw_text, period=period, keywords=keywords, field=field)
     if not pairs:
         # 高信噪比预警：响应不是 MCP / JSON / Markdown 任何已知 shape。
         # 这是上游协议变更或 server 异常的强信号，而不是单字段缺失。
@@ -270,14 +271,24 @@ def _parse_mx_mcp_response(
             (raw_text[:80] + "...") if len(raw_text) > 80 else raw_text,
         )
         return None
-    value, _col = _pick_value(pairs, keywords)
+    value, col = _pick_value(pairs, keywords, field=field)
     if value is None:
         return None
+    actual, basis = report_period_from_fields(pairs, col)
+    value, unit, currency, error = normalize_anchor_value(field, pairs[col], col, unit=pairs.get("unit"), currency=pairs.get("currency"))
+    if value is None:
+        return None
+    observed = observation_time_from_fields(pairs, pairs.get("report_period") if field not in _PERIOD_FIELDS else None)
     return AnchorReading(
         source="mx_mcp",
         value=value,
-        caliber="TTM" if field == "pe_ratio" else None,
-        period=period if field in _PERIOD_FIELDS else None,
+        caliber=caliber_from_label(field, col),
+        period=actual if field in _PERIOD_FIELDS else None,
+        period_basis=basis if field in _PERIOD_FIELDS else "unknown",
+        requested_period=period if field in _PERIOD_FIELDS else None,
+        observed_at=observed, fetched_at=pairs.get("fetched_at"),
+        unit=unit, currency=currency, raw_value=pairs[col], raw_label=col, normalization_error=error,
+        raw_unit=pairs.get("unit"), raw_currency=pairs.get("currency"),
     )
 
 
@@ -322,15 +333,19 @@ class MxMcpFetcher:
         return bool(self._endpoint and self._api_key)
 
     def fetch(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步获取（封装 async MCP）。无 token/失败 → None。"""
         if not self.available:
             return None
         if field not in _MX_MCP_ANCHOR_QUERIES:
             return None
+        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
+        if remaining is not None and remaining <= 0:
+            return None
         try:
-            return asyncio.run(self._async_fetch(code, field, period))
+            call = self._async_fetch(code, field, period, deadline=deadline)
+            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug(
                 "[MxMcpFetcher] fetch %s/%s failed: %s", code, field, exc
@@ -338,62 +353,37 @@ class MxMcpFetcher:
             return None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，CI 不覆盖
-        self, code: str, field: str, period: Optional[str]
+        self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """执行一次 Choice MCP 调用。"""
-        import inspect
-        from mcp import ClientSession  # type: ignore
-        # mcp 2.x renamed ``streamablehttp_client`` → ``streamable_http_client`` AND changed
-        # the signature from ``(url, headers=..., timeout=...)`` to ``(url, *, http_client=...)``.
-        # Detect at runtime; pass headers + timeout via ``httpx.AsyncClient`` for 2.x, pass
-        # kwargs directly for 1.x legacy.
-        try:  # pragma: no cover — real MCP call path, CI not covered
-            from mcp.client.streamable_http import streamable_http_client  # type: ignore
-        except ImportError:  # pragma: no cover — 1.x legacy
-            from mcp.client.streamable_http import (  # type: ignore
-                streamablehttp_client,  # type: ignore[attr-defined]
-            )
-            streamable_http_client = streamablehttp_client  # type: ignore[assignment]
-
-        sig_params = inspect.signature(streamable_http_client).parameters
-        uses_http_client_kwarg = "http_client" in sig_params
+        from mcp import ClientSession
+        from mcp.client import streamable_http
+        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
 
         tool, query_tpl, keywords = _MX_MCP_ANCHOR_QUERIES[field]
         query = query_tpl.format(code=code, period=period or "")
         headers = {"em_api_key": self._api_key}
         last_error: Optional[str] = None
         for attempt in range(2):
+            timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
+            if timeout <= 0:
+                return None
             try:
-                if uses_http_client_kwarg:  # mcp >= 2.0
-                    import httpx as _httpx  # type: ignore
-
-                    async with streamable_http_client(
-                        self._endpoint,
-                        http_client=_httpx.AsyncClient(
-                            headers=headers, timeout=self._timeout
-                        ),
-                    ) as streams:
-                        # mcp 2.x yields 2-tuple; 1.x legacy yielded 3-tuple.
-                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
-                            read, write, _ = streams  # type: ignore[misc]
-                        else:
-                            read, write = streams  # type: ignore[misc]
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            result = await session.call_tool(tool, {"query": query})
-                else:  # mcp < 2.0 (legacy)
-                    async with streamable_http_client(
-                        self._endpoint,
-                        headers=headers,
-                        timeout=self._timeout,
-                    ) as streams:
-                        if len(streams) == 3:  # pragma: no cover — 1.x legacy
-                            read, write, _ = streams  # type: ignore[misc]
-                        else:
-                            read, write = streams  # type: ignore[misc]
-                        async with ClientSession(read, write) as session:
-                            await session.initialize()
-                            result = await session.call_tool(tool, {"query": query})
+                async with AsyncExitStack() as stack:
+                    close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
+                    if "http_client" in signature(transport).parameters:
+                        from mcp.shared._httpx_utils import create_mcp_http_client
+                        client = create_mcp_http_client(headers=headers)
+                        client.timeout = timeout
+                        if deadline is not None:
+                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                        await stack.enter_async_context(client)
+                        streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
+                    else:
+                        streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
+                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+                    await session.initialize()
+                    result = await session.call_tool(tool, {"query": query})
                 # 解析在上下文管理器关闭后做，避免持连接做正则
                 content = getattr(result, "content", None) or []
                 raw_text = next(
@@ -444,7 +434,7 @@ class MxMcpSource:
         return bool(self._fetcher and getattr(self._fetcher, "available", False))
 
     def read(
-        self, code: str, field: str, period: Optional[str] = None
+        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
         if self._fetcher is None:
@@ -452,15 +442,10 @@ class MxMcpSource:
         if field not in _MX_MCP_ANCHOR_QUERIES:
             return None
         try:
-            reading = self._fetcher.fetch(code, field, period)
+            reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：MX 异常不影响其他源
             logger.debug("[MxMcpSource] read %s/%s failed: %s", code, field, exc)
             return None
         if reading is None:
             return None
-        return AnchorReading(
-            source=self.name,
-            value=reading.value,
-            caliber=reading.caliber,
-            period=reading.period,
-        )
+        return replace(reading, source=self.name, requested_period=reading.requested_period if reading.requested_period is not None else period if field in _PERIOD_FIELDS else None)

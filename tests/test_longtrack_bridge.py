@@ -469,23 +469,28 @@ class TestSkipNarrationsPropagation:
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
         ctx = SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="2026-10-01T12:00:00")
         ctx.quote = {"price": 13.0}
-        ctx.fundamental = {"pe_ttm": 25.0}
+        from tests.test_f1_financial_quality import context
+        ctx.fundamental = context({
+            "pe_ratio": 25.0, "pb_ratio": 2.0, "roe": 18.0, "gross_margin": 40.0,
+            "revenue_yoy": 10.0, "net_profit_yoy": 10.0,
+        }).fundamental
         ctx.history = [
             {"date": str(date(2026, 8, 1) + timedelta(days=i)), "open": 10 + i * 0.1,
              "high": 10.3 + i * 0.1, "low": 9.7 + i * 0.1, "close": 10 + i * 0.1, "volume": 10000}
             for i in range(40)
         ]
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
-        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中性", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
-        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        monkeypatch.setattr(orch, "run_intel_agent", lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中性", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1})
+        monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
         for _name in (
             "run_technical_agent", "run_capital_agent", "run_sentiment_agent",
-            "run_ownership_agent", "run_us_china_agent", "run_business_agent",
+            "run_ownership_agent", "run_us_china_agent",
         ):
-            setattr(
+            monkeypatch.setattr(
                 orch, _name,
                 lambda *a, **k: {"ok": True, "data": {"score": 55, "narrative": "测试"}, "steps": 1},
             )
+        monkeypatch.setattr(orch, "run_business_agent", lambda *a, **k: {"ok": True, "data": {"business_model": {"说明": "测试业务"}, "score": 55, "narrative": "测试"}, "steps": 1})
 
         # narrate 被调用即失败（证明 skip 生效）
         def _forbidden_narrate(*a, **k):
@@ -497,5 +502,5 @@ class TestSkipNarrationsPropagation:
             "600519", "贵州茅台", llm_adapter=None,
             force_refresh=True, skip_narrations=True,
         )
-        assert result.status == "success"
+        assert result.status == "success", {key: dim.degraded_reason for key, dim in result.dims.items() if dim.status == "degraded"}
         assert len(result.dims) == len(DIM_IDS) == 19

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, cast
+from uuid import uuid4
+from time import monotonic
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +28,8 @@ def get_fundamentals_dir() -> Path:
 
 
 def _resolve_unique_id(base: str) -> str:
-    from src.storage import get_db
-
-    rid = base
-    seq = 1
-    while get_db().get_fundamentals_report(rid) is not None:
-        rid = f"{base}_{seq}"
-        seq += 1
-    return rid
+    # Numeric suffix preserves the existing report-ID API and rollback readers.
+    return f"{base}_{uuid4().int}"
 
 
 def _rule_dim(dim_id: str, code: str, name: str, ctx: Any, position_text: str = "") -> Dict[str, Any]:
@@ -67,14 +64,14 @@ def _position_text(business_payload: Dict[str, Any]) -> str:
     return " ".join(parts)[:400]
 
 
-def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
+def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """跑一个研究员（带维度缓存），失败返回降级占位。"""
     from src.deep_research.researchers import REGISTRY, RUNNER_NAMES
     import src.agent.deep_research.orchestrator as orch
 
     from src.deep_research_dims.dim_cache import load_cached_dim, save_cached_dim
 
-    cached = load_cached_dim(code, dim_id)
+    cached = None if force_refresh else load_cached_dim(code, dim_id)
     if cached is not None:
         # 契约校验：旧 schema 缓存值（如 str 时代的 Dict 字段）非法即 miss 重算
         try:
@@ -84,18 +81,27 @@ def _research_dim(dim_id: str, code: str, name: str) -> Dict[str, Any]:
             return cached
         except Exception:  # noqa: BLE001
             pass
+    reason = "研究员不可用"
     try:
         runner = getattr(orch, RUNNER_NAMES[dim_id])
-        out = runner(code, name, orch._get_dual_track_adapter() if hasattr(orch, "_get_dual_track_adapter") else __import__("src.services.deep_research_service", fromlist=["_get_dual_track_adapter"])._get_dual_track_adapter(), None, 8)
+        from src.services.deep_research_service import _get_dual_track_adapter
+        out = runner(code, name, _get_dual_track_adapter(), None, 8, deadline=deadline)
         if out.get("ok"):
             dim, _ = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
             payload = dim.model_dump()
             if dim.status == "ok":
                 save_cached_dim(code, dim_id, payload)
             return cast(Dict[str, Any], payload)
+        error = str(out.get("error") or "")
+        reason = "模型未成功完成研究，业务画像未完成"
+        for marker, explanation in (("时限", "研究时限耗尽"), ("length", "模型输出被截断"),
+                                    ("content_filter", "模型输出被服务商过滤"), ("JSON", "模型输出格式无效")):
+            if marker in error:
+                reason = explanation + "，业务画像未完成"
+                break
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
-    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": "研究员不可用"})
+    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": reason})
 
 
 def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
@@ -118,9 +124,35 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
+def report_markdown(record: Dict[str, Any]) -> str:
+    """Read historical files without rewriting them; legacy quality remains unknown."""
+    try:
+        markdown = Path(record["md_path"]).read_text(encoding="utf-8")
+    except OSError:
+        markdown = ""
+    dims = json.loads(record.get("dims_json") or "{}")
+    # Re-present old structured snapshots without recomputing or rewriting them.
+    snapshot_fields = {
+        "business": {"business_model", "main_products", "competitive_position", "vs_market_leader", "narrative", "data_gaps"},
+        "sector": {"narrative", "data_gaps"},
+        "financial": {"profitability", "growth_quality", "valuation_detail", "narrative", "data_gaps"},
+    }
+    report_date = re.search(r"(?m)^> 报告日期：(.+?) ｜", markdown)
+    if ('<font color="#e03131">' in markdown and report_date
+            and all(isinstance(dims.get(key), dict) and fields <= dims[key].keys()
+                    for key, fields in snapshot_fields.items())
+            and any(dims["business"].get(key) for key in snapshot_fields["business"])):
+        markdown = _render_markdown(record["stock_name"], record["stock_code"],
+                                    report_date.group(1), dims, record["id"])
+    if not (dims.get("financial") or {}).get("data_quality"):
+        markdown = "> 财务数据未核验：历史报告没有字段质量证据，不能认定已验证。\n\n" + markdown
+    return markdown
+
+
+def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """生成基本面专项报告（经营模式/主营产品/行业地位/龙头与大盘对比 + 财务体检）。"""
-    from src.agent.tools.data_tools import _get_fetcher_manager
+    from src.config import get_config
+    deadline = monotonic() + get_config().fundamentals_report_timeout_seconds
 
     # 归一化：兼容 300260.SZ / SH600519 / 文本中夹代码 等输入（与深度投研 normalize_a_share 同口径）
     from src.services.stock_code_utils import normalize_code
@@ -129,24 +161,17 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
     code = normalize_code(raw) if raw else ""
     if not code or not code.isdigit() or len(code) != 6:
         raise ValueError(f"仅支持 A 股 6 位代码：{raw_code}")
+    created_at = datetime.now()
     name = (raw_name or "").strip()
     # 名称里夹带代码后缀时剥掉（如"新莱应材 300260.SZ"）
     if name and code in name:
         name = name.replace(code, "").replace(".SZ", "").replace(".SH", "").strip()
-    if not name:
-        try:
-            quote = _get_fetcher_manager().get_realtime_quote(code)
-            name = str(getattr(quote, "name", "") or "").strip() or code
-        except Exception:  # noqa: BLE001
-            name = code
+    name = name or code
 
     # 当天已生成过则直接返回已有报告，避免重复
-    existing = _same_day_dedup_report(code)
+    existing = None if force_refresh else _same_day_dedup_report(code)
     if existing is not None:
-        try:
-            md = Path(existing["md_path"]).read_text(encoding="utf-8")
-        except OSError:
-            md = ""
+        md = report_markdown(existing)
         return {
             "report_id": existing["id"],
             "stock_code": code,
@@ -158,15 +183,23 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
 
     from src.deep_research_dims.context import build_shared_context
 
-    ctx = build_shared_context(code, name)
-    business = _research_dim("business", code, name)
+    from data_provider.mx_data_adapter import financial_refresh
+    token = financial_refresh.set((code, uuid4().hex) if force_refresh else None)
+    try:
+        ctx = build_shared_context(code, name, deadline=deadline)
+    finally:
+        financial_refresh.reset(token)
+    if name == code and ctx.quote.get("name"):
+        name = str(ctx.quote["name"])
+        ctx.stock_name = name
+    business = _research_dim("business", code, name, deadline=deadline, force_refresh=force_refresh)
     dims = {
         "business": business,
         "sector": _rule_dim("sector", code, name, ctx, _position_text(business)),
         "financial": _rule_dim("fundamental", code, name, ctx),
     }
     as_of = datetime.now().isoformat(timespec="seconds")
-    rid = _resolve_unique_id(_ID_PATTERN.format(ts=datetime.now()))
+    rid = _resolve_unique_id(_ID_PATTERN.format(ts=created_at))
     md = _render_markdown(name, code, as_of, dims, rid)
     md_path = get_fundamentals_dir() / f"{rid}.md"
     md_path.write_text(md, encoding="utf-8")
@@ -179,14 +212,17 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None) 
                 "id": rid, "stock_code": code, "stock_name": name,
                 "md_path": str(md_path),
                 "dims_json": json.dumps(dims, ensure_ascii=False, default=str),
+                "created_at": created_at,
             }
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 落库失败: %s", exc)
+    if not ok:
+        md_path.unlink(missing_ok=True)
     return {
         "report_id": rid if ok else None,
         "stock_code": code, "stock_name": name,
-        "status": "success" if ok else "failed",
+        "status": ("partial" if any(dim.get("status") != "ok" for dim in dims.values()) else "success") if ok else "failed",
         "markdown": md, "dims": dims,
     }
 
@@ -208,26 +244,23 @@ def _pangu_spacing(text: str) -> str:
 
 def _render_markdown(name: str, code: str, as_of: str, dims: Dict[str, Any], report_id: str = "") -> str:
     from jinja2 import Environment, FileSystemLoader
+    from functools import partial
+    from src.deep_research_dims.render import KEY_ZH_MAP, _format_cn
 
     env = Environment(
         loader=FileSystemLoader(Path(__file__).parent.parent.parent / "templates"),
         autoescape=False, trim_blocks=True, lstrip_blocks=True,
     )
+    env.filters["cn"] = partial(_format_cn, labels={
+        **KEY_ZH_MAP, "value": "说明", "industry_rank": "行业地位", "demand_backdrop": "需求背景",
+    })
     md = env.get_template("fundamentals_report.j2").render(
         stock_name=name, stock_code=code, as_of=as_of, report_id=report_id,
         business=dims.get("business") or {}, sector=dims.get("sector") or {},
         financial=dims.get("financial") or {},
         degraded_note=_degraded_note,
     )
-    md = _pangu_spacing(md)
-    # 红色双保险：🔴 加粗短语外包 <font color>（跨端显红，前缀保底）
-    import re as _re
-
-    return _re.sub(
-        r"🔴 \*\*([^*\n]+)\*\*",
-        r'<font color="#e03131">🔴 **\1**</font>',
-        md,
-    )
+    return _pangu_spacing(md)
 
 
 def _degraded_note(dim: Dict[str, Any]) -> str:

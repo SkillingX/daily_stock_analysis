@@ -383,3 +383,11 @@ VISION_PROVIDER_PRIORITY=gemini,anthropic,openai
 | **Ollama 报 404、`Could not get model info` 或 `api/generate/api/show`** | 误用 `OPENAI_BASE_URL` 配置 Ollama，系统会错误拼接 URL | 改用 `OLLAMA_API_BASE=http://localhost:11434` 或渠道模式（`LLM_CHANNELS=ollama` + `LLM_OLLAMA_BASE_URL`） |
 
 *进阶老手的叮嘱：如果你开启了 **Agent (深度思考网络搜索问股) 模式**，这里有个经验之谈，推荐选用如 `deepseek-v4-pro` 这种逻辑推导能力更强的大模型。如果为了省钱用小微模型跑 Agent，它逻辑能力大概率跟不上，不仅达不到预期，还会白跑一堆空流程。*
+
+### GLM-5.3 中档推理与工具后续请求验证
+
+GLM-5.3 原生支持 1M 上下文，模型 ID 使用 `glm-5.3`，无需 `[1m]` 后缀。标准 API 的推理档位为 `low/high/max`，中档对应 `high`；不要传 `medium` 或关闭 thinking。参考[官方模型说明](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3)。最高档本身并非故障：基本面报告还必须为搜索和最终生成合理分配时间。
+
+复用 [GLM YAML 示例](examples/litellm_glm.example.yaml)：在根 `.env` 设置 `LITELLM_CONFIG=docs/examples/litellm_glm.example.yaml`、`LITELLM_MODEL=openai/glm-5.3`，将 `AGENT_LITELLM_MODEL` 留空以继承；密钥继续放在被忽略的 `.env` 的 `LLM_ZHIPU_API_KEY` 或进程环境中。已有进程环境优先；YAML 的模型列表优先于渠道配置。不要把真实密钥复制到 YAML。重启现有后端以清除缓存的 Agent adapter；Web 渠道编辑不会覆盖该 YAML 的模型级参数。
+
+用 `python scripts/probe_agent_model.py <request.json> --timeout 120` 可将私有的 OpenAI 格式 `messages/tools` 请求重放到当前配置模型。工具历史保留 reasoning_content 和关联 ID，脚本不执行工具，不写业务数据库，只输出耗时、结束原因、长度及 JSON 对象解析状态；会消耗模型额度。请求中的 model 等顶层字段不覆盖运行配置。不上传带凭据或私人内容的原始请求。退出 0 表示 stop 且正文为 JSON 对象，不代表内容事实正确或整份报告完成；超时、截断、仅工具调用或非法 JSON 均退出非零。

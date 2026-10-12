@@ -511,12 +511,22 @@ class TestLongbridgeFetcherMocked(unittest.TestCase):
 
         # pe_ratio = price / eps_ttm
         self.assertAlmostEqual(quote.pe_ratio, 253.79 / 6.08, places=1)
+        self.assertEqual(quote.field_meta["pe_ratio"]["caliber"], "TTM")
 
         # pb_ratio = price / bps
         self.assertAlmostEqual(quote.pb_ratio, 253.79 / 4.40, places=1)
 
         # total_mv
         self.assertAlmostEqual(quote.total_mv, 253.79 * 16000000000, places=0)
+
+    def test_plain_eps_fallback_does_not_claim_ttm(self):
+        fetcher, ctx = self._make_fetcher_with_mock_ctx()
+        ctx.quote.return_value = [self._make_mock_quote()]
+        ctx.static_info.return_value = [self._make_mock_static(eps_ttm=None, eps="6.08")]
+        ctx.history_candlesticks_by_offset.return_value = []
+        quote = fetcher.get_realtime_quote("AAPL")
+        self.assertAlmostEqual(quote.pe_ratio, 253.79 / 6.08, places=1)
+        self.assertNotIn("pe_ratio", quote.field_meta)
 
     def test_turnover_falls_back_to_total_shares_when_circulating_zero(self):
         """US API often reports circulating_shares=0; use total_shares for turnover."""
@@ -644,6 +654,7 @@ class TestSupplementFromLongbridge(unittest.TestCase):
             volume_ratio=1.25,
             turnover_rate=0.33,
             pe_ratio=41.7,
+            field_meta={"pe_ratio": {"caliber": "TTM"}},
             pb_ratio=57.7,
             total_mv=4060640000000.0,
         )

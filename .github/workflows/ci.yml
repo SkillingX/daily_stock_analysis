@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [main]
 
@@ -102,6 +103,8 @@ jobs:
           from src.patches.eastmoney_patch import eastmoney_patch; print('patch OK')
           from bot.dispatcher import CommandDispatcher; print('bot OK')
           from api.app import app; print('api OK')
+          from src.deep_research_dims.narrate import load_dim_prompt
+          assert 'data_gaps' in load_dim_prompt('business'), 'Business prompt missing from image'
           print('All Docker imports OK')
           "
 
@@ -109,7 +112,7 @@ jobs:
     name: web-gate
     runs-on: ubuntu-latest
     needs: [changes, ai-governance]
-    if: needs.changes.outputs.frontend == 'true'
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.frontend == 'true'
     defaults:
       run:
         working-directory: apps/dsa-web

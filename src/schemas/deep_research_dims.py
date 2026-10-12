@@ -13,9 +13,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic_core import to_json
+
+from data_provider.cross_source_validator import AnchorQuality, AnchorReading
 
 from src.schemas.bayesian_framework import BayesianFramework, EvidenceItem
 from src.schemas.investment_conclusion import InvestmentConclusion
@@ -276,6 +279,27 @@ class ScenariosDim(DimEnvelope):
     narrative: str = ""
 
 
+class FinancialFieldQuality(BaseModel):
+    """Read-only projection of the context's adopted field evidence."""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    reading: Optional[AnchorReading] = None
+    quality: AnchorQuality = Field(default_factory=AnchorQuality)
+    rule_eligible: bool = False
+    input_reasons: tuple[str, ...] = ()
+    selection_reason: str = "unknown"
+
+
+class FinancialDataQuality(BaseModel):
+    """Acquisition, rule usability and participating components have distinct meanings."""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    state: Literal["none", "partial", "complete"]
+    obtained_count: Annotated[int, Field(ge=0, le=6)]
+    rule_usable_count: Annotated[int, Field(ge=0, le=6)]
+    health_components: Annotated[int, Field(ge=0, le=5)]
+    fields: dict[str, FinancialFieldQuality] = Field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+
+
 class FundamentalDim(DimEnvelope):
     """F1 财务与基本面（方案 v2.1 新增）：盈利/成长/安全/估值四框架详表。
 
@@ -284,6 +308,7 @@ class FundamentalDim(DimEnvelope):
     """
 
     dim: Literal["fundamental"] = "fundamental"
+    data_quality: Optional[FinancialDataQuality] = None
     profitability: Dict[str, Any] = Field(default_factory=dict)
     growth_quality: Dict[str, Any] = Field(default_factory=dict)
     financial_safety: Dict[str, Any] = Field(default_factory=dict)
@@ -429,7 +454,7 @@ def parse_dim(dim: str, payload: Dict[str, Any]) -> DimEnvelope:
     model = DIM_MODELS.get(dim)
     if model is None:
         raise ValueError(f"未知维度: {dim}")
-    return model.model_validate(payload)
+    return model.model_validate_json(to_json(payload)) if dim == "fundamental" else model.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------

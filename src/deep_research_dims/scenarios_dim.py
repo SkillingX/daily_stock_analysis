@@ -10,6 +10,7 @@ import logging
 from icontract import require
 
 from src.deep_research_dims.context import SharedContext
+from src.deep_research_dims.fundamental_dim import eligible_financial_value
 from src.schemas.deep_research_dims import ScenariosDim
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def build_scenarios_dim(
 ) -> ScenariosDim:
     """L5：LLM 提供情景叙述（可选），概率/EV/口径全部机器计算；时间层级挂条件句。"""
     fund = ctx.fundamental
-    pe_ttm = fund.get("pe_ttm")
+    pe_ttm = eligible_financial_value(fund, "pe_ratio")
     basis = _valuation_basis(pe_ttm if isinstance(pe_ttm, (int, float)) else None)
 
     raw_scenarios: List[Scenario] = []

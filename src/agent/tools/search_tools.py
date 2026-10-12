@@ -160,7 +160,7 @@ search_stock_news_tool = ToolDefinition(
 
 
 def _handle_search_comprehensive_intel(
-    stock_code: str, stock_name: str
+    stock_code: str, stock_name: str, *, profile: str = "comprehensive"
 ) -> dict[str, Any]:
     """Multi-dimensional intelligence search."""
     service = _get_search_service()
@@ -171,14 +171,15 @@ def _handle_search_comprehensive_intel(
     intel_results = service.search_comprehensive_intel(
         stock_code=stock_code,
         stock_name=stock_name,
-        max_searches=6,
+        max_searches=3 if profile == "business" else 6,
+        profile=profile,
     )
 
     if not intel_results:
         return {"error": "Comprehensive intel search returned no results"}
 
     # Format into readable report
-    report = service.format_intel_report(intel_results, stock_name)
+    report = service.format_intel_report(intel_results, stock_name) if profile != "business" else None
 
     # Also return structured data
     dimensions = {}
@@ -198,6 +199,8 @@ def _handle_search_comprehensive_intel(
                         "title": r.title,
                         "snippet": r.snippet,
                         "source": r.source,
+                        "url": r.url,
+                        "published_date": r.published_date,
                     }
                     for r in response.results[
                         :3
@@ -205,10 +208,23 @@ def _handle_search_comprehensive_intel(
                 ],
             }
 
-    return {
-        "report": report,
-        "dimensions": dimensions,
-    }
+        elif profile == "business":
+            dimensions[dim_name] = {"results": [], "error": "资料获取失败"}
+
+    if profile == "business":
+        seen: list[dict[str, Any]] = []
+        for dimension in dimensions.values():
+            records = dimension["results"]
+            unique = []
+            for record in records:
+                if record not in seen:
+                    unique.append(record)
+                    seen.append(record)
+            dimension["results"] = unique
+            dimension["results_count"] = len(unique)
+            dimension["duplicate_results_omitted"] = len(records) - len(unique)
+        return {"dimensions": dimensions}
+    return {"report": report, "dimensions": dimensions}
 
 
 search_comprehensive_intel_tool = ToolDefinition(

@@ -116,8 +116,10 @@ class HTMLScrapeNewsProvider(BaseSearchProvider):
     """P3-1 (2026-07-17): Last-resort news provider that scrapes Eastmoney
     announcements when Tavily / SearXNG / Brave all return 0."""
 
+    requires_api_key = False
+
     def __init__(self) -> None:
-        super().__init__(api_keys=[""], name="html_scrape")
+        super().__init__(api_keys=[], name="html_scrape")
 
     def _do_search(
         self,

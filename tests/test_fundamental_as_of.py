@@ -33,7 +33,7 @@ class TestAsOfDerivation(unittest.TestCase):
         ctx = {"as_of": "2025-09-30"}
         self.assertEqual(DataFetcherManager._derive_as_of_date(ctx), "2025-09-30")
 
-    def test_falls_back_to_earnings_block_year(self) -> None:
+    def test_forecast_year_does_not_prove_actual_report_date(self) -> None:
         ctx = {
             "earnings": {
                 "data": {
@@ -41,9 +41,9 @@ class TestAsOfDerivation(unittest.TestCase):
                 }
             }
         }
-        self.assertEqual(DataFetcherManager._derive_as_of_date(ctx), "2024-12-31")
+        self.assertIsNone(DataFetcherManager._derive_as_of_date(ctx))
 
-    def test_falls_back_to_growth_block_year(self) -> None:
+    def test_note_year_does_not_prove_actual_report_date(self) -> None:
         ctx = {
             "growth": {
                 "data": {
@@ -53,14 +53,14 @@ class TestAsOfDerivation(unittest.TestCase):
                 }
             }
         }
-        self.assertEqual(DataFetcherManager._derive_as_of_date(ctx), "2024-12-31")
+        self.assertIsNone(DataFetcherManager._derive_as_of_date(ctx))
 
-    def test_takes_max_year_across_blocks(self) -> None:
+    def test_unrelated_years_do_not_fabricate_december_period(self) -> None:
         ctx = {
             "earnings": {"data": {"forecast_summary": "预计2020年1-3月..."}},
             "growth": {"data": {"revenue_yoy": 5.0, "_period": "2024Q3"}},
         }
-        self.assertEqual(DataFetcherManager._derive_as_of_date(ctx), "2024-12-31")
+        self.assertIsNone(DataFetcherManager._derive_as_of_date(ctx))
 
     def test_returns_none_when_no_year(self) -> None:
         self.assertIsNone(DataFetcherManager._derive_as_of_date({}))

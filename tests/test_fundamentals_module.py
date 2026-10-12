@@ -16,7 +16,7 @@ class TestFundamentalsService:
             svc, "_resolve_unique_id", lambda base: "fd_test001"
         )
 
-        def _fake_research(dim_id, code, name):
+        def _fake_research(dim_id, code, name, **kwargs):
             return {
                 "dim": dim_id, "status": "ok", "narrative": f"{dim_id} 分析结论",
                 "business_model": {"经营模式": "测试模式（inferred）"},
@@ -34,7 +34,7 @@ class TestFundamentalsService:
         monkeypatch.setattr(svc, "_research_dim", _fake_research)
         monkeypatch.setattr(svc, "_rule_dim", lambda dim_id, code, name, ctx, position_text="": _fake_research(dim_id, code, name))
         import src.deep_research_dims.context as ctx_mod
-        monkeypatch.setattr(ctx_mod, "build_shared_context", lambda code, name: object())
+        monkeypatch.setattr(ctx_mod, "build_shared_context", lambda code, name, **kwargs: object())
         out = svc.generate_fundamentals_report("600519", "贵州茅台")
         assert out["report_id"] == "fd_test001"
         md = out["markdown"]
@@ -52,8 +52,10 @@ class TestFundamentalsService:
         monkeypatch.setattr(svc, "_REPORT_DIR", tmp_path)
         monkeypatch.setattr(svc, "_resolve_unique_id", lambda base: "fd_norm001")
         captured: dict = {}
+        from src.deep_research_dims.context import SharedContext
+        monkeypatch.setattr("src.deep_research_dims.context.build_shared_context", lambda code, name, **kwargs: SharedContext(code, name, "fixture"))
 
-        def _fake(dim_id, code, name):
+        def _fake(dim_id, code, name, **kwargs):
             captured["code"] = code
             captured["name"] = name
             return {"dim": dim_id, "status": "degraded", "degraded_reason": "fake"}

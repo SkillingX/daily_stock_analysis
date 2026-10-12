@@ -160,14 +160,14 @@ class TestExtractKeyValuePairs(unittest.TestCase):
         pairs = _extract_key_value_pairs(
             json.loads(_SYNTHETIC_REAL_MCP_CURRENT_PRICE)
         )
-        self.assertEqual(pairs, {"收盘价": "1237元"})
+        self.assertEqual(pairs["收盘价"], "1237元")
 
     def test_real_mcp_shape_net_profit(self):
         """真实 Choice MCP shape：归母净利 → 服务端实际指标名（股东的，不是所有者的）。"""
         pairs = _extract_key_value_pairs(
             json.loads(_SYNTHETIC_REAL_MCP_NET_PROFIT)
         )
-        self.assertEqual(pairs, {"归属于母公司股东的净利润": "862.3亿元"})
+        self.assertEqual(pairs, {"归属于母公司股东的净利润": "862.3亿元", "report_period": "2024年报"})
 
 
 class TestParseMarkdownFirstRow(unittest.TestCase):
@@ -288,7 +288,8 @@ class TestParseMxMcpResponse(unittest.TestCase):
             period="2024年报",
         )
         self.assertIsNotNone(reading)
-        self.assertEqual(reading.period, "2024年报")
+        self.assertIsNone(reading.period)
+        self.assertEqual(reading.requested_period, "2024年报")
 
     def test_real_mcp_current_price_uses_close_price_label(self):
         """真实 server 用「收盘价」label 而不是「最新价」；关键词列表应包含两者。"""
@@ -319,7 +320,7 @@ class TestParseMxMcpResponse(unittest.TestCase):
         )
         self.assertIsNotNone(reading)
         self.assertEqual(reading.value, 8.623e10)  # 862.3 亿元
-        self.assertEqual(reading.period, "2024年报")
+        self.assertEqual(reading.period, "2024-12-31")
 
     def test_unknown_shape_logs_warning(self):
         """响应不是 MCP/JSON/Markdown 任何已知 shape → WARN 一次，让运维发现 shape 漂移。"""

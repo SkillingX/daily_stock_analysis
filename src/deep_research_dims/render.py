@@ -102,29 +102,30 @@ KEY_ZH_MAP: Dict[str, str] = {
 }
 
 
-def _format_cn(value: Any) -> str:
+def _format_cn(value: Any, labels: Optional[Dict[str, str]] = None) -> str:
     """把 dict/list/JSON 字符串递归格式化为中文可读多行文本（治 JSON 裸奔）。
 
     - 字符串若整体是 JSON 则解析后递归；普通字符串原样返回。
     - dict → 「- **键**：值」分行（键经 KEY_ZH_MAP 中文化）。
     - list → 标量列表逐项 bullet；dict 列表每项一行「键：值」聚合。
     """
+    labels = KEY_ZH_MAP if labels is None else labels
     if value is None:
         return "缺失"
     if isinstance(value, str):
         s = value.strip()
         if s.startswith(("{", "[")):
             try:
-                return _format_cn(json.loads(s))
+                return _format_cn(json.loads(s), labels)
             except ValueError:
                 return value
         return value
     if isinstance(value, dict):
         lines: List[str] = []
         for k, v in value.items():
-            label = KEY_ZH_MAP.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))
+            label = labels.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))
             if isinstance(v, (dict, list)):
-                sub = _format_cn(v)
+                sub = _format_cn(v, labels)
                 if not sub:
                     continue
                 lines.append(f"- **{label}**：")
@@ -140,9 +141,9 @@ def _format_cn(value: Any) -> str:
                 items.append("- 缺失")
             elif isinstance(entry, dict):
                 flat = "；".join(
-                    f"{KEY_ZH_MAP.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))}：{_format_cn(v)}"
+                    f"{labels.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))}：{_format_cn(v, labels)}"
                     if isinstance(v, (dict, list))
-                    else f"{KEY_ZH_MAP.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))}：{'缺失' if v is None else v}"
+                    else f"{labels.get(str(k), ZH_TOKEN_MAP.get(str(k), str(k)))}：{'缺失' if v is None else v}"
                     for k, v in entry.items()
                 )
                 items.append(f"- {flat}" if flat else "")

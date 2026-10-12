@@ -3251,6 +3251,12 @@ class GeminiAnalyzer:
                     ],
                     "max_tokens": max_tokens,
                 }
+                request_timeout_seconds = generation_config.get("timeout_seconds")
+                if request_timeout_seconds is None:
+                    request_timeout_seconds = getattr(
+                        config, "llm_stream_response_timeout", 90.0
+                    )
+                call_kwargs["timeout"] = float(request_timeout_seconds)
                 if extra:
                     call_kwargs["extra_body"] = extra
                 uses_router = (

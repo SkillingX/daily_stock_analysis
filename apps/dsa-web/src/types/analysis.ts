@@ -206,6 +206,16 @@ export interface AnalysisContextPackOverviewBlock {
   source?: string | null;
   warnings: string[];
   missingReasons: string[];
+  financialQuality?: Record<string, {
+    status: 'missing' | 'unverified' | 'single_source' | 'not_comparable' | 'verified' | 'conflict';
+    ruleEligible: boolean;
+    source?: string | null;
+    period?: string | null;
+    periodBasis?: string | null;
+    caliber?: string | null;
+    unit?: string | null;
+    currency?: string | null;
+  }>;
 }
 
 export interface AnalysisContextPackOverviewCounts {

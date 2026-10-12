@@ -10,11 +10,12 @@ from typing import Any
 
 from src.agent.deep_research.explore_agents import run_business_agent
 from src.deep_research.researchers.base import generic_parse
+from src.schemas.deep_research_dims import BusinessDim
 
 DIM_ID = "business"
 DISPLAY_NAME = "基本面研究员（业务画像）"
 SKILL_MD = "researchers/business/SKILL.md"
-TOOLS = frozenset(frozenset({'search_comprehensive_intel', 'get_market_indices', 'search_stock_news'}))
+TOOLS = frozenset({'search_comprehensive_intel'})
 TTL_HOURS = 24.0
 SCORE_KEY = 'score'
 
@@ -34,5 +35,9 @@ def _strip_noise_keys(value: Any) -> Any:
     return value
 
 
-def parse(parsed, steps):
-    return generic_parse(DIM_ID, _strip_noise_keys(parsed or {}), steps)
+def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
+    dim, used = generic_parse(DIM_ID, _strip_noise_keys(parsed or {}), steps)
+    assert isinstance(dim, BusinessDim)
+    if dim.data_gaps or not any((dim.business_model, dim.main_products, dim.competitive_position, dim.vs_market_leader)):
+        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": "业务资料不足，已有内容仅供部分参考"})
+    return dim, used
