@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
+from datetime import date
+from functools import partial
 from time import monotonic
 from typing import Any, Callable, Dict, Optional
 
@@ -76,16 +79,23 @@ def _run_explore(
     """在共同截止时间内研究；仅成功响应的 JSON 格式错误允许修复。"""
     deadline = deadline if deadline is not None else monotonic() + 480.0
     system = (
-        load_constitution()
+        ("" if dim_id == "business" else load_constitution())
         + "\n\n"
         + load_dim_prompt(dim_id)
         + "\n\n最终回答必须是且仅是一个 JSON 对象（不要 Markdown 代码围栏外的任何文字）。"
     )
+    if dim_id == "business":
+        system += f"\n分析日期：{date.today().isoformat()}；日期未知的资料不得称为最新。"
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
         {"role": "user", "content": user_task},
     ]
     registry = _build_registry(_registry_source(), tool_names)
+    if dim_id == "business":
+        tool = registry.get("search_comprehensive_intel")
+        if tool is not None:
+            registry.register(replace(tool, handler=partial(tool.handler, profile="business"),
+                                      description="Search company business, products and competitors; returns evidence with URLs and dates."))
 
     last_error = ""
     for attempt in range(retry + 1):
@@ -327,7 +337,7 @@ def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=No
     return _run_explore("us_china", _US_CHINA_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
 
-_BUSINESS_TOOLS = {"search_comprehensive_intel", "search_stock_news", "get_market_indices"}
+_BUSINESS_TOOLS = {"search_comprehensive_intel"}
 
 
 def run_business_agent(
@@ -338,8 +348,7 @@ def run_business_agent(
     """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与龙头对比。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做业务画像与竞争地位分析并直接输出 JSON：\n"
-        "1) search_comprehensive_intel 调研主营业务/经营模式/行业地位，search_stock_news 查业务动态，"
-        "get_market_indices 取大盘环境作对比基准；\n"
+        "1) 用 search_comprehensive_intel 一次调研主营业务、产品和竞争地位；资料不足标缺失，不重复搜索；\n"
         "2) 输出 JSON：business_model(一句话经营模式)、main_products(主营产品与收入结构)、"
         "competitive_position(行业地位与护城河)、vs_market_leader(与板块龙头/大盘的对比，标注 inferred 或来源等级)、"
         "score(0-100 业务画像分，可 null)、data_gaps(取不到的数据项数组，禁止编造)、narrative(一段结论)。"

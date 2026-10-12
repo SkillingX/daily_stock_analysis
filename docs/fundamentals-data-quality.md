@@ -112,3 +112,9 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 新浪 `stock_financial_abstract` 的已核实标签 `净资产收益率(ROE)`、`毛利率`、`营业总收入增长率`、`归属母公司净利润增长率` 恢复百分比百分点单位，ROE 明确为加权，来源家族为 sina；该接口报告期序列的年末为 annual、季末为累计 YTD。依据为 [AKShare 关键指标接口说明](https://akshare.akfamily.xyz/data/stock/stock.html)、安装包对新浪 `CompanyFinanceService.getFinanceReport2022` 的调用及 2026-10-12 原始响应的 `ROEWEIGHTED`、`SGPMARGIN`、`TAGRT`、`NPGRT` 字段。仅恢复这四个精确标签的接口契约；其他接口、未知标签和金额单位仍保留 unknown。元数据完整不自动升级为跨源 verified，必须经过实际独立来源比对。
 
 回归：`python -m pytest tests/test_fundamentals_generation_budget.py tests/test_search_comprehensive_intel.py tests/test_fundamentals_data_quality.py tests/test_fundamentals_refresh.py`。包含本机 HTTP 服务拖延响应、真实 LiteLLM Router/SDK 无叠加重试、报告 API 部分结果保存与重开、慢行情不挤占 MX、无 Key 抓取器进入真实抓取入口的受控验证。没有配对英文专题，无需同步 README；无数据库迁移，回滚对应源码并重启即可恢复原行为。
+
+### 业务画像的资料边界
+
+业务画像采用独立 prompt，只研究主营、产品和竞争地位，显式提供分析日期；不继承终稿强制评级/目标价要求。使用现有综合搜索的 business profile，围绕三个业务问题查找资料，省去重复最新新闻和缺乏同口径依据的大盘查询。其他调用默认仍走原综合情报路径。
+
+业务 profile 只向模型提供结构化资料，保留 URL、来源和发布日期；日期未知保持未知，已知过期资料按分析资料窗口过滤。来源等级须根据实际出处判断，不把检索渠道或相关性分数当作核验。模型须在既有业务字段/narrative 中保留证据链接和时点，报告展示业务 data_gaps；不新增会被解析器丢弃的来源字段。结构成功不等于事实已核验，也不保证旧报告自动获得新证据。

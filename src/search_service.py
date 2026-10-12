@@ -4655,7 +4655,8 @@ class SearchService:
         )
 
     def search_comprehensive_intel(
-        self, stock_code: str, stock_name: str, max_searches: int = 3
+        self, stock_code: str, stock_name: str, max_searches: int = 3,
+        *, profile: str = "comprehensive",
     ) -> Dict[str, SearchResponse]:
         """
         多维度情报搜索（同时使用多个引擎、多个维度）
@@ -4791,6 +4792,19 @@ class SearchService:
                 },
             ]
 
+        if profile == "business":
+            search_dimensions = [
+                {"name": name, "query": f"{stock_name} {stock_code} {question}",
+                 "desc": question, "tavily_topic": None, "strict_freshness": False}
+                for name, question in (
+                    ("business", "公司官网 主营业务 经营模式 定期报告"),
+                    ("products", "主营产品 分部收入 收入结构 最新年报 中报"),
+                    ("industry", "行业竞争 对手 市场份额 公司公告"),
+                )
+            ]
+        elif profile != "comprehensive":
+            raise ValueError(f"Unsupported search profile: {profile}")
+
         search_days = self._effective_news_window_days()
         target_per_dimension = 3
         provider_max_results = self._provider_request_size(target_per_dimension)
@@ -4823,7 +4837,7 @@ class SearchService:
 
             request_days = (
                 self.ANALYTICAL_INTEL_LOOKBACK_DAYS
-                if dim["name"] in self.ANALYTICAL_INTEL_DIMENSIONS
+                if profile == "business" or dim["name"] in self.ANALYTICAL_INTEL_DIMENSIONS
                 else search_days
             )
 
@@ -4865,7 +4879,7 @@ class SearchService:
                         max_results=provider_max_results,
                         log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
                     )
-                elif dim["name"] in self.ANALYTICAL_INTEL_DIMENSIONS:
+                elif profile == "business" or dim["name"] in self.ANALYTICAL_INTEL_DIMENSIONS:
                     filtered_response = self._filter_news_response(
                         response,
                         search_days=self.ANALYTICAL_INTEL_LOOKBACK_DAYS,
