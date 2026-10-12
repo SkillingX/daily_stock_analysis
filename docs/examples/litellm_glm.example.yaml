@@ -1,0 +1,10 @@
+# GLM-5.3 的中档推理配置，配合 LITELLM_CONFIG 使用。
+# API Key 从环境变量或根 .env 加载；本文件不保存凭据。
+# API 的三档为 low/high/max；high 为中间档，1M 上下文无需后缀。
+model_list:
+  - model_name: openai/glm-5.3
+    litellm_params:
+      model: openai/glm-5.3
+      api_base: https://open.bigmodel.cn/api/paas/v4
+      api_key: os.environ/LLM_ZHIPU_API_KEY
+      reasoning_effort: high

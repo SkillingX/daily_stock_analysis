@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] 提供 GLM-5.3 中档推理 YAML 示例与基于真实 Agent 适配器的脱敏模型请求复跑入口。
 - [修复] 基本面报告统一研究时限，关闭有预算模型请求的嵌套重试，保存并提示部分结果；搜索逐维度补查、无 Key 公告抓取恢复，财务取数为 MX/核验保留预算并补齐新浪已知指标元数据。
 
 - [修复] 将既有 `LLM_STREAM_RESPONSE_TIMEOUT` 应用到 Analyzer 的流式与非流式 LLM 请求；大盘上下文超时后使用模板回退并继续个股分析。

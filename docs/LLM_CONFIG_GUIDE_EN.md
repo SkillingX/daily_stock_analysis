@@ -334,3 +334,11 @@ Afraid you got the config wrong? Type the following commands in your terminal to
 | **Ollama returns 404, `Could not get model info`, or `api/generate/api/show`** | Using `OPENAI_BASE_URL` for Ollama makes the system concatenate URLs incorrectly | Use `OLLAMA_API_BASE=http://localhost:11434` or channel mode (`LLM_CHANNELS=ollama` + `LLM_OLLAMA_BASE_URL`) instead |
 
 *Veteran's Tip: If you enable **Agent Mode (Deep-thinking & web-search)**, experience shows you should use a stronger model like `deepseek-v4-pro`. Trying to save money by using weak mini-models for agents will likely result in infinite loops or missed objectives.*
+
+### GLM-5.3 reasoning and tool-history replay
+
+GLM-5.3 has native 1M context; use `glm-5.3` without a `[1m]` suffix. Its standard API accepts `low/high/max`: the middle setting is `high`, not `medium`; thinking cannot be disabled. See the [official model guide](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3). Maximum effort is not inherently broken: the report must also budget search and final generation time.
+
+Use the [GLM YAML example](examples/litellm_glm.example.yaml). Set `LITELLM_CONFIG=docs/examples/litellm_glm.example.yaml` and `LITELLM_MODEL=openai/glm-5.3` in the root `.env`; leave `AGENT_LITELLM_MODEL` empty to inherit. Keep `LLM_ZHIPU_API_KEY` in the ignored local `.env` or process environment, never in YAML. Process environment wins; YAML model routing takes precedence over channels. Restart the backend to clear its cached Agent adapter. Editing Web channels does not override YAML model parameters.
+
+Run `python scripts/probe_agent_model.py <request.json> --timeout 120` to replay private OpenAI-format messages/tools through the configured adapter. It preserves tool-history reasoning and call IDs, executes no tools, writes no business database, and prints only timing, finish reason, lengths and JSON-object status. This consumes provider quota. Top-level model parameters in the input do not override runtime configuration. Keep raw requests private. Exit 0 requires a stop response containing a JSON object; this does not validate factual accuracy or a complete report. Timeout, truncation, tool-only responses and invalid JSON exit nonzero.
