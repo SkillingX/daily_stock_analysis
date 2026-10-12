@@ -465,3 +465,17 @@ CI 通过只能说明自动检查通过，不能替代人工语义收敛，也�
   3. 任务本身有多种理解且选错代价大
 
   除此之外，不要问，做完给我看。
+
+## Agent skills
+
+### Issue tracker
+
+本仓库的工单和实施规格使用 GitHub Issues，通过 `gh` CLI 操作。见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+采用五个默认分流标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`。见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+采用 single-context：根目录 `GLOSSARY.md` 与 `docs/adr/`，有实际术语或决策时再创建。见 `docs/agents/domain.md`。
