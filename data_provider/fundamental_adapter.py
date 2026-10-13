@@ -608,7 +608,7 @@ class AkshareFundamentalAdapter:
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
-    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+    def get_capital_flow(self, stock_code: str, top_n: int = 5, *, include_stock: bool = True) -> Dict[str, Any]:
         """
         Return stock + sector capital flow.
         """
@@ -628,7 +628,7 @@ class AkshareFundamentalAdapter:
                 ("stock_main_fund_flow", {"symbol": stock_code}),
                 ("stock_main_fund_flow", {}),
             ]
-        )
+        ) if include_stock else (None, "", [])
         result["errors"].extend(stock_errors)
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)

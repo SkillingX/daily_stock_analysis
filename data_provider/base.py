@@ -4284,6 +4284,21 @@ class DataFetcherManager:
                 ],
                 ["fundamental stage timeout"],
             )
+        if config.data_source_profile == "choice":
+            from data_provider.capital_flow_provider import get_main_inflow_cumulative
+            deadline = time.monotonic() + timeout
+            stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline)
+            # Sector flows have their own definition; retain their public path.
+            sector, sector_error, cost_ms = self._run_with_timeout(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code, include_stock=False),
+                max(0.0, deadline - time.monotonic()), "capital_sector",
+            )
+            sector = sector if isinstance(sector, dict) else {}
+            return self._build_fundamental_block(
+                "partial", {"stock_flow": stock_flow, "sector_rankings": sector.get("sector_rankings", {})},
+                [{"provider": "choice", "result": stock_flow["status"], "duration_ms": cost_ms}],
+                stock_flow["errors"] + sector.get("errors", []) + ([sector_error] if sector_error else []),
+            )
         payload, err, cost_ms = self._run_with_retry(
             lambda: self._fundamental_adapter.get_capital_flow(stock_code),
             timeout,

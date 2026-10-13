@@ -145,7 +145,7 @@ def _serve_native(connection: Connection) -> None:
 
 class ChoiceAdapter:
     name = "choice"
-    contract_version = "choice-v2"
+    contract_version = "choice-v3"
     _lock = Lock()
     _process: BaseProcess | None = None
     _connection: Connection | None = None
@@ -223,7 +223,29 @@ class ChoiceAdapter:
         reply = self.query("tradedates", (start.isoformat(), end.isoformat()), "Market=CNSESH", deadline=deadline)
         if not isinstance(reply.data, list):
             raise SourceReadError(self.name, "invalid_response")
-        return sorted({self.report_date(d) for d in reply.data if d})
+        dates = sorted({self.report_date(d) for d in reply.data if d})
+        if any(d < start.isoformat() or d > end.isoformat() for d in dates):
+            raise SourceReadError(self.name, "invalid_response")
+        return dates
+
+    def capital_series(self, code: str, start: date, end: date, *, deadline: float) -> list[tuple[str, float | None]]:
+        reply = self.query("csd", (self.stock_code(code), "NETINFLOW", start.isoformat(), end.isoformat()),
+                           "Period=1,AdjustFlag=1,CurType=1,Order=1,Market=CNSESH", deadline=deadline)
+        if reply.indicators != ["NETINFLOW"] or not isinstance(reply.data, dict):
+            raise SourceReadError(self.name, "invalid_response")
+        rows = reply.data.get(self.stock_code(code))
+        if rows is None or len(rows) != 1 or not isinstance(rows[0], list) or len(rows[0]) != len(reply.dates):
+            raise SourceReadError(self.name, "invalid_response")
+        values: dict[str, float | None] = {}
+        for raw_date, raw_value in zip(reply.dates, rows[0]):
+            day = self.report_date(raw_date)
+            if day < start.isoformat() or day > end.isoformat():
+                raise SourceReadError(self.name, "invalid_response")
+            value = self.number(raw_value)
+            if day in values and values[day] != value:
+                raise SourceReadError(self.name, "invalid_response")
+            values[day] = value
+        return sorted(values.items(), reverse=True)
 
     @staticmethod
     def report_date(value: object) -> str:

@@ -91,3 +91,17 @@ def test_partial_financial_snapshot_retries_real_manager_and_provider(financial_
     assert second.fundamental['revenue_growth'] == 4.56
     assert data_tools._get_fetcher_manager()._fundamental_cache
 
+
+def test_orchestration_keeps_guarded_final_payload_for_missing_evidence(financial_sources):
+    from src.agent.deep_research.orchestrator import run_dual_track
+    from src.deep_research_dims.manager_writeup import INCOMPLETE_EVIDENCE_NOTE
+    from tests.test_manager_writeup_render import _WaveLLM
+    class ResearchLLM(_WaveLLM):
+        def call_text(self, messages, **kwargs):
+            assert "3-5 句的中文投资结论" not in messages[0]["content"]
+            return super().call_text(messages, **kwargs)
+    result = run_dual_track("600519", "样本", ResearchLLM(), dims_filter={"phase", "history"}, write_cache=False)
+    assert result.final_conclusion == INCOMPLETE_EVIDENCE_NOTE
+    assert result.manager_writeup["money_paths"] == []
+    assert result.manager_writeup["decision_matrix"] == []
+    assert INCOMPLETE_EVIDENCE_NOTE in result.markdown

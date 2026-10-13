@@ -102,7 +102,7 @@ def test_old_keys_cannot_enable_sources_after_choice_failure(choice_transport, m
     assert "choice:authentication_failed" in result["errors"]
     assert build_cross_validation_block("300260", ["roe"]) is None
     assert fetch_fuyao_financial_series("300260")["years"] == []
-    assert get_main_inflow_cumulative("300260")["status"] == "not_supported"
+    assert get_main_inflow_cumulative("300260")["status"] == "failed"
 
 
 def test_refresh_replaces_snapshot_value_and_metadata_together(choice_transport, monkeypatch):

@@ -15,11 +15,40 @@ import json
 import logging
 import os
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from src.deep_research_dims.narrate import load_constitution
 
 logger = logging.getLogger(__name__)
+
+INCOMPLETE_EVIDENCE_NOTE = "财务估值或资金依据不完整，暂不形成综合目标价或操作建议；有效的独立研究见各维度。"
+
+
+def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
+    """Global investment prose combines these inputs and cannot outvote their quality."""
+    return all(getattr(dims.get(key), "status", None) == "ok"
+               for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"))
+
+
+def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep evidenced sections; unstructured global claims cannot be separated safely."""
+    result = dict(manager)
+    complete = manager_evidence_complete(dims)
+    if not complete:
+        for key in ("title_angle", "executive_summary"):
+            result[key] = ""
+        for key in ("thesis_points", "risk_matrix", "money_paths", "decision_matrix"):
+            result[key] = []
+        for key in ("scenario_triggers", "dim_verdicts"):
+            result[key] = {}
+    for key in ("section_titles", "section_narratives"):
+        result[key] = {
+            section: value for section, value in (manager.get(key) or {}).items()
+            if (section in dims and dims[section].status == "ok")
+            or (complete and section in SECTION_FALLBACK_TITLES)
+        }
+    return result
 
 # 主干节 key → 规则回退标题（LLM 缺席时模板用）
 SECTION_FALLBACK_TITLES: Dict[str, str] = {
@@ -426,7 +455,7 @@ def generate_manager_writeup(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 经理终稿波C失败: %s", exc)
 
-    return out
+    return qualified_manager_writeup(out, dims)
 
 
 def section_title(manager: Optional[Dict[str, Any]], key: str) -> str:

@@ -525,8 +525,11 @@ def build_view(
     ownership: Any = dims["ownership"]
     us_china: Any = dims["us_china"]
 
-    manager = manager or {}
-    from src.deep_research_dims.manager_writeup import section_title
+    from src.deep_research_dims.manager_writeup import (
+        INCOMPLETE_EVIDENCE_NOTE, manager_evidence_complete, qualified_manager_writeup, section_title,
+    )
+    manager = qualified_manager_writeup(manager or {}, dims)
+    investment_available = manager_evidence_complete(dims)
 
     dim_sections = [
         {"id": dim_id, "label": DIM_LABELS[dim_id], "env": dims[dim_id]}
@@ -539,7 +542,8 @@ def build_view(
         "stock_code": stock_code,
         "as_of": as_of,
         "report_id": report_id,
-        "final_conclusion": final_conclusion,
+        "final_conclusion": final_conclusion if investment_available else INCOMPLETE_EVIDENCE_NOTE,
+        "investment_available": investment_available,
         "report_type": "首次覆盖" if not getattr(history, "rows", None) else "跟踪更新",
         "manager": manager,
         "title_angle": str(manager.get("title_angle") or ""),

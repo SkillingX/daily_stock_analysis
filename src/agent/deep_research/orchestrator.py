@@ -224,6 +224,10 @@ def _generate_final_conclusion(
     """
     import json
     import re
+    from src.deep_research_dims.manager_writeup import INCOMPLETE_EVIDENCE_NOTE, manager_evidence_complete
+
+    if not manager_evidence_complete(dims):
+        return INCOMPLETE_EVIDENCE_NOTE
 
     signal = dims.get("signal")
     conclusion = dims.get("conclusion")
@@ -469,7 +473,8 @@ def run_dual_track(
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
     from data_provider.mx_data_adapter import financial_refresh
     from uuid import uuid4
-    refresh_token = financial_refresh.set((stock_code, uuid4().hex)) if force_refresh else None
+    refresh_marker = (stock_code, uuid4().hex) if force_refresh else None
+    refresh_token = financial_refresh.set(refresh_marker) if refresh_marker else None
     try:
         ctx = build_shared_context(stock_code, stock_name)
     finally:
@@ -555,6 +560,14 @@ def run_dual_track(
         (d, globals()[RUNNER_NAMES[d]]) for d in researcher_dim_ids if d in selected
     ]
     if active_researchers:
+        def run_researcher(runner: Callable[..., Dict[str, Any]]) -> Dict[str, Any]:
+            token = financial_refresh.set(refresh_marker) if refresh_marker else None
+            try:
+                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
+            finally:
+                if token is not None:
+                    financial_refresh.reset(token)
+
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures: Dict[Any, str] = {}
             for dim_id, runner in active_researchers:
@@ -565,8 +578,7 @@ def run_dual_track(
                 start_dim(dim_id)
                 futures[
                     pool.submit(
-                        runner, stock_code, stock_name, llm_adapter,
-                        progress_callback, explore_max_steps,
+                        run_researcher, runner,
                     )
                 ] = dim_id
 

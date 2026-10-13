@@ -34,6 +34,40 @@ def _dims() -> dict:
     return {d: DIM_MODELS[d]() for d in DIM_IDS}
 
 
+def test_degraded_evidence_cannot_reenter_global_manager_or_final_conclusion():
+    dims = _dims()
+    for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"):
+        dims[key] = dims[key].model_copy(update={"status": "degraded", "degraded_reason": "缺少可用输入"})
+    invented = "主力净流入五亿元，目标价48.16，立即加仓"
+    manager = {
+        "title_angle": invented, "executive_summary": invented,
+        "section_titles": {"investment": invented, "capital": invented},
+        "section_narratives": {"investment": invented, "capital": invented, "business": "有独立来源的业务定性"},
+        "thesis_points": [{"header": invented, "body": invented}],
+        "risk_matrix": [{"risk": invented, "impact": invented, "trigger": invented}],
+        "money_paths": [{"name": "资金驱动", "playbook": invented, "win_rate": "80%"}],
+        "decision_matrix": [{"persona": "空仓者", "action": "加仓", "price_range": "48.16", "rationale": invented}],
+        "scenario_triggers": {"optimistic": invented}, "dim_verdicts": {"资金面": invented},
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager, final_conclusion=invented)
+    markdown = render_markdown(view)
+    assert "五亿元" not in markdown and "48.16" not in markdown and "立即加仓" not in markdown
+    assert "有独立来源的业务定性" in markdown
+    assert "依据不完整" in markdown
+    assert manager["section_narratives"]["investment"] == invented
+
+
+def test_manager_generation_with_degraded_evidence_keeps_only_qualified_sections():
+    dims = _dims()
+    dims["capital"] = dims["capital"].model_copy(update={"status": "degraded", "degraded_reason": "单位未知"})
+    llm = _WaveLLM()
+    result = generate_manager_writeup(llm, "fixture", "300260", dims, [])
+    assert not result["money_paths"] and not result["executive_summary"]
+    assert "investment" not in result["section_narratives"]
+    assert "capital" not in result["section_narratives"]
+    assert result["section_narratives"]["business"]
+
+
 # ---------------------------------------------------------------------------
 # _format_cn：JSON 裸奔治理
 # ---------------------------------------------------------------------------
@@ -721,3 +755,17 @@ class TestSellSideView:
         md = render_markdown(view)
         assert "（未知）" in md
         assert "未知(按A股规则需在2026年4月30日" not in md
+
+
+def test_manager_cannot_rewrite_degraded_or_skipped_dimension_as_valid_conclusion():
+    dims = _dims()
+    dims["capital"] = DIM_MODELS["capital"](status="degraded", degraded_reason="choice:netinflow_unit_unconfirmed", narrative="资金单位未确认，金额结论不可用")
+    dims["technical"] = DIM_MODELS["technical"](status="skipped")
+    manager = {"section_titles": {"capital": "机构用脚投票"}, "section_narratives": {"capital": "主力净买入1亿元，建议加仓", "technical": "趋势确认", "business": "已验证业务事实"}}
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    assert view["section_narrative"]("capital") == ""
+    assert view["section_narrative"]("technical") == ""
+    assert view["section_title"]("capital") != "机构用脚投票"
+    assert view["section_narrative"]("business") == "已验证业务事实"
+    rendered = render_markdown(view)
+    assert "主力净买入1亿元" not in rendered and "资金单位未确认" in rendered

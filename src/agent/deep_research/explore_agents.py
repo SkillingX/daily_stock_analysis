@@ -292,7 +292,7 @@ def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=N
     return _run_explore("technical", _TECHNICAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
 
-def run_capital_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8) -> Dict[str, Any]:
     """资金研究员：资金流向 + 机构/大户持仓变动 + 筹码成本结构。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON：\n"
@@ -304,7 +304,34 @@ def run_capital_agent(stock_code, stock_name, llm_adapter, progress_callback=Non
         "score(三项加权总分)、每项说明含具体数字；取不到的项 score 填 null；"
         "narrative(50-100 字结论：必须含至少 2 个硬数字——净流入金额/获利盘比例/成本价等，禁止只给分无论据)。"
     )
-    return _run_explore("capital", _CAPITAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
+    tools = _CAPITAL_TOOLS
+    flow = None
+    institution_eligible = True
+    if get_config().data_source_profile == "choice":
+        import json
+        from src.agent.tools.data_tools import _handle_get_capital_flow, _handle_get_stock_info
+        deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+        flow = _handle_get_capital_flow(stock_code)
+        info = _handle_get_stock_info(stock_code, deadline=deadline)
+        institution = (info.get("fundamental_context") or {}).get("institution") or {}
+        institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
+        tools = tools - {"get_capital_flow", "get_stock_info"}
+        task += "\n资金流工具已执行，结果：" + json.dumps(flow, ensure_ascii=False)
+        task += "\n基本面工具已执行，结果：" + json.dumps(info, ensure_ascii=False)
+        task += "\n金额缺失或单位未确认时，flow_score、资金总分填 null，不推断资金金额、方向或交易行动。narrative 只说明已验证内容与缺口，不要求凑齐数字。"
+        task += "\n机构与股东资料按各自 source_chain 引用；股东户数不等于持仓量，缺统计对象、日期或单位时只作线索，不给机构分数或方向结论。"
+    out = _run_explore("capital", tools, task, llm_adapter, progress_callback, max_steps)
+    if out.get("ok") and not institution_eligible:
+        out["data"]["institution_score"] = None
+        out["data"]["institution_summary"] = "公开机构/股东资料仅作线索；统计对象、日期或单位未核实，不能据此判定持仓方向。"
+    if flow is not None and out.get("ok") and flow.get("main_net_inflow") is None:
+        data = out["data"]
+        data["flow_score"] = data["score"] = None
+        data["flow_summary"] = flow.get("note") or "资金流数据不可用"
+        data["narrative"] = data["flow_summary"]
+        data["status"] = "degraded"
+        data["degraded_reason"] = "; ".join(flow.get("errors") or [])
+    return out
 
 
 def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):

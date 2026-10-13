@@ -1057,6 +1057,9 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
         },
         "errors": errors,
     }
+    if get_config().data_source_profile == "choice":
+        result.update({key: stock_flow.get(key) for key in ("latest_date", "expected_date", "coverage", "source", "source_unit", "currency")})
+        result["note"] = "Choice CSD NETINFLOW 单位尚未确认；金额与资金流评分不可用。交易窗口覆盖与最近观测日期仅作数据诊断，不能将原始量当元或万元。"
     if note:
         result["note"] = note
     # opt-in 交叉验证：主力净流入/融资余额 MX↔iFinD 双源验证（方向+量级）；开关关 → _cv None，零回归。

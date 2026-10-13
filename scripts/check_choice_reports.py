@@ -15,7 +15,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--code", required=True)
-    parser.add_argument("--kind", choices=("fundamentals", "financial-analysis", "sector-analysis"), required=True)
+    parser.add_argument("--kind", choices=("fundamentals", "financial-analysis", "sector-analysis", "deep-research"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     args = parser.parse_args()
@@ -26,9 +26,23 @@ def main() -> None:
         parser.error("timeout must be positive")
     http = build_opener(ProxyHandler({}))
     base = f"{args.base_url.rstrip('/')}/api/v1/{args.kind}"
-    request = Request(f"{base}/generate?{urlencode({'stock_code': args.code, 'force_refresh': 'true'})}", data=b"", method="POST")
-    with http.open(request, timeout=args.timeout) as response:
-        generated = json.load(response)
+    if args.kind == "deep-research":
+        request = Request(f"{base}/generate/stream", data=json.dumps({"stock_code": args.code, "force_refresh": True,
+                          "dims": ["fundamental", "sector", "capital"]}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+        generated = {}
+        with http.open(request, timeout=args.timeout) as response:
+            for line in response:
+                if not line.startswith(b"data:"):
+                    continue
+                event = json.loads(line[5:])
+                if event.get("type") == "error":
+                    raise RuntimeError(event.get("message") or "Deep research failed")
+                if event.get("type") == "done":
+                    generated = event
+    else:
+        request = Request(f"{base}/generate?{urlencode({'stock_code': args.code, 'force_refresh': 'true'})}", data=b"", method="POST")
+        with http.open(request, timeout=args.timeout) as response:
+            generated = json.load(response)
     report_id = generated.get("report_id")
     if not report_id:
         raise RuntimeError("Report was not persisted")
@@ -36,14 +50,14 @@ def main() -> None:
         reread = json.load(response)
     with http.open(f"{base}/reports/{report_id}/markdown?download=1", timeout=args.timeout) as response:
         downloaded = response.read().decode("utf-8")
-    markdown = generated["markdown"]
+    markdown = generated.get("markdown", reread["data"]["markdown"])
     if markdown != downloaded or markdown != reread["data"]["markdown"]:
         raise RuntimeError("Generation, reread and download disagree")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.output_dir / f"{args.kind}-{args.code}"
     prefix.with_suffix(".json").write_text(json.dumps({"generated": generated, "reread": reread}, ensure_ascii=False, indent=2))
     prefix.with_suffix(".md").write_text(markdown)
-    print(json.dumps({"kind": args.kind, "report_id": report_id, "status": generated["status"], "reread_download_match": True}, ensure_ascii=False))
+    print(json.dumps({"kind": args.kind, "report_id": report_id, "status": generated.get("status"), "reread_download_match": True}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

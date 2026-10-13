@@ -329,6 +329,9 @@ class DeepResearchService:
             # 清理超额（事务内删元数据，事务外删文件）
             self._prune_and_clean_files(_max_reports())
 
+        # Use the same saved-report presentation as detail and download.
+        from src.deep_research_dims.render import normalize_saved_markdown
+        markdown = normalize_saved_markdown(markdown)
         done_event: Dict[str, Any] = {
             "type": "done",
             "report_id": report_id if write_ok else None,
