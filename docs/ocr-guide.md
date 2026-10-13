@@ -592,3 +592,11 @@ ocr review --help
 ocr scan --help
 ocr config --help
 ```
+
+## GitHub PR 工作流的权限边界
+
+PR Review 的静态检查在 pull_request 下以 contents:read 执行，不导入 PR 的 Python 代码。pull_request_target 的标签/说明只使用 GitHub API，不检出 PR 代码，也不读取来自 PR 的产物执行指令。
+
+自动 AI 审查复用仓库现有 ai_review 脚本：仅同仓库 PR 且仓库变量 ENABLE_AI_REVIEW=true 时启用，运行 base 提交的可信脚本，head 只用于 git diff，不检出或执行。需要既有 GEMINI_API_KEY 或 OPENAI_API_KEY 仓库 secret，模型与地址使用对应仓库变量；缺少配置或审查结果则失败，不能表示审查通过。fork AI 审查跳过，可由维护者本机使用 OCR 审查；首次贡献的 Actions 审批仍需维护者处理。审查结果作为带 PR 编号和提交 SHA 的 artifact 展示，不由有写权限作业执行或信任。
+
+此文档为中文工具说明，无对应英文版本；贡献指南的通用流程未改动。

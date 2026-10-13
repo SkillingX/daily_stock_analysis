@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] PR 静态检查移至只读 pull_request，标签/说明与不可信代码隔离；AI 审查显式启用并仅运行可信 base 脚本，fork 跳过且不误报通过。
+
 - [修复] 深度投研事件与术语改为标准 Markdown，股权资料保留详情与来源；历史详情、子报告和下载统一兼容旧标签/对象格式，保留原文件与代码示例。
 
 - [修复] 深度投研取消缺少依据的价格倍数估值，结论与信号同步降级；强制刷新贯穿财务缓存，当前行情派生维度重算，部分报告不再固化为成功日缓存。
