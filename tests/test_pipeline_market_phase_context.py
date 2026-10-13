@@ -51,7 +51,9 @@ def _phase_payload() -> dict:
 
 def _make_pipeline(*, agent_mode: bool = False, save_context_snapshot: bool = True) -> StockAnalysisPipeline:
     pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+    pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
     pipeline.config = SimpleNamespace(
+            enabled_markets=("cn", "hk", "us"),
         enable_realtime_quote=False,
         enable_chip_distribution=False,
         realtime_source_priority=[],
@@ -109,6 +111,7 @@ def _make_pipeline(*, agent_mode: bool = False, save_context_snapshot: bool = Tr
 class PipelineMarketPhaseContextTestCase(unittest.TestCase):
     def test_process_single_stock_propagates_current_time_to_analyze_stock(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.query_id = None
         pipeline._emit_progress = MagicMock()
         pipeline._resolve_resume_target_date = MagicMock(return_value=date(2026, 3, 26))

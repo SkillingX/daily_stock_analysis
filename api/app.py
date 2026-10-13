@@ -138,6 +138,7 @@ def _warn_if_open_cors_without_auth() -> None:
 from api.v1 import api_v1_router
 from api.middlewares.auth import add_auth_middleware
 from api.middlewares.error_handler import add_error_handlers
+from src.config import get_config
 from api.v1.schemas.common import HealthResponse
 from src.auth import is_auth_enabled
 from src.data.stock_index_loader import find_existing_stock_index_path
@@ -374,7 +375,7 @@ def create_app(static_dir: Optional[Path] = None) -> FastAPI:
     )
     async def health_check() -> HealthResponse:
         """健康检查接口"""
-        return HealthResponse(status="ok", timestamp=datetime.now().isoformat())
+        return HealthResponse(status="ok", timestamp=datetime.now().isoformat(), enabled_markets=list(get_config().enabled_markets))
 
     def _stock_index_candidate_paths() -> tuple[Path, ...]:
         local_candidates = (

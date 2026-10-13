@@ -725,6 +725,7 @@ class Config:
 
     # === 自选股配置 ===
     stock_list: List[str] = field(default_factory=list)
+    enabled_markets: tuple[str, ...] = ("cn", "hk", "us")
 
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
@@ -1257,6 +1258,8 @@ class Config:
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
+        if not self.enabled_markets or set(self.enabled_markets) - {"cn", "hk", "us"}:
+            raise ValueError("ENABLED_MARKETS must be a nonempty subset of cn,hk,us")
         if self.agent_arch not in self._VALID_AGENT_ARCH:
             _log.warning(
                 "Invalid AGENT_ARCH=%r, falling back to 'single'. Valid: %s",
@@ -1709,6 +1712,7 @@ class Config:
 
         return cls(
             stock_list=stock_list,
+            enabled_markets=tuple(dict.fromkeys(v.strip().lower() for v in os.getenv("ENABLED_MARKETS", "cn,hk,us").split(",") if v.strip())),
             feishu_app_id=os.getenv("FEISHU_APP_ID"),
             feishu_app_secret=os.getenv("FEISHU_APP_SECRET"),
             feishu_folder_token=os.getenv("FEISHU_FOLDER_TOKEN"),

@@ -369,6 +369,9 @@ def _compact_portfolio_risk(risk: dict[str, Any], top_n: int = 10) -> dict[str, 
 
 def _handle_get_realtime_quote(stock_code: str) -> dict[str, Any]:
     """Get real-time stock quote."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     quote = manager.get_realtime_quote(stock_code)
     if quote is None:
@@ -452,6 +455,9 @@ get_realtime_quote_tool = ToolDefinition(
 
 def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]:
     """Get daily OHLCV history data."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     effective_days, metadata = _normalize_history_days(days)
 
     from src.services.history_loader import load_history_df
@@ -589,6 +595,9 @@ def _estimate_chip_from_history(
 
 def _handle_get_chip_distribution(stock_code: str) -> dict[str, Any]:
     """Get chip distribution data."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     chip = manager.get_chip_distribution(stock_code)
 
@@ -731,6 +740,9 @@ def _fallback_valuation_from_quote(
 
 def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None) -> dict[str, Any]:
     """Get stock fundamental information through unified fundamental context."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     from src.config import get_config
     deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_stage_timeout_seconds
@@ -994,6 +1006,9 @@ ALL_DATA_TOOLS = [
 
 def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
     """Get main-force capital flow data for a stock."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     from src.config import get_config
     deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     manager = _get_fetcher_manager()

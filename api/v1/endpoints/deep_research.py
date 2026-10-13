@@ -146,6 +146,9 @@ async def generate_stream(request: DeepResearchRequest):
     通过后在线程池跑 ``deep_research_service.generate_report``，
     progress_callback 把事件塞入 asyncio.Queue，event_generator 消费并加 30s 心跳。
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(request.stock_code)
+
     config = get_config()
     _require_agent(config)
 

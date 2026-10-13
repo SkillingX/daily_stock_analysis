@@ -43,6 +43,9 @@ class FundamentalsGenerateResponse(BaseModel):
 @router.post("/generate", response_model=FundamentalsGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false") -> dict[str, Any]:
     """同步生成基本面专项报告；在配置时限内研究，未完成章节显式降级。"""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     try:
         return await asyncio.to_thread(
             fundamentals_service.generate_fundamentals_report, stock_code, stock_name, force_refresh == "true"

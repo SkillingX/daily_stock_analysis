@@ -6,6 +6,7 @@ Regression tests for single-stock notification thread safety.
 import os
 import sys
 import threading
+from types import SimpleNamespace
 import time
 import unittest
 from unittest.mock import MagicMock
@@ -75,6 +76,7 @@ class _CriticalSectionTrackingNotifier:
 class TestPipelineSingleNotifyThreadSafety(unittest.TestCase):
     def test_process_single_stock_serializes_direct_notification_path(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
         pipeline.notifier = _CriticalSectionTrackingNotifier()
 

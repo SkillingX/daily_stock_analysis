@@ -138,6 +138,9 @@ def normalize_a_share(raw_code: str) -> str:
     A 股 = 归一化后 6 位纯数字（沪深京：60xxxx/00xxxx/30xxxx/688xxx/920xxx/430xxx/83xxxx）。
     非 A 股抛 ``DeepResearchInputError``（endpoint 转为 HTTP 400）。
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(raw_code)
+
     if not raw_code or not str(raw_code).strip():
         raise DeepResearchInputError("股票代码不能为空")
 

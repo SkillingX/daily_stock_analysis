@@ -49,6 +49,9 @@ class BacktestService:
         limit: int = 200,
     ) -> Dict[str, Any]:
         config = get_config()
+        from src.core.market_policy import require_stock_market, MarketDisabledError
+        if code:
+            require_stock_market(code)
 
         if eval_window_days is None:
             eval_window_days = getattr(config, "backtest_eval_window_days", 10)
@@ -86,6 +89,11 @@ class BacktestService:
         results_to_save: List[BacktestResult] = []
 
         for analysis in candidates:
+            try:
+                require_stock_market(analysis.code)
+            except MarketDisabledError as exc:
+                logger.info("跳过未启用市场的回测候选：%s", exc)
+                continue
             processed += 1
             touched_codes.add(analysis.code)
 

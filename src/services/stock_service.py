@@ -42,6 +42,9 @@ class StockService:
         Returns:
             实时行情数据字典
         """
+        from src.core.market_policy import require_stock_market
+        require_stock_market(stock_code)
+
         try:
             # 调用数据获取器获取实时行情
             from data_provider.base import DataFetcherManager
@@ -105,6 +108,9 @@ class StockService:
         Raises:
             ValueError: 当 period 不是 daily 时抛出（weekly/monthly 暂未实现）
         """
+        from src.core.market_policy import require_stock_market
+        require_stock_market(stock_code)
+
         # 验证 period 参数，只支持 daily
         if period != "daily":
             raise ValueError(

@@ -85,6 +85,14 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "ENABLED_MARKETS": {
+        "title": "开放个股市场",
+        "description": "非空 cn/hk/us 子集。部署为 cn 时仅接受沪深京新请求；历史可读。修改后重启分析、API 与调度进程。",
+        "category": "base", "data_type": "array", "ui_control": "text",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "cn,hk,us", "options": [],
+        "validation": {"min_items": 1, "allowed_values": ["cn", "hk", "us"], "delimiter": ","}, "display_order": 11,
+    },
     "STOCK_LIST": {
         "title": "Stock List",
         "description": "Comma-separated watchlist stock codes.",

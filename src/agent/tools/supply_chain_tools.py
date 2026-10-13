@@ -753,6 +753,8 @@ def _fetch_real_stock_info(ticker: str) -> Dict[str, Any]:
     [v3 P6 修复竞态] 用 threading.Lock + in-flight set 保证同 ticker 并发请求
     只触发一次网络调用（5 个 handler 同时进入时只有一个真正执行，其余等待结果）。
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(ticker)
     # 1) 快路径：缓存命中直接返回
     cached = _STOCK_INFO_CACHE.get(ticker)
     if cached is not None:
@@ -820,6 +822,8 @@ def _run_concurrent_v3_fetches(
     ticker: str,
 ) -> Tuple[Dict[str, Any], Any, List[Dict[str, Any]], Any]:
     """[v3 P6] 并发执行 4 个独立网络调用（fundamental bundle / quote / boards / cross-validation）。"""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(ticker)
     from src.agent.tools.data_tools import _get_fetcher_manager
 
     manager = _get_fetcher_manager()
@@ -965,6 +969,8 @@ def _fetch_real_realtime_quote(ticker: str) -> Dict[str, Any]:
 
     [v3 P6 优化] 复用 _STOCK_INFO_CACHE 中缓存的 quote 数据，避免重复网络请求。
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(ticker)
     # [v3 P6] 优先复用 _fetch_real_stock_info 已经请求到的完整 quote
     cached = _STOCK_INFO_CACHE.get(ticker)
     if cached is not None:

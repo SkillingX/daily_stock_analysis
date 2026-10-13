@@ -19,6 +19,8 @@ from src.repositories.portfolio_repo import (
     PortfolioRepository,
 )
 
+from src.core.market_policy import require_market, require_stock_market, MarketDisabledError
+
 logger = logging.getLogger(__name__)
 
 PortfolioBusyError = RepoPortfolioBusyError
@@ -102,6 +104,7 @@ class PortfolioService:
         if not name_norm:
             raise ValueError("name is required")
         market_norm = self._normalize_market(market)
+        require_market(market_norm)
         base_currency_norm = self._normalize_currency(base_currency)
         row = self.repo.create_account(
             name=name_norm,
@@ -137,6 +140,7 @@ class PortfolioService:
             fields["broker"] = broker.strip() or None
         if market is not None:
             fields["market"] = self._normalize_market(market)
+            require_market(fields["market"])
         if base_currency is not None:
             fields["base_currency"] = self._normalize_currency(base_currency)
         if owner_id is not None:
@@ -192,6 +196,8 @@ class PortfolioService:
                     session=session, account_id=account_id
                 )
                 market_norm = self._normalize_market(market or account.market)
+                require_market(market_norm)
+                require_stock_market(symbol_norm)
                 currency_norm = self._normalize_currency(
                     currency or self._default_currency_for_market(market_norm)
                 )
@@ -292,6 +298,8 @@ class PortfolioService:
                 session=session, account_id=account_id
             )
             market_norm = self._normalize_market(market or account.market)
+            require_market(market_norm)
+            require_stock_market(symbol)
             currency_norm = self._normalize_currency(
                 currency or self._default_currency_for_market(market_norm)
             )
@@ -1058,7 +1066,7 @@ class PortfolioService:
                 )
 
             price_info = self._resolve_position_price(
-                symbol=symbol, as_of_date=as_of_date
+                symbol=symbol, as_of_date=as_of_date, market=market
             )
             last_price = price_info.price
 
@@ -1118,11 +1126,19 @@ class PortfolioService:
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
 
     def _resolve_position_price(
-        self, *, symbol: str, as_of_date: date
+        self, *, symbol: str, as_of_date: date, market: Optional[str] = None
     ) -> _ResolvedPositionPrice:
         today = date.today()
 
-        if as_of_date == today:
+        try:
+            require_stock_market(symbol)
+            if market is not None:
+                require_market(market)
+            live_allowed = True
+        except MarketDisabledError:
+            live_allowed = False
+
+        if as_of_date == today and live_allowed:
             realtime_price, provider = self._fetch_realtime_position_price(symbol)
             if realtime_price is not None and realtime_price > 0:
                 return _ResolvedPositionPrice(

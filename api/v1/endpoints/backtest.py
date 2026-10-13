@@ -67,6 +67,9 @@ def run_backtest(
         )
         return BacktestRunResponse(**stats)
     except Exception as exc:
+        from src.core.market_policy import MarketDisabledError
+        if isinstance(exc, MarketDisabledError):
+            raise HTTPException(status_code=400, detail={"error": "market_disabled", "message": str(exc)})
         logger.error(f"回测执行失败: {exc}", exc_info=True)
         raise HTTPException(
             status_code=500,

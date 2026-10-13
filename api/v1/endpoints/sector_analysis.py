@@ -36,6 +36,9 @@ def _validate_id(report_id: str) -> str:
 
 @router.post("/generate", response_model=SectorAnalysisGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None):
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     try:
         raw = await asyncio.to_thread(
             sector_analysis_service.generate_report, stock_code, stock_name

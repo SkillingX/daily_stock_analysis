@@ -389,6 +389,9 @@ def generate_earnings_report(
     Returns:
         {"report_id": "...", "report_path": "...", "status": "ok", "calculations": [...]}
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     import time
     from src.services.financial_analysis_service import _fetch_financial_data
 

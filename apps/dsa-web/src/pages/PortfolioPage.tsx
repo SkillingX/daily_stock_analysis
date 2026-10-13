@@ -1,4 +1,5 @@
 import type React from 'react';
+import { useEnabledMarkets } from '../hooks/useEnabledMarkets';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pie, PieChart, ResponsiveContainer, Tooltip, Legend, Cell } from 'recharts';
 import { decisionSignalsApi } from '../api/decisionSignals';
@@ -157,6 +158,7 @@ async function loadPortfolioSignalLookup(lookup: PortfolioSignalLookup): Promise
 }
 
 const PortfolioPage: React.FC = () => {
+  const { markets: enabledMarkets, error: marketError } = useEnabledMarkets();
   const { language, t } = useUiLanguage();
   const text = PORTFOLIO_TEXT[language];
 
@@ -1073,13 +1075,12 @@ const PortfolioPage: React.FC = () => {
               value={accountForm.market}
               onChange={(e) => setAccountForm((prev) => ({ ...prev, market: e.target.value as 'cn' | 'hk' | 'us' }))}
             >
-              <option value="cn">市场：A 股</option>
-              <option value="hk">市场：港股</option>
-              <option value="us">市场：美股</option>
+              {enabledMarkets.map((market) => <option key={market} value={market}>市场：{market === 'cn' ? 'A 股' : market === 'hk' ? '港股' : '美股'}</option>)}
             </select>
-            <button type="submit" className="btn-secondary text-sm" disabled={accountCreating}>
+            <button type="submit" className="btn-secondary text-sm" disabled={accountCreating || !enabledMarkets.includes(accountForm.market)}>
               {accountCreating ? '创建中...' : '创建账户'}
             </button>
+            {marketError && <p role="alert">无法读取开放市场：{marketError.message}</p>}
           </form>
         </Card>
       ) : null}
