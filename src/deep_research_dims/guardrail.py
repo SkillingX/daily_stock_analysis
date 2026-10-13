@@ -77,6 +77,8 @@ def rule3_weak_six_dim(
 @require(lambda scenarios_payload: isinstance(scenarios_payload, dict))
 def rule4_probability_sum(scenarios_payload: Dict[str, Any]) -> List[GuardrailEvent]:
     """情景概率和 ≠ 100% → 机器归一化（scenarios_dim 已内置），异常时记录。"""
+    if scenarios_payload.get("valuation_basis") == "analyst_consensus" and not (scenarios_payload.get("scenarios") or {}).get("scenarios"):
+        return []  # Analyst target ranges have no scenario probabilities.
     prob_sum = float(scenarios_payload.get("probability_sum") or 0.0)
     if not (0.95 <= prob_sum <= 1.05):
         return [

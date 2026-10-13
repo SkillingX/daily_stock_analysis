@@ -867,7 +867,7 @@ def run_dual_track(
     result.status = status
     result.markdown = markdown
     result.dims = dims
-    result.dims_payload = {d: m.model_dump() for d, m in dims.items()}
+    result.dims_payload = {d: m.model_dump(mode="json") for d, m in dims.items()}
     result.total_steps = steps_total
     result.provider = ""
     result.error = None if result.success else "维度降级过多，报告不可用"

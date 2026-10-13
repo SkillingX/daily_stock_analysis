@@ -9,7 +9,7 @@
 # {{ stock_name }}（{{ stock_code }}）深度投研{% if title_angle %}：{{ title_angle }}{% endif %}
 
 > 报告类型：{{ report_type }} ｜ 数据截至：{{ as_of }}（阶段 0 快照时点）｜ 评分框架 {{ six_dim.scoring_version }}
-> 评级：**{{ signal.rating if investment_available else '依据不足' }}** ｜ 期望值：**{{ scenarios.expected_value or 'N/A' }}** ｜ 现价：**{{ current_price or 'N/A' }}**{% if upside_pct is not none %} ｜ 隐含空间：**{{ upside_pct }}%**{% endif %} ｜ 置信度：{{ signal.confidence }}{{ range_bit }}{{ pe_bit }}
+> 评级：**{{ signal.rating if investment_available else '依据不足' }}** ｜ {{ valuation_label }}：**{{ valuation_price|round(2) if valuation_price is not none else 'N/A' }} 元** ｜ 现价：**{{ current_price or 'N/A' }}**{% if upside_pct is not none %} ｜ 参考价差：**{{ upside_pct }}%**{% endif %} ｜ 置信度：{{ signal.confidence }}{{ range_bit }}{{ pe_bit }}
 > 核心逻辑：{{ signal.one_sentence if investment_available else final_conclusion }}
 > 本报告为模拟盘研究记录，不构成投资建议
 
@@ -76,7 +76,7 @@
 {% set entry = plan.position_strategy.entry_plan if plan.position_strategy else None %}
 {% set risk = plan.position_strategy.risk_control if plan.position_strategy else None %}
 
-**模拟操作日志（非实盘建议）**——台账编号规则：T1-0 基准 ｜ T1-L 左侧买入 ｜ T1-R 右侧确认 ｜ T1-S1 减仓/止盈 ｜ T1-SL 止损。事件预案（走势节）引用同一编号联动：
+**独立技术点位与模拟记录（非综合买卖建议）**——以下点位来自价格、支撑阻力与技术规则，不能替代财务估值或因综合结论不可用而被视为推荐。台账编号：T1-0 基准 ｜ T1-L 左侧参考 ｜ T1-R 右侧参考 ｜ T1-S1 止盈参考 ｜ T1-SL 止损参考。
 
 | 编号 | 项 | 指令 |
 |------|----|------|
@@ -145,6 +145,15 @@
 
 {% endif %}
 {{ degraded_note(scenarios) }}
+{% if scenarios.analyst_target %}
+| 机构目标价综合值 | 机构目标价最低值 | 机构目标价最高值 | 截至日期 | 统计窗口 |
+|---|---|---|---|---|
+| {{ scenarios.target_price|round(2) }} 元 | {{ '%.2f 元'|format(scenarios.analyst_target.low) if scenarios.analyst_target.low is not none else '未提供' }} | {{ '%.2f 元'|format(scenarios.analyst_target.high) if scenarios.analyst_target.high is not none else '未提供' }} | {{ scenarios.analyst_target.as_of }} | {{ scenarios.analyst_target.window_days }} 日 |
+
+来源/指标：Choice / {{ scenarios.analyst_target.indicator }}。
+
+上述区间表示研报目标价分布，不代表置信区间、三种情景或目标价期限；不生成三情景 EV。
+{% endif %}
 {%- if scenarios.scenarios and scenarios.scenarios.scenarios %}
 **情景与概率**（机器归一化，概率和 {{ (scenarios.probability_sum * 100)|round(0) }}%）：
 
@@ -154,11 +163,13 @@
 | {{ s.type }} | {{ (s.probability * 100)|round(0) }}% | {{ s.value_anchor or 'N/A' }} | {{ scenario_triggers.get(s.type, '—') }} | {{ s.description or '' }} |
 {% endfor %}
 
+{% if scenarios.expected_value is not none %}
 **期望值桥**（概率加权，可回推）：
 {% for s in scenarios.scenarios.scenarios %}
 - {{ s.type }}：{{ s.value_anchor or 'N/A' }} × {{ (s.probability * 100)|round(0) }}% = {{ ((s.value_anchor or 0) * s.probability)|round(2) }}
 {% endfor %}
 - **期望值 EV：{{ scenarios.expected_value or 'N/A' }}**{% if upside_pct is not none %} ｜ 对照现价 {{ current_price or 'N/A' }} = 隐含空间 **{{ upside_pct }}%**{% endif %}{{ valuation_basis_bit }}
+{% endif %}
 
 {% if ev_sensitivity %}
 **期望值敏感性**（中性假设松动能动摇结论吗）：
@@ -337,6 +348,10 @@
 {% endif %}
 - 未经证实情报条数：{{ s.env.unverified_count }}
 {% elif s.id == 'capital' %}
+{% if s.env.flow_summary %}
+{{ s.env.flow_summary | cn }}
+
+{% endif %}
 {% if ind_capital %}
 {{ ind_capital }}
 {% endif %}
@@ -371,7 +386,10 @@
 - 替代进度：{{ s.env.substitution | cn }}
 {% endif %}
 {% elif s.id == 'ownership' %}
-{% if s.env.controller %}- 实际控制人：{{ s.env.controller }}{% endif %}
+{% if s.env.controller %}
+- 实际控制人：{{ s.env.controller }}
+
+{% endif %}
 {% if s.env.top_holders %}
 **前十大股东**：
 {% for h in s.env.top_holders %}

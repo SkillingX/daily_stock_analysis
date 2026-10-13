@@ -5,8 +5,31 @@ Value Scenarios Schema.
 Defines data structures for long-term value scenarios.
 """
 
-from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
+from datetime import date
+from decimal import Decimal
+from typing import Annotated, List, Optional, Literal
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class AnalystTarget(BaseModel):
+    """Dated vendor research consensus; not a probability-weighted fair value."""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
+    source: Literal["choice"] = "choice"
+    indicator: Literal["RATINGTARGETPRICE"] = "RATINGTARGETPRICE"
+    as_of: date
+    window_days: Literal[180] = 180
+    currency: Literal["CNY"] = "CNY"
+    price: Annotated[Decimal, Field(gt=0)]
+    low: Annotated[Decimal, Field(gt=0)] | None = None
+    high: Annotated[Decimal, Field(gt=0)] | None = None
+
+    @model_validator(mode="after")
+    def consistent_reference(self) -> "AnalystTarget":
+        if self.as_of > date.today():
+            raise ValueError("Target reference date cannot be in the future")
+        if self.low is not None and self.low > self.price or self.high is not None and self.high < self.price:
+            raise ValueError("Consensus must lie within published target bounds")
+        return self
 
 
 class Scenario(BaseModel):

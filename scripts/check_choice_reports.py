@@ -18,17 +18,20 @@ def main() -> None:
     parser.add_argument("--kind", choices=("fundamentals", "financial-analysis", "sector-analysis", "deep-research"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--dims", nargs="+", help="Deep-research dimensions; omit for the full report")
     args = parser.parse_args()
     target = urlsplit(args.base_url)
     if target.scheme != "http" or target.hostname not in {"localhost", "127.0.0.1", "::1"}:
         parser.error("This acceptance command requires an explicit local HTTP API")
     if args.timeout <= 0:
         parser.error("timeout must be positive")
+    if args.dims and args.kind != "deep-research":
+        parser.error("--dims is only supported for deep-research")
     http = build_opener(ProxyHandler({}))
     base = f"{args.base_url.rstrip('/')}/api/v1/{args.kind}"
     if args.kind == "deep-research":
         request = Request(f"{base}/generate/stream", data=json.dumps({"stock_code": args.code, "force_refresh": True,
-                          "dims": ["fundamental", "sector", "capital"]}).encode(), headers={"Content-Type": "application/json"}, method="POST")
+                          "dims": args.dims}).encode(), headers={"Content-Type": "application/json"}, method="POST")
         generated = {}
         with http.open(request, timeout=args.timeout) as response:
             for line in response:

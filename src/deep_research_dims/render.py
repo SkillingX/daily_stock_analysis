@@ -81,6 +81,7 @@ VIEW_DIM_ORDER = [
 
 # _format_cn 键名专用中文化（结构与正文替换分离：键名可大胆映射，正文不受影响）
 KEY_ZH_MAP: Dict[str, str] = {
+    "institution_holding_change": "机构持仓变化", "leverage": "资产负债率（%）", "period": "报告期",
     "value": "数值", "score": "评分", "label": "评价",
     "products": "产品清单", "products_known": "已知产品明细",
     "moat": "护城河", "position": "行业定位", "industry_status": "行业地位",
@@ -485,8 +486,10 @@ def _fin_snapshot(fundamental: Any) -> str:
             gaps += 1
             lines.append(f"| {label} | 数据缺失 | — |")
         else:
-            suffix = f"%" if isinstance(value, (int, float)) and key not in ("pe_ttm", "pb", "market_cap") else ""
-            cell = f"{value}{suffix}" if isinstance(value, (int, float)) else str(value)
+            if isinstance(value, (int, float)):
+                cell = f"{value / 100000000:,.2f} 亿元" if key == "market_cap" else f"{value:.2f}{' 倍' if key in ('pe_ttm', 'pb') else '%'}"
+            else:
+                cell = str(value)
             lines.append(f"| {label} | {cell} | {eval_label or '—'} |")
     if gaps:
         lines.append(f"\n*快照为阶段 0 单期数据，{gaps} 项缺口按纪律不编造；补齐数据后看年报/中报分产品收入拆分与两期毛利率方向。*")
@@ -544,6 +547,8 @@ def build_view(
         "report_id": report_id,
         "final_conclusion": final_conclusion if investment_available else INCOMPLETE_EVIDENCE_NOTE,
         "investment_available": investment_available,
+        "valuation_label": "机构目标价综合值" if scenarios.valuation_basis == "analyst_consensus" else "期望价值 EV",
+        "valuation_price": scenarios.target_price if scenarios.target_price is not None else scenarios.expected_value,
         "report_type": "首次覆盖" if not getattr(history, "rows", None) else "跟踪更新",
         "manager": manager,
         "title_angle": str(manager.get("title_angle") or ""),
@@ -558,7 +563,7 @@ def build_view(
             getattr(getattr(six_dim, "framework", None), "dimension_total", None), as_of
         ),
         "upside_pct": _upside_pct(
-            getattr(scenarios, "expected_value", None),
+            scenarios.target_price if scenarios.target_price is not None else scenarios.expected_value,
             getattr(getattr(getattr(data, "perspective", None), "price_position", None), "current_price", None),
         ),
         "current_price": getattr(

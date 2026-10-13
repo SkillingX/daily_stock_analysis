@@ -117,10 +117,14 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         institution = (compact.get("institution") or {}).get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
         industry_hint = ""
+        research = compact.get("research") or {}
+        choice_industry = (research.get("industry") or {}).get("HISSW2021")
+        if isinstance(choice_industry, str):
+            industry_hint = choice_industry.strip()
         if isinstance(boards, dict):
             for key in ("industry", "industry_name", "sw_industry", "sector"):
                 value = boards.get(key)
-                if isinstance(value, str) and value.strip():
+                if not industry_hint and isinstance(value, str) and value.strip():
                     industry_hint = value.strip()
                     break
         result: Dict[str, Any] = {
@@ -139,6 +143,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "gross_margin": financial.get("gross_margin"),
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
+            "research": research,
+            "balance_sheet": financial.get("balance_sheet") or {},
+            "sector_rankings": (((compact.get("capital_flow") or {}).get("data") or {}).get("sector_rankings") or {}),
             "stock_name": raw.get("stock_name"),
             "source": "choice" if config.data_source_profile == "choice" else "fundamental_context",
             "errors": list(compact.get("errors") or []),

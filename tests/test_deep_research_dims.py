@@ -643,7 +643,7 @@ class TestNarrateHardening:
                 return _R()
 
         out = narrate(
-            _ThinkAdapter(), "data", {"a": 1}, "默认句", timeout=1
+            _ThinkAdapter(), "phase", {"a": 1}, "默认句", timeout=1
         )
         assert "<think>" not in out
         assert out.startswith("均线空头排列")

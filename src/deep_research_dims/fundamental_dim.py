@@ -49,6 +49,7 @@ def _band(value: Optional[float], bands: list[tuple[float, float, str]]) -> tupl
 
 @ensure(lambda result: result.data_quality is not None and result.data_quality.rule_usable_count <= result.data_quality.obtained_count, "Usable fields must have been acquired")
 @ensure(lambda result: result.data_quality is not None and (result.health_score is None) == (result.data_quality.health_components == 0), "Health exists exactly when a component participates")
+@ensure(lambda ctx, result: result.financial_safety.get("leverage") is None or abs(Decimal(str(result.financial_safety["leverage"])) - Decimal(str(ctx.fundamental["balance_sheet"]["liabilities"])) / Decimal(str(ctx.fundamental["balance_sheet"]["assets"])) * 100) <= Decimal("0.005"), "Debt ratio uses assets and liabilities from the same balance sheet")
 def build_fundamental_dim(
     ctx: SharedContext,
     llm_scenarios: Optional[Dict[str, Any]] = None,
@@ -112,11 +113,19 @@ def build_fundamental_dim(
         gaps.append("净利增速")
 
     inst = fund.get("institution_holding_change")
+    balance = fund.get("balance_sheet") or {}
+    assets, liabilities = balance.get("assets"), balance.get("liabilities")
+    leverage = None
+    if balance.get("source") == "choice" and balance.get("currency") == "CNY" and balance.get("unit") == "currency_base" and balance.get("period") and balance.get("disclosed_at") and isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)) and assets > 0 and liabilities >= 0:
+        leverage = float(round(Decimal(str(liabilities)) / Decimal(str(assets)) * 100, 2))
     financial_safety = {
         "institution_holding_change": inst,
-        "leverage": None,  # 数据源暂无 → 缺口
+        "leverage": leverage,
+        "period": balance.get("period"),
+        "source": balance.get("source"),
     }
-    gaps.append("资产负债结构")
+    if leverage is None:
+        gaps.append("资产负债结构")
 
     valuation = score_valuation(
         usable["pe_ratio"],

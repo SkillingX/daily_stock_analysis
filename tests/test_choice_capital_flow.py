@@ -36,24 +36,28 @@ def native_flow(monkeypatch):
     return calls, dates
 
 
-def test_real_flow_tool_preserves_coverage_and_sector_without_using_unknown_unit(native_flow):
+def test_real_flow_tool_uses_yuan_and_requires_complete_trading_windows(native_flow):
     calls, dates = native_flow
     result = data_tools._handle_get_capital_flow("300260")
     assert calls == ["tradedates", "csd"]
-    assert result["main_net_inflow"] is result["inflow_5d"] is result["inflow_10d"] is None
+    assert (result["main_net_inflow"], result["inflow_5d"], result["inflow_10d"]) == (7, 25, 25)
+    assert result["source_unit"] == "CNY"
+    assert result["field_meta"]["main_inflow"]["rule_eligible"]
     assert result["coverage"]["10"]["complete"]
     assert result["latest_date"] == DATES[0]
     assert result["sector_rankings"]["top_inflow_sectors"][0]["name"] == "半导体"
     assert "daily_series" not in result
-    assert "choice:netinflow_unit_unconfirmed" in result["errors"]
+    assert not result["errors"]
     dates.remove(DATES[0])
     fresh = data_tools._handle_get_capital_flow("300260")
     assert calls == ["tradedates", "csd"] * 2
     assert fresh["latest_date"] == DATES[1]
     assert not fresh["coverage"]["5"]["complete"]
+    assert fresh["main_net_inflow"] is fresh["inflow_5d"] is fresh["inflow_10d"] is None
 
 
 def test_actual_researcher_consumer_removes_unsupported_scores(native_flow, monkeypatch):
+    native_flow[1].remove(DATES[0])
     monkeypatch.setattr(data_tools, "_handle_get_stock_info", lambda *a, **k: {"fundamental_context": {"institution": {"data": {"top10_holder_change": -1323}, "field_meta": {}}}})
     def generate(**kwargs):
         return SimpleNamespace(success=True, content='{"flow_score": 95, "score": 90, "institution_score": 95, "institution_summary": "机构减持", "flow_summary": "主力买入", "narrative": "可加仓", "chip_score": 60}', total_steps=1, error=None)
@@ -65,7 +69,7 @@ def test_actual_researcher_consumer_removes_unsupported_scores(native_flow, monk
     assert dim.chip_score == 60
     assert dim.institution_score is None
     assert "机构减持" not in dim.institution_summary
-    assert "单位尚未确认" in dim.narrative
+    assert "窗口" in dim.narrative
     assert "加仓" not in dim.narrative
 
 

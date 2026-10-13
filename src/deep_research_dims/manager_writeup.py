@@ -45,9 +45,14 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
     for key in ("section_titles", "section_narratives"):
         result[key] = {
             section: value for section, value in (manager.get(key) or {}).items()
-            if (section in dims and dims[section].status == "ok")
-            or (complete and section in SECTION_FALLBACK_TITLES)
+            if complete and ((section in dims and dims[section].status == "ok")
+                             or section in SECTION_FALLBACK_TITLES)
         }
+    for section, dim in (("market", "data"), ("valuation", "scenarios")):
+        evidence = dims.get(dim)
+        if evidence is not None:
+            result["section_narratives"][section] = evidence.narrative
+            result["section_titles"][section] = SECTION_FALLBACK_TITLES[section]
     return result
 
 # 主干节 key → 规则回退标题（LLM 缺席时模板用）
@@ -320,6 +325,8 @@ def _wave_a_facts(
         },
         "root_cause": root_cause,
         "expected_value": getattr(scenarios, "expected_value", None),
+        "target_price": getattr(scenarios, "target_price", None),
+        "valuation_basis": getattr(scenarios, "valuation_basis", None),
         "guardrail_count": len(guardrail_events),
         "guardrail_rules": [getattr(e, "rule_id", "") for e in guardrail_events],
     }
@@ -368,6 +375,10 @@ def generate_manager_writeup(
     }
     if llm_adapter is None:
         return out
+    if not manager_evidence_complete(dims):
+        # Independent researcher facts remain in dims and the template. A manager
+        # rewrite can introduce global actions even inside an otherwise valid section.
+        return qualified_manager_writeup(out, dims)
 
     constitution = load_constitution()
     expert_persona = _load_expert_persona()

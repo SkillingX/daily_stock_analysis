@@ -1,5 +1,5 @@
 """Compute capital amounts only from complete, dated, single-source windows.
-Choice CSD NETINFLOW units remain unconfirmed: expose coverage, not amounts.
+Choice A-share CSD NETINFLOW is in yuan (see choice-quantapi-integration.md).
 Legacy iFinD remains available only outside the Choice deployment profile.
 """
 from __future__ import annotations
@@ -50,14 +50,14 @@ def get_main_inflow_cumulative(
     from src.config import get_config
     if get_config().data_source_profile == "choice":
         from data_provider.choice_adapter import ChoiceAdapter
-        from data_provider.cross_source_validator import SourceReadError
+        from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
         adapter = ChoiceAdapter()
-        end = date.today()
+        end = adapter.completed_day()
         start = end - timedelta(days=max(60, days))
         deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_fetch_timeout_seconds
-        result: dict[str, Any] = {"status": "partial", "source": "choice", "currency": "CNY", "source_unit": None,
+        result: dict[str, Any] = {"status": "partial", "source": "choice", "currency": "CNY", "source_unit": "CNY",
                                   "main_net_inflow": None, "inflow_5d": None, "inflow_10d": None,
-                                  "errors": ["choice:netinflow_unit_unconfirmed"], "daily_series": [], "coverage": {}}
+                                  "errors": [], "daily_series": [], "coverage": {}}
         try:
             expected = sorted(adapter.trading_dates(start, end, deadline=deadline), reverse=True)
             series = adapter.capital_series(code, start, end, deadline=deadline)
@@ -65,19 +65,24 @@ def get_main_inflow_cumulative(
             result["expected_date"] = expected[0] if expected else None
             result["latest_date"] = max((d for d, v in series if v is not None), default=None)
             by_date = dict(series)
-            for n in (1, 5, 10):
+            for n, field in ((1, "main_net_inflow"), (5, "inflow_5d"), (10, "inflow_10d")):
                 window = expected[:n]
                 missing = [d for d in window if by_date.get(d) is None]
-                complete = len(window) == n and not missing
+                amount = compute_cumulative(series, n, trading_dates=expected, source_unit="CNY")
+                complete = amount is not None
+                result[field] = float(amount) if amount is not None else None
                 result["coverage"][str(n)] = {"expected_dates": window, "missing_dates": missing, "complete": complete}
                 if not complete:
                     result["errors"].append(f"choice:window_{n}_incomplete")
-            latest = result["latest_date"]
-            result["field_meta"] = {"main_inflow": {"source": "choice", "source_family": "eastmoney", "observed_at": latest,
-                                    "currency": "CNY", "unit": None, "value": None, "rule_eligible": False,
-                                    "quality": {"status": "missing", "reason_codes": ["unit_unknown"]}}}
+            if result["main_net_inflow"] is not None:
+                reading = AnchorReading("choice", result["main_net_inflow"], observed_at=result["expected_date"],
+                                        unit="currency_base", currency="CNY", caliber="daily_main_net_inflow", raw_label="CSD NETINFLOW")
+                result["field_meta"] = {"main_inflow": adopted_field_record("main_inflow", reading, AnchorQuality(status="single_source", reason_codes=("single_family",)))}
+            else:
+                result["field_meta"] = {"main_inflow": {"value": None, "rule_eligible": False, "quality": {"status": "missing", "reason_codes": ["window_incomplete"]}}}
             if not expected:
                 result["errors"].append("choice:calendar_unavailable")
+            result["status"] = "ok" if not result["errors"] else "partial"
         except SourceReadError as exc:
             result["status"] = "failed"
             result["errors"].append(str(exc))

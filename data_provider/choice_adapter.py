@@ -14,7 +14,8 @@ from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from threading import Lock
 from time import monotonic
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Annotated
 
@@ -145,10 +146,16 @@ def _serve_native(connection: Connection) -> None:
 
 class ChoiceAdapter:
     name = "choice"
-    contract_version = "choice-v3"
+    contract_version = "choice-v4"
     _lock = Lock()
     _process: BaseProcess | None = None
     _connection: Connection | None = None
+
+    @staticmethod
+    def completed_day() -> date:
+        """Daily amounts/valuation use closed sessions, not today's partial session."""
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        return now.date() if now.time() >= time(15) else now.date() - timedelta(days=1)
 
     @classmethod
     def close(cls) -> None:
@@ -302,8 +309,18 @@ class ChoiceAdapter:
                 out["growth"].update(report_date=report, disclosure_date=disclosure)
             except SourceReadError as exc:
                 out["errors"].append(str(exc))
+            try:
+                balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
+                disclosed = self.report_date(balance["ACTUALISSUINGDATE"]) if balance.get("ACTUALISSUINGDATE") else None
+                if disclosed and report < disclosed <= today.isoformat():
+                    out["growth"]["balance_sheet"] = {"assets": self.number(balance.get("SUMASSETNEW")), "liabilities": self.number(balance.get("SUMLIABNEW")), "period": report, "disclosed_at": disclosed, "source": "choice", "currency": "CNY", "unit": "currency_base", "statement_scope": "consolidated", "adjustment": "restated"}
+                else:
+                    out["errors"].append("choice:balance_sheet:disclosure_unknown")
+            except SourceReadError as exc:
+                out["errors"].append(f"choice:balance_sheet:{exc.reason_code}")
         try:
-            dates = self.trading_dates(today - timedelta(days=14), today, deadline=deadline)
+            end = self.completed_day()
+            dates = self.trading_dates(end - timedelta(days=14), end, deadline=deadline)
             if not dates:
                 raise SourceReadError(self.name, "calendar_unavailable")
             trade_day = dates[-1]
@@ -314,6 +331,24 @@ class ChoiceAdapter:
         except SourceReadError as exc:
             out["errors"].append(str(exc))
         out.update(as_of=trade_day, report_date=report, disclosure_date=disclosure)
+        out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
+        for name, indicators, options in (
+            ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
+            ("company", "MAINBUSINESS,MAINPRODUCT,COMPROFILE,AHOLDER,AHOLDERTYPE", f"EndDate={today}"),
+            ("targets", "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180"),
+        ):
+            try:
+                out["research"][name] = self.css(code, indicators, options, deadline=deadline)
+            except SourceReadError as exc:
+                out["research"]["errors"].append(f"choice:{name}:{exc.reason_code}")
+        out["research"]["target_window_days"] = 180
+        if report and disclosure:
+            try:
+                holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
+                out["research"]["holders"] = {**holders, "period": report, "disclosed_at": disclosure,
+                                              "note": "HOLDPCTR为前十名合计持股比例（%），不可分配为各股东比例"}
+            except SourceReadError as exc:
+                out["research"]["errors"].append(f"choice:holders:{exc.reason_code}")
         return out
 
     def annual_reports(self, code: str, limit: int = 4, *, deadline: float) -> dict[str, Any]:

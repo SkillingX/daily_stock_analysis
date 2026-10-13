@@ -54,6 +54,10 @@ def _build_registry(source_registry: Any, names: set[str]) -> Any:
     for tool in source_registry.list_tools():
         if tool.name in names:
             registry.register(tool)
+    if "verify_supply_chain_evidence" in names and registry.get("verify_supply_chain_evidence") is None:
+        # This verifier uses public Eastmoney/THS pages, not retired iFinD/MCP APIs.
+        from src.agent.tools.supply_chain_tools import verify_supply_chain_evidence_tool
+        registry.register(verify_supply_chain_evidence_tool)
     missing = names - set(registry.list_names())
     if missing:
         logger.warning("[DualTrack] 探索维度缺失工具: %s", sorted(missing))
@@ -323,7 +327,11 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
     out = _run_explore("capital", tools, task, llm_adapter, progress_callback, max_steps)
     if out.get("ok") and not institution_eligible:
         out["data"]["institution_score"] = None
+        out["data"]["score"] = None
         out["data"]["institution_summary"] = "公开机构/股东资料仅作线索；统计对象、日期或单位未核实，不能据此判定持仓方向。"
+    if flow is not None and out.get("ok") and flow.get("main_net_inflow") is not None:
+        amounts = [f"{label} {flow[key] / 10000:,.2f} 万元" if flow.get(key) is not None else f"{label}窗口不完整" for key, label in (("main_net_inflow", "当日"), ("inflow_5d", "5交易日"), ("inflow_10d", "10交易日"))]
+        out["data"]["flow_summary"] = f"Choice 主力净流入，截至{flow.get('expected_date')}已收盘交易日：" + "；".join(amounts) + "。单源数据，未独立核验。"
     if flow is not None and out.get("ok") and flow.get("main_net_inflow") is None:
         data = out["data"]
         data["flow_score"] = data["score"] = None
@@ -353,13 +361,31 @@ def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=N
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做股权架构与高管背景调查并直接输出 JSON：\n"
         "1) search_knowledge_base 查已有资料，search_comprehensive_intel / search_stock_news "
-        "查实控人/股东/高管的公开信息（同花顺数据源为本，搜索为补）；\n"
+        "查实控人/股东/高管的公开信息（结构化资料优先，搜索为补）；\n"
         "2) 输出 JSON：controller(实际控制人/控股股东，一句话)、top_holders(前十大股东要点数组)、"
         "executives(核心高管：姓名/职务/背景一句，数组)、recent_changes(近一年增减持/任免/股权变动数组)、"
         "data_gaps(取不到的数据项数组，禁止编造)、score(治理结构健康度参考分 0-100，可 null)、"
         "narrative(调查结论一段)。所有事实带来源等级标签。"
     )
-    return _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps)
+    research: dict[str, Any] = {}
+    if get_config().data_source_profile == "choice":
+        import json
+        from src.agent.tools.data_tools import _handle_get_stock_info
+        info = _handle_get_stock_info(stock_code)
+        research = (info.get("fundamental_context") or {}).get("research") or {}
+        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
+    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps)
+    if research and not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为Choice结构化资料；模型研究未完成，不生成治理评分。"}}
+    if out.get("ok") and research:
+        company = research.get("company") or {}
+        if company.get("AHOLDER"):
+            out["data"]["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
+        holders = research.get("holders") or {}
+        names = holders.get("HOLDNAMER")
+        if isinstance(names, str) and names.strip():
+            out["data"]["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {holders.get('period')}"} for name in names.split(";") if name.strip()]
+    return out
 
 
 def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
@@ -393,4 +419,19 @@ def run_business_agent(
         "competitive_position(行业地位与护城河)、vs_market_leader(与板块龙头/大盘的对比，标注 inferred 或来源等级)、"
         "score(0-100 业务画像分，可 null)、data_gaps(取不到的数据项数组，禁止编造)、narrative(一段结论)。"
     )
-    return _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
+    if get_config().data_source_profile == "choice":
+        import json
+        from src.agent.tools.data_tools import _handle_get_stock_info
+        info = _handle_get_stock_info(stock_code, deadline=deadline)
+        research = (info.get("fundamental_context") or {}).get("research") or {}
+        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
+    else:
+        research = {}
+    out = _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
+    company = research.get("company") or {}
+    if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为Choice结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
+        for field, indicator in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
+            if company.get(indicator):
+                out["data"][field] = {"value": company[indicator], "source": f"Choice {indicator}，截至{research.get('as_of')}"}
+    return out

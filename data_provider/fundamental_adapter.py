@@ -493,13 +493,15 @@ class AkshareFundamentalAdapter:
         from copy import deepcopy
         result = deepcopy(financials) if financials is not None else self.get_financial_indicators(stock_code)
 
+        # These AkShare endpoints accept a quarter-end date, never a stock symbol.
+        today = datetime.now().date()
+        quarters = sorted(f"{year}{month:02d}{day:02d}" for year in (today.year - 1, today.year) for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)) if f"{year}{month:02d}{day:02d}" <= today.strftime("%Y%m%d"))
+        report_date = quarters[-1]
+
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates(
             [
-                ("stock_yjyg_em", {"symbol": stock_code}),
-                ("stock_yjyg_em", {}),
-                ("stock_yjbb_em", {"symbol": stock_code}),
-                ("stock_yjbb_em", {}),
+                ("stock_yjyg_em", {"date": report_date}),
             ]
         )
         result["errors"].extend(forecast_errors)
@@ -514,8 +516,7 @@ class AkshareFundamentalAdapter:
         # Earnings quick report
         quick_df, quick_source, quick_errors = self._call_df_candidates(
             [
-                ("stock_yjkb_em", {"symbol": stock_code}),
-                ("stock_yjkb_em", {}),
+                ("stock_yjkb_em", {"date": report_date}),
             ]
         )
         result["errors"].extend(quick_errors)

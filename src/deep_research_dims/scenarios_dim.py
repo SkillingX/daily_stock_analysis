@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+import json
+from datetime import date
+from pydantic import ValidationError
 
 from icontract import require
 
@@ -11,7 +14,7 @@ from src.deep_research_dims.context import SharedContext
 from src.deep_research_dims.fundamental_dim import eligible_financial_value
 from src.schemas.deep_research_dims import ScenariosDim
 
-from src.schemas.value_scenarios import Scenario, ValueHorizons, ValueScenarios
+from src.schemas.value_scenarios import AnalystTarget, Scenario, ValueHorizons, ValueScenarios
 
 
 @require(lambda scenarios: len(scenarios) > 0, "至少一个情景")
@@ -83,13 +86,32 @@ def build_scenarios_dim(
         risks=list((llm_scenarios or {}).get("risks") or []),
     )
     prob_sum = round(sum(s.probability for s in normalized), 4)
+    research = fund.get("research") or {}
+    targets = research.get("targets") or {}
+    reference = None
+    reason = "缺少可追溯的目标价与估值计算依据，仅保留定性情景"
+    if research.get("source") == "choice":
+        reason = "Choice 在截至日期的近180日窗口未提供机构目标价；不以现价倍数或模型猜测补齐"
+        if research.get("errors"):
+            reason += "；" + "; ".join(research["errors"])
+        if targets.get("RATINGTARGETPRICE") is not None:
+            try:
+                reference = AnalystTarget.model_validate_json(json.dumps({"source": research["source"], "as_of": research.get("as_of"), "window_days": research.get("target_window_days"), "price": targets["RATINGTARGETPRICE"], "low": targets.get("RATINGTARGETPRICEMIN"), "high": targets.get("RATINGTARGETPRICEMAX")}))
+                if (date.fromisoformat(ctx.as_of[:10]) - reference.as_of).days not in (0, 1):
+                    reference = None
+                    reason = "机构目标价快照已过期，需重新获取"
+            except (ValidationError, ValueError):
+                reference = None
+                reason = "机构目标价数据契约异常，不能参与估值"
     return ScenariosDim(
-        status="degraded",
-        degraded_reason="缺少可追溯的目标价与估值计算依据，仅保留定性情景",
+        status="ok" if reference is not None else "degraded",
+        degraded_reason=None if reference is not None else reason,
         scenarios=scenarios,
         probability_sum=prob_sum,
         expected_value=None,
-        valuation_basis="none",
+        valuation_basis="analyst_consensus" if reference is not None else "none",
+        analyst_target=reference,
+        target_price=float(reference.price) if reference is not None else None,
         current_pe_ttm=pe_ttm,
-        narrative="估值不可用：现价倍数和无来源模型目标价不能作为财务估值依据。",
+        narrative=(f"机构目标价综合值 {reference.price:.2f} 元；Choice {reference.indicator}，截至 {reference.as_of}，统计窗口180日。仅为机构研报参考，不是独立估值或三情景概率加权期望值，窗口不代表目标价期限。" if reference is not None else reason),
     )

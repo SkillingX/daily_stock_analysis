@@ -31,7 +31,7 @@ from src.schemas.report_schema import (
 )
 from src.schemas.research_framework import ResearchFramework
 from src.schemas.supply_chain import SupplyChain
-from src.schemas.value_scenarios import ValueScenarios
+from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
 
 DimId = Literal[
@@ -272,7 +272,9 @@ class ScenariosDim(DimEnvelope):
     scenarios: Optional[ValueScenarios] = None
     probability_sum: float = Field(0.0, ge=0, le=2)
     expected_value: Optional[float] = Field(None, gt=0)
-    valuation_basis: Literal["PE_TTM", "PB", "PS", "none"] = "none"
+    valuation_basis: Literal["PE_TTM", "PB", "PS", "analyst_consensus", "none"] = "none"
+    analyst_target: Optional[AnalystTarget] = None
+    target_price: Optional[float] = Field(None, gt=0)
     current_pe_ttm: Optional[float] = None
     # 时间层级路径（段三）：每周期一句"条件→目标位"，由 LLM 生成机器不背书数字
     time_paths: Dict[str, str] = Field(default_factory=dict)

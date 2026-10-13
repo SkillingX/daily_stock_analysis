@@ -35,8 +35,12 @@ def build_conclusion_dim(
     six_total = float(framework.get("dimension_total") or 50.0)
     posterior = float(bay.get("posterior_p") or 0.5)
     edge = float(bay.get("edge") or 0.0)
-    valuation_available = scenarios_payload.get("status") == "ok" and scenarios_payload.get("expected_value") is not None
+    valuation_available = scenarios_payload.get("status") == "ok" and (scenarios_payload.get("target_price") is not None or scenarios_payload.get("expected_value") is not None)
     action = _map_action(posterior, edge, six_total) if valuation_available else "观察"
+    target = scenarios_payload.get("target_price") or scenarios_payload.get("expected_value")
+    current = ctx.quote.get("price")
+    if action in {"建仓", "加仓"} and (not isinstance(current, (int, float)) or not isinstance(target, (int, float)) or current <= 0 or target <= current):
+        action = "观察"
 
     horizons = ((scenarios_payload or {}).get("scenarios") or {}).get("horizons") or {}
     if not valuation_available:

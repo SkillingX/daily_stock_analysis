@@ -4192,7 +4192,7 @@ class DataFetcherManager:
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
         snapshot = ChoiceAdapter().snapshot(code, deadline=deadline)
-        errors = snapshot["errors"]
+        errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         # Only attempt licensed public supplements for holes, within the same deadline.
         missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
         if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline:
@@ -4212,7 +4212,7 @@ class DataFetcherManager:
                         snapshot["growth"][field] = reading.value
                         snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
         result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": ChoiceAdapter.contract_version,
-                                  "stock_name": snapshot.get("stock_name"), "errors": errors, "source_chain": [], "coverage": {}}
+                                  "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
         for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
             payload = dict(snapshot[block])
             payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
@@ -4236,7 +4236,8 @@ class DataFetcherManager:
         for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
             result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
             errors.extend(result[block].get("errors") or [])
-        result["capital_flow"] = self._build_fundamental_block("partial", {}, [], ["choice:netinflow_unit_unconfirmed"])
+        result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()))
+        errors.extend(result["capital_flow"].get("errors") or [])
         result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
         result["status"] = "partial"
         if not errors and self._should_cache_fundamental_context(result):
@@ -4295,7 +4296,7 @@ class DataFetcherManager:
             )
             sector = sector if isinstance(sector, dict) else {}
             return self._build_fundamental_block(
-                "partial", {"stock_flow": stock_flow, "sector_rankings": sector.get("sector_rankings", {})},
+                "ok" if stock_flow["status"] == "ok" and not sector_error and not sector.get("errors") else "partial", {"stock_flow": stock_flow, "sector_rankings": sector.get("sector_rankings", {})},
                 [{"provider": "choice", "result": stock_flow["status"], "duration_ms": cost_ms}],
                 stock_flow["errors"] + sector.get("errors", []) + ([sector_error] if sector_error else []),
             )
