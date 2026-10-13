@@ -3135,6 +3135,11 @@ class DataFetcherManager:
     def _should_cache_fundamental_context(context: Any) -> bool:
         if not isinstance(context, dict):
             return False
+        if context.get("market") == "cn":
+            valuation = (context.get("valuation") or {}).get("data") or {}
+            growth = (context.get("growth") or {}).get("data") or {}
+            if any(valuation.get(key) is None for key in ("pe_ratio", "pb_ratio")) or any(growth.get(key) is None for key in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")):
+                return False
         status = str(context.get("status", "")).strip().lower()
         if status == "ok":
             return True
@@ -3296,7 +3301,7 @@ class DataFetcherManager:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
-                    if age <= cache_ttl:
+                    if age <= cache_ttl and self._should_cache_fundamental_context(cache_item.get("context")):
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         result_ctx: Dict[str, Any] = {
@@ -3608,7 +3613,7 @@ class DataFetcherManager:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
-                    if age <= cache_ttl:
+                    if age <= cache_ttl and self._should_cache_fundamental_context(cache_item.get("context")):
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         remaining_seconds = stage_timeout

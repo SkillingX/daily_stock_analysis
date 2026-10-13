@@ -186,7 +186,7 @@ class DeepResearchService:
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
-            if cached:
+            if cached and cached[2].get("status") in ("success", "ok"):
                 cached_id, cached_ts, cached_result = cached
                 logger.info(
                     "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
@@ -368,7 +368,7 @@ class DeepResearchService:
             )
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
-        if write_ok and return_dict.get("markdown"):
+        if write_ok and return_dict.get("markdown") and return_dict.get("status") in ("success", "ok"):
             cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:

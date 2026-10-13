@@ -330,7 +330,7 @@ class TestCacheHygieneRegressions:
         assert after == before, "缓存命中不得刷新 saved_at（TTL 滑动语义）"
 
     def test_cache_exclude_skips_scenarios_but_writes_others(self, monkeypatch, tmp_path):
-        """B2：cache_exclude=scenarios 时探索/评分维度照写、scenarios 不写。"""
+        """探索资料仍缓存，依赖本次行情的评分/情景重新计算。"""
         import json
         import os
 
@@ -344,7 +344,7 @@ class TestCacheHygieneRegressions:
         names = set(os.listdir(str(tmp_path)))
         assert "600519_scenarios.json" not in names, "被排除维度不得写缓存"
         assert "600519_supply_chain.json" in names, "探索维度照写（次日命中省探索 Agent）"
-        assert "600519_six_dim.json" in names, "评分维度照写"
+        assert "600519_six_dim.json" not in names, "行情派生评分不固化为下次输入"
         # 写出的 supply_chain payload 叙述无关（skip_narrations 不污染）
         sc = json.loads(open(os.path.join(str(tmp_path), "600519_supply_chain.json"), encoding="utf-8").read())
         assert sc["payload"]["supply_chain"]["company_position"] == "白酒"
@@ -502,5 +502,7 @@ class TestSkipNarrationsPropagation:
             "600519", "贵州茅台", llm_adapter=None,
             force_refresh=True, skip_narrations=True,
         )
-        assert result.status == "success", {key: dim.degraded_reason for key, dim in result.dims.items() if dim.status == "degraded"}
+        assert result.status == "partial"
+        assert result.dims['scenarios'].status == result.dims['conclusion'].status == result.dims['signal'].status == 'degraded'
+        assert result.dims['scenarios'].expected_value is None
         assert len(result.dims) == len(DIM_IDS) == 19

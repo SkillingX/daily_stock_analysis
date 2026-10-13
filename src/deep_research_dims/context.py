@@ -94,7 +94,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
     refresh = financial_refresh.get()
-    if cached is not None and not config.deep_research_cross_validate and not (refresh and refresh[0] == code):
+    financial_keys = ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy")
+    if cached is not None and all(cached.get(key) is not None for key in financial_keys) and not config.deep_research_cross_validate and not (refresh and refresh[0] == code):
         return cached
     try:
         from src.agent.tools.data_tools import (
@@ -189,11 +190,10 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                     key = aliases[field]
                     if result.get(key) is None:
                         result[key] = record["value"]
-        # 全 None 的占位结果不缓存（缓存污染 bug：失败抓取会被固化 24h）
-        if any(result.get(key) is not None for key in ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy")):
+        if all(result.get(key) is not None for key in financial_keys):
             save_snapshot(cache_key, result)
         else:
-            ctx.limitation("基本面数据全缺（快照不缓存，下次重试）")
+            ctx.limitation("基本面数据不完整（快照不缓存，下次重试）")
         return result
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 基本面装配失败 %s: %s", code, exc)

@@ -48,6 +48,10 @@ def build_signal_dim(
         float(ev) if isinstance(ev, (int, float)) else None,
     )
 
+    if scenarios_payload.get("status") != "ok" or ev is None:
+        return SignalDim(status="degraded", degraded_reason="估值依据不足", rating="中性", confidence="低",
+                         one_sentence="估值不可用，暂观察；技术点位见独立行动计划。", narrative="缺少估值依据，不生成目标价或期望收益。")
+
     rating, conf = _map_rating(action, upside)
     prob_sum = (scenarios_payload or {}).get("probability_sum") or 0
     one_sentence = (
