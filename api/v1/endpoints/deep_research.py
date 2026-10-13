@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
 from src.config import get_config
@@ -423,11 +423,12 @@ async def download_markdown(report_id: str):
     display = name or code or "未知"
     filename = f"{display}（{code}）{label}{_format_date(_created)}.md"
 
-    return FileResponse(
-        str(safe_path),
+    from urllib.parse import quote
+    return Response(
+        content=record.get("markdown") or "",
         media_type="text/markdown; charset=utf-8",
-        filename=filename,
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename),
+                 "Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
 
@@ -470,10 +471,7 @@ async def get_dim_report(report_id: str, dim_id: str, download: int = 0):
     safe_path = _resolve_safe_path(data["path"])
     if safe_path is None or not safe_path.exists():
         raise HTTPException(status_code=404, detail="维度子报告文件不存在")
-    response_kwargs: Dict[str, Any] = {
-        "media_type": "text/markdown; charset=utf-8",
-        "headers": {"Cache-Control": "no-store, no-cache, must-revalidate"},
-    }
+    headers = {"Cache-Control": "no-store, no-cache, must-revalidate"}
     if download:
-        response_kwargs["filename"] = f"{report_id}_dim_{dim_id}.md"
-    return FileResponse(str(safe_path), **response_kwargs)
+        headers["Content-Disposition"] = f'attachment; filename="{report_id}_dim_{dim_id}.md"'
+    return Response(content=data["markdown"], media_type="text/markdown; charset=utf-8", headers=headers)

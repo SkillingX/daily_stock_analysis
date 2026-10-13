@@ -3,12 +3,15 @@ import type { Root, RootContent } from 'mdast';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-// Only unwrap the font tags emitted by legacy reports; code nodes stay literal.
+// Adapt only legacy report tags; code nodes stay literal and arbitrary HTML stays disabled.
 function remarkLegacyReportFont() {
   return (tree: Root) => {
     const visit = (node: Root | RootContent): void => {
       if (node.type === 'html' && /^(?:<font color=["']#e03131["']>|<\/font>)$/i.test(node.value)) {
         node.value = '';
+      }
+      if (node.type === 'html') {
+        node.value = node.value.replace(/^\s*<\/?details>\s*$/gm, '').replace(/<summary>([^<>]*)<\/summary>/g, '$1').replace(/^\s*<!-- dim:[a-z_]+ -->\s*$/gm, '');
       }
       if ('children' in node) node.children.forEach(visit);
     };

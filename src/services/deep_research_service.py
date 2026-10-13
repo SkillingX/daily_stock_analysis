@@ -396,7 +396,7 @@ class DeepResearchService:
         if record is None:
             return None
         data = record.to_dict()
-        # 读取 Markdown 正文
+        from src.deep_research_dims.render import normalize_saved_markdown
         markdown = ""
         try:
             md_path = Path(record.md_path)
@@ -404,7 +404,7 @@ class DeepResearchService:
                 markdown = md_path.read_text(encoding="utf-8")
         except OSError as exc:
             logger.warning("[DeepResearch] 读取报告正文失败 %s: %s", record.md_path, exc)
-        data["markdown"] = markdown
+        data["markdown"] = normalize_saved_markdown(markdown)
         return data
 
     def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:
@@ -461,11 +461,12 @@ class DeepResearchService:
         path = self._dim_report_path(report_id, dim_id)
         if path is None:
             return None
+        from src.deep_research_dims.render import normalize_saved_markdown
         try:
             return {
                 "dim": dim_id,
                 "path": str(path),
-                "markdown": path.read_text(encoding="utf-8"),
+                "markdown": normalize_saved_markdown(path.read_text(encoding="utf-8")),
             }
         except OSError as exc:
             logger.warning("[DeepResearch] 读维度子报告失败 %s: %s", path, exc)
@@ -531,7 +532,8 @@ class DeepResearchService:
         md_path = Path(record.md_path)
         if not md_path.exists():
             return None
-        markdown = md_path.read_text(encoding="utf-8")
+        from src.deep_research_dims.render import normalize_saved_markdown
+        markdown = normalize_saved_markdown(md_path.read_text(encoding="utf-8"))
         pdf_path = str(md_path.with_suffix(".pdf"))
 
         result_path = markdown_to_pdf_file(markdown, pdf_path)

@@ -185,8 +185,7 @@
 {% endif %}
 
 {% if event_plans %}
-<details>
-<summary>未来事件与预案（{{ event_plans|length }} 个，点击展开）</summary>
+### 未来事件与预案（{{ event_plans|length }} 个）
 
 {% for ev in event_plans %}
 - **{{ ev.event }}**（{{ ev.date }}）
@@ -195,7 +194,6 @@
 {% for pl in ev.plans %}  - 预案：{{ pl }}
 {% endfor %}
 {% endfor %}
-</details>
 {% endif %}
 
 ---
@@ -371,19 +369,19 @@
 {% if s.env.top_holders %}
 **前十大股东**：
 {% for h in s.env.top_holders %}
-- {{ h }}
+- {{ h | holder }}
 {% endfor %}
 {% endif %}
 {% if s.env.executives %}
 **核心高管**：
 {% for e in s.env.executives %}
-- {{ e }}
+- {{ e | holder }}
 {% endfor %}
 {% endif %}
 {% if s.env.recent_changes %}
 **近一年变动**：
 {% for c in s.env.recent_changes %}
-- {{ c }}
+- {{ c | holder }}
 {% endfor %}
 {% endif %}
 {% if s.env.data_gaps %}
@@ -410,15 +408,12 @@
 
 ### 术语速查
 
-<details>
-<summary>术语速查（点击展开）</summary>
 
 - 期望值 EV：乐观/中性/悲观三种情景按概率加权的目标价，可理解为「按概率折算后的合理价」。
 - 隐含空间：期望值相对现价的折溢价，正为上行、负为下行——这是「现价贵不贵」的第一判断。
 - 先验胜率：六维评分折算出的初始获胜概率；后验胜率：纳入最新证据修正后的概率。
 - 认知差 Edge：我们的后验胜率与市场隐含胜率的差——Edge 为正才值得买，为负说明市场定价已比我们的判断更乐观。
 - 财务健康分：ROE、毛利率、营收增长、净利增长、估值五组件的可得均值（0-100），无可用组件时不评分。
-</details>
 
 ### 交易参考（择时类内容，非本报告重点）
 - 信号：{{ signal.rating }} ｜ {{ signal.confidence }} ｜ 期望值 {{ signal.expected_value or 'N/A' }}

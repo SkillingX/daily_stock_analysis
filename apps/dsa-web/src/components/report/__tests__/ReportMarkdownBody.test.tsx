@@ -21,3 +21,18 @@ describe('saved report formatting', () => {
     expect(container.querySelector('a')?.getAttribute('href')).not.toContain('javascript:');
   });
 });
+
+it('shows legacy disclosure content without raw details tags and keeps code literal', () => {
+  const { container } = render(<ReportMarkdownBody content={'<details>\n<summary>未来事件与预案</summary>\n\n- **公告**：等待披露\n\n</details>\n\n```html\n<details><summary>example</summary></details>\n```'} />);
+  expect(container.querySelector('li')?.textContent).toContain('公告');
+  expect(container.querySelector('code')?.textContent).toContain('<details>');
+  expect(container.querySelector('details,summary')).toBeNull();
+  expect(container.textContent?.replace(container.querySelector('code')?.textContent || '', '')).not.toContain('<summary>');
+});
+
+it('hides report split markers while preserving code examples', () => {
+  const { container } = render(<ReportMarkdownBody content={'<!-- dim:ownership -->\n\n## 股权资料\n\n```html\n<!-- dim:ownership -->\n```'} />);
+  const code = container.querySelector('code')?.textContent || '';
+  expect(code).toContain('<!-- dim:ownership -->');
+  expect(container.textContent?.replace(code, '')).not.toContain('<!-- dim:');
+});

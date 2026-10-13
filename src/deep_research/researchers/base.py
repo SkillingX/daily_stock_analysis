@@ -71,15 +71,6 @@ def _coerce_list(dim_id: str, key: str, value: list) -> list:
     """List[dict] → List[str]，对 ownership 三字段取 dict["name"] 拼字符串；其余原样返回。"""
     ownership_list_keys = {"top_holders", "executives", "recent_changes"}
     if dim_id == "ownership" and key in ownership_list_keys:
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                name = item.get("name") or item.get("holder_name") or str(item)
-            elif isinstance(item, str):
-                name = item
-            else:
-                name = str(item)
-            result.append(HolderInfo(name=name))
-        return result
+        return [item if isinstance(item, HolderInfo) else HolderInfo.model_validate(item) for item in value]
     # 普通 list（如 List[str]）原样返回
     return value

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any, Dict, List, Optional
 
@@ -100,6 +101,48 @@ KEY_ZH_MAP: Dict[str, str] = {
     "role_cn": "中国链位置", "role_us": "美国/全球链位置",
     "export_control": "出口管制", "sanction_risk": "制裁风险", "substitution": "替代进度",
 }
+
+
+def _format_holder(value: Any) -> str:
+    from src.schemas.deep_research_dims import HolderInfo
+    holder = value if isinstance(value, HolderInfo) else HolderInfo.model_validate(value)
+    return holder.name + (f"：{holder.detail}" if holder.detail else "") + (f"（来源：{holder.source}）" if holder.source else "")
+
+
+def normalize_saved_markdown(markdown: str) -> str:
+    """Adapt legacy report formatting without changing stored content or code examples."""
+    import ast
+    fence = ""
+    lines = []
+    for line in markdown.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            token = marker[1]
+            if not fence:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not line[marker.end():].strip():
+                fence = ""
+            lines.append(line)
+            continue
+        if fence or line.startswith(("    ", "\t")):
+            lines.append(line)
+            continue
+        if re.fullmatch(r"\s*(?:</?details>|<!-- dim:[a-z_]+ -->)\s*", line):
+            continue
+        summary = re.fullmatch(r"\s*<summary>(.*?)</summary>\s*", line)
+        if summary:
+            line = f"**{summary[1]}**\n"
+        if line.startswith("- name=") and " source=" in line:
+            try:
+                parsed = ast.parse("entry(" + line[2:].strip().replace(" source=", ", source=") + ")", mode="eval").body
+                if isinstance(parsed, ast.Call) and not parsed.args:
+                    values = {item.arg: ast.literal_eval(item.value) for item in parsed.keywords if item.arg in {"name", "source", "detail"}}
+                    if isinstance(values.get("name"), str):
+                        line = "- " + _format_holder(values) + "\n"
+            except (ValueError, SyntaxError, TypeError, RecursionError):
+                pass  # Unknown historical forms remain readable as original text.
+        lines.append(line)
+    return "".join(lines)
 
 
 def _format_cn(value: Any, labels: Optional[Dict[str, str]] = None) -> str:
@@ -630,6 +673,7 @@ def render_markdown(
         keep_trailing_newline=True,
     )
     env.filters["cn"] = _format_cn
+    env.filters["holder"] = _format_holder
     template = env.get_template(template_name or _TEMPLATE_NAME)
     return _zh_polish(template.render(**view))
 
