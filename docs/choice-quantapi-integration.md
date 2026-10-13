@@ -130,3 +130,15 @@ SDK 作为可选运行依赖，普通离线 CI 不要求设备令牌；未配置
 - 本机无响应代理实验中，SDK `HTTPTimeout=1` 的登录仍超过 12 秒未返回。故仅为原生 SDK 使用一个串行、可终止的子进程：正常复用设备会话，沿报告剩余预算等待，超时终止该进程并释放连接，下次重新建会话。没有 ForceLogin、删令牌或自动升级操作；退出时尝试正常关闭会话。进程回收有最多约 0.4 秒的额外清理预算。
 - Choice 策略不装配 MX/iFinD，核验注册不启用四旧源，年度及资金旁路不读旧源缓存或旧密钥。来源合同与映射版本进入缓存身份；历史报告保留原始来源。强制刷新不复用当前财务快照。
 - 回滚使用 `DATA_SOURCE_PROFILE=legacy` 并重启，旧适配器和 Tushare 保留；是否恢复旧账号服务须由部署方主动选择，Choice 失败不会自动切回。
+
+## 年度财报与财务报告
+
+Choice 取最近最多四份已披露年报（合并、人民币、调整前），保留科目金额、加权 ROE 和披露日。现金流和归母权益分别进入现金流表及资产负债表；毛利金额与营业收入减营业成本核对。已知值为零或负数仍保留，不足两年、相邻年份缺失或前期为零时不计算同比；亏损时不使用现金流/净利比率解释利润质量。金额公式使用 Decimal，加权 ROE 不用期末权益反推。
+
+财务分析页面的“刷新数据并生成新报告”对应 `POST /api/v1/financial-analysis/generate?stock_code=<code>&force_refresh=true`。普通生成仅复用当天相同来源及分析版本的完整报告；缺数、源失败或旧分析版本重新取当前快照和年报，不退回更早的完整报告。Choice 与 legacy 的刷新都绕过年度、快照与报告缓存，保留历史版本。
+
+生成响应增加 `partial`：表示报告已保存但有明确缺口，Web 仍可查看与下载。`success` 表示完整报告；`already_exists` 仅表示复用完整报告；`failed` 仍表示生成或保存失败。持久化 `analysis_json.gaps` 与 `analysis_version` 保留完整性和计算版本，旧报告仍可读，但不会作为新版完整结果复用。PE、PB 统一取自共享快照的合格字段，不使用年度旁路的无质量元数据标量；年报序列的 partial 状态同样进入报告缺口，即使缺项不在最近两年。估值失败原因进入缺口，局部财务评分不产生行动建议。不适用字段不能承诺等待源恢复后补齐。大于 10 的有限现金流/净利比率可能来自低利润基数，不作人为截断。
+
+业绩报告服务目前没有独立 Web/API 页面；可通过 `src.services.earnings_analysis_service.generate_earnings_report` 调用。其 Markdown、三表 CSV 和计算 CSV 保留实际来源，按报告分目录保存；仅支持已取到的年度报告，指定年报时选择该年度及更早年份。
+
+本机验收可重跑：`.venv/bin/python scripts/check_choice_reports.py --base-url <local-api-url> --code 300260 --kind financial-analysis --output-dir .claude/reviews/choice-acceptance`。其他报告类型用 `--kind fundamentals` 或 `sector-analysis`，脚本检查生成、API 重读、下载内容相同，不调用通知入口。英文首页未同步，因为此内容是本部署的中文专题说明，未改变首页级定位。

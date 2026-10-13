@@ -92,16 +92,20 @@ class TestNumericRanges:
         with pytest.raises(ValidationError):
             FinancialAnalysis.model_validate(bad)
 
-    def test_cash_quality_extreme_rejected(self):
+    def test_cash_quality_large_finite_ratio_is_valid(self):
+        result = FinancialAnalysis.model_validate({**_valid_analysis(), "cash_quality": 50.0})
+        assert result.cash_quality == 50.0
+
+    def test_cash_quality_nonfinite_rejected(self):
         with pytest.raises(ValidationError):
-            FinancialAnalysis.model_validate({**_valid_analysis(), "cash_quality": 50.0})
+            FinancialAnalysis.model_validate({**_valid_analysis(), "cash_quality": float("inf")})
 
 
 # 枚举与pattern
 
 class TestEnumsAndPatterns:
     def test_status_valid_values(self):
-        for s in ("success", "failed", "already_exists"):
+        for s in ("success", "partial", "failed", "already_exists"):
             r = FinancialAnalysisGenerateResponse.model_validate({
                 "report_id": "fa_1",
                 "stock_code": "600519",

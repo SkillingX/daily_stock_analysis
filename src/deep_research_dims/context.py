@@ -139,6 +139,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "gross_margin": financial.get("gross_margin"),
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
+            "stock_name": raw.get("stock_name"),
             "source": "choice" if config.data_source_profile == "choice" else "fundamental_context",
             "errors": list(compact.get("errors") or []),
             "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
@@ -295,15 +296,40 @@ def fetch_fuyao_financial_series(code: str, limit: int = 4) -> Dict[str, Any]:
         失败返回空结构，不抛异常。
     """
     from src.config import get_config
+    from data_provider.base import normalize_stock_code
+    code = normalize_stock_code(code)
     if get_config().data_source_profile == "choice":
-        return {"years": [], "valuation": {}, "as_of": "", "errors": ["choice:annual_reports_not_integrated"]}
+        from data_provider.choice_adapter import ChoiceAdapter, AnnualReport
+        from data_provider.mx_data_adapter import financial_refresh
+        from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
+        from src.patches.eastmoney_patch import request_deadline
+        adapter = ChoiceAdapter()
+        key = f"{adapter.contract_version}_annual_{code}_{limit}"
+        refresh = financial_refresh.get()
+        cached = None if refresh and refresh[0] == code else load_snapshot(key, ttl_hours=24)
+        if cached is not None:
+            try:
+                cached["years"] = [AnnualReport.from_record(row).as_record() for row in cached["years"]]
+                return cached
+            except (ValueError, KeyError, TypeError):
+                logger.warning("Choice 年报缓存合同无效，重新查询")
+        deadline = monotonic()+get_config().fundamental_stage_timeout_seconds
+        outer = request_deadline.get()
+        if outer is not None:
+            deadline = min(deadline, outer)
+        result = adapter.annual_reports(code, limit, deadline=deadline)
+        if result["status"] == "ok":
+            save_snapshot(key, result)
+        return result
     import os as _os
     import requests as _rq
 
     from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
+    from data_provider.mx_data_adapter import financial_refresh
 
-    key = f"fin_series_{code}"
-    cached = load_snapshot(key, ttl_hours=24.0)
+    key = f"fin_series_legacy_v2_{code}"
+    refresh = financial_refresh.get()
+    cached = None if refresh and refresh[0] == code else load_snapshot(key, ttl_hours=24.0)
     if cached is not None:
         return cached
 
@@ -356,7 +382,10 @@ def fetch_fuyao_financial_series(code: str, limit: int = 4) -> Dict[str, Any]:
                 "revenue": rev,
                 "net_profit": np_,
                 "gross_margin": round((rev - cost) / rev * 100, 2) if rev and cost is not None else None,
-                "roe": round(np_ / equity * 100, 2) if np_ is not None and equity else None,
+                "roe": None,
+                "ending_equity_return": round(np_ / equity * 100, 2) if np_ is not None and equity else None,
+                "roe_method": "unknown",
+                "source": "fuyao",
                 "debt_ratio": round(debt / assets * 100, 2) if debt is not None and assets else None,
                 "op_cash_flow": cf.get("act_cash_flow_net"),
                 "eps": item.get("basic_eps"),

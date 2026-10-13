@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Download, FileText, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
@@ -19,6 +19,7 @@ export default function FinancialAnalysisPage() {
   const [history, setHistory] = useState<FinancialItem[]>([]);
   const [detail, setDetail] = useState<{ id: string; markdown: string; stock_name?: string } | null>(null);
   const [generating, setGenerating] = useState(false);
+  const inFlight = useRef(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadHistory = useCallback(async () => {
@@ -28,12 +29,15 @@ export default function FinancialAnalysisPage() {
 
   useEffect(() => { void loadHistory(); }, [loadHistory]);
 
-  const handleGenerate = useCallback(async () => {
+  const handleGenerate = useCallback(async (forceRefresh = false) => {
+    if (inFlight.current) return;
     if (!selected) { setError('请先选择一只 A 股'); return; }
-    setError(null); setGenerating(true); setDetail(null);
+    inFlight.current = true;
+    setError(null); setGenerating(true);
     try {
       const res = await apiClient.post<{ report_id: string | null; markdown: string }>(
-        `/api/v1/financial-analysis/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}`,
+        `/api/v1/financial-analysis/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}&force_refresh=${forceRefresh}`,
+        undefined, { timeout: 180000 },
       );
       if (res.data.report_id) {
         setDetail({ id: res.data.report_id, markdown: res.data.markdown });
@@ -45,6 +49,7 @@ export default function FinancialAnalysisPage() {
       setError(e instanceof Error ? e.message : '生成失败');
     } finally {
       setGenerating(false);
+      inFlight.current = false;
     }
   }, [selected, loadHistory]);
 
@@ -104,7 +109,10 @@ export default function FinancialAnalysisPage() {
               className="inline-flex h-11 items-center gap-2 rounded-xl bg-cyan px-5 text-sm font-semibold text-black hover:bg-cyan/90 disabled:opacity-60"
             >
               {generating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              {generating ? '生成中（约1-2分钟）...' : '生成报告'}
+              {generating ? '生成中...' : '生成报告'}
+            </button>
+            <button className="btn-secondary text-sm" disabled={generating || !selected} onClick={() => void handleGenerate(true)}>
+              <RefreshCw size={14} /> 刷新数据并生成新报告
             </button>
           </div>
           {error && <p className="text-sm text-red-400">{error}</p>}

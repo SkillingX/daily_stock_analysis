@@ -16,10 +16,10 @@
 ## 二、盈利质量（ROE / 毛利率）
 
 {% if a.years %}
-| 年度 | 营收（亿元） | 归母净利（亿元） | 毛利率 | ROE |
-|------|------------|----------------|--------|-----|
+| 年度 | 营收（亿元） | 归母净利（亿元） | 毛利率 | 加权 ROE | 披露日 |
+|------|------------|----------------|--------|-----|--------|
 {% for y in a.years %}
-| {{ y.year }} | {{ '%.1f'|format(y.revenue/1e8) if y.revenue else '—' }} | {{ '%.1f'|format(y.net_profit/1e8) if y.net_profit is not none else '—' }} | {{ '%.1f'|format(y.gross_margin) if y.gross_margin is not none else '—' }}% | {{ '%.2f'|format(y.roe) if y.roe is not none else '—' }}% |
+| {{ y.year }} | {{ '%.1f'|format(y.revenue/1e8) if y.revenue is not none else '—' }} | {{ '%.1f'|format(y.net_profit/1e8) if y.net_profit is not none else '—' }} | {{ '%.1f'|format(y.gross_margin) if y.gross_margin is not none else '—' }}% | {{ '%.2f'|format(y.roe) if y.roe is not none else '—' }}% | {{ y.disclosure_date or '未知' }} |
 {% endfor %}
 {% else %}
 （多年序列缺失）
@@ -69,14 +69,17 @@
 | 财务安全 | 20% | {{ a.dims.safety.score or '—' }} | {{ a.dims.safety.label }} |
 | 估值 | 20% | {{ a.dims.valuation.score or '—' }} | {{ a.dims.valuation.label }} |
 
-🔴 **财务健康分**：**{{ a.health_score if a.health_score is not none else '数据不足' }}**/100
+🔴 **{{ '局部财务评分' if a.gaps else '财务健康分' }}**：**{{ a.health_score if a.health_score is not none else '数据不足' }}**/100
 
+{% if not a.gaps and a.health_score is not none %}
 > **分数参考**：≥75 持有或加仓；65~74 关注等待抄底；50~64 减持或止损；<50 谨慎（基本面走弱或数据严重缺失）
 
+{% endif %}
 {% if a.gaps %}
-- 数据缺口：{{ a.gaps|join('、') }}（不编造，待数据源恢复后自动补全）
+> 数据不足，评分仅对已获得数据作局部参考，不形成完整财务判断或行动建议。
+- 数据缺口：{{ a.gaps|join('、') }}。请按披露与适用性核对缺口；可恢复的取数失败可重新生成，不适用字段不补零。
 {% endif %}
 
 ---
 
-*数据来源：同花顺 fuyao 年报序列 + AkShare 财务指标兜底毛利率；多年序列为年报口径。*
+*数据来源：{{ 'Choice 原生接口；合并报表 / 人民币 / 调整前' if a.get('data_contract', 'legacy').startswith('choice-') else '各年度原始来源见年度记录' }}；年度财报与最新估值使用各自时点。*

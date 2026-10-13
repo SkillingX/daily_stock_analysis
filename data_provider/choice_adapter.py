@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import json
 import math
 import multiprocessing
 import os
@@ -15,9 +16,10 @@ from threading import Lock
 from time import monotonic
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal
+from typing import Any, Literal, Annotated
 
-from pydantic import BaseModel, ConfigDict, ValidationError, Field
+from pydantic import BaseModel, ConfigDict, ValidationError, Field, model_validator
+from icontract import ensure
 
 from data_provider.base import is_bse_code, normalize_stock_code
 from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
@@ -30,6 +32,63 @@ class NativeReply(BaseModel):
     indicators: list[str] = Field(default_factory=list)
     dates: list[str] = Field(default_factory=list)
     data: dict[str, list[float | int | str | None | list[float | int | str | None]]] | list[str] = Field(default_factory=dict)
+
+
+class AnnualReport(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
+    report_date: Annotated[str, Field(pattern=r"^\d{4}-12-31$")]
+    disclosure_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+    source: Literal["choice"] = "choice"
+    currency: Literal["CNY"] = "CNY"
+    statement_scope: Literal["consolidated"] = "consolidated"
+    adjustment: Literal["unadjusted"] = "unadjusted"
+    revenue: Decimal | None = None
+    operating_cost: Decimal | None = None
+    gross_profit: Decimal | None = None
+    net_profit: Decimal | None = None
+    roe: Decimal | None = None
+    gross_margin: Decimal | None = None
+    op_cash_flow: Decimal | None = None
+    assets_total: Decimal | None = None
+    total_debt: Decimal | None = None
+    equity_total: Decimal | None = None
+    eps: Decimal | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> AnnualReport:
+        report, disclosed = date.fromisoformat(self.report_date), date.fromisoformat(self.disclosure_date)
+        if not report < disclosed <= date.today():
+            raise ValueError("Annual disclosure must follow the report period and be known today")
+        return self
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> AnnualReport:
+        payload = {key: record[key] for key in cls.model_fields if key in record}
+        payload.update({key: record.get(key) for key in ("source", "currency", "statement_scope", "adjustment")})
+        report = cls.model_validate_json(json.dumps(payload))
+        if record.get("year") != int(report.report_date[:4]):
+            raise ValueError("Annual year and report period disagree")
+        return report
+
+    @ensure(lambda self, result: result["gross_profit"] is None or self.revenue is None or self.operating_cost is None or abs(Decimal(str(result["gross_profit"])) - (self.revenue-self.operating_cost)) <= Decimal("0.01"), "Gross profit must agree with revenue minus cost")
+    def as_record(self) -> dict[str, Any]:
+        record = self.model_dump(mode="json")
+        for field in ("revenue", "operating_cost", "gross_profit", "net_profit", "roe", "gross_margin", "op_cash_flow", "assets_total", "total_debt", "equity_total", "eps"):
+            value = getattr(self, field)
+            record[field] = float(value) if value is not None else None
+        if self.gross_profit is not None and self.revenue is not None and self.operating_cost is not None:
+            computed = self.revenue-self.operating_cost
+            if self.gross_profit is not None and abs(self.gross_profit-computed) > Decimal("0.01"):
+                record["gross_profit"] = None
+                record["errors"] = ["gross_profit:identity_mismatch"]
+            else:
+                record["gross_profit"] = float(computed)
+        record["year"] = int(self.report_date[:4])
+        record["period"] = self.report_date
+        record["debt_ratio"] = float(self.total_debt/self.assets_total*100) if self.total_debt is not None and self.assets_total is not None and self.assets_total > 0 else None
+        record["roe_method"] = "weighted_roe"
+        record["field_meta"] = {field: {"source": self.source, "source_family": "eastmoney", "period": self.report_date, "period_basis": "annual", "disclosed_at": self.disclosure_date, "currency": self.currency, "statement_scope": self.statement_scope, "adjustment": self.adjustment, "unit": "percentage_point" if field in {"roe", "gross_margin", "debt_ratio"} else "CNY/share" if field == "eps" else "currency_base"} for field in ("revenue", "operating_cost", "gross_profit", "net_profit", "roe", "gross_margin", "op_cash_flow", "assets_total", "total_debt", "equity_total", "eps", "debt_ratio")}
+        return record
 
 
 def _native_error(code: int, message: str) -> str:
@@ -86,7 +145,7 @@ def _serve_native(connection: Connection) -> None:
 
 class ChoiceAdapter:
     name = "choice"
-    contract_version = "choice-v1"
+    contract_version = "choice-v2"
     _lock = Lock()
     _process: BaseProcess | None = None
     _connection: Connection | None = None
@@ -233,6 +292,43 @@ class ChoiceAdapter:
         except SourceReadError as exc:
             out["errors"].append(str(exc))
         out.update(as_of=trade_day, report_date=report, disclosure_date=disclosure)
+        return out
+
+    def annual_reports(self, code: str, limit: int = 4, *, deadline: float) -> dict[str, Any]:
+        if not 1 <= limit <= 4:
+            raise ValueError("Annual reports limit must be between one and four")
+        today = date.today()
+        out: dict[str, Any] = {"years": [], "valuation": {}, "as_of": today.isoformat(), "source": self.name, "data_contract": self.contract_version, "errors": []}
+        mapping = {"revenue": "OPERATEREVENEW", "operating_cost": "OPERATEEXPNEW", "net_profit": "PARENTNETPROFITNEW", "gross_profit": "GROSSMARGIN", "roe": "ROEWA", "gross_margin": "GPMARGIN", "op_cash_flow": "NETOPERATECASHFLOWNEW", "assets_total": "SUMASSETNEW", "total_debt": "SUMLIABNEW", "equity_total": "SUMPARENTEQUITYNEW", "eps": "BASICEPSNEW"}
+        for year in range(today.year-1, today.year-limit-2, -1):
+            if len(out["years"]) == limit or monotonic() >= deadline:
+                break
+            report_date = f"{year}-12-31"
+            try:
+                values = self.css(code, ",".join((*mapping.values(), "ACTUALISSUINGDATE")), f"ReportDate={report_date},Type=1,CurType=2,DataAdjustType=1", deadline=deadline)
+                if not values.get("ACTUALISSUINGDATE"):
+                    out["errors"].append(f"choice:{report_date}:disclosure_unknown")
+                    continue
+                disclosure = self.report_date(values["ACTUALISSUINGDATE"])
+                if disclosure > today.isoformat() or disclosure <= report_date:
+                    out["errors"].append(f"choice:{report_date}:not_disclosed")
+                    continue
+                numbers: dict[str, Decimal | None] = {}
+                for field, indicator in mapping.items():
+                    try:
+                        value = self.number(values.get(indicator))
+                        numbers[field] = Decimal(str(values[indicator])) if value is not None else None
+                    except SourceReadError as error:
+                        numbers[field] = None
+                        out["errors"].append(f"choice:{report_date}:{field}:{error.reason_code}")
+                row = AnnualReport(report_date=report_date, disclosure_date=disclosure, **numbers).as_record()
+                out["years"].append(row)
+                out["errors"].extend(f"choice:{report_date}:{reason}" for reason in row.get("errors") or [])
+            except SourceReadError as error:
+                out["errors"].append(f"choice:{report_date}:{error.reason_code}")
+                if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "timeout"}:
+                    break
+        out["status"] = "ok" if len(out["years"]) == limit and not out["errors"] and all(row.get(field) is not None for row in out["years"] for field in mapping) else "partial"
         return out
 
     def _adopt(self, out: dict[str, Any], block: str, field: str, value: object, unit: Literal["currency_base", "percentage_point", "multiple"], caliber: str, period: str | None, observed: str | None, adjustment: str, indicator: str, error: str | None = None) -> None:

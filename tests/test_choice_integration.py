@@ -34,6 +34,8 @@ class ChoiceSDK:
 
 @pytest.fixture
 def choice_transport(monkeypatch, tmp_path):
+    from src.agent.tools import data_tools
+    monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", None)
     from src.deep_research_dims import dim_cache
     monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path / "cache"))
     config = Config(enable_fundamental_pipeline=True, deep_research_cross_validate=False)

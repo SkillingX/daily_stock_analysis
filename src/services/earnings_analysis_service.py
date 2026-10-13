@@ -2,18 +2,20 @@
 """A股业绩分析报告服务。
 
 参考 anthropics/financial-services 的数据完整性规则设计：
-1. 中间文件是唯一真相来源（write-after-query）
-2. 算术验证先行（从原始数据计算派生指标）
-3. 报告只引用中间文件，不依赖内存数据
+1. 年度快照与计算 CSV 一并保存，便于逐项核对
+2. 使用原始科目作算术验证，保留缺口
+3. 报告与导出文件使用同一份已取得的数据
 
-数据源：AkShare（主）+ Fuyao 年报序列（补充）
+数据源由部署策略选择；来源、财期和报表口径随年度数据保留。
 """
 
 from __future__ import annotations
 
 import csv
+from decimal import Decimal
 import json
 import logging
+from data_provider.cross_source_validator import SourceReadError
 import subprocess
 from datetime import datetime, date
 from pathlib import Path
@@ -40,9 +42,9 @@ def get_report_dir() -> Path:
 # 数据采集（每步立即写入中间文件）
 # ---------------------------------------------------------------------------
 
-def _write_company_profile(stock_code: str, profile: Dict[str, Any]) -> Path:
+def _write_company_profile(stock_code: str, profile: Dict[str, Any], output_dir: Path | None = None) -> Path:
     """Query 1: 写入公司基本信息"""
-    path = get_tmp_dir() / "company-profile.txt"
+    path = (output_dir or get_tmp_dir()) / "company-profile.txt"
     lines = [f"# 公司基本信息 ({stock_code})", f"# 生成时间: {datetime.now().isoformat()}"]
     for key, value in profile.items():
         lines.append(f"{key}: {value}")
@@ -50,32 +52,25 @@ def _write_company_profile(stock_code: str, profile: Dict[str, Any]) -> Path:
     return path
 
 
-def _write_financials_csv(stock_code: str, financials: Dict[str, Any]) -> Path:
-    """Query 2: 写入财务报表 CSV"""
-    path = get_tmp_dir() / "financials.csv"
-    rows = [["period", "line_item", "value", "source"]]
-
-    # income statement
-    for period, data in financials.get("income_statement", {}).items():
-        for item, value in data.items():
-            if value is not None:
-                rows.append([period, item, str(value), "AkShare"])
-
-    # balance sheet summary
-    for period, data in financials.get("balance_sheet", {}).items():
-        for item, value in data.items():
-            if value is not None:
-                rows.append([period, f"BS_{item}", str(value), "AkShare"])
-
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
+def _write_financials_csv(stock_code: str, financials: Dict[str, Any], output_dir: Path | None = None) -> Path:
+    """Export all three statements with their actual annual evidence."""
+    path = (output_dir or get_tmp_dir()) / f"{stock_code}_financials.csv"
+    rows: list[list[str]] = [["period", "statement", "line_item", "value", "source", "currency", "unit", "scope", "adjustment", "disclosure_date"]]
+    for statement in ("income_statement", "balance_sheet", "cash_flow"):
+        for period, data in financials.get(statement, {}).items():
+            metadata = (financials.get("metadata") or {}).get(period) or {}
+            for item, value in data.items():
+                if value is not None:
+                    rows.append([period, statement, item, str(value), str(metadata.get("source") or "unknown"), str(metadata.get("currency") or "unknown"), "percentage_point" if item == "weighted_roe" else "CNY/share" if item == "eps" else "currency_base", str(metadata.get("statement_scope") or "unknown"), str(metadata.get("adjustment") or "unknown"), str(metadata.get("disclosure_date") or "unknown")])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as output:
+        csv.writer(output).writerows(rows)
     return path
 
 
-def _write_calculations_csv(calculations: List[Dict[str, str]]) -> Path:
+def _write_calculations_csv(calculations: List[Dict[str, str]], output_dir: Path | None = None) -> Path:
     """Step 3b: 写入派生指标计算结果"""
-    path = get_tmp_dir() / "calculations.csv"
+    path = (output_dir or get_tmp_dir()) / "calculations.csv"
     rows = [["metric", "value", "formula", "components"]]
     for calc in calculations:
         rows.append([
@@ -138,108 +133,56 @@ def _parse_float(val: Any) -> Optional[float]:
 
 
 def _validate_and_compute(financials: Dict[str, Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    从原始财务数据计算派生指标，并做算术验证。
-
-    验证规则：
-    - 毛利率 = 毛利 / 营收（误差 < 0.5%）
-    - 净利率 = 净利润 / 营收（误差 < 0.5%）
-    - YoY = (本期 - 上期) / |上期|（与报表附注对比）
-    - ROE = 净利润 / 股东权益（0 < ROE < 100%）
-    - 盈利质量 = 经营现金流 / 净利润（> 0 高质量）
-
-    Returns:
-        List of calculation records [{metric, value, formula, components}, ...]
-    """
-    calcs = []
-    is_income = financials.get("income_statement", {})
-    is_bs = financials.get("balance_sheet", {})
-    is_cf = financials.get("cash_flow", {})
-
-    # 获取最近两期数据
-    periods = sorted(is_income.keys(), reverse=True)
-    if len(periods) < 1:
-        return calcs
-
-    current_period = periods[0]
-    prior_period = periods[1] if len(periods) > 1 else None
-
-    def get_val(data: Dict, item: str, default=None) -> Optional[float]:
-        v = data.get(item, default)
-        return _parse_float(v)
-
-    # ----- 营收 -----
-    revenue_cur = get_val(is_income.get(current_period, {}), "revenue")
-    gross_profit_cur = get_val(is_income.get(current_period, {}), "gross_profit")
-    net_profit_cur = get_val(is_income.get(current_period, {}), "net_profit")
-    operating_cf_cur = get_val(is_cf.get(current_period, {}), "operating_cash_flow")
-    equity_cur = get_val(is_bs.get(current_period, {}), "total_equity")
-
-    # ----- 上期 -----
-    revenue_prior = get_val(is_income.get(prior_period, {}), "revenue") if prior_period else None
-    net_profit_prior = get_val(is_income.get(prior_period, {}), "net_profit") if prior_period else None
-
-    # 毛利率
-    if revenue_cur and gross_profit_cur:
-        gm = gross_profit_cur / revenue_cur
-        calcs.append({
-            "metric": f"gross_margin_{current_period}",
-            "value": f"{gm * 100:.2f}%",
-            "formula": "gross_profit / revenue",
-            "components": f"{gross_profit_cur:.2f} / {revenue_cur:.2f}",
-        })
-
-    # 净利率
-    if revenue_cur and net_profit_cur:
-        nm = net_profit_cur / revenue_cur
-        calcs.append({
-            "metric": f"net_margin_{current_period}",
-            "value": f"{nm * 100:.2f}%",
-            "formula": "net_profit / revenue",
-            "components": f"{net_profit_cur:.2f} / {revenue_cur:.2f}",
-        })
-
-    # YoY 营收增长率
-    if revenue_cur and revenue_prior:
-        yoy_rev = (revenue_cur - revenue_prior) / abs(revenue_prior)
-        calcs.append({
-            "metric": f"revenue_yoy_{current_period}",
-            "value": f"{yoy_rev * 100:.2f}%",
-            "formula": "(current - prior) / |prior|",
-            "components": f"({revenue_cur:.2f} - {revenue_prior:.2f}) / {revenue_prior:.2f}",
-        })
-
-    # YoY 净利润增长率
-    if net_profit_cur and net_profit_prior:
-        yoy_np = (net_profit_cur - net_profit_prior) / abs(net_profit_prior)
-        calcs.append({
-            "metric": f"net_profit_yoy_{current_period}",
-            "value": f"{yoy_np * 100:.2f}%",
-            "formula": "(current - prior) / |prior|",
-            "components": f"({net_profit_cur:.2f} - {net_profit_prior:.2f}) / {abs(net_profit_prior):.2f}",
-        })
-
-    # ROE
-    if net_profit_cur and equity_cur and equity_cur > 0:
-        roe = net_profit_cur / equity_cur
-        calcs.append({
-            "metric": f"roe_{current_period}",
-            "value": f"{roe * 100:.2f}%",
-            "formula": "net_profit / total_equity",
-            "components": f"{net_profit_cur:.2f} / {equity_cur:.2f}",
-        })
-
-    # 盈利质量
-    if operating_cf_cur and net_profit_cur and net_profit_cur > 0:
-        cash_quality = operating_cf_cur / net_profit_cur
-        calcs.append({
-            "metric": f"cash_quality_{current_period}",
-            "value": f"{cash_quality:.2f}",
-            "formula": "operating_cash_flow / net_profit",
-            "components": f"{operating_cf_cur:.2f} / {net_profit_cur:.2f}",
-        })
-
+    """Compute monetary ratios in Decimal; ROE uses the reported weighted metric."""
+    income = financials.get("income_statement", {})
+    cash = financials.get("cash_flow", {})
+    periods = sorted(income, reverse=True)
+    if not periods:
+        return []
+    current = periods[0]
+    prior = periods[1] if len(periods) > 1 else None
+    calcs: list[dict[str, str]] = []
+    def number(row: dict[str, Any], key: str) -> Decimal | None:
+        value = _parse_float(row.get(key))
+        return Decimal(str(value)) if value is not None and Decimal(str(value)).is_finite() else None
+    revenue = number(income[current], "revenue")
+    gross = number(income[current], "gross_profit")
+    profit = number(income[current], "net_profit")
+    ocf = number(cash.get(current, {}), "operating_cash_flow")
+    weighted_roe = number(income[current], "weighted_roe")
+    for metric, numerator in (("gross_margin", gross), ("net_margin", profit)):
+        if revenue is not None and revenue != 0 and numerator is not None:
+            calcs.append({"metric": f"{metric}_{current}", "value": f"{numerator/revenue*100:.2f}%", "formula": f"{'gross_profit' if metric == 'gross_margin' else 'net_profit'} / revenue", "components": f"{numerator:.2f} / {revenue:.2f}"})
+    if prior is not None:
+        metadata = financials.get("metadata", {})
+        current_meta, prior_meta = metadata.get(current, {}), metadata.get(prior, {})
+        compatible = all(current_meta.get(key) == prior_meta.get(key) for key in ("currency", "statement_scope", "adjustment"))
+        # Only adjacent years form a year-on-year comparison.
+        adjacent = current[:4].isdigit() and prior[:4].isdigit() and int(current[:4])-int(prior[:4]) == 1
+        if compatible and adjacent:
+            for metric, key, current_value in (("revenue_yoy", "revenue", revenue), ("gross_profit_yoy", "gross_profit", gross), ("net_profit_yoy", "net_profit", profit)):
+                previous = number(income[prior], key)
+                if current_value is not None and previous is not None and previous != 0:
+                    calcs.append({"metric": f"{metric}_{current}", "value": f"{(current_value-previous)/abs(previous)*100:.2f}%", "formula": "(current - prior) / |prior|", "components": f"({current_value:.2f} - {previous:.2f}) / {abs(previous):.2f}"})
+    if weighted_roe is not None:
+        calcs.append({"metric": f"roe_{current}", "value": f"{weighted_roe:.2f}%", "formula": "weighted_roe (reported)", "components": str(weighted_roe)})
+    if ocf is not None and profit is not None and profit > 0:
+        calcs.append({"metric": f"cash_quality_{current}", "value": f"{ocf/profit:.2f}", "formula": "operating_cash_flow / parent_net_profit", "components": f"{ocf:.2f} / {profit:.2f}"})
     return calcs
+
+
+def _statements_from_series(series: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    from data_provider.choice_adapter import AnnualReport
+    statements: dict[str, dict[str, Any]] = {"income_statement": {}, "balance_sheet": {}, "cash_flow": {}, "metadata": {}}
+    for entry in series.get("years") or []:
+        period = str(entry.get("report_date") or entry.get("period") or entry.get("year"))
+        if entry.get("source") == "choice":
+            entry = AnnualReport.from_record(entry).as_record()
+        statements["income_statement"][period] = {"revenue": entry.get("revenue"), "operating_cost": entry.get("operating_cost"), "gross_profit": entry.get("gross_profit"), "net_profit": entry.get("net_profit"), "eps": entry.get("eps"), "weighted_roe": entry.get("roe") if entry.get("roe_method") == "weighted_roe" else None}
+        statements["balance_sheet"][period] = {"total_equity": entry.get("equity_total"), "total_assets": entry.get("assets_total"), "total_liabilities": entry.get("total_debt")}
+        statements["cash_flow"][period] = {"operating_cash_flow": entry.get("op_cash_flow")}
+        statements["metadata"][period] = {key: entry.get(key) for key in ("source", "currency", "statement_scope", "adjustment", "disclosure_date")}
+    return statements
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +228,7 @@ def _render_report(
     revenue_prior = fv(prior_data.get("revenue"))
     gross_profit_cur = fv(cur_data.get("gross_profit"))
     net_profit_cur = fv(cur_data.get("net_profit"))
-    operating_cf_cur = fv(cur_data.get("operating_cash_flow"))
+    operating_cf_cur = fv((financials.get("cash_flow", {}).get(current) or {}).get("operating_cash_flow"))
 
     # 毛利率（从计算结果）
     gm = calc_dict.get(f"gross_margin_{current}", "N/A")
@@ -295,12 +238,6 @@ def _render_report(
     rev_yoy = calc_dict.get(f"revenue_yoy_{current}", "N/A")
     np_yoy = calc_dict.get(f"net_profit_yoy_{current}", "N/A")
 
-    # YoY helper
-    def yoy_cell(cur, prior):
-        if cur is None or prior is None or prior == 0:
-            return "N/A"
-        return f"{((cur - prior) / abs(prior)) * 100:+.1f}%"
-
     # EPS（如有）
     eps_cur = cur_data.get("eps", "N/A")
 
@@ -309,7 +246,7 @@ def _render_report(
         "",
         f"> **报告日期：** {datetime.now().strftime('%Y-%m-%d')}｜",
         f"> **股票代码：** {stock_code}｜**报告期：** {current}｜",
-        f"> 数据来源：AkShare 财报 + Fuyao 年报序列",
+        f"> 数据来源：{' / '.join(sorted({'Choice' if row.get('source') == 'choice' else str(row.get('source') or 'unknown') for row in financials.get('metadata', {}).values()})) or 'unknown'}；报表口径详见 CSV",
         "",
         "---",
         "",
@@ -317,12 +254,12 @@ def _render_report(
         "",
         f"| 指标 | {current} | {prior} | 变化 |",
         f"|------|------|------|------|",
-        f"| 营收 | {fmt(revenue_cur)} | {fmt(revenue_prior)} | {yoy_cell(revenue_cur, revenue_prior)} |",
-        f"| 毛利 | {fmt(gross_profit_cur)} | {'N/A' if not gross_profit_cur else fmt(fv(prior_data.get('gross_profit')))} | {yoy_cell(gross_profit_cur, fv(prior_data.get('gross_profit'))) if gross_profit_cur else 'N/A'} |",
-        f"| 净利润 | {fmt(net_profit_cur)} | {'N/A' if not net_profit_cur else fmt(fv(prior_data.get('net_profit')))} | {yoy_cell(net_profit_cur, fv(prior_data.get('net_profit'))) if net_profit_cur else 'N/A'} |",
+        f"| 营收 | {fmt(revenue_cur)} | {fmt(revenue_prior)} | {rev_yoy} |",
+        f"| 毛利 | {fmt(gross_profit_cur)} | {fmt(fv(prior_data.get('gross_profit')))} | {calc_dict.get(f'gross_profit_yoy_{current}', 'N/A')} |",
+        f"| 净利润 | {fmt(net_profit_cur)} | {fmt(fv(prior_data.get('net_profit')))} | {np_yoy} |",
         f"| 毛利率 | {gm} | {'N/A'} | — |",
         f"| 净利率 | {nm} | {'N/A'} | — |",
-        f"| ROE | {roe_v} | {'N/A'} | — |",
+        f"| 加权 ROE | {roe_v} | {'N/A'} | — |",
         f"| 经营现金流/净利润 | {cash_q} | {'N/A'} | {'优质' if cash_q != 'N/A' and float(cash_q) > 0 else '需关注'} |",
         f"| EPS | {eps_cur} | {'N/A'} | — |",
         "",
@@ -377,6 +314,8 @@ def generate_earnings_report(
     stock_code: str,
     period: Optional[str] = None,
     company_name: Optional[str] = None,
+    *,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """
     生成单只股票业绩分析报告。
@@ -389,75 +328,91 @@ def generate_earnings_report(
     Returns:
         {"report_id": "...", "report_path": "...", "status": "ok", "calculations": [...]}
     """
-    from src.core.market_policy import require_stock_market
-    require_stock_market(stock_code)
-
-    import time
-    from src.services.financial_analysis_service import _fetch_financial_data
-
-    ts = datetime.now()
-    report_id = f"ea_{ts.strftime('%Y%m%d%H%M%S')}"
-    tmp_dir = get_tmp_dir()
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"[EarningsAnalysis] 开始分析 {stock_code} {period}")
-
-    # Step 1: 获取公司基本信息
+    from data_provider.base import normalize_stock_code
+    from data_provider.mx_data_adapter import financial_refresh
+    from uuid import uuid4
+    stock_code = normalize_stock_code(stock_code)
+    refresh_token = financial_refresh.set((stock_code, uuid4().hex)) if force_refresh else None
     try:
-        from src.agent.tools.data_tools import _handle_get_stock_info
-        profile = _handle_get_stock_info(stock_code)
-        company_name = company_name or profile.get("name", stock_code)
-        _write_company_profile(stock_code, profile)
-    except Exception as e:
-        logger.warning(f"[EarningsAnalysis] 获取公司信息失败: {e}")
-        profile = {"name": company_name or stock_code, "stock_code": stock_code}
+        from src.core.market_policy import require_stock_market
+        require_stock_market(stock_code)
 
-    # Step 2: 获取财务数据
-    try:
-        from src.deep_research_dims.context import fetch_fuyao_financial_series
-        # fetch_fuyao_financial_series 返回 {"years": [...], "valuation": {...}}
-        raw = fetch_fuyao_financial_series(stock_code, limit=4)
-        years: List[Dict[str, Any]] = raw.get("years", []) if isinstance(raw, dict) else []
-        financials = {"income_statement": {}, "balance_sheet": {}, "cash_flow": {}}
-        for entry in years:
-            p = entry.get("period") or entry.get("year") or entry.get("report_date", "unknown")
-            financials["income_statement"][p] = {
-                "revenue": entry.get("revenue"),
-                "gross_profit": entry.get("gross_profit"),
-                "net_profit": entry.get("net_profit"),
-                "operating_cash_flow": entry.get("op_cash_flow"),
-                "eps": entry.get("eps"),
-            }
-        _write_financials_csv(stock_code, financials)
-    except Exception as e:
-        logger.warning(f"[EarningsAnalysis] 获取财务数据失败: {e}")
-        financials = {}
+        ts = datetime.now()
+        report_id = f"ea_{ts.strftime('%Y%m%d%H%M%S%f')}"
+        tmp_dir = get_tmp_dir() / report_id
+        tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 3: 计算派生指标（算术验证）
-    calculations = _validate_and_compute(financials)
-    _write_calculations_csv(calculations)
+        logger.info(f"[EarningsAnalysis] 开始分析 {stock_code} {period}")
 
-    # Step 4: 生成报告
-    report_content = _render_report(
-        stock_code=stock_code,
-        company_name=company_name or stock_code,
-        period=period or "最新",
-        financials=financials,
-        calculations=calculations,
-    )
+        # Step 1: 获取公司基本信息
+        try:
+            from src.agent.tools.data_tools import _handle_get_stock_info
+            from src.config import get_config
+            if get_config().data_source_profile == "choice":
+                from src.agent.tools.data_tools import _get_fetcher_manager
+                context = _get_fetcher_manager().get_fundamental_context(stock_code)
+                profile = {"name": context.get("stock_name") or stock_code, "stock_code": stock_code, "fundamental_context": context}
+            else:
+                profile = _handle_get_stock_info(stock_code)
+            company_name = company_name or profile.get("name", stock_code)
+            _write_company_profile(stock_code, profile, tmp_dir)
+        except Exception as e:
+            logger.warning(f"[EarningsAnalysis] 获取公司信息失败: {e}")
+            profile = {"name": company_name or stock_code, "stock_code": stock_code}
 
-    # 保存报告
-    report_dir = get_report_dir()
-    report_path = report_dir / f"{report_id}.md"
-    report_path.write_text(report_content, encoding="utf-8")
+        # Step 2: 获取财务数据
+        try:
+            from src.deep_research_dims.context import fetch_fuyao_financial_series
+            # fetch_fuyao_financial_series 返回 {"years": [...], "valuation": {...}}
+            raw = fetch_fuyao_financial_series(stock_code, limit=4)
+            if period and period not in {"最新", "最新一期"}:
+                import re
+                match = re.fullmatch(r"(\d{4})(?:年报|-12-31)?", period)
+                if match is None:
+                    raise ValueError("Only disclosed annual reports are supported")
+                requested_year = int(match[1])
+                if not any(entry.get("year") == requested_year for entry in raw.get("years") or []):
+                    raise ValueError("Requested annual report is not available in the retrieved years")
+                raw = {**raw, "years": [entry for entry in raw["years"] if entry["year"] <= requested_year]}
+            financials = _statements_from_series(raw)
+            financials_path = _write_financials_csv(stock_code, financials, tmp_dir)
+        except SourceReadError as e:
+            logger.warning(f"[EarningsAnalysis] 获取财务数据失败: {e}")
+            financials = {}
+            raw = {"status": "partial"}
+            financials_path = _write_financials_csv(stock_code, financials, tmp_dir)
 
-    logger.info(f"[EarningsAnalysis] 报告已生成: {report_path}")
+        # Step 3: 计算派生指标（算术验证）
+        calculations = _validate_and_compute(financials)
+        calculations_path = _write_calculations_csv(calculations, tmp_dir)
 
-    return {
-        "report_id": report_id,
-        "report_path": str(report_path),
-        "status": "ok",
-        "company_name": company_name,
-        "period": period or "最新一期",
-        "calculations": calculations,
-    }
+        # Step 4: 生成报告
+        report_content = _render_report(
+            stock_code=stock_code,
+            company_name=company_name or stock_code,
+            period=period or "最新",
+            financials=financials,
+            calculations=calculations,
+        )
+
+        # 保存报告
+        report_dir = get_report_dir()
+        report_path = report_dir / f"{report_id}.md"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(report_content, encoding="utf-8")
+
+        logger.info(f"[EarningsAnalysis] 报告已生成: {report_path}")
+
+        return {
+            "report_id": report_id,
+            "report_path": str(report_path),
+            "status": "ok" if financials and raw.get("status", "ok") == "ok" else "partial",
+            "company_name": company_name,
+            "period": period or "最新一期",
+            "calculations": calculations,
+            "financials_csv": str(financials_path),
+            "calculations_csv": str(calculations_path),
+        }
+    finally:
+        if refresh_token is not None:
+            financial_refresh.reset(refresh_token)

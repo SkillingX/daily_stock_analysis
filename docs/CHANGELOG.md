@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] Choice 年报驱动财务与业绩报告，修正现金流/权益错层、期末权益冒称加权 ROE、零值丢失和负债分档顺序；财务页面支持显式刷新并保留真实来源与披露日。
+- [修复] 资金累计只接受完整交易日窗口，Choice 资金工具披露真实日期与缺口并保留板块数据；NETINFLOW 官方单位待确认，资金金额及相关评分明确不可用，降级/未选择维度不被经理终稿改写为确定结论。
+
+- [修复] Choice 年报驱动财务与业绩报告，修正现金流/权益错层、加权 ROE、零值和负债分档；PE/PB 统一质量校验，缺数报告明确 partial 且可重试，Choice/legacy 刷新穿透年报缓存，保留真实来源与历史版本。
+
 - [新功能] 接入可选的 Choice 原生财务/估值快照，按来源隔离缓存；Choice 策略停止 MX、iFinD、Choice MCP、Fuyao，并用受控子进程终止卡住的 SDK 请求。
 - [修复] 板块报告按实际板块总数校验排名，避免公开来源超过 200 个板块时有效报告被 API 拒绝。
 
