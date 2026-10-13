@@ -25,7 +25,7 @@ def financial_field_quality(fund: Dict[str, Any], field: str) -> FinancialFieldQ
         metadata = {}
     reading = reading_from_field_record(fund.get(_FUNDAMENTAL_FIELDS[field]), metadata)
     if reading is None:
-        return FinancialFieldQuality(quality=AnchorQuality(status="missing"))
+        return FinancialFieldQuality(quality=AnchorQuality(status="missing", reason_codes=tuple((metadata.get("quality") or {}).get("reason_codes") or ())))
     quality = AnchorQuality.model_validate_json(json.dumps(metadata.get("quality") or {"status": "unverified"})) if reading.normalization_error != "metadata_invalid" else AnchorQuality()
     record = adopted_field_record(field, reading, quality, selection_reason=metadata.get("selection_reason", "unknown"))
     return FinancialFieldQuality(reading=reading, quality=quality, rule_eligible=record["rule_eligible"], input_reasons=tuple(record["input_reasons"]), selection_reason=record["selection_reason"])
@@ -137,7 +137,7 @@ def build_fundamental_dim(
     n = sum(evidence.reading is not None for evidence in fields.values())
     m = sum(evidence.rule_eligible for evidence in fields.values())
     complete = m == 6 and len(scores) == 5
-    warnings = ["各字段仅按自身证据使用，组件完整不代表同期财报。", "规则评分置信度与跨源核验状态分别解释。"]
+    warnings = list(dict.fromkeys(fund.get("errors") or [])) + ["各字段仅按自身证据使用，组件完整不代表同期财报。", "规则评分置信度与跨源核验状态分别解释。"]
     if not all(evidence.quality.status == "verified" for evidence in fields.values()):
         warnings.append("财务字段尚未全部独立核验；未核验、单源、不可比或冲突限制详见字段证据。")
     if not complete:

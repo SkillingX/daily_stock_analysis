@@ -294,7 +294,7 @@ def test_sina_endpoint_metadata_reaches_rules_without_rewriting_values(financial
         assert record['period_basis'] == 'YTD'
         assert record['source_family'] == 'sina'
         assert record['quality']['status'] != 'verified'
-    assert ctx.fundamental['roe'] == 4.56
+    assert ctx.fundamental['roe'] == 4.56, ctx.limitations
     assert ctx.fundamental['net_profit_yoy'] == -7.517906
 
 
@@ -306,3 +306,53 @@ def test_sina_contract_does_not_apply_to_unknown_interface() -> None:
     assert record['rule_eligible'] is False
     assert record['unit'] is None
     assert record['period_basis'] == 'unknown'
+
+
+def test_slow_auxiliary_query_preserves_financial_snapshot(financial_sources, monkeypatch):
+    from threading import Event
+    from src.deep_research_dims.context import SharedContext
+    import akshare
+    received, release, finished = Event(), Event(), Event()
+    manager = data_tools._get_fetcher_manager()
+    manager._mx_source = SimpleNamespace(available=False)
+    manager._tushare_ifind_adapter = SimpleNamespace(available=False)
+    original = akshare.stock_financial_abstract
+    def financial(**kwargs):
+        received.set()
+        return original(**kwargs)
+    def slow_shareholders(**kwargs):
+        try:
+            release.wait(1)
+            return pd.DataFrame()
+        finally:
+            finished.set()
+    monkeypatch.setattr(akshare, 'stock_financial_abstract', financial)
+    monkeypatch.setattr(akshare, 'stock_zh_a_gdhs_detail_em', slow_shareholders)
+    cfg = Config(fundamental_stage_timeout_seconds=0.2, fundamental_fetch_timeout_seconds=0.1, fundamental_cache_ttl_seconds=0)
+    monkeypatch.setattr('src.config.get_config', lambda: cfg)
+    try:
+        fund = context._safe_fundamental('600519', SharedContext('600519', '样本', 'fixture'))
+        assert received.is_set()
+        assert fund['roe'] == 0.0
+        assert build_fundamental_dim(SharedContext('600519', '样本', 'fixture', fundamental=fund)).profitability['roe']['value'] == 0.0
+    finally:
+        release.set()
+        finished.wait(1)
+
+
+def test_fuyao_missing_field_fallback_uses_same_official_adapter(financial_sources, monkeypatch):
+    from data_provider.fuyao_adapter import FuyaoFetcher
+    from src.deep_research_dims.context import SharedContext
+    financial_sources['ratio'] = None
+    cfg = Config(enable_fuyao=True, fuyao_api_key='fixture', fuyao_endpoint='https://fixture', fundamental_cache_ttl_seconds=0)
+    monkeypatch.setattr('src.config.get_config', lambda: cfg)
+    response = Mock(status_code=200, text=json.dumps({'code': 0, 'message': 'success', 'data': {'thscode': '600519.SH', 'report': '2025-4', 'abilities': [{'ability': 'profitability', 'indicators': [{'index_id': 'index_weighted_avg_roe', 'value': '4.56'}]}]}}))
+    session = Mock()
+    session.get.return_value = response
+    monkeypatch.setattr(FuyaoFetcher, '_build_session', staticmethod(lambda: session))
+    ctx = SharedContext('600519', '样本', 'fixture')
+    ctx.fundamental = context._safe_fundamental('600519', ctx)
+    assert ctx.fundamental['roe'] == 4.56, ctx.limitations
+    assert build_fundamental_dim(ctx).profitability['roe']['value'] == 4.56
+    assert session.get.call_args.kwargs['headers']['X-api-key'] == 'fixture'
+    session.post.assert_not_called()

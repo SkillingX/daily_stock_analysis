@@ -3634,7 +3634,7 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, min(remaining_seconds - consumed_ms / 1000.0, stage_deadline - time.monotonic()))
 
         mx_reserved = min(fetch_timeout, stage_timeout / 3) if self._mx_source.available else 0.0
-        valuation_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
+        valuation_timeout = min(fetch_timeout, stage_timeout / 3, max(0.0, remaining_seconds - mx_reserved))
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -3706,7 +3706,7 @@ class DataFetcherManager:
         else:
             bundle_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._fundamental_adapter.get_financial_indicators(stock_code),
                 bundle_timeout,
                 "fundamental_bundle",
             )
@@ -3864,7 +3864,9 @@ class DataFetcherManager:
                     _mx_bundle = _mx_payload if isinstance(_mx_payload, dict) else None
                     if _mx_error:
                         bundle_errors.append(_mx_error)
-                    if isinstance(_mx_bundle, dict):
+                    if isinstance(_mx_bundle, dict) and _mx_bundle.get("error"):
+                        bundle_errors.append(str(_mx_bundle["error"]))
+                    if isinstance(_mx_bundle, dict) and not _mx_bundle.get("error"):
                         _mx_period_raw = _mx_bundle.get("_mx_period")
                         from data_provider.cross_source_validator import adopted_field_record
                         for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
@@ -3876,8 +3878,9 @@ class DataFetcherManager:
                             record = adopted_field_record(field, reading, selection_reason="fallback")
                             self._fill_growth_fields(growth_payload, {field: record["value"], "field_meta": {field: record}}, "fallback_mx")
                             _mx_filled = _mx_filled or growth_payload.get(field) is not None
-                except Exception:  # noqa: BLE001 — fail-open
-                    _mx_bundle = None
+                except Exception as exc:  # noqa: BLE001 — isolated source failure
+                    bundle_errors.append(str(exc))
+                    _mx_bundle = {"error": str(exc)}
 
                 # If batch query missed any field, fall back to per-field read()
                 for _mx_field in (
@@ -3886,7 +3889,7 @@ class DataFetcherManager:
                     "roe",
                     "gross_margin",
                 ):
-                    if growth_payload.get(_mx_field) is None:
+                    if growth_payload.get(_mx_field) is None and not (_mx_bundle or {}).get("error"):
                         try:
                             _mx_ar, _mx_error, _ = self._run_with_timeout(
                                 lambda field=_mx_field: self._mx_source.read(stock_code, field, deadline=mx_deadline),
@@ -3902,8 +3905,8 @@ class DataFetcherManager:
                                     _mx_filled = True
                                     if _mx_ar.period and not _mx_period_raw:
                                         _mx_period_raw = _mx_ar.period
-                        except Exception:  # noqa: BLE001 — fail-open
-                            pass
+                        except Exception as exc:  # noqa: BLE001 — isolated source failure
+                            bundle_errors.append(str(exc))
 
                 mx_valuation_filled = False
                 for field in ("pe_ratio", "pb_ratio"):
@@ -3950,6 +3953,24 @@ class DataFetcherManager:
                         result_ctx["as_of"] = (
                             f"{mx_period_norm[:4]}-{mx_period_norm[4:6]}-{mx_period_norm[6:8]}"
                         )
+
+        # Auxiliary calls may time out; core financials have already been retained.
+        _consume_budget(0)
+        if remaining_seconds > 0:
+            auxiliary, auxiliary_error, auxiliary_ms = self._run_with_timeout(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code, financials={
+                    "status": bundle_status, "growth": growth_payload, "earnings": earnings_payload,
+                    "institution": institution_payload, "source_chain": [], "errors": [],
+                }), min(fetch_timeout, remaining_seconds), "fundamental_auxiliary",
+            )
+            _consume_budget(auxiliary_ms)
+            if isinstance(auxiliary, dict):
+                earnings_payload = auxiliary.get("earnings", earnings_payload)
+                institution_payload = auxiliary.get("institution", institution_payload)
+                bundle_errors.extend(auxiliary.get("errors") or [])
+                bundle_chain.extend(self._normalize_source_chain(auxiliary.get("source_chain", []), "fundamental_auxiliary", auxiliary.get("status", "partial"), auxiliary_ms))
+            if auxiliary_error:
+                bundle_errors.append(auxiliary_error)
 
         # Derive TTM dividend yield from already-fetched quote price; avoid extra quote calls.
         earnings_extra_errors: List[str] = []

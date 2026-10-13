@@ -419,7 +419,7 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_financial_indicators(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
         """
@@ -484,6 +484,14 @@ class AkshareFundamentalAdapter:
                     result["errors"].append("financial_table:no_usable_metrics")
                 result["growth"]["field_meta"] = growth_meta
                 result["source_chain"].append(f"growth:{fin_source}")
+
+        result["status"] = "partial" if any(value is not None for key, value in result["growth"].items() if key not in {"report_date", "field_meta"}) or result["earnings"] else "not_supported"
+        return result
+
+    def get_fundamental_bundle(self, stock_code: str, *, financials: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Append optional details without mutating already acquired financials."""
+        from copy import deepcopy
+        result = deepcopy(financials) if financials is not None else self.get_financial_indicators(stock_code)
 
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates(

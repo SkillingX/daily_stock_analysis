@@ -1,3 +1,4 @@
+from data_provider.cross_source_validator import SourceReadError
 # -*- coding: utf-8 -*-
 """ifind_fundamental_adapter 单测 —— 100% 覆盖（网络层 pragma）。
 
@@ -192,7 +193,8 @@ class TestIfindSource(unittest.TestCase):
             raise RuntimeError("boom")
 
         src = IfindSource(fetcher=_FakeFetcher(available=True, fetch_fn=boom))
-        self.assertIsNone(src.read("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            src.read("600519", "pe_ratio")
 
     def test_read_fetcher_returns_none(self):
         src = IfindSource(fetcher=_FakeFetcher(available=True, fetch_fn=lambda c, f, p: None))

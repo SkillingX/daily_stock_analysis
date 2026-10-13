@@ -154,14 +154,6 @@ def test_validation_only_conflict_is_visible_evidence_but_not_a_rule_input(finan
     assert dim.valuation_detail["score"] is None
 
 
-def test_derived_percentage_rejects_zero_denominator() -> None:
-    from decimal import Decimal
-    from icontract import ViolationError
-    from src.deep_research_dims.context import _financial_percentage
-    assert _financial_percentage(Decimal(20), Decimal(100)) == Decimal(20)
-    with pytest.raises(ViolationError):
-        _financial_percentage(Decimal(20), Decimal(0))
-
 
 def test_direct_fuyao_slow_body_keeps_shared_stage_deadline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -275,12 +267,10 @@ def test_fuyao_derived_roe_is_period_bound_evidence_not_weighted_score(financial
     monkeypatch.setattr(requests, "get", get)
     ctx = SharedContext("600519", "样本", "2026-10-09")
     ctx.fundamental = _safe_fundamental("600519", ctx)
-    assert ctx.fundamental["roe"] == expected
+    assert ctx.fundamental["roe"] is None
     f1 = build_fundamental_dim(ctx)
     assert f1.profitability["roe"]["score"] is None
-    if expected is not None:
-        evidence = f1.data_quality.fields["roe"]
-        assert evidence.reading.caliber == "parent_net_profit/ending_equity" and evidence.reading.period == "2025-12-31"
+    assert f1.data_quality.fields["roe"].reading is None
 
 
 @pytest.mark.parametrize("values", [{}, {"revenue_yoy": 10}, {"pe_ratio": 0}, {"roe": 18, "revenue_yoy": 10}])

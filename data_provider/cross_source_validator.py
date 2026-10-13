@@ -49,6 +49,27 @@ _SOURCE_FAMILIES = {"mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "f
 QualityStatus = Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"]
 
 
+class SourceReadError(RuntimeError):
+    """A supplier failure with a safe reason, isolated by the validator."""
+    def __init__(self, source: str, reason_code: str) -> None:
+        known = {"authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error"}
+        self.reason_code = reason_code if reason_code in known or re.fullmatch(r"http_[1-5][0-9]{2}", reason_code) else "source_error"
+        super().__init__(f"{source}:{self.reason_code}")
+
+
+def source_failure_reason(exc: BaseException) -> str:
+    if isinstance(exc, SourceReadError):
+        return exc.reason_code
+    nested = getattr(exc, "exceptions", ())
+    if nested:
+        return source_failure_reason(nested[0])
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        return "authentication_failed" if status in (401, 403) else "quota_exhausted" if status == 429 else f"http_{status}"
+    return "timeout" if "timeout" in type(exc).__name__.lower() else "source_error"
+
+
 class AnchorQuality(BaseModel):
     """Stable, low sensitivity quality state at the context output boundary."""
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
@@ -586,7 +607,7 @@ def _judge_readings(
     from src.config import get_config
     ttl = int(get_config().realtime_cache_ttl) if ttl is None else ttl
     if not readings:
-        return AnchorVerification(spec.field, None, "low", (), False, note="所有数据源均无该锚点数据", quality=AnchorQuality(status="missing", reason_codes=("missing",)), source_errors=source_errors)
+        return AnchorVerification(spec.field, None, "low", (), False, note="所有数据源均无该锚点数据", quality=AnchorQuality(status="missing", reason_codes=tuple(sorted({"missing", *(reason for _, reason in source_errors)}))), source_errors=source_errors)
     primary = readings[0]
     reasons = [_comparison_reasons(reading, spec, code, ttl) for reading in readings]
     if spec.mode == MODE_DIRECTION:
@@ -796,9 +817,9 @@ class CrossSourceValidator:
                     "[CrossValidate] source %s read %s failed: %s",
                     source.name,
                     field,
-                    exc,
+                    source_failure_reason(exc),
                 )
-                return None, "timeout" if "timeout" in type(exc).__name__.lower() else "source_error"
+                return None, source_failure_reason(exc)
 
         if deadline is not None and deadline <= monotonic():
             return (), tuple((source.name, "timeout") for source in self._sources)

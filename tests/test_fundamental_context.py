@@ -203,6 +203,10 @@ class TestFundamentalContext(unittest.TestCase):
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
             patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value=bundle,
+            ),
+            patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value=bundle,
             ),
@@ -317,6 +321,11 @@ class TestFundamentalContext(unittest.TestCase):
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
             patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value={"status": "not_supported", "growth": {}, "earnings": {}, "errors": []},
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
+            patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value={
                     "status": "partial",
@@ -384,6 +393,11 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value={"status": "not_supported", "growth": {}, "earnings": {}, "errors": []},
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value={
@@ -483,6 +497,11 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value=bundle,
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value=bundle,

@@ -24,6 +24,7 @@ import requests
 from pydantic import ValidationError
 
 from data_provider.cross_source_validator import AnchorReading
+from data_provider.cross_source_validator import SourceReadError
 from data_provider.fuyao_adapter import (
     FuyaoFetcher,
     FuyaoResponse,
@@ -175,7 +176,7 @@ class EndpointForTests(unittest.TestCase):
         spec = _endpoint_for("pe_ratio")
         self.assertIsNotNone(spec)
         assert spec is not None
-        self.assertEqual(spec.path, "/v1/valuations/snapshot")
+        self.assertEqual(spec.path, "/api/a-share/valuations/snapshot")
         self.assertEqual(spec.item_key, "pe_ttm")
         self.assertFalse(spec.needs_period)
 
@@ -403,14 +404,15 @@ class FuyaoFetcherTests(unittest.TestCase):
 
     def test_fetch_returns_none_for_period_field_without_period(self) -> None:
         f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "revenue"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "revenue")
 
     def test_fetch_200_returns_anchor(self) -> None:
         raw = _ok_envelope(
             {"thscode": "600519.SH", "fields": {"pe_ttm": 25.3}}
         )
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(200, raw)
+        fake_session.get.return_value = _FakeResp(200, raw)
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k", timeout_seconds=5.0)
         r = f.fetch("600519", "pe_ratio")
@@ -420,11 +422,11 @@ class FuyaoFetcherTests(unittest.TestCase):
         self.assertAlmostEqual(r.value, 25.3)
         self.assertEqual(r.caliber, "TTM")
         # 验证 URL + payload + headers
-        called = fake_session.post.call_args
-        self.assertEqual(called.args[0], "https://x/v1/valuations/snapshot")
-        self.assertEqual(called.kwargs["json"], {"thscode": "600519.SH"})
+        called = fake_session.get.call_args
+        self.assertEqual(called.args[0], "https://x/api/a-share/valuations/snapshot")
+        self.assertEqual(called.kwargs["params"], {"thscodes": "600519.SH"})
         self.assertEqual(
-            called.kwargs["headers"]["Authorization"], "Bearer k"
+            called.kwargs["headers"]["X-api-key"], "k"
         )
 
     def test_fetch_200_with_period(self) -> None:
@@ -432,7 +434,7 @@ class FuyaoFetcherTests(unittest.TestCase):
             {"thscode": "600519.SH", "report": "2024-4", "fields": {"revenue": 1.7e11}}
         )
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(200, raw)
+        fake_session.get.return_value = _FakeResp(200, raw)
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
         r = f.fetch("600519", "revenue", period="2024年报")
@@ -440,62 +442,69 @@ class FuyaoFetcherTests(unittest.TestCase):
         assert r is not None
         self.assertAlmostEqual(r.value, 1.7e11)
         self.assertEqual(r.period, "2024-12-31")
-        called = fake_session.post.call_args
+        called = fake_session.get.call_args
         self.assertEqual(
-            called.kwargs["json"], {"thscode": "600519.SH", "report": "2024-4"}
+            called.kwargs["params"], {"thscode": "600519.SH", "period": "annual", "limit": 8}
         )
 
     def test_fetch_401_returns_none(self) -> None:
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(401, "unauth")
+        fake_session.get.return_value = _FakeResp(401, "unauth")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="bad")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_fetch_429_returns_none(self) -> None:
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(429, "rate limit")
+        fake_session.get.return_value = _FakeResp(429, "rate limit")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_fetch_500_returns_none(self) -> None:
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(500, "server error")
+        fake_session.get.return_value = _FakeResp(500, "server error")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_fetch_timeout_returns_none(self) -> None:
         fake_session = MagicMock()
-        fake_session.post.side_effect = requests.Timeout("read timeout")
+        fake_session.get.side_effect = requests.Timeout("read timeout")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_fetch_connection_error_returns_none(self) -> None:
         fake_session = MagicMock()
-        fake_session.post.side_effect = requests.ConnectionError("dns fail")
+        fake_session.get.side_effect = requests.ConnectionError("dns fail")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_fetch_business_error_returns_none(self) -> None:
         raw = json.dumps({"code": 4001, "message": "rate", "data": None})
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(200, raw)
+        fake_session.get.return_value = _FakeResp(200, raw)
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="k")
-        self.assertIsNone(f.fetch("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            f.fetch("600519", "pe_ratio")
 
     def test_logs_no_api_key(self) -> None:
         """凭据安全：debug 日志不应打印 API key 任何片段。"""
         fake_session = MagicMock()
-        fake_session.post.return_value = _FakeResp(500, "server error")
+        fake_session.get.return_value = _FakeResp(500, "server error")
         with patch.object(FuyaoFetcher, "_build_session", return_value=fake_session):
             f = FuyaoFetcher(endpoint="https://x", api_key="SECRET-KEY-DO-NOT-LEAK")
         with self.assertLogs("data_provider.fuyao_adapter", level=logging.DEBUG) as cm:
-            f.fetch("600519", "pe_ratio")
+            with self.assertRaises(SourceReadError):
+                f.fetch("600519", "pe_ratio")
         joined = "\n".join(cm.output)
         self.assertNotIn("SECRET-KEY-DO-NOT-LEAK", joined)
 
@@ -561,7 +570,8 @@ class FuyaoSourceTests(unittest.TestCase):
             raise RuntimeError("explode")
 
         s = FuyaoSource(fetcher=_FakeFetcher(fetch_fn=boom))
-        self.assertIsNone(s.read("600519", "pe_ratio"))
+        with self.assertRaises(SourceReadError):
+            s.read("600519", "pe_ratio")
 
     def test_read_renames_source_to_fuyao(self) -> None:
         """即便利他 fetcher 误填 source，FuyaoSource 也应覆写为 'fuyao'。"""

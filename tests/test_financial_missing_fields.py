@@ -28,7 +28,7 @@ def manager(monkeypatch: pytest.MonkeyPatch, growth: dict, earnings: dict | None
     monkeypatch.setattr("src.config.get_config", lambda: cfg)
     mgr = DataFetcherManager(fetchers=[])
     monkeypatch.setattr(mgr, "get_realtime_quote", lambda code: None)
-    monkeypatch.setattr(mgr._fundamental_adapter, "get_fundamental_bundle", lambda code: {"growth": growth, "earnings": earnings or {"dividend": {"cash": 1}}, "institution": {"top10_holder_change": 0}, "status": "partial"})
+    monkeypatch.setattr(mgr._fundamental_adapter, "get_financial_indicators", lambda code: {"growth": growth, "earnings": earnings or {"dividend": {"cash": 1}}, "institution": {"top10_holder_change": 0}, "status": "partial"})
     monkeypatch.setattr(mgr, "get_capital_flow_context", lambda *args, **kwargs: {})
     monkeypatch.setattr(mgr, "get_belong_boards", lambda *args, **kwargs: [])
     monkeypatch.setattr(mgr, "get_sector_rankings", lambda *args, **kwargs: {})
@@ -56,7 +56,7 @@ def test_acquired_primary_earnings_roe_precedes_fallback_and_needs_no_roe_reques
     growth = {key: value for key, value in [("revenue_yoy", 10.0), ("net_profit_yoy", 20.0), ("gross_margin", 40.0)]}
     earnings = {"financial_report": {"roe": 18.0, "field_meta": {"roe": record("roe", 18, "2025年报")}}, "dividend": {"cash": 1}}
     mgr = manager(monkeypatch, growth, earnings)
-    mgr._fundamental_adapter.get_fundamental_bundle = lambda code: {"growth": growth, "earnings": earnings, "institution": {"top10_holder_change": 0}, "status": "partial"}
+    mgr._fundamental_adapter.get_financial_indicators = lambda code: {"growth": growth, "earnings": earnings, "institution": {"top10_holder_change": 0}, "status": "partial"}
     fallback = Mock(return_value={"growth": {"roe": 14, "field_meta": {"roe": record("roe", 14, "2025年报")}}})
     mgr._tushare_ifind_adapter = SimpleNamespace(available=True, get_fundamental_bundle=fallback)
     result = mgr.get_fundamental_context("600519")
@@ -85,7 +85,9 @@ def test_real_mx_transport_timeout_and_retry_share_remaining_budget(monkeypatch:
     monkeypatch.setattr(requests, "post", transport)
     source = MXSource(MXClient(api_key="fixture", timeout=8))
     start = monotonic()
-    assert source.read("600519", "roe", deadline=start + 0.02) is None
+    from data_provider.cross_source_validator import SourceReadError
+    with pytest.raises(SourceReadError, match="timeout"):
+        source.read("600519", "roe", deadline=start + 0.02)
     assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.02
     assert monotonic() - start < 0.2
 
@@ -227,7 +229,9 @@ def test_actual_mcp_session_uses_remaining_timeout_and_cancels_slow_tool(monkeyp
     kwargs = {"token": "fixture"} if class_name == "IfindFetcher" else {"api_key": "fixture"}
     fetcher = getattr(module, class_name)(endpoint="https://mcp.example", timeout_seconds=8, **kwargs)
     start = monotonic()
-    assert fetcher.fetch("600519", "roe", "2025年报", deadline=start + 0.02) is None
+    from data_provider.cross_source_validator import SourceReadError
+    with pytest.raises(SourceReadError, match="timeout"):
+        fetcher.fetch("600519", "roe", "2025年报", deadline=start + 0.02)
     assert timeouts and 0 < timeouts[0] <= 0.02 and closed
     assert monotonic() - start < 0.3
 
@@ -321,9 +325,10 @@ def test_real_sdk_does_not_start_cleanup_io_past_deadline(monkeypatch, module_na
     cls = getattr(importlib.import_module("data_provider."+module_name), class_name)
     fetcher = cls(endpoint="https://fixture.invalid", timeout_seconds=1, **({"token":"fixture"} if class_name == "IfindFetcher" else {"api_key":"fixture"}))
     start = time.monotonic()
-    result = fetcher.fetch("600519", "roe", "2025年报", deadline=start+0.03)
+    from data_provider.cross_source_validator import SourceReadError
+    with pytest.raises(SourceReadError, match="timeout"):
+        fetcher.fetch("600519", "roe", "2025年报", deadline=start+0.03)
     elapsed = time.monotonic()-start
-    assert result is None
     assert 0.025 <= elapsed < 0.15
     assert [call for call in calls if call[0] == "tools/call"]
     assert [call for call in calls if call[0] == "tools/cancelled"]

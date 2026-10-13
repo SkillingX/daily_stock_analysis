@@ -134,12 +134,14 @@ def _compact_fundamental_context(fundamental_context: dict[str, Any]) -> dict[st
         "market": fundamental_context.get("market"),
         "status": fundamental_context.get("status"),
         "coverage": fundamental_context.get("coverage", {}),
+        "errors": list(fundamental_context.get("errors") or []),
     }
     for block in blocks:
         payload = fundamental_context.get(block, {})
         if isinstance(payload, dict):
             compact[block] = {
                 "status": payload.get("status"),
+                "errors": list(payload.get("errors") or []),
                 "data": payload.get("data", {}),
                 "field_meta": dict(payload.get("field_meta") or {}),
             }
