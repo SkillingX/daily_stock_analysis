@@ -64,7 +64,7 @@ def test_current_data_dimension_does_not_reuse_previous_quote(monkeypatch, tmp_p
     assert second.dims['data'].perspective.price_position.current_price == 35.0
 
 
-def test_partial_financial_snapshot_retries_real_manager_and_provider(financial_sources):
+def test_partial_financial_snapshot_retries_real_manager_and_provider(financial_sources, monkeypatch):
     from src.deep_research_dims import context, dim_cache
     from src.agent.tools import data_tools
     from src.config import get_config
@@ -74,10 +74,20 @@ def test_partial_financial_snapshot_retries_real_manager_and_provider(financial_
     first = context.build_shared_context('600519', '样本')
     assert first.fundamental['roe'] is None
     # Seed a previously persisted partial snapshot, too: it must not prevent retry.
-    key = f'stage0_fund_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519'
+    key = f'stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519'
     dim_cache.save_snapshot(key, first.fundamental)
+    load_snapshot = dim_cache.load_snapshot
+    consulted = []
+    def read_snapshot(name, *args, **kwargs):
+        result = load_snapshot(name, *args, **kwargs)
+        if name == key and result is not None:
+            consulted.append(result)
+        return result
+    monkeypatch.setattr(dim_cache, 'load_snapshot', read_snapshot)
     financial_sources['ratio'] = 4.56
     second = context.build_shared_context('600519', '样本')
+    assert consulted and consulted[0]['roe'] is None
     assert second.fundamental['roe'] == 4.56
     assert second.fundamental['revenue_growth'] == 4.56
     assert data_tools._get_fetcher_manager()._fundamental_cache
+

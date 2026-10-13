@@ -15,6 +15,7 @@
 """
 
 import logging
+import json
 import os
 import random
 import re
@@ -688,16 +689,18 @@ class DataFetcherManager:
         # first use. Only spin it up when both endpoint and token are
         # configured; tests that do not mock ``_tushare_ifind_adapter``
         # get a no-op adapter and stay network-free.
+        from src.config import get_config
+        choice_profile = get_config().data_source_profile == "choice"
         ifind_source: Optional[Any] = None
         try:
-            if os.getenv("IFIND_MCP_TOKEN") and os.getenv("IFIND_MCP_ENDPOINT"):
+            if not choice_profile and os.getenv("IFIND_MCP_TOKEN") and os.getenv("IFIND_MCP_ENDPOINT"):
                 ifind_source = IfindSource(fetcher=IfindFetcher.get_instance())
         except Exception:  # noqa: BLE001
             ifind_source = None
         self._tushare_ifind_adapter = TushareIfindFundamentalAdapter(
             ifind_source=ifind_source, tushare_token=tushare_token
         )
-        self._mx_source = MXSource()
+        self._mx_source = None if choice_profile else MXSource()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -2874,7 +2877,7 @@ class DataFetcherManager:
                     from dataclasses import replace
                     reading = replace(reading, is_stale=True)
                 from data_provider.cross_source_validator import AnchorQuality
-                quality = AnchorQuality(status="conflict") if (record.get("quality") or {}).get("status") == "conflict" else None
+                quality = AnchorQuality.model_validate_json(json.dumps(record.get("quality") or {}))
                 metadata[field] = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
         return {
             "status": status,
@@ -3591,6 +3594,9 @@ class DataFetcherManager:
                 budget_seconds=budget_seconds,
             )
 
+        if getattr(config, "data_source_profile", "legacy") == "choice":
+            return self._build_choice_fundamental_context(stock_code, budget_seconds)
+
         stage_timeout = float(
             budget_seconds
             if budget_seconds is not None
@@ -4167,6 +4173,76 @@ class DataFetcherManager:
                 }
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
+
+    def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float]) -> Dict[str, Any]:
+        from src.config import get_config
+        from data_provider.choice_adapter import ChoiceAdapter
+        from data_provider.mx_data_adapter import financial_refresh
+        config = get_config()
+        budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
+        deadline = time.monotonic() + budget
+        key = f"{ChoiceAdapter.contract_version}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        refresh = financial_refresh.get()
+        self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
+        if not (refresh and refresh[0] == code):
+            with self._fundamental_cache_lock:
+                cached = self._fundamental_cache.get(key)
+                if cached is not None:
+                    return cast(Dict[str, Any], cached["context"])
+        if _is_etf_code(code):
+            return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline)
+        errors = snapshot["errors"]
+        # Only attempt licensed public supplements for holes, within the same deadline.
+        missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
+        if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline:
+            bundle, error, _ = self._run_with_timeout(
+                lambda: self._tushare_ifind_adapter.get_fundamental_bundle(code, snapshot["report_date"], fields=missing, include_institution=False, deadline=deadline),
+                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_supplement",
+            )
+            if error:
+                errors.append(error)
+            elif isinstance(bundle, dict):
+                from data_provider.cross_source_validator import reading_from_field_record, reading_input_reasons
+                growth = bundle.get("growth") or {}
+                for field in missing:
+                    record = (growth.get("field_meta") or {}).get(field) or {}
+                    reading = reading_from_field_record(growth.get(field), record)
+                    if reading is not None and not reading_input_reasons(reading, field) and reading.period == snapshot["report_date"] and reading.statement_scope == "consolidated" and reading.adjustment == "restated" and reading.raw_currency == "CNY":
+                        snapshot["growth"][field] = reading.value
+                        snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
+        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": ChoiceAdapter.contract_version,
+                                  "stock_name": snapshot.get("stock_name"), "errors": errors, "source_chain": [], "coverage": {}}
+        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
+            payload = dict(snapshot[block])
+            payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
+            status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
+            chain = [{"provider": "choice", "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)}]
+            result[block] = self._build_fundamental_block(status, payload, chain, errors)
+            result["source_chain"].extend(chain)
+        seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
+        auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
+            lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),
+            min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_details",
+        )
+        auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+        auxiliary_errors = auxiliary.get("errors", []) + ([auxiliary_error] if auxiliary_error else [])
+        errors.extend(auxiliary_errors)
+        for block in ("earnings", "institution"):
+            payload = auxiliary.get(block) or {}
+            status = "partial" if self._has_meaningful_payload(payload) else "failed" if auxiliary_errors else "not_supported"
+            chain = self._normalize_source_chain(auxiliary.get("source_chain", []), "public_details", status, cost_ms)
+            result[block] = self._build_fundamental_block(status, payload, chain, auxiliary_errors)
+        for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
+            result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
+            errors.extend(result[block].get("errors") or [])
+        result["capital_flow"] = self._build_fundamental_block("partial", {}, [], ["choice:netinflow_unit_unconfirmed"])
+        result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
+        result["status"] = "partial"
+        if not errors and self._should_cache_fundamental_context(result):
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "context": result}
+        return result
 
     def get_capital_flow_context(
         self, stock_code: str, budget_seconds: Optional[float] = None

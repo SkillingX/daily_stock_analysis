@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] 接入可选的 Choice 原生财务/估值快照，按来源隔离缓存；Choice 策略停止 MX、iFinD、Choice MCP、Fuyao，并用受控子进程终止卡住的 SDK 请求。
+- [修复] 板块报告按实际板块总数校验排名，避免公开来源超过 200 个板块时有效报告被 API 拒绝。
+
 - [新功能] 通过 ENABLED_MARKETS 统一限制新个股操作；禁用市场的历史报告、组合和交易仍可读取，组合只使用已有价格。
 
 - [文档] 建立数据渠道、来源家族与财务日期术语，形成 Choice 接入、A 股准入及旧渠道停用的规格、四张子工单与验收边界。

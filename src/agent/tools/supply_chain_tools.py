@@ -755,8 +755,15 @@ def _fetch_real_stock_info(ticker: str) -> Dict[str, Any]:
     """
     from src.core.market_policy import require_stock_market
     require_stock_market(ticker)
+    from src.config import get_config
+    from data_provider.mx_data_adapter import financial_refresh
+    config = get_config()
+    cache_key = f"{config.data_source_contract}:{ticker}"
+    refresh = financial_refresh.get()
+    if refresh and refresh[0] == ticker:
+        return _fetch_real_stock_info_uncached(ticker)
     # 1) 快路径：缓存命中直接返回
-    cached = _STOCK_INFO_CACHE.get(ticker)
+    cached = _STOCK_INFO_CACHE.get(cache_key)
     if cached is not None:
         cached_at, payload = cached
         if (time.monotonic() - cached_at) < _STOCK_INFO_CACHE_TTL:
@@ -766,40 +773,57 @@ def _fetch_real_stock_info(ticker: str) -> Dict[str, Any]:
     waiter: Optional[_threading.Event] = None
     with _STOCK_INFO_LOCK:
         # 双重检查：拿锁期间其他线程可能已完成
-        cached = _STOCK_INFO_CACHE.get(ticker)
+        cached = _STOCK_INFO_CACHE.get(cache_key)
         if cached is not None:
             cached_at, payload = cached
             if (time.monotonic() - cached_at) < _STOCK_INFO_CACHE_TTL:
                 return payload
         # 如果别的线程正在 fetch，则等待它完成并复用其结果
-        if ticker in _STOCK_INFO_INFLIGHT:
-            waiter = _STOCK_INFO_INFLIGHT[ticker]
+        if cache_key in _STOCK_INFO_INFLIGHT:
+            waiter = _STOCK_INFO_INFLIGHT[cache_key]
         else:
             # 自己成为 fetcher：注册事件
-            _STOCK_INFO_INFLIGHT[ticker] = _threading.Event()
+            _STOCK_INFO_INFLIGHT[cache_key] = _threading.Event()
 
     if waiter is not None:
         # 等待别的线程完成
         waiter.wait(timeout=_STOCK_INFO_CACHE_TTL)
         with _STOCK_INFO_LOCK:
-            return _STOCK_INFO_PAYLOAD.get(ticker) or {}
+            return _STOCK_INFO_PAYLOAD.get(cache_key) or {}
         # fallback（极端情况：等待超时）
 
     try:
         payload = _fetch_real_stock_info_uncached(ticker)
         with _STOCK_INFO_LOCK:
-            _STOCK_INFO_CACHE[ticker] = (time.monotonic(), payload)
-            _STOCK_INFO_PAYLOAD[ticker] = payload
+            if config.data_source_profile != "choice" or not (payload.get("fundamental_context") or {}).get("errors"):
+                _STOCK_INFO_CACHE[cache_key] = (time.monotonic(), payload)
+            _STOCK_INFO_PAYLOAD[cache_key] = payload
         return payload
     finally:
         with _STOCK_INFO_LOCK:
-            evt = _STOCK_INFO_INFLIGHT.pop(ticker, None)
+            evt = _STOCK_INFO_INFLIGHT.pop(cache_key, None)
             if evt is not None:
                 evt.set()
 
 
 def _fetch_real_stock_info_uncached(ticker: str) -> Dict[str, Any]:
     """[v3 P6] 实际的 4 个网络调用（并发执行），无缓存层。"""
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        from copy import deepcopy
+        from src.agent.tools.data_tools import _handle_get_stock_info, _handle_get_realtime_quote
+        info = deepcopy(_handle_get_stock_info(ticker))
+        context = info.get("fundamental_context") or {}
+        for block in ("valuation", "growth"):
+            payload = context.get(block) or {}
+            for field in list(payload.get("field_meta") or {}):
+                if not payload["field_meta"][field].get("rule_eligible", False):
+                    payload.get("data", {})[field] = None
+        valuation = (context.get("valuation") or {}).get("data") or {}
+        realtime = _handle_get_realtime_quote(ticker)
+        quote = {key: realtime.get(key) for key in ("price", "change_pct", "turnover_rate")}
+        quote.update({key: valuation.get(key) for key in ("pe_ratio", "pb_ratio", "total_mv")})
+        return {**info, "_quote_dict": quote}
     try:
         bundle, quote, belong_boards, _cv = _run_concurrent_v3_fetches(ticker)
         valuation_data, quote_dict = _extract_valuation_from_quote(quote)
@@ -844,6 +868,10 @@ def _run_concurrent_v3_fetches(
 
 def _fetch_bundle_v3(manager: Any, ticker: str) -> Dict[str, Any]:
     """[v3] 拉取 fundamental bundle；失败返回 status='failed' 占位 dict。"""
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        context = manager.get_fundamental_context(ticker)
+        return {**context, **{block: context.get(block, {}).get("data", {}) for block in ("valuation", "growth", "earnings", "institution")}}
     try:
         return cast(
             Dict[str, Any], manager._fundamental_adapter.get_fundamental_bundle(ticker)
@@ -971,8 +999,12 @@ def _fetch_real_realtime_quote(ticker: str) -> Dict[str, Any]:
     """
     from src.core.market_policy import require_stock_market
     require_stock_market(ticker)
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        info = _fetch_real_stock_info(ticker)
+        return {**(info.get("_quote_dict") or {}), "belong_boards": info.get("belong_boards") or []}
     # [v3 P6] 优先复用 _fetch_real_stock_info 已经请求到的完整 quote
-    cached = _STOCK_INFO_CACHE.get(ticker)
+    cached = _STOCK_INFO_CACHE.get(f"legacy:{ticker}")
     if cached is not None:
         cached_at, payload = cached
         if (time.monotonic() - cached_at) < _STOCK_INFO_CACHE_TTL:

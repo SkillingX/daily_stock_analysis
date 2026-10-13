@@ -90,11 +90,11 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     outer_deadline = request_deadline.get()
     if outer_deadline is not None:
         deadline = min(deadline, outer_deadline)
-    cache_key = f"stage0_fund_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
+    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
     refresh = financial_refresh.get()
-    financial_keys = ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy")
+    financial_keys = ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy", "market_cap")
     if cached is not None and all(cached.get(key) is not None for key in financial_keys) and not config.deep_research_cross_validate and not (refresh and refresh[0] == code):
         return cached
     try:
@@ -106,7 +106,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         manager = _get_fetcher_manager()
         remaining = max(0.0, deadline - monotonic())
         # Verification needs its own share of the same stage budget, not leftover zero.
-        verification_budget = min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else min(config.fundamental_fetch_timeout_seconds, remaining / 3) if config.enable_fuyao and config.fuyao_api_key else 0.0
+        verification_budget = 0.0 if config.data_source_profile == "choice" else min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else min(config.fundamental_fetch_timeout_seconds, remaining / 3) if config.enable_fuyao and config.fuyao_api_key else 0.0
         fetch_deadline = deadline - verification_budget
         raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, fetch_deadline - monotonic()))
         compact = _compact_fundamental_context(raw)
@@ -139,7 +139,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "gross_margin": financial.get("gross_margin"),
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
-            "source": "fundamental_context",
+            "source": "choice" if config.data_source_profile == "choice" else "fundamental_context",
             "errors": list(compact.get("errors") or []),
             "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
         }
@@ -154,9 +154,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                 primary[field] = reading
                 previous = records.get(field) or {}
                 conflict = previous.get("value") == reading.value and (previous.get("quality") or {}).get("status") == "conflict"
-                records[field] = adopted_field_record(field, reading, AnchorQuality(status="conflict" if conflict else "unverified"))
+                records[field] = adopted_field_record(field, reading, AnchorQuality(status="conflict" if conflict else "single_source" if config.data_source_profile == "choice" else "unverified"), previous_record=previous)
         # Reuse the same supplier adapter for missing fields and verification.
-        if config.enable_fuyao and config.fuyao_api_key:
+        if config.data_source_profile != "choice" and config.enable_fuyao and config.fuyao_api_key:
             from data_provider.fuyao_adapter import FuyaoFetcher, FuyaoSource
             source = FuyaoSource(FuyaoFetcher(endpoint=config.fuyao_endpoint, api_key=config.fuyao_api_key))
             period = next((reading.period for reading in primary.values() if reading.period), None) or ((compact.get("growth") or {}).get("data") or {}).get("report_date")
@@ -190,7 +190,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                     key = aliases[field]
                     if result.get(key) is None:
                         result[key] = record["value"]
-        if all(result.get(key) is not None for key in financial_keys):
+        if not result.get("errors") and all(result.get(key) is not None for key in financial_keys):
             save_snapshot(cache_key, result)
         else:
             ctx.limitation("基本面数据不完整（快照不缓存，下次重试）")
@@ -294,6 +294,9 @@ def fetch_fuyao_financial_series(code: str, limit: int = 4) -> Dict[str, Any]:
                     op_cash_flow, eps}...], "valuation": {...}, "as_of": str}
         失败返回空结构，不抛异常。
     """
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        return {"years": [], "valuation": {}, "as_of": "", "errors": ["choice:annual_reports_not_integrated"]}
     import os as _os
     import requests as _rq
 

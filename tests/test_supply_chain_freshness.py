@@ -268,8 +268,8 @@ class TestStockInfoCacheFreshness:
             t_mod._fetch_real_stock_info(ticker)
 
         # _STOCK_INFO_PAYLOAD 应被填充（供 _fetch_real_realtime_quote 复用）
-        assert ticker in t_mod._STOCK_INFO_PAYLOAD
-        cached_payload = t_mod._STOCK_INFO_PAYLOAD[ticker]
+        assert f"legacy:{ticker}" in t_mod._STOCK_INFO_PAYLOAD
+        cached_payload = t_mod._STOCK_INFO_PAYLOAD[f"legacy:{ticker}"]
         assert cached_payload["_quote_dict"]["price"] == 100.0
 
     def test_inflight_lock_prevents_concurrent_fetches(self) -> None:
@@ -277,12 +277,12 @@ class TestStockInfoCacheFreshness:
         ticker = "TEST_INFLIGHT"
         t_mod._STOCK_INFO_CACHE.clear()
         t_mod._STOCK_INFO_PAYLOAD.clear()
-        t_mod._STOCK_INFO_INFLIGHT.pop(ticker, None)
+        t_mod._STOCK_INFO_INFLIGHT.pop(f"legacy:{ticker}", None)
 
         # 第一次模拟耗时长：注入一个已 set 的 evt 表示"有别的线程在跑"
         evt = MagicMock()
         evt.wait.return_value = True
-        t_mod._STOCK_INFO_INFLIGHT[ticker] = evt
+        t_mod._STOCK_INFO_INFLIGHT[f"legacy:{ticker}"] = evt
 
         with patch(
             "src.agent.tools.supply_chain_tools._fetch_real_stock_info_uncached"
@@ -296,7 +296,7 @@ class TestStockInfoCacheFreshness:
             mock_uncached.assert_not_called()
 
         # 清理
-        t_mod._STOCK_INFO_INFLIGHT.pop(ticker, None)
+        t_mod._STOCK_INFO_INFLIGHT.pop(f"legacy:{ticker}", None)
 
 
 # ============================================================

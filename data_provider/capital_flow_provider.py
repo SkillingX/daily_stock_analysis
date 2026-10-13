@@ -49,6 +49,9 @@ def get_main_inflow_cumulative(
     返回 ``{main_net_inflow, inflow_5d, inflow_10d, daily_series, source}``；
     iFinD 未配置 / 抓取失败 / 空序列 → ``{}``（fail-open，不抛异常）。
     """
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        return {"status": "not_supported", "errors": ["choice:capital_flow_not_integrated"]}
     from data_provider.ifind_fundamental_adapter import IfindFetcher
 
     fetcher = IfindFetcher.get_instance()

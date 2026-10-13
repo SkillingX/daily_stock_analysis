@@ -40,7 +40,8 @@ def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
     dims 指纹：省钱模式下不同维度子集各自独立缓存，避免全量/子集报告互相串包。
     """
     dims_fp = ",".join(sorted(d for d in (dims or []) if d)) or "full"
-    return f"{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
+    from src.config import get_config
+    return f"{get_config().data_source_contract}:{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）

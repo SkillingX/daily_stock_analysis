@@ -1,0 +1,50 @@
+"""Generate, reread and download a report from an explicitly chosen local API.
+Run with --base-url, --code, --kind and --output-dir (keep evidence out of git).
+The report endpoints used here do not send notifications; no credentials are read.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, ProxyHandler, build_opener
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--code", required=True)
+    parser.add_argument("--kind", choices=("fundamentals", "financial-analysis", "sector-analysis"), required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--timeout", type=float, default=180)
+    args = parser.parse_args()
+    target = urlsplit(args.base_url)
+    if target.scheme != "http" or target.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        parser.error("This acceptance command requires an explicit local HTTP API")
+    if args.timeout <= 0:
+        parser.error("timeout must be positive")
+    http = build_opener(ProxyHandler({}))
+    base = f"{args.base_url.rstrip('/')}/api/v1/{args.kind}"
+    request = Request(f"{base}/generate?{urlencode({'stock_code': args.code, 'force_refresh': 'true'})}", data=b"", method="POST")
+    with http.open(request, timeout=args.timeout) as response:
+        generated = json.load(response)
+    report_id = generated.get("report_id")
+    if not report_id:
+        raise RuntimeError("Report was not persisted")
+    with http.open(f"{base}/reports/{report_id}", timeout=args.timeout) as response:
+        reread = json.load(response)
+    with http.open(f"{base}/reports/{report_id}/markdown?download=1", timeout=args.timeout) as response:
+        downloaded = response.read().decode("utf-8")
+    markdown = generated["markdown"]
+    if markdown != downloaded or markdown != reread["data"]["markdown"]:
+        raise RuntimeError("Generation, reread and download disagree")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = args.output_dir / f"{args.kind}-{args.code}"
+    prefix.with_suffix(".json").write_text(json.dumps({"generated": generated, "reread": reread}, ensure_ascii=False, indent=2))
+    prefix.with_suffix(".md").write_text(markdown)
+    print(json.dumps({"kind": args.kind, "report_id": report_id, "status": generated["status"], "reread_download_match": True}, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

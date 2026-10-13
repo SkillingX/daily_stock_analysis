@@ -761,7 +761,7 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
     valuation = compact_context.get("valuation", {}).get("data", {})
     valuation_meta = dict(compact_context.get("valuation", {}).get("field_meta") or {})
     # fail-open：fundamental valuation 受严格超时易缺失，用 get_realtime_quote 兜底估值
-    if any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
+    if get_config().data_source_profile != "choice" and any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
         valuation = _fallback_valuation_from_quote(manager, stock_code, valuation, valuation_meta, deadline=deadline)
     compact_context["valuation"] = {**compact_context.get("valuation", {}), "data": valuation, "field_meta": valuation_meta}
     primary_readings = {}

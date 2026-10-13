@@ -214,6 +214,9 @@ def test_actual_mcp_session_uses_remaining_timeout_and_cancels_slow_tool(monkeyp
             await asyncio.sleep(1)
     monkeypatch.setattr(streamable_http, "streamablehttp_client", stream, raising=False)
     if modern:
+        # This fixture replaces MCP transport; do not initialize an unused system TLS store.
+        # Real MCP request/cancellation coverage below uses the same isolated HTTP transport.
+        install_real_mcp_mock_http(monkeypatch)
         @asynccontextmanager
         async def modern_stream(url, *, http_client=None):
             timeouts.append(http_client.timeout.read)

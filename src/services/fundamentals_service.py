@@ -118,6 +118,10 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                 # 列表只返回少量字段，再查一次拿完整字段
                 full = db.get_fundamentals_report(r["id"])
                 if full:
+                    from src.config import get_config
+                    contract = get_config().data_source_contract
+                    if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
+                        continue
                     return full
     except Exception:  # noqa: BLE001
         pass
@@ -198,6 +202,8 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
         "sector": _rule_dim("sector", code, name, ctx, _position_text(business)),
         "financial": _rule_dim("fundamental", code, name, ctx),
     }
+    from src.config import get_config
+    dims["_data_contract"] = get_config().data_source_contract
     as_of = datetime.now().isoformat(timespec="seconds")
     rid = _resolve_unique_id(_ID_PATTERN.format(ts=created_at))
     md = _render_markdown(name, code, as_of, dims, rid)
@@ -222,7 +228,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     return {
         "report_id": rid if ok else None,
         "stock_code": code, "stock_name": name,
-        "status": ("partial" if any(dim.get("status") != "ok" for dim in dims.values()) else "success") if ok else "failed",
+        "status": ("partial" if any(dim.get("status") != "ok" for key, dim in dims.items() if not key.startswith("_")) else "success") if ok else "failed",
         "markdown": md, "dims": dims,
     }
 

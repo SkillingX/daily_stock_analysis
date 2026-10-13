@@ -45,14 +45,14 @@ _CURRENCY_MARKERS = {
     "SGD": ("SGD", "新加坡元"), "AUD": ("AUD", "澳元"),
     "CAD": ("CAD", "加元"), "CHF": ("CHF", "瑞士法郎"),
 }
-_SOURCE_FAMILIES = {"mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney", "akshare:stock_financial_abstract": "sina"}
+_SOURCE_FAMILIES = {"choice": "eastmoney", "mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney", "akshare:stock_financial_abstract": "sina"}
 QualityStatus = Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"]
 
 
 class SourceReadError(RuntimeError):
     """A supplier failure with a safe reason, isolated by the validator."""
     def __init__(self, source: str, reason_code: str) -> None:
-        known = {"authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error"}
+        known = {"authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error", "sdk_unavailable", "permission_denied", "calendar_unavailable"}
         self.reason_code = reason_code if reason_code in known or re.fullmatch(r"http_[1-5][0-9]{2}", reason_code) else "source_error"
         super().__init__(f"{source}:{self.reason_code}")
 
@@ -342,6 +342,9 @@ class AnchorReading:
     normalization_error: Optional[str] = None
     source_family: Optional[str] = None
     is_stale: Optional[bool] = None
+    statement_scope: Optional[str] = None
+    adjustment: Optional[str] = None
+    disclosed_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         actual, inferred_basis = normalize_report_period(self.period)

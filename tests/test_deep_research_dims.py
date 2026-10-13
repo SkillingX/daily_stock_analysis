@@ -609,9 +609,9 @@ class TestSnapshotCache:
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
-        dim_cache.save_snapshot(f"stage0_fund_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {
+        dim_cache.save_snapshot(f"stage0_fund_legacy_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {
             "pe_ttm": 19.09, "pb": 2.0, "roe": 18.0, "gross_margin": 40.0,
-            "revenue_growth": 10.0, "net_profit_yoy": 10.0,
+            "revenue_growth": 10.0, "net_profit_yoy": 10.0, "market_cap": 10000.0,
         })
 
         def _boom(*a, **k):

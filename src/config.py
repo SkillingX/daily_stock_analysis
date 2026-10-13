@@ -744,6 +744,7 @@ class Config:
     stock_index_remote_update_enabled: bool = True
 
     # === 深度投研多源交叉验证（MX Data 主源 + iFinD 验证；opt-in，默认关）===
+    data_source_profile: str = "legacy"
     mx_apikey: Optional[str] = None  # 东财妙想 API key（MX_APIKEY）
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
@@ -1258,6 +1259,8 @@ class Config:
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
+        if self.data_source_profile not in {"legacy", "choice"}:
+            raise ValueError("DATA_SOURCE_PROFILE must be legacy or choice")
         if not self.enabled_markets or set(self.enabled_markets) - {"cn", "hk", "us"}:
             raise ValueError("ENABLED_MARKETS must be a nonempty subset of cn,hk,us")
         if self.agent_arch not in self._VALID_AGENT_ARCH:
@@ -1712,6 +1715,7 @@ class Config:
 
         return cls(
             stock_list=stock_list,
+            data_source_profile=os.getenv("DATA_SOURCE_PROFILE", "legacy").strip().lower(),
             enabled_markets=tuple(dict.fromkeys(v.strip().lower() for v in os.getenv("ENABLED_MARKETS", "cn,hk,us").split(",") if v.strip())),
             feishu_app_id=os.getenv("FEISHU_APP_ID"),
             feishu_app_secret=os.getenv("FEISHU_APP_SECRET"),
@@ -2925,6 +2929,13 @@ class Config:
                 value,
             )
         return normalized
+
+    @property
+    def data_source_contract(self) -> str:
+        if self.data_source_profile == "choice":
+            from data_provider.choice_adapter import ChoiceAdapter
+            return ChoiceAdapter.contract_version
+        return "legacy"
 
     def get_effective_news_window_days(self) -> int:
         """Return effective news window days after profile + max-age merge."""
