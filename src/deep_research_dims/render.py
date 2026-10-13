@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 from typing import Any, Dict, List, Optional
 
@@ -80,6 +81,7 @@ VIEW_DIM_ORDER = [
 
 # _format_cn 键名专用中文化（结构与正文替换分离：键名可大胆映射，正文不受影响）
 KEY_ZH_MAP: Dict[str, str] = {
+    "institution_holding_change": "机构持仓变化", "leverage": "资产负债率（%）", "period": "报告期",
     "value": "数值", "score": "评分", "label": "评价",
     "products": "产品清单", "products_known": "已知产品明细",
     "moat": "护城河", "position": "行业定位", "industry_status": "行业地位",
@@ -100,6 +102,48 @@ KEY_ZH_MAP: Dict[str, str] = {
     "role_cn": "中国链位置", "role_us": "美国/全球链位置",
     "export_control": "出口管制", "sanction_risk": "制裁风险", "substitution": "替代进度",
 }
+
+
+def _format_holder(value: Any) -> str:
+    from src.schemas.deep_research_dims import HolderInfo
+    holder = value if isinstance(value, HolderInfo) else HolderInfo.model_validate(value)
+    return holder.name + (f"：{holder.detail}" if holder.detail else "") + (f"（来源：{holder.source}）" if holder.source else "")
+
+
+def normalize_saved_markdown(markdown: str) -> str:
+    """Adapt legacy report formatting without changing stored content or code examples."""
+    import ast
+    fence = ""
+    lines = []
+    for line in markdown.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if marker:
+            token = marker[1]
+            if not fence:
+                fence = token
+            elif token[0] == fence[0] and len(token) >= len(fence) and not line[marker.end():].strip():
+                fence = ""
+            lines.append(line)
+            continue
+        if fence or line.startswith(("    ", "\t")):
+            lines.append(line)
+            continue
+        if re.fullmatch(r"\s*(?:</?details>|<!-- dim:[a-z_]+ -->)\s*", line):
+            continue
+        summary = re.fullmatch(r"\s*<summary>(.*?)</summary>\s*", line)
+        if summary:
+            line = f"**{summary[1]}**\n"
+        if line.startswith("- name=") and " source=" in line:
+            try:
+                parsed = ast.parse("entry(" + line[2:].strip().replace(" source=", ", source=") + ")", mode="eval").body
+                if isinstance(parsed, ast.Call) and not parsed.args:
+                    values = {item.arg: ast.literal_eval(item.value) for item in parsed.keywords if item.arg in {"name", "source", "detail"}}
+                    if isinstance(values.get("name"), str):
+                        line = "- " + _format_holder(values) + "\n"
+            except (ValueError, SyntaxError, TypeError, RecursionError):
+                pass  # Unknown historical forms remain readable as original text.
+        lines.append(line)
+    return "".join(lines)
 
 
 def _format_cn(value: Any, labels: Optional[Dict[str, str]] = None) -> str:
@@ -442,8 +486,10 @@ def _fin_snapshot(fundamental: Any) -> str:
             gaps += 1
             lines.append(f"| {label} | 数据缺失 | — |")
         else:
-            suffix = f"%" if isinstance(value, (int, float)) and key not in ("pe_ttm", "pb", "market_cap") else ""
-            cell = f"{value}{suffix}" if isinstance(value, (int, float)) else str(value)
+            if isinstance(value, (int, float)):
+                cell = f"{value / 100000000:,.2f} 亿元" if key == "market_cap" else f"{value:.2f}{' 倍' if key in ('pe_ttm', 'pb') else '%'}"
+            else:
+                cell = str(value)
             lines.append(f"| {label} | {cell} | {eval_label or '—'} |")
     if gaps:
         lines.append(f"\n*快照为阶段 0 单期数据，{gaps} 项缺口按纪律不编造；补齐数据后看年报/中报分产品收入拆分与两期毛利率方向。*")
@@ -482,8 +528,11 @@ def build_view(
     ownership: Any = dims["ownership"]
     us_china: Any = dims["us_china"]
 
-    manager = manager or {}
-    from src.deep_research_dims.manager_writeup import section_title
+    from src.deep_research_dims.manager_writeup import (
+        INCOMPLETE_EVIDENCE_NOTE, manager_evidence_complete, qualified_manager_writeup, section_title,
+    )
+    manager = qualified_manager_writeup(manager or {}, dims)
+    investment_available = manager_evidence_complete(dims)
 
     dim_sections = [
         {"id": dim_id, "label": DIM_LABELS[dim_id], "env": dims[dim_id]}
@@ -496,7 +545,10 @@ def build_view(
         "stock_code": stock_code,
         "as_of": as_of,
         "report_id": report_id,
-        "final_conclusion": final_conclusion,
+        "final_conclusion": final_conclusion if investment_available else INCOMPLETE_EVIDENCE_NOTE,
+        "investment_available": investment_available,
+        "valuation_label": "机构目标价综合值" if scenarios.valuation_basis == "analyst_consensus" else "期望价值 EV",
+        "valuation_price": scenarios.target_price if scenarios.target_price is not None else scenarios.expected_value,
         "report_type": "首次覆盖" if not getattr(history, "rows", None) else "跟踪更新",
         "manager": manager,
         "title_angle": str(manager.get("title_angle") or ""),
@@ -511,7 +563,7 @@ def build_view(
             getattr(getattr(six_dim, "framework", None), "dimension_total", None), as_of
         ),
         "upside_pct": _upside_pct(
-            getattr(scenarios, "expected_value", None),
+            scenarios.target_price if scenarios.target_price is not None else scenarios.expected_value,
             getattr(getattr(getattr(data, "perspective", None), "price_position", None), "current_price", None),
         ),
         "current_price": getattr(
@@ -630,6 +682,7 @@ def render_markdown(
         keep_trailing_newline=True,
     )
     env.filters["cn"] = _format_cn
+    env.filters["holder"] = _format_holder
     template = env.get_template(template_name or _TEMPLATE_NAME)
     return _zh_polish(template.render(**view))
 

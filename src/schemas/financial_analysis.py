@@ -38,8 +38,8 @@ class _StrictBase(BaseModel):
 # Literal 枚举
 # ---------------------------------------------------------------------------
 
-GenerateStatus = Literal["success", "failed", "already_exists"]
-"""生成报告状态：success（首次成功落库）/ failed（生成成功但落库失败）/ already_exists（同日已生成）。"""
+GenerateStatus = Literal["success", "partial", "failed", "already_exists"]
+"""success 为完整报告；partial 保留缺口；failed 为生成/落库失败；already_exists 为复用完整报告。"""
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,8 @@ class FinancialAnalysis(_StrictBase):
     np_yoy / scissors / cash_quality / ocf / np / valuation）。
     """
 
+    data_contract: Annotated[str, Field(pattern=r"^(legacy|choice-v[0-9]+)$")] = "legacy"
+    analysis_version: Annotated[int, Field(ge=1)] = 1
     dims: Dict[Annotated[str, Field(min_length=1, max_length=32)], FinancialDimension]
     """服务实际键：profitability / growth / safety / valuation（用 dict 接收，避开字段名漂移）。"""
     health_score: Optional[Annotated[float, Field(ge=0.0, le=100.0)]]
@@ -91,8 +93,8 @@ class FinancialAnalysis(_StrictBase):
     rev_yoy: Optional[float] = None
     np_yoy: Optional[float] = None
     scissors: Optional[float] = None
-    cash_quality: Optional[Annotated[float, Field(ge=-10.0, le=10.0)]] = None
-    """OCF/NP 比率，经验范围 [-10, 10]；越界说明数据异常。"""
+    cash_quality: Optional[Annotated[float, Field(allow_inf_nan=False)]] = None
+    """OCF/归母净利比率；低利润基数下可大于 10，范围不作人为截断。"""
     ocf: Optional[float] = None
     np: Optional[float] = None
     # 预格式化字符串（模板渲染用，避开 |format() 与 % 冲突）

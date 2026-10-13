@@ -23,16 +23,16 @@ class TestDateKey:
         """key 格式为 {code}:{YYYYMMDD}:{dims指纹}，全量 dims 指纹为 full。"""
         key = _date_key("600519")
         today = datetime.now().strftime("%Y%m%d")
-        assert key == f"600519:{today}:full"
-        assert len(key) == 6 + 1 + 8 + 1 + 4  # code:date:full
+        assert key == f"legacy:600519:{today}:full"
+        assert len(key) == len("legacy:") + 6 + 1 + 8 + 1 + 4  # code:date:full
 
     def test_date_key_different_codes(self):
         """不同股票代码 key 不同。"""
         key1 = _date_key("600519")
         key2 = _date_key("000001")
         assert key1 != key2
-        assert key1.startswith("600519:")
-        assert key2.startswith("000001:")
+        assert key1.startswith("legacy:600519:")
+        assert key2.startswith("legacy:000001:")
 
 
 class TestReportCacheMechanism:
@@ -217,4 +217,4 @@ class TestCacheServiceLevel:
         # 使用一个 mock 的方式验证缓存写入路径存在
         # （实际 LLM 调用由集成测试覆盖）
         cache_key = _date_key("600519")
-        assert cache_key == f"600519:{datetime.now().strftime('%Y%m%d')}:full"
+        assert cache_key == f"legacy:600519:{datetime.now().strftime('%Y%m%d')}:full"

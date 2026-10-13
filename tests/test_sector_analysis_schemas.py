@@ -312,3 +312,11 @@ class TestNestedStructures:
         d["prosperity_score"] = None
         sa = SectorAnalysis.model_validate(d)
         assert sa.prosperity_score is None
+
+
+def test_board_population_is_not_capped_at_two_hundred():
+    from src.schemas.sector_analysis import ProsperityPillar
+    pillar = ProsperityPillar(rank_of=205, total_boards=496)
+    assert pillar.rank_of == 205 and pillar.total_boards == 496
+    with pytest.raises(ValidationError):
+        ProsperityPillar(rank_of=497, total_boards=496)

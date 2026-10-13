@@ -6,8 +6,11 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from src.agent.deep_research.explore_agents import run_capital_agent
 from src.deep_research.researchers.base import generic_parse
+from src.schemas.deep_research_dims import DimEnvelope
 
 DIM_ID = "capital"
 DISPLAY_NAME = "资金面研究员"
@@ -19,5 +22,8 @@ SCORE_KEY = 'flow_score'
 runner_fn = run_capital_agent
 
 
-def parse(parsed, steps):
-    return generic_parse(DIM_ID, parsed, steps)
+def parse(parsed: dict[str, Any], steps: int) -> tuple[DimEnvelope, int]:
+    dim, used = generic_parse(DIM_ID, parsed, steps)
+    if parsed.get("status") == "degraded":
+        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": parsed.get("degraded_reason")})
+    return dim, used

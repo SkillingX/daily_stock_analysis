@@ -33,7 +33,7 @@ class TestHKRealtimeRouting(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_manager_routes_hk_suffix_only_to_akshare_once(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             enable_realtime_quote=True,
             realtime_source_priority="tencent,akshare_sina,efinance,akshare_em,tushare",
         )

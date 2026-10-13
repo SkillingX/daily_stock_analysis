@@ -1561,6 +1561,14 @@ class SystemConfigService:
             raise ConfigValidationError(issues=errors)
 
         previous_map = self._manager.read_config_map()
+        from src.core.market_policy import require_stock_market
+        from data_provider.base import canonical_stock_code
+        existing_codes = {canonical_stock_code(code) for code in self._split_csv(previous_map.get("STOCK_LIST") or "")}
+        for item in items:
+            if item["key"].upper() == "STOCK_LIST":
+                for code in self._split_csv(item["value"]):
+                    if canonical_stock_code(code) not in existing_codes:
+                        require_stock_market(code)
         submitted_keys: Set[str] = set()
         updates: List[Tuple[str, str]] = []
         sensitive_keys: Set[str] = set()

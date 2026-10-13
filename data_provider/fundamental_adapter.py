@@ -419,7 +419,7 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
-    def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
+    def get_financial_indicators(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
         """
@@ -485,13 +485,23 @@ class AkshareFundamentalAdapter:
                 result["growth"]["field_meta"] = growth_meta
                 result["source_chain"].append(f"growth:{fin_source}")
 
+        result["status"] = "partial" if any(value is not None for key, value in result["growth"].items() if key not in {"report_date", "field_meta"}) or result["earnings"] else "not_supported"
+        return result
+
+    def get_fundamental_bundle(self, stock_code: str, *, financials: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Append optional details without mutating already acquired financials."""
+        from copy import deepcopy
+        result = deepcopy(financials) if financials is not None else self.get_financial_indicators(stock_code)
+
+        # These AkShare endpoints accept a quarter-end date, never a stock symbol.
+        today = datetime.now().date()
+        quarters = sorted(f"{year}{month:02d}{day:02d}" for year in (today.year - 1, today.year) for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)) if f"{year}{month:02d}{day:02d}" <= today.strftime("%Y%m%d"))
+        report_date = quarters[-1]
+
         # Earnings forecast
         forecast_df, forecast_source, forecast_errors = self._call_df_candidates(
             [
-                ("stock_yjyg_em", {"symbol": stock_code}),
-                ("stock_yjyg_em", {}),
-                ("stock_yjbb_em", {"symbol": stock_code}),
-                ("stock_yjbb_em", {}),
+                ("stock_yjyg_em", {"date": report_date}),
             ]
         )
         result["errors"].extend(forecast_errors)
@@ -506,8 +516,7 @@ class AkshareFundamentalAdapter:
         # Earnings quick report
         quick_df, quick_source, quick_errors = self._call_df_candidates(
             [
-                ("stock_yjkb_em", {"symbol": stock_code}),
-                ("stock_yjkb_em", {}),
+                ("stock_yjkb_em", {"date": report_date}),
             ]
         )
         result["errors"].extend(quick_errors)
@@ -600,7 +609,7 @@ class AkshareFundamentalAdapter:
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
-    def get_capital_flow(self, stock_code: str, top_n: int = 5) -> Dict[str, Any]:
+    def get_capital_flow(self, stock_code: str, top_n: int = 5, *, include_stock: bool = True) -> Dict[str, Any]:
         """
         Return stock + sector capital flow.
         """
@@ -620,7 +629,7 @@ class AkshareFundamentalAdapter:
                 ("stock_main_fund_flow", {"symbol": stock_code}),
                 ("stock_main_fund_flow", {}),
             ]
-        )
+        ) if include_stock else (None, "", [])
         result["errors"].extend(stock_errors)
         if stock_df is not None:
             row = _extract_latest_row(stock_df, stock_code)

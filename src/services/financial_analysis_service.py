@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """个股财务分析模块：盈利/成长/安全/估值四维度专项报告。
 
-数据源：Fuyao 年报序列（主）+ AkShare 财务指标兜底（gross_margin）+ 快照估值。
+数据源由部署策略选择；年度口径与最新估值日期分别披露。
 分档打分复用 fundamental_dim 的分档逻辑；缺数据记缺口不硬算。
 """
 
 from __future__ import annotations
 
 import json
+from decimal import Decimal
+from uuid import uuid4
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,7 @@ _ID_PATTERN = "fa_{ts:%Y%m%d%H%M%S}"   # Fix 12: 精确到秒，避免并发冲�
 
 # 健康分维度权重
 _DIM_WEIGHTS = {"profitability": 0.30, "growth": 0.30, "safety": 0.20, "valuation": 0.20}
+_ANALYSIS_VERSION = 2  # Older reports predate valuation eligibility and completeness checks.
 
 
 def get_report_dir() -> Path:
@@ -33,6 +36,10 @@ def get_report_dir() -> Path:
 # Fix 11: 先查 DB 再尝试锁文件，双重保险防并发重复生成
 # -------------------------------------------------------------------
 _DEDUP_LOCK: Dict[str, float] = {}   # code -> 请求到达时间戳
+
+
+class FinancialReportInProgressError(RuntimeError):
+    """A forced refresh cannot return an older report while another run is active."""
 
 
 def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
@@ -47,6 +54,17 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
             if created.startswith(today):
                 full = db.get_financial_analysis_report(r["id"])
                 if full:
+                    from src.config import get_config
+                    contract = get_config().data_source_contract
+                    analysis = json.loads(full.get("analysis_json") or "{}")
+                    if analysis.get("data_contract", "legacy") != contract:
+                        continue
+                    if analysis.get("analysis_version") != _ANALYSIS_VERSION or analysis.get("gaps"):
+                        return None
+                    if not analysis.get("years") or any(
+                        (analysis.get("dims", {}).get(key) or {}).get("score") is None for key in _DIM_WEIGHTS
+                    ):
+                        return None
                     return full
     except Exception:  # noqa: BLE001
         pass
@@ -138,11 +156,21 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     years_data: list[Dict[str, Any]] = series.get("years") or []
     latest = years_data[0] if years_data else {}
     prev = years_data[1] if len(years_data) > 1 else {}
-    gaps: list[str] = []
+    gaps: list[str] = list(series.get("errors") or [])
+    if series.get("status") == "partial":
+        gaps.append("年度财报覆盖不完整")
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        from data_provider.choice_adapter import AnnualReport
+        years_data = [AnnualReport.from_record(row).as_record() for row in years_data]
+        latest = years_data[0] if years_data else {}
+        prev = years_data[1] if len(years_data) > 1 else {}
+    if not years_data:
+        gaps.append("年度财报缺失")
 
     # ---- Fix 1: gross_margin fallback ----
     gm_v = latest.get("gross_margin")
-    if gm_v is None and years_data:
+    if gm_v is None and years_data and get_config().data_source_profile != "choice":
         # 用 AkShare 财务指标表兜底
         avail_years: list[int] = [int(y.get("year", 0)) for y in years_data if y.get("year")]
         code_for_ak = latest.get("code") or ""
@@ -171,10 +199,14 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     # ---- 成长质量 ----
     rev_yoy = None
     np_yoy = None
-    if latest.get("revenue") and prev.get("revenue"):
-        rev_yoy = round((latest["revenue"] - prev["revenue"]) / prev["revenue"] * 100, 2)
-    if latest.get("net_profit") is not None and prev.get("net_profit"):
-        np_yoy = round((latest["net_profit"] - prev["net_profit"]) / abs(prev["net_profit"]) * 100, 2)
+    adjacent = not years_data or not prev or int(latest.get("year", 0))-int(prev.get("year", 0)) == 1
+    compatible = all(latest.get(key) == prev.get(key) for key in ("currency", "statement_scope", "adjustment"))
+    if adjacent and compatible and latest.get("revenue") is not None and prev.get("revenue") not in (None, 0):
+        current, previous = Decimal(str(latest["revenue"])), Decimal(str(prev["revenue"]))
+        rev_yoy = float(round((current-previous)/abs(previous)*100, 2))
+    if adjacent and compatible and latest.get("net_profit") is not None and prev.get("net_profit") not in (None, 0):
+        current, previous = Decimal(str(latest["net_profit"])), Decimal(str(prev["net_profit"]))
+        np_yoy = float(round((current-previous)/abs(previous)*100, 2))
     scissors = round(np_yoy - rev_yoy, 2) if rev_yoy is not None and np_yoy is not None else None
 
     growth_score = None
@@ -189,6 +221,10 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
             base -= 10   # 双降警示
         growth_score = max(0.0, min(100.0, base))
 
+    if roe_v is None:
+        gaps.append("加权 ROE")
+    if gm_v is None:
+        gaps.append("毛利率缺失或不适用")
     if rev_yoy is None:
         gaps.append("营收增速（需至少两期年报）")
     if np_yoy is None:
@@ -200,12 +236,14 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
         total_debt = latest.get("total_debt")
         total_assets = latest.get("assets_total")
         if total_debt is not None and total_assets:
-            debt_v = round(total_debt / total_assets * 100, 2)
+            debt_v = float(round(Decimal(str(total_debt))/Decimal(str(total_assets))*100, 2))
     debt_score, debt_label = _band(
-        debt_v, [(0, 80.0, "低杠杆"), (30, 70.0, "适中"), (60, 50.0, "偏高"), (100, 30.0, "高杠杆")]
+        debt_v, [(100, 30.0, "高杠杆"), (60, 50.0, "偏高"), (30, 70.0, "适中"), (0, 80.0, "低杠杆")]
     ) if debt_v is not None else (None, "数据缺失")
 
-    ocf = latest.get("act_cash_flow_net") or latest.get("op_cash_flow")
+    ocf = latest.get("act_cash_flow_net")
+    if ocf is None:
+        ocf = latest.get("op_cash_flow")
     if ocf is None:
         for k in ("operating_cash_flow", "cash_flow_from_operations", "net_op_cash_flow"):
             ocf = latest.get(k)
@@ -213,7 +251,7 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
                 break
     np_ = latest.get("net_profit")
     # Fix 3: cash_quality 保留 2 位小数
-    cash_quality = round(ocf / np_, 2) if ocf is not None and np_ and np_ != 0 else None
+    cash_quality = float(round(Decimal(str(ocf))/Decimal(str(np_)), 2)) if ocf is not None and np_ is not None and np_ > 0 else None
 
     # Fix 2: safety.label 只描述债务水位，ocf 单独出
     safety_label = f"资产负债率 {debt_label}"
@@ -227,10 +265,16 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- 估值 ----
     from src.scoring.indicators_v2 import score_valuation
+    from src.deep_research_dims.fundamental_dim import eligible_financial_value
     snap = fund or {}
-    pe_ttm = (series.get("valuation") or {}).get("pe_ttm")
-    pb = (series.get("valuation") or {}).get("pb_mrq") or snap.get("pb")
+    pe_ttm = eligible_financial_value(snap, "pe_ratio")
+    pb = eligible_financial_value(snap, "pb_ratio")
     valuation = score_valuation(pe_ttm, pb) or {"score": None, "summary": "估值数据缺失"}
+    if pe_ttm is None or pb is None:
+        gaps.extend(snap.get("errors") or [])
+        gaps.extend(label for value, label in ((pe_ttm, "PE 缺失或不可用于规则"), (pb, "PB 缺失或不可用于规则")) if value is None)
+    if valuation.get("score") is None:
+        gaps.append("估值数据缺失或不可用于规则")
 
     # Fix 5: PE/PB 保留 2 位小数
     pe_disp = f"{pe_ttm:.2f}" if pe_ttm is not None else None
@@ -259,7 +303,8 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     available = [(d["score"], w) for d, w in zip(dims.values(), _DIM_WEIGHTS.values()) if d["score"] is not None]
-    health = round(sum(s * w for s, w in available) / sum(w for _, w in available), 1) if available else None
+    has_financial_score = any(dims[key]["score"] is not None for key in ("profitability", "growth", "safety"))
+    health = round(sum(s * w for s, w in available) / sum(w for _, w in available), 1) if available and has_financial_score else None
 
     # Fix: 预格式化增长率，避免在模板里用 |format() 与 % 格式化冲突
     rev_yoy_fmt = f"{rev_yoy:+.2f}" if rev_yoy is not None else None
@@ -269,7 +314,9 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "dims": dims,
         "health_score": health,
-        "gaps": gaps,
+        "gaps": list(dict.fromkeys(gaps))[:20],
+        "analysis_version": _ANALYSIS_VERSION,
+        "data_contract": get_config().data_source_contract,
         "years": years_data,
         "rev_yoy": rev_yoy,
         "rev_yoy_fmt": rev_yoy_fmt,
@@ -308,10 +355,10 @@ def _raw_code_valid(raw_code: Any) -> bool:
     "generate_report must return the documented dict contract",
 )
 @ensure(
-    lambda result: result["status"] in ("success", "failed", "already_exists"),
-    "status must be one of success/failed/already_exists",
+    lambda result: result["status"] in ("success", "partial", "failed", "already_exists"),
+    "status must be one of success/partial/failed/already_exists",
 )
-def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, Any]:
+def generate_report(raw_code: str, raw_name: Optional[str] = None, force_refresh: bool = False) -> Dict[str, Any]:
     """生成个股财务分析专项报告。"""
     from src.services.stock_code_utils import normalize_code
 
@@ -323,8 +370,14 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
     if name and code in name:
         name = name.replace(code, "").replace(".SZ", "").replace(".SH", "").strip()
 
+    from src.core.market_policy import require_stock_market
+    require_stock_market(code)
+    from data_provider.mx_data_adapter import financial_refresh
+    refresh_token = None
     # Fix 11: 并发锁
     if not _try_acquire_dedup_lock(code):
+        if force_refresh:
+            raise FinancialReportInProgressError("该股票的财务报告正在生成，请完成后再刷新")
         existing = _same_day_dedup_report(code)
         if existing is not None:
             try:
@@ -339,10 +392,11 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
                 "markdown": md,
                 "analysis": json.loads(existing.get("analysis_json") or "{}"),
             }
+        raise FinancialReportInProgressError("该股票的财务报告正在生成，请完成后再重试")
 
     try:
         # 当天已生成过则直接返回已有报告
-        existing = _same_day_dedup_report(code)
+        existing = None if force_refresh else _same_day_dedup_report(code)
         if existing is not None:
             _release_dedup_lock(code)
             try:
@@ -358,17 +412,28 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
                 "analysis": json.loads(existing.get("analysis_json") or "{}"),
             }
 
+        from src.config import get_config
         if not name:
             name = code
             try:
                 from src.agent.tools.data_tools import _get_fetcher_manager
-                quote = _get_fetcher_manager().get_realtime_quote(code)
-                name = str(getattr(quote, "name", "") or "").strip() or code
+                if get_config().data_source_profile != "choice":
+                    quote = _get_fetcher_manager().get_realtime_quote(code)
+                    name = str(getattr(quote, "name", "") or "").strip() or code
             except Exception:  # noqa: BLE001
                 pass
 
-        from src.deep_research_dims.context import build_shared_context, fetch_fuyao_financial_series
-        ctx = build_shared_context(code, name)
+        from src.deep_research_dims.context import build_shared_context, fetch_fuyao_financial_series, SharedContext, _safe_fundamental
+        from src.config import get_config
+        # A new report (including a retry after partial acquisition) needs current inputs.
+        refresh_token = financial_refresh.set((code, uuid4().hex))
+        if get_config().data_source_profile == "choice":
+            ctx = SharedContext(code, name, datetime.now().isoformat())
+            ctx.fundamental = _safe_fundamental(code, ctx)
+            if name == code:
+                name = str(ctx.fundamental.get("stock_name") or code)
+        else:
+            ctx = build_shared_context(code, name)
         series = fetch_fuyao_financial_series(code)
         # 把 code 注入 series years，方便 AkShare fallback 查毛利率
         for y in series.get("years") or []:
@@ -396,10 +461,12 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
         return {
             "report_id": rid if ok else None,
             "stock_code": code, "stock_name": name,
-            "status": "success" if ok else "failed",
+            "status": ("partial" if analysis["gaps"] else "success") if ok else "failed",
             "markdown": md, "analysis": analysis,
         }
     finally:
+        if refresh_token is not None:
+            financial_refresh.reset(refresh_token)
         _release_dedup_lock(code)
 
 

@@ -145,6 +145,9 @@ class AlertService:
         return self.repo.delete_rule(rule_id)
 
     def enable_rule(self, rule_id: int, enabled: bool) -> Dict[str, Any]:
+        if enabled:
+            row = self.get_rule(rule_id)
+            self._normalize_target(row["target_scope"], row["target"])
         updated = self.repo.update_rule(rule_id, {"enabled": enabled})
         if updated is None:
             raise AlertNotFoundError(f"Alert rule not found: {rule_id}")
@@ -224,6 +227,12 @@ class AlertService:
         monitor: EventMonitor,
         daily_cache: Optional[Dict[Any, Any]] = None,
     ) -> Dict[str, Any]:
+        if getattr(rule, "stock_code", None):
+            from src.core.market_policy import MarketDisabledError, require_stock_market
+            try:
+                require_stock_market(rule.stock_code)
+            except MarketDisabledError as exc:
+                return self._not_triggered(rule, None, str(exc), record_status="degraded")
         if isinstance(rule, PriceAlert):
             return await self._evaluate_price(rule, monitor)
         if isinstance(rule, PriceChangeAlert):
@@ -1006,6 +1015,8 @@ class AlertService:
 
     def _normalize_target(self, target_scope: str, target: str) -> str:
         if target_scope == "single_symbol":
+            from src.core.market_policy import require_stock_market
+            require_stock_market(target)
             return target.strip()
         if target_scope == "market":
             try:

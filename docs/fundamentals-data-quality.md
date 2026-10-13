@@ -148,3 +148,13 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 有任务 deadline 的 requests 响应在每次底层 socket 读取前重算剩余时间，覆盖持续慢响应头、正文、chunk 头及 gzip 数据；超时由 requests 清理连接，工具线程退出。该实现复用 CPython HTTP/HTTPS 的 `SocketIO`，无 deadline 的调用不变，保留 Session、Cookie、重定向和流式消费。此边界不保证中断 DNS 解析、非 makefile 客户端、CPU 运算或第三方 SDK 自建线程；不能据此声称任何外部 IO 都可强制取消。
 
 回归执行：`python -m pytest tests/test_fundamental_units_contract.py tests/test_f1_financial_quality.py tests/test_fundamentals_generation_budget.py`。慢流测试包含本机 HTTPS（需要 `openssl` 命令），不使用外部凭据；Docker CI 额外验证默认业务提示词可读。本专题没有英文配对文件。
+
+## 取数超时与供应商不可用
+
+核心财务先独立取得，再用剩余预算读取预告、分红和股东等资料。辅助请求超时不会清空已取得的财务；估值、核心财务、补值和辅助查询遵守同一总时限。
+
+MX 业务错误不作为正常财务缓存；额度、认证、HTTP 状态及超时等原因由适配器向聚合层传播，单源失败仍与其他源隔离，报告保留固定脱敏原因码。普通 iFinD 补值与交叉验证均保留原因。源接口可能抛出带脱敏原因的 SourceReadError，调用方须在聚合边界隔离，不能把异常文本当数值；资金流入口保持原有空结果降级契约。
+
+Fuyao 补值与交叉验证共用适配器。按[官方接口说明](https://fuyao.aicubes.cn/llms-full.txt)，REST 使用 GET、X-api-key，估值调用 /api/a-share/valuations/snapshot，财务指标调用 /api/a-share/financials/indicators，后者必须提供已确认报告期。abilities 中的指标按官方指标 ID、百分数单位及响应报告期解释；普通净利润同比不能冒充归母净利润同比。利润表 operating_income 与 parent_holder_net_profit 分别采用营业收入、归母净利口径，按响应 period_end_ms（上海时区）、currency 与原币元单位解释；quarterly 未证实累计或单季时保持期间基础未知。无期间时说明 period_unknown，不猜期间。
+
+MX/iFinD 的账户额度恢复、Choice 正式 MCP 地址与权限核对、Fuyao 服务权限由账户维护者处理。连接测试成功不证明额度或数据查询可用。生产数据库迁移仍需独立备份和验收；本修复不自动修改账户或数据库。

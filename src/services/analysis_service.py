@@ -79,6 +79,9 @@ class AnalysisService:
             - stock_name: 股票名称
             - report: 分析报告
         """
+        from src.core.market_policy import require_stock_market
+        require_stock_market(stock_code)
+
         try:
             self.last_error = None
             # 导入分析相关模块

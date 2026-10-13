@@ -631,6 +631,15 @@ def run_full_analysis(
 
         # Issue #373: Trading day filter (per-stock, per-market)
         effective_codes = stock_codes if stock_codes is not None else config.stock_list
+        from src.core.market_policy import require_stock_market, MarketDisabledError
+        admitted_codes = []
+        for code in effective_codes:
+            try:
+                require_stock_market(code, config.enabled_markets)
+                admitted_codes.append(code)
+            except MarketDisabledError as exc:
+                logger.warning("Skipping %s: %s", code, exc)
+        effective_codes = admitted_codes
         filtered_codes, effective_region, should_skip = _compute_trading_day_filter(
             config, args, effective_codes
         )
@@ -1147,6 +1156,13 @@ def main() -> int:
         stock_codes = [
             canonical_stock_code(c) for c in args.stocks.split(",") if (c or "").strip()
         ]
+        from src.core.market_policy import require_stock_market, MarketDisabledError
+        try:
+            for code in stock_codes:
+                require_stock_market(code, config.enabled_markets)
+        except MarketDisabledError as exc:
+            logger.error("%s", exc)
+            return 1
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
 
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===

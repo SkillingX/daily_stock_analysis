@@ -205,8 +205,8 @@ class TestExtractFirstTableRow(unittest.TestCase):
         self.assertEqual(out["总市值"], "2e12")
         self.assertIn("_mx_entity", out)
 
-    def test_error_dict_returns_empty(self):
-        self.assertEqual(_extract_first_table_row({"error": "x"}), {})
+    def test_error_dict_retains_safe_reason(self):
+        self.assertEqual(_extract_first_table_row({"error": "x"}), {"error": "mx:source_error"})
 
     def test_bad_status_returns_empty(self):
         self.assertEqual(_extract_first_table_row({"status": 1, "data": {}}), {})
@@ -372,10 +372,12 @@ class TestMXSource(unittest.TestCase):
         self.assertIsNone(src.read("600519", "no_such_field"))
 
     def test_read_exception_isolated(self):
+        from data_provider.cross_source_validator import SourceReadError
         client = _FakeMXClient(available=True)
         client.fetch_snapshot = lambda code: (_ for _ in ()).throw(RuntimeError("boom"))
         src = MXSource(client=client)
-        self.assertIsNone(src.read("600519", "pe_ratio"))  # fail-open，不抛
+        with self.assertRaisesRegex(SourceReadError, 'mx:source_error'):
+            src.read("600519", "pe_ratio")
 
     def test_default_client_built_when_none(self):
         # 不传 client 时自动构造 MXClient（验证不崩）

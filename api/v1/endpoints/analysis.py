@@ -303,6 +303,10 @@ def trigger_analysis(
             seen.add(norm)
             unique_codes.append(code)
 
+    from src.core.market_policy import require_stock_market
+    for code in unique_codes:
+        require_stock_market(code, config.enabled_markets)
+
     stock_codes = unique_codes
 
     # Limit the number of stocks in a single request to prevent DoS

@@ -466,6 +466,10 @@ class AnalysisTaskQueue:
             if normalized
         ]
 
+        from src.core.market_policy import require_stock_market
+        for stock_code in canonical_codes:
+            require_stock_market(stock_code)
+
         with self._data_lock:
             for stock_code in canonical_codes:
                 dedupe_key = _dedupe_stock_code_key(stock_code)
@@ -774,6 +778,9 @@ class AnalysisTaskQueue:
         self._broadcast_event("task_started", task.to_dict())
 
         try:
+            from src.core.market_policy import require_stock_market
+            require_stock_market(stock_code)
+
             # 导入分析服务（延迟导入避免循环依赖）
             from src.services.analysis_service import AnalysisService
 

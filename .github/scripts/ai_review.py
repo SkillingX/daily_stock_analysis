@@ -5,7 +5,6 @@ AI code review script used by GitHub Actions PR Review workflow.
 import json
 import os
 import subprocess
-import traceback
 
 
 MAX_DIFF_LENGTH = 18000
@@ -38,7 +37,7 @@ def run_git(args):
 def get_diff():
     """Get PR diff content for review-relevant files."""
     base_ref = os.environ.get('GITHUB_BASE_REF', 'main')
-    diff = run_git(['git', 'diff', f'origin/{base_ref}...HEAD', '--', *REVIEW_PATHS])
+    diff = run_git(['git', 'diff', f'origin/{base_ref}...{os.environ.get("GITHUB_HEAD_SHA", "HEAD")}', '--', *REVIEW_PATHS])
     truncated = len(diff) > MAX_DIFF_LENGTH
     return diff[:MAX_DIFF_LENGTH], truncated
 
@@ -46,7 +45,7 @@ def get_diff():
 def get_changed_files():
     """Get changed file list for review-relevant files."""
     base_ref = os.environ.get('GITHUB_BASE_REF', 'main')
-    output = run_git(['git', 'diff', '--name-only', f'origin/{base_ref}...HEAD', '--', *REVIEW_PATHS])
+    output = run_git(['git', 'diff', '--name-only', f'origin/{base_ref}...{os.environ.get("GITHUB_HEAD_SHA", "HEAD")}', '--', *REVIEW_PATHS])
     return output.split('\n') if output else []
 
 
@@ -194,16 +193,15 @@ def review_with_gemini(prompt):
         print("   请确保安装了 google-genai: pip install google-genai")
         return None
     except Exception as e:
-        print(f"❌ Gemini 审查失败: {e}")
-        traceback.print_exc()
+        print(f"❌ Gemini 审查失败: {type(e).__name__}")
         return None
 
 
 def review_with_openai(prompt):
     """Run review with OpenAI-compatible API as fallback."""
     api_key = os.environ.get('OPENAI_API_KEY')
-    base_url = os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1')
-    model = os.environ.get('OPENAI_MODEL', 'gpt-4o-mini')
+    base_url = os.environ.get('OPENAI_BASE_URL') or 'https://api.openai.com/v1'
+    model = os.environ.get('OPENAI_MODEL') or 'gpt-4o-mini'
 
     if not api_key:
         print("❌ OpenAI API Key 未配置（检查 GitHub Secrets: OPENAI_API_KEY）")
@@ -228,8 +226,7 @@ def review_with_openai(prompt):
         print("   请确保安装了 openai: pip install openai")
         return None
     except Exception as e:
-        print(f"❌ OpenAI 兼容接口审查失败: {e}")
-        traceback.print_exc()
+        print(f"❌ OpenAI 兼容接口审查失败: {type(e).__name__}")
         return None
 
 

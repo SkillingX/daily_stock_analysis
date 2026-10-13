@@ -196,6 +196,11 @@ class PortfolioImportService:
         dry_run: bool = False,
     ) -> Dict[str, Any]:
         broker_norm = self._normalize_broker(broker)
+        from src.core.market_policy import require_market, require_stock_market
+        for record in records:
+            require_stock_market(str(record["symbol"]))
+            if record.get("market"):
+                require_market(str(record["market"]).lower())
 
         inserted_count = 0
         duplicate_count = 0

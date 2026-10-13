@@ -12,6 +12,7 @@
 """
 
 from __future__ import annotations
+from data_provider.cross_source_validator import SourceReadError
 
 import json
 import logging
@@ -387,7 +388,8 @@ class TestMxMcpSource(unittest.TestCase):
         fake = _FakeFetcher(available=True, fetch_fn=boom)
         src = MxMcpSource(fetcher=fake)
         # fail-open：fetcher 抛异常 → 返回 None，不阻塞其他源
-        self.assertIsNone(src.read("600519", "current_price"))
+        with self.assertRaises(SourceReadError):
+            src.read("600519", "current_price")
 
     def test_fetcher_returns_none_passthrough(self):
         fake = _FakeFetcher(
@@ -466,7 +468,8 @@ class TestMxMcpFetcherAvailable(unittest.TestCase):
         logger_obj.setLevel(logging.DEBUG)
         try:
             # 故意构造异常路径触发 logger.debug
-            fetcher.fetch("600519", "current_price")
+            with self.assertRaises(SourceReadError):
+                fetcher.fetch("600519", "current_price")
             # _async_fetch 会因 mcp 未实际连接而抛异常，被 fetch() 吞掉并 debug log
             # 验证：所有 captured 日志中不出现 SECRET_KEY 任何片段
             leaked = [msg for msg in captured if self.SECRET_KEY in msg]

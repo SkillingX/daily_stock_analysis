@@ -22,17 +22,20 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import os
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from pydantic import BaseModel, ConfigDict, Field
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
+from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -93,22 +96,28 @@ _EXCHANGE_BY_PREFIX: Dict[str, str] = {
 }
 
 _ENDPOINT_BY_FIELD: Dict[str, _EndpointSpec] = {
-    "current_price": _EndpointSpec("/v1/quotation/snapshot", "price", False),
-    "total_mv": _EndpointSpec("/v1/quotation/snapshot", "total_mv", False),
-    "circ_mv": _EndpointSpec("/v1/quotation/snapshot", "circ_mv", False),
-    "pe_ratio": _EndpointSpec("/v1/valuations/snapshot", "pe_ttm", False),
-    "pb_ratio": _EndpointSpec("/v1/valuations/snapshot", "pb_mrq", False),
-    "revenue": _EndpointSpec("/v1/financial/income", "revenue", True),
-    "net_profit": _EndpointSpec("/v1/financial/income", "net_profit", True),
-    "gross_margin": _EndpointSpec("/v1/financial/income", "gross_margin", True),
-    "roe": _EndpointSpec("/v1/financial/balance", "roe", True),
-    "revenue_yoy": _EndpointSpec("/v1/financial/growth", "revenue_yoy", True),
-    "net_profit_yoy": _EndpointSpec("/v1/financial/growth", "net_profit_yoy", True),
+    "current_price": _EndpointSpec("/api/a-share/prices/snapshot", "last_price", False),
+    "total_mv": _EndpointSpec("/api/a-share/prices/snapshot", "total_mv", False),
+    "circ_mv": _EndpointSpec("/api/a-share/prices/snapshot", "circ_mv", False),
+    "pe_ratio": _EndpointSpec("/api/a-share/valuations/snapshot", "pe_ttm", False),
+    "pb_ratio": _EndpointSpec("/api/a-share/valuations/snapshot", "pb_mrq", False),
+    "revenue": _EndpointSpec("/api/a-share/financials/income-statements", "operating_income", True),
+    "net_profit": _EndpointSpec("/api/a-share/financials/income-statements", "parent_holder_net_profit", True),
+    "gross_margin": _EndpointSpec("/api/a-share/financials/indicators", "sale_gross_margin", True),
+    "roe": _EndpointSpec("/api/a-share/financials/indicators", "index_weighted_avg_roe", True),
+    "revenue_yoy": _EndpointSpec("/api/a-share/financials/indicators", "operating_income_yoy_growth_ratio", True),
+    "net_profit_yoy": _EndpointSpec("/api/a-share/financials/indicators", "net_profit_yoy_growth_ratio", True),
 }
 
 _CALIBERS: Dict[str, Optional[str]] = {
     "pe_ratio": "TTM",
     "pb_ratio": "MRQ",
+    "revenue": "operating_revenue",
+    "net_profit": "parent_net_profit",
+    "roe": "weighted_roe",
+    "gross_margin": "gross_margin",
+    "revenue_yoy": "operating_revenue_yoy",
+    "net_profit_yoy": "net_profit_yoy",
 }
 
 
@@ -173,6 +182,12 @@ def _map_period(period: Optional[str]) -> Optional[str]:
     if not period:
         return None
     s = period.strip()
+    from .cross_source_validator import normalize_report_period
+    actual, _ = normalize_report_period(s)
+    if actual:
+        quarter = {"03-31": "1", "06-30": "2", "09-30": "3", "12-31": "4"}.get(actual[5:])
+        if quarter:
+            return f"{actual[:4]}-{quarter}"
     for pattern, repl in _PERIOD_PATTERNS:
         m = re.match(pattern, s)
         if m:
@@ -215,7 +230,29 @@ def _parse_fuyao_response(
         return None
     if resp.data is None:
         return None
-    items_raw = resp.data.get("items")
+    data = resp.data
+    # Current API returns indicator abilities or flat item rows; retain legacy rows.
+    if isinstance(data.get("abilities"), list):
+        values = {entry["index_id"]: entry.get("value") for ability in data["abilities"] if isinstance(ability, dict)
+                  for entry in ability.get("indicators", []) if isinstance(entry, dict) and "index_id" in entry}
+        items_raw = [{"thscode": data.get("thscode"), "report": data.get("report"), "fields": {**values, "unit": "percentage_point"}}]
+    elif isinstance(data.get("item"), list):
+        items_raw = [{"thscode": row.get("thscode", data.get("thscode", "")), "fields": {**row, "timestamp": data.get("timestamp")}}
+                     for row in data["item"] if isinstance(row, dict)]
+        if field in {"revenue", "net_profit"}:
+            # Official statement amounts are in original currency base units.
+            for row in items_raw:
+                fields = row["fields"]
+                fields.setdefault("unit", "currency_base")
+                if isinstance(fields.get("period_end_ms"), (int, float)):
+                    try:
+                        fields["period_end"] = datetime.fromtimestamp(fields["period_end_ms"] / 1000, ZoneInfo("Asia/Shanghai")).date().isoformat()
+                    except (ValueError, OverflowError, OSError):
+                        pass
+                if fields.get("period") == "annual":
+                    fields["period_basis"] = "annual"
+    else:
+        items_raw = data.get("items")
     if not isinstance(items_raw, list) or not items_raw:
         return None
     spec = _endpoint_for(field)
@@ -227,7 +264,8 @@ def _parse_fuyao_response(
             item = FuyaoItem.model_validate(raw)
         except Exception:  # noqa: BLE001 — 跳过畸形 item
             continue
-        value = normalize_anchor_value(field, item.fields.get(spec.item_key), spec.item_key)[0]
+        raw_key = spec.item_key if spec.item_key in item.fields else {"revenue": "revenue", "net_profit": "net_profit", "gross_margin": "gross_margin", "roe": "roe", "revenue_yoy": "revenue_yoy", "net_profit_yoy": "net_profit_yoy"}.get(field, spec.item_key)
+        value = normalize_anchor_value(field, item.fields.get(raw_key), raw_key)[0]
         if value is None:
             continue
         period_fields = dict(item.fields)
@@ -236,18 +274,18 @@ def _parse_fuyao_response(
             report_label = f"{encoded[1]}{('一季报', '中报', '三季报', '年报')[int(encoded[2]) - 1]}" if encoded else item.report
             period_fields.setdefault("report_period", report_label)
         actual, basis = report_period_from_fields(period_fields, spec.item_key)
-        value, unit, currency, error = normalize_anchor_value(field, item.fields[spec.item_key], spec.item_key, unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), currency=item.fields.get("currency"))
+        value, unit, currency, error = normalize_anchor_value(field, item.fields[raw_key], spec.item_key, unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), currency=item.fields.get("currency"))
         if value is None:
             continue
         readings.append(AnchorReading(
             source="fuyao",
             value=value,
-            caliber=_CALIBERS.get(field) or caliber_from_label(field, spec.item_key),
+            caliber=(_CALIBERS.get(field) if raw_key == spec.item_key else None) or caliber_from_label(field, raw_key),
             period=actual if spec.needs_period else None,
             period_basis=basis if spec.needs_period else "unknown",
             requested_period=period if spec.needs_period else None,
             observed_at=observation_time_from_fields(item.fields), fetched_at=item.fields.get("fetched_at"),
-            unit=unit, currency=currency, raw_value=str(item.fields[spec.item_key]), raw_label=spec.item_key, normalization_error=error,
+            unit=unit, currency=currency, raw_value=str(item.fields[raw_key]), raw_label=spec.item_key, normalization_error=error,
             raw_unit=item.fields.get(f"{spec.item_key}_unit", item.fields.get("unit")), raw_currency=item.fields.get("currency"),
         ))
     selected = select_report_period([(reading.period, reading.period_basis) for reading in readings], period)
@@ -306,16 +344,18 @@ class FuyaoFetcher:
             thscode = _to_thscode(code)
         except ValueError:
             return None
-        payload: Dict[str, Any] = {"thscode": thscode}
+        payload: Dict[str, Any] = {"thscode" if spec.needs_period else "thscodes": thscode}
         if spec.needs_period:
             mapped_period = _map_period(period)
             if mapped_period is None:
-                # 财务字段缺 period：无法定锚，宁可不抓而非错锚。
-                return None
-            payload["report"] = mapped_period
+                raise SourceReadError("fuyao", "period_unknown")
+            if "income-statements" in spec.path:
+                payload.update(period="annual" if mapped_period.endswith("-4") else "quarterly", limit=8)
+            else:
+                payload["report"] = mapped_period
         url = f"{self._endpoint}{spec.path}"
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "X-api-key": self._api_key,
             "Content-Type": "application/json",
         }
         for attempt in range(3):
@@ -323,15 +363,22 @@ class FuyaoFetcher:
             if timeout <= 0:
                 return None
             try:
-                resp = self._session.post(url, json=payload, headers=headers, timeout=timeout)
+                resp = self._session.get(url, params=payload, headers=headers, timeout=timeout)
             except requests.RequestException as exc:
-                logger.debug("[FuyaoFetcher] POST %s failed: %s", spec.path, type(exc).__name__)
-                return None
+                logger.debug("[FuyaoFetcher] GET %s failed: %s", spec.path, type(exc).__name__)
+                raise SourceReadError("fuyao", source_failure_reason(exc)) from None
             if resp.status_code == 200:
+                try:
+                    body = json.loads(resp.text)
+                except ValueError:
+                    raise SourceReadError("fuyao", "invalid_response") from None
+                if body.get("code") not in (0, None):
+                    reason = "authentication_failed" if body.get("code") in (2001, 2003) else "business_error"
+                    raise SourceReadError("fuyao", reason)
                 return _parse_fuyao_response(resp.text, field, period)
             if resp.status_code not in (429, 500, 502, 503, 504) or attempt == 2:
                 logger.debug("[FuyaoFetcher] non-200 for %s/%s: status=%s", code, field, resp.status_code)
-                return None
+                raise SourceReadError("fuyao", f"http_{resp.status_code}")
             pause = 0.3 * (2 ** attempt)
             if deadline is not None and deadline - time.monotonic() <= pause:
                 return None
@@ -370,8 +417,7 @@ class FuyaoSource:
         try:
             reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：单源异常不影响其他源
-            logger.debug("[FuyaoSource] read %s/%s failed: %s", code, field, exc)
-            return None
+            raise SourceReadError(self.name, source_failure_reason(exc)) from None
         if reading is None:
             return None
         return replace(reading, source=self.name, requested_period=reading.requested_period if reading.requested_period is not None else period if field in _ENDPOINT_BY_FIELD and _ENDPOINT_BY_FIELD[field].needs_period else None)

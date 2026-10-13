@@ -1,70 +1,103 @@
-# -*- coding: utf-8 -*-
-"""主力资金流稳定源编排（KISS · fail-open · 不读 config）。
-
-职责：akshare ``push2his.eastmoney.com`` 在代理/限流环境下不可达、导致
-``get_capital_flow`` 的 ``inflow_5d``/``inflow_10d``/``main_net_inflow`` 全超时为 None 时，
-用 iFinD 多日「主力净流入额」序列作为稳定源算累计，给工具层一个可回填的 dict。
-
-设计（高内聚低耦合）：
-- iFinD 多行序列的「格式解析」留在 ``ifind_fundamental_adapter``（它最懂 iFinD 格式）；
-  本模块只做「源无关」的累计计算 + 编排（取序列 → 算 today/5d/10d）。
-- ``compute_cumulative`` 是纯函数（无 IO），100% 可单测；``get_main_inflow_cumulative``
-  编排 iFinD 单例，fail-open（不可用/失败 → ``{}``）。
-- 本模块**不读 config / 不感知交叉验证开关**——是否启用回填由调用方（data_tools）按开关决定。
+"""Compute capital amounts only from complete, dated, single-source windows.
+Choice A-share CSD NETINFLOW is in yuan (see choice-quantapi-integration.md).
+Legacy iFinD remains available only outside the Choice deployment profile.
 """
-
 from __future__ import annotations
 
-import logging
+from datetime import date, timedelta
+from decimal import Decimal
 from time import monotonic
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Literal, Sequence
 
-logger = logging.getLogger(__name__)
+from icontract import ensure, require
 
-# 求和窗口（对齐 get_capital_flow 的 inflow_5d / inflow_10d）
 _WINDOW_5D = 5
 _WINDOW_10D = 10
-# 请求天数（够 10 日求和；交易日少一两个亦无妨，compute_cumulative 不足 n 求全和）
 _DEFAULT_FETCH_DAYS = 12
 
 
+@require(lambda n: n > 0)
+@ensure(lambda result, trading_dates, n, source_unit: result is None or (source_unit is not None and trading_dates is not None and len(set(trading_dates)) >= n))
 def compute_cumulative(
-    series: Optional[List[Tuple[str, float]]], n: int
-) -> Optional[float]:
-    """对「最新在前」序列取最近 ``n`` 个值求和。
-
-    不足 ``n`` 个则全求和（诚实：有多少算多少）；序列为空/None → None。
-    """
-    if not series:
+    series: Sequence[tuple[str, float | None]] | None, n: int, *,
+    trading_dates: Sequence[str] | None = None,
+    source_unit: Literal["CNY", "CNY_10K"] | None = None,
+) -> Decimal | None:
+    """Return yuan only when every expected trading date has one finite value."""
+    if not trading_dates or source_unit is None:
         return None
-    take = series[: max(1, n)]
-    return float(sum(v for _date, v in take))
+    expected = sorted({date.fromisoformat(d).isoformat() for d in trading_dates}, reverse=True)[:n]
+    if len(expected) < n:
+        return None
+    values: dict[str, Decimal | None] = {}
+    for day, raw in series or ():
+        day = date.fromisoformat(day).isoformat()
+        value = Decimal(str(raw)) if raw is not None else None
+        if value is not None and not value.is_finite():
+            value = None
+        if day in values and values[day] != value:
+            return None
+        values[day] = value
+    if any(values.get(day) is None for day in expected):
+        return None
+    total = sum((value for day in expected if (value := values[day]) is not None), Decimal(0))
+    return total * (10000 if source_unit == "CNY_10K" else 1)
 
 
 def get_main_inflow_cumulative(
-    code: str, days: int = _DEFAULT_FETCH_DAYS, *, deadline: Optional[float] = None
-) -> Dict[str, Any]:
-    """用 iFinD 多日序列算主力净流入 today/5d/10d（稳定源，akshare 不可达时兜底）。
+    code: str, days: int = _DEFAULT_FETCH_DAYS, *, deadline: float | None = None,
+) -> dict[str, Any]:
+    from src.config import get_config
+    if get_config().data_source_profile == "choice":
+        from data_provider.choice_adapter import ChoiceAdapter
+        from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
+        adapter = ChoiceAdapter()
+        end = adapter.completed_day()
+        start = end - timedelta(days=max(60, days))
+        deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_fetch_timeout_seconds
+        result: dict[str, Any] = {"status": "partial", "source": "choice", "currency": "CNY", "source_unit": "CNY",
+                                  "main_net_inflow": None, "inflow_5d": None, "inflow_10d": None,
+                                  "errors": [], "daily_series": [], "coverage": {}}
+        try:
+            expected = sorted(adapter.trading_dates(start, end, deadline=deadline), reverse=True)
+            series = adapter.capital_series(code, start, end, deadline=deadline)
+            result["daily_series"] = [{"date": d, "value": v} for d, v in series]
+            result["expected_date"] = expected[0] if expected else None
+            result["latest_date"] = max((d for d, v in series if v is not None), default=None)
+            by_date = dict(series)
+            for n, field in ((1, "main_net_inflow"), (5, "inflow_5d"), (10, "inflow_10d")):
+                window = expected[:n]
+                missing = [d for d in window if by_date.get(d) is None]
+                amount = compute_cumulative(series, n, trading_dates=expected, source_unit="CNY")
+                complete = amount is not None
+                result[field] = float(amount) if amount is not None else None
+                result["coverage"][str(n)] = {"expected_dates": window, "missing_dates": missing, "complete": complete}
+                if not complete:
+                    result["errors"].append(f"choice:window_{n}_incomplete")
+            if result["main_net_inflow"] is not None:
+                reading = AnchorReading("choice", result["main_net_inflow"], observed_at=result["expected_date"],
+                                        unit="currency_base", currency="CNY", caliber="daily_main_net_inflow", raw_label="CSD NETINFLOW")
+                result["field_meta"] = {"main_inflow": adopted_field_record("main_inflow", reading, AnchorQuality(status="single_source", reason_codes=("single_family",)))}
+            else:
+                result["field_meta"] = {"main_inflow": {"value": None, "rule_eligible": False, "quality": {"status": "missing", "reason_codes": ["window_incomplete"]}}}
+            if not expected:
+                result["errors"].append("choice:calendar_unavailable")
+            result["status"] = "ok" if not result["errors"] else "partial"
+        except SourceReadError as exc:
+            result["status"] = "failed"
+            result["errors"].append(str(exc))
+        return result
 
-    返回 ``{main_net_inflow, inflow_5d, inflow_10d, daily_series, source}``；
-    iFinD 未配置 / 抓取失败 / 空序列 → ``{}``（fail-open，不抛异常）。
-    """
     from data_provider.ifind_fundamental_adapter import IfindFetcher
-
+    from data_provider.cross_source_validator import AnchorReading, adopted_field_record
     fetcher = IfindFetcher.get_instance()
     if not fetcher.available or (deadline is not None and deadline <= monotonic()):
         return {}
     series = fetcher.fetch_main_inflow_series(code, days, **({"deadline": deadline} if deadline is not None else {}))
     if not series:
         return {}
-    from data_provider.cross_source_validator import AnchorReading, adopted_field_record
-    # Legacy series contain scalar values only; they do not prove unit/currency.
     reading = AnchorReading("ifind", series[0][1], observed_at=series[0][0])
-    return {
-        "main_net_inflow": series[0][1],  # 最新日
-        "inflow_5d": compute_cumulative(series, _WINDOW_5D),
-        "inflow_10d": compute_cumulative(series, _WINDOW_10D),
-        "daily_series": [{"date": d, "value": v} for d, v in series],
-        "source": "ifind",
-        "field_meta": {"main_inflow": adopted_field_record("main_inflow", reading, selection_reason="fallback")},
-    }
+    return {"main_net_inflow": series[0][1], "inflow_5d": None, "inflow_10d": None,
+            "daily_series": [{"date": d, "value": v} for d, v in series], "source": "ifind",
+            "errors": ["ifind:window_calendar_and_unit_unconfirmed"],
+            "field_meta": {"main_inflow": adopted_field_record("main_inflow", reading, selection_reason="fallback")}}

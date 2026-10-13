@@ -8,6 +8,7 @@ import { useState, useEffect } from 'react';
 import type { StockIndexItem } from '../types/stockIndex';
 import { preloadStockIndex } from '../utils/stockIndexLoader';
 import type { IndexLoadResult } from '../utils/stockIndexLoader';
+import { useEnabledMarkets } from './useEnabledMarkets';
 
 export interface UseStockIndexResult {
   /** Stock index data */
@@ -28,6 +29,7 @@ export interface UseStockIndexResult {
  * @returns Index state and data
  */
 export function useStockIndex(): UseStockIndexResult {
+  const { markets, error: marketError } = useEnabledMarkets();
   const [index, setIndex] = useState<StockIndexItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
@@ -60,9 +62,9 @@ export function useStockIndex(): UseStockIndexResult {
   }, []);
 
   return {
-    index,
-    loading,
-    error,
+    index: index.filter((item) => markets.includes(item.market === 'HK' ? 'hk' : item.market === 'US' ? 'us' : 'cn')),
+    loading: loading || (markets.length === 0 && !marketError),
+    error: error || marketError,
     fallback,  // Whether fallback
     loaded: !loading,
   };

@@ -127,6 +127,8 @@ def _fetch_trend_data(stock_code: str) -> Any:
 
 def _handle_analyze_trend(stock_code: str) -> dict[str, Any]:
     """Run technical trend analysis on a stock."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
     from src.stock_analyzer import StockTrendAnalyzer
 
     if not (stock_code and str(stock_code).strip()):
@@ -217,6 +219,8 @@ def _handle_calculate_ma(
     stock_code: str, periods: Optional[str] = None, days: int = 120
 ) -> dict[str, Any]:
     """Calculate moving averages for arbitrary periods from historical K-line data."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
     from src.services.history_loader import load_history_df
 
     df, source = load_history_df(stock_code, days=days)
@@ -313,6 +317,8 @@ calculate_ma_tool = ToolDefinition(
 
 def _handle_get_volume_analysis(stock_code: str, days: int = 30) -> dict[str, Any]:
     """Analyse volume-price patterns over recent trading days."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
     from src.services.history_loader import load_history_df
     import pandas as pd
 
@@ -447,6 +453,8 @@ get_volume_analysis_tool = ToolDefinition(
 
 def _handle_analyze_pattern(stock_code: str, days: int = 60) -> dict[str, Any]:
     """Detect common candlestick and chart patterns in recent price history."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
     from src.services.history_loader import load_history_df
 
     df, source = load_history_df(stock_code, days=max(days, 120))

@@ -25,7 +25,7 @@ def financial_field_quality(fund: Dict[str, Any], field: str) -> FinancialFieldQ
         metadata = {}
     reading = reading_from_field_record(fund.get(_FUNDAMENTAL_FIELDS[field]), metadata)
     if reading is None:
-        return FinancialFieldQuality(quality=AnchorQuality(status="missing"))
+        return FinancialFieldQuality(quality=AnchorQuality(status="missing", reason_codes=tuple((metadata.get("quality") or {}).get("reason_codes") or ())))
     quality = AnchorQuality.model_validate_json(json.dumps(metadata.get("quality") or {"status": "unverified"})) if reading.normalization_error != "metadata_invalid" else AnchorQuality()
     record = adopted_field_record(field, reading, quality, selection_reason=metadata.get("selection_reason", "unknown"))
     return FinancialFieldQuality(reading=reading, quality=quality, rule_eligible=record["rule_eligible"], input_reasons=tuple(record["input_reasons"]), selection_reason=record["selection_reason"])
@@ -49,6 +49,7 @@ def _band(value: Optional[float], bands: list[tuple[float, float, str]]) -> tupl
 
 @ensure(lambda result: result.data_quality is not None and result.data_quality.rule_usable_count <= result.data_quality.obtained_count, "Usable fields must have been acquired")
 @ensure(lambda result: result.data_quality is not None and (result.health_score is None) == (result.data_quality.health_components == 0), "Health exists exactly when a component participates")
+@ensure(lambda ctx, result: result.financial_safety.get("leverage") is None or abs(Decimal(str(result.financial_safety["leverage"])) - Decimal(str(ctx.fundamental["balance_sheet"]["liabilities"])) / Decimal(str(ctx.fundamental["balance_sheet"]["assets"])) * 100) <= Decimal("0.005"), "Debt ratio uses assets and liabilities from the same balance sheet")
 def build_fundamental_dim(
     ctx: SharedContext,
     llm_scenarios: Optional[Dict[str, Any]] = None,
@@ -112,11 +113,19 @@ def build_fundamental_dim(
         gaps.append("净利增速")
 
     inst = fund.get("institution_holding_change")
+    balance = fund.get("balance_sheet") or {}
+    assets, liabilities = balance.get("assets"), balance.get("liabilities")
+    leverage = None
+    if balance.get("source") == "choice" and balance.get("currency") == "CNY" and balance.get("unit") == "currency_base" and balance.get("period") and balance.get("disclosed_at") and isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)) and assets > 0 and liabilities >= 0:
+        leverage = float(round(Decimal(str(liabilities)) / Decimal(str(assets)) * 100, 2))
     financial_safety = {
         "institution_holding_change": inst,
-        "leverage": None,  # 数据源暂无 → 缺口
+        "leverage": leverage,
+        "period": balance.get("period"),
+        "source": balance.get("source"),
     }
-    gaps.append("资产负债结构")
+    if leverage is None:
+        gaps.append("资产负债结构")
 
     valuation = score_valuation(
         usable["pe_ratio"],
@@ -137,7 +146,7 @@ def build_fundamental_dim(
     n = sum(evidence.reading is not None for evidence in fields.values())
     m = sum(evidence.rule_eligible for evidence in fields.values())
     complete = m == 6 and len(scores) == 5
-    warnings = ["各字段仅按自身证据使用，组件完整不代表同期财报。", "规则评分置信度与跨源核验状态分别解释。"]
+    warnings = list(dict.fromkeys(fund.get("errors") or [])) + ["各字段仅按自身证据使用，组件完整不代表同期财报。", "规则评分置信度与跨源核验状态分别解释。"]
     if not all(evidence.quality.status == "verified" for evidence in fields.values()):
         warnings.append("财务字段尚未全部独立核验；未核验、单源、不可比或冲突限制详见字段证据。")
     if not complete:

@@ -224,6 +224,10 @@ def _generate_final_conclusion(
     """
     import json
     import re
+    from src.deep_research_dims.manager_writeup import INCOMPLETE_EVIDENCE_NOTE, manager_evidence_complete
+
+    if not manager_evidence_complete(dims):
+        return INCOMPLETE_EVIDENCE_NOTE
 
     signal = dims.get("signal")
     conclusion = dims.get("conclusion")
@@ -430,9 +434,11 @@ def run_dual_track(
     )
     from src.schemas.deep_research_dims import parse_dim as _parse_dim
 
+    context_dims = {"data", "technical", "capital", "fundamental", "sector", "six_dim", "scenarios"}
+
     def try_cache(dim_id: str) -> Optional[DimEnvelope]:
         """命中未过期缓存则直接载入该维度（force_refresh 时跳过）。"""
-        if force_refresh or dim_id not in CACHEABLE_DIMS:
+        if force_refresh or dim_id not in CACHEABLE_DIMS or dim_id in context_dims:
             return None
         payload = load_cached_dim(stock_code, dim_id)
         if payload is None:
@@ -453,19 +459,27 @@ def run_dual_track(
 
         write_cache=False（批量桥接场景）：只读缓存不写。
         cache_exclude：按维度排除——如批量场景跳过情景维度（其叙述为空，固化后
-        web 端缓存命中会拿到无叙述 payload）；探索/评分类维度 payload 与叙述无关，
-        批量写入仍能让次日命中省下探索 Agent。
+        web 端缓存命中会拿到无叙述 payload）；可复用探索资料允许写入，
+        行情派生维度每次按当前快照计算。
         """
         if not write_cache:
             return
         if cache_exclude and dim_id in cache_exclude:
             return
-        if dim.status == "ok" and dim_id in CACHEABLE_DIMS:
+        if dim.status == "ok" and dim_id in CACHEABLE_DIMS and dim_id not in context_dims:
             save_cached_dim(stock_code, dim_id, dim.model_dump())
 
     # ---- 阶段 0 + 前置 S2 ----
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
-    ctx = build_shared_context(stock_code, stock_name)
+    from data_provider.mx_data_adapter import financial_refresh
+    from uuid import uuid4
+    refresh_marker = (stock_code, uuid4().hex) if force_refresh else None
+    refresh_token = financial_refresh.set(refresh_marker) if refresh_marker else None
+    try:
+        ctx = build_shared_context(stock_code, stock_name)
+    finally:
+        if refresh_token is not None:
+            financial_refresh.reset(refresh_token)
     _perf_mark("stage0_context")
 
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力/筹码）..."})
@@ -546,6 +560,14 @@ def run_dual_track(
         (d, globals()[RUNNER_NAMES[d]]) for d in researcher_dim_ids if d in selected
     ]
     if active_researchers:
+        def run_researcher(runner: Callable[..., Dict[str, Any]]) -> Dict[str, Any]:
+            token = financial_refresh.set(refresh_marker) if refresh_marker else None
+            try:
+                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
+            finally:
+                if token is not None:
+                    financial_refresh.reset(token)
+
         with ThreadPoolExecutor(max_workers=5) as pool:
             futures: Dict[Any, str] = {}
             for dim_id, runner in active_researchers:
@@ -556,8 +578,7 @@ def run_dual_track(
                 start_dim(dim_id)
                 futures[
                     pool.submit(
-                        runner, stock_code, stock_name, llm_adapter,
-                        progress_callback, explore_max_steps,
+                        run_researcher, runner,
                     )
                 ] = dim_id
 
@@ -846,7 +867,7 @@ def run_dual_track(
     result.status = status
     result.markdown = markdown
     result.dims = dims
-    result.dims_payload = {d: m.model_dump() for d, m in dims.items()}
+    result.dims_payload = {d: m.model_dump(mode="json") for d, m in dims.items()}
     result.total_steps = steps_total
     result.provider = ""
     result.error = None if result.success else "维度降级过多，报告不可用"

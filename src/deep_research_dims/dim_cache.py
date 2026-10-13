@@ -48,15 +48,18 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 7  # BusinessDim 四字段为 Dict；F1结构仅由财务mapping版本隔离
+SCHEMA_VERSION = 9  # Choice research inputs, capital amounts and truthful completeness
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 15  # 股东等指标词不再误判单位，拒读旧财务资格
+FUNDAMENTAL_MAPPING_VERSION = 18  # Choice latest-period balance sheet and research evidence
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 
 def _cache_path(stock_code: str, dim: str) -> str:
-    return os.path.join(_CACHE_DIR, f"{stock_code}_{dim}.json")
+    from src.config import get_config
+    contract = get_config().data_source_contract
+    suffix = "" if contract == "legacy" else f"_{contract}"
+    return os.path.join(_CACHE_DIR, f"{stock_code}{suffix}_{dim}.json")
 
 
 def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:

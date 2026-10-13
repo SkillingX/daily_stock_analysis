@@ -38,12 +38,12 @@ def coerce_value(key: str, value: Any) -> Any:
                 if isinstance(value.get(sub), (int, float)):
                     return value[sub]
             return None
-        for sub in ("summary", "note", "text", "reason"):
+        for sub in ("summary", "note", "text", "reason", "interpretation", "description", "analysis"):
             if isinstance(value.get(sub), str):
                 return value[sub]
         import json as _json
 
-        return _json.dumps(value, ensure_ascii=False)[:300]
+        return _json.dumps(value, ensure_ascii=False)
     return str(value)
 
 
@@ -63,7 +63,8 @@ def generic_parse(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[DimE
             payload[k] = v if isinstance(v, dict) else ({} if v is None else {"value": v})
         else:
             payload[k] = coerce_value(k, v)
-    payload["status"] = "ok"
+    # Parsing succeeds independently of whether the research is complete.
+    payload["status"] = "degraded" if payload.get("status") == "degraded" or payload.get("degraded_reason") else "ok"
     return model(**payload), steps
 
 
@@ -71,15 +72,6 @@ def _coerce_list(dim_id: str, key: str, value: list) -> list:
     """List[dict] → List[str]，对 ownership 三字段取 dict["name"] 拼字符串；其余原样返回。"""
     ownership_list_keys = {"top_holders", "executives", "recent_changes"}
     if dim_id == "ownership" and key in ownership_list_keys:
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                name = item.get("name") or item.get("holder_name") or str(item)
-            elif isinstance(item, str):
-                name = item
-            else:
-                name = str(item)
-            result.append(HolderInfo(name=name))
-        return result
+        return [item if isinstance(item, HolderInfo) else HolderInfo.model_validate(item) for item in value]
     # 普通 list（如 List[str]）原样返回
     return value

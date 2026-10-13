@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_core import to_json
 
 from data_provider.cross_source_validator import AnchorQuality, AnchorReading
@@ -31,7 +31,7 @@ from src.schemas.report_schema import (
 )
 from src.schemas.research_framework import ResearchFramework
 from src.schemas.supply_chain import SupplyChain
-from src.schemas.value_scenarios import ValueScenarios
+from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
 
 DimId = Literal[
@@ -272,7 +272,9 @@ class ScenariosDim(DimEnvelope):
     scenarios: Optional[ValueScenarios] = None
     probability_sum: float = Field(0.0, ge=0, le=2)
     expected_value: Optional[float] = Field(None, gt=0)
-    valuation_basis: Literal["PE_TTM", "PB", "PS", "none"] = "none"
+    valuation_basis: Literal["PE_TTM", "PB", "PS", "analyst_consensus", "none"] = "none"
+    analyst_target: Optional[AnalystTarget] = None
+    target_price: Optional[float] = Field(None, gt=0)
     current_pe_ttm: Optional[float] = None
     # 时间层级路径（段三）：每周期一句"条件→目标位"，由 LLM 生成机器不背书数字
     time_paths: Dict[str, str] = Field(default_factory=dict)
@@ -377,9 +379,32 @@ class SentimentDim(DimEnvelope):
 
 
 class HolderInfo(BaseModel):
-    """股权信息条目：姓名 + 来源等级。"""
-    name: str
-    source: Optional[str] = None  # news/announcement/knowledge_base/inferred
+    """Named ownership evidence with its original detail and source."""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    name: str = Field(min_length=1)
+    source: Optional[str] = None
+    detail: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_report_entry(cls, value: Any) -> Any:
+        import ast
+        if isinstance(value, str):
+            value = {"name": value}
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        name = data.get("name")
+        if isinstance(name, str) and name.lstrip().startswith("{"):
+            try:
+                recovered = ast.literal_eval(name)
+            except (ValueError, SyntaxError, RecursionError):
+                recovered = None
+            if isinstance(recovered, dict):
+                data = {**recovered, **{key: item for key, item in data.items() if key != "name" and item is not None}}
+        title = data.get("name") or data.get("holder_name") or data.get("title") or data.get("rank_or_note") or data.get("role") or "资料缺失"
+        parts = [str(data[key]) for key in ("date", "type", "detail", "description", "change", "position", "holding_ratio", "shares") if data.get(key) is not None]
+        return {"name": title, "source": data.get("source"), "detail": "；".join(parts) or None}
 
 
 class OwnershipDim(DimEnvelope):

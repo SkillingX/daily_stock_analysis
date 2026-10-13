@@ -100,7 +100,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_manager_skips_unconfigured_optional_fetchers(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             tushare_token="",
             longbridge_app_key="",
             longbridge_app_secret="",
@@ -157,7 +157,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_manager_enables_longbridge_with_oauth_client_id(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             tushare_token="",
             longbridge_app_key="",
             longbridge_app_secret="",
@@ -196,7 +196,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_us_realtime_route_skips_temporarily_unavailable_longbridge(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             enable_realtime_quote=True,
             realtime_source_priority="efinance,akshare_em,tushare",
         )
@@ -222,7 +222,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_us_realtime_route_marks_longbridge_fallback_when_secondary_succeeds(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             enable_realtime_quote=True,
             realtime_source_priority="efinance,akshare_em,tushare",
             realtime_cache_ttl=600,
@@ -252,7 +252,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_us_daily_route_skips_temporarily_unavailable_longbridge(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             longbridge_app_key="app-key",
             longbridge_app_secret="app-secret",
             longbridge_access_token="access-token",
@@ -279,7 +279,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_hk_daily_route_skips_temporarily_unavailable_longbridge(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace(
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
             longbridge_app_key="app-key",
             longbridge_app_secret="app-secret",
             longbridge_access_token="access-token",
@@ -307,7 +307,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_skips_repeatedly_failing_source(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy", )
         DataFetcherManager.reset_daily_source_health()
         try:
             flaky = MagicMock()
@@ -340,7 +340,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_does_not_skip_source_after_empty_results(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy", )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()
@@ -373,7 +373,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_does_not_preconsume_half_open_fallback(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy", )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()
@@ -413,7 +413,7 @@ class TestFetcherSourceOptimization(unittest.TestCase):
 
     @patch("src.config.get_config")
     def test_daily_source_health_releases_half_open_probe_after_empty_result(self, mock_get_config):
-        mock_get_config.return_value = SimpleNamespace()
+        mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy", )
         DataFetcherManager.reset_daily_source_health()
         try:
             primary = MagicMock()

@@ -86,6 +86,9 @@ class TaskService:
         Returns:
             任务信息字典
         """
+        from src.core.market_policy import require_stock_market
+        require_stock_market(code)
+
         # 确保 report_type 是枚举类型
         if isinstance(report_type, str):
             report_type = ReportType.from_str(report_type)
@@ -172,6 +175,8 @@ class TaskService:
             logger.info(f"[TaskService] 开始分析股票: {code}")
 
             # 创建分析管道
+            from src.core.market_policy import require_stock_market
+            require_stock_market(code)
             config = get_config()
             pipeline = StockAnalysisPipeline(
                 config=config,

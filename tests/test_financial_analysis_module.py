@@ -19,6 +19,16 @@ FAKE_ANALYSIS = {
 }
 
 
+def valuation_snapshot(pe: float, pb: float) -> dict:
+    from data_provider.cross_source_validator import AnchorReading, adopted_field_record
+    return {"pe_ttm": pe, "pb": pb, "field_meta": {
+        field: adopted_field_record(field, AnchorReading(
+            "choice", value, caliber=caliber, unit="multiple", observed_at="2026-10-13",
+            statement_scope="consolidated", adjustment="unadjusted",
+        )) for field, value, caliber in (("pe_ratio", pe, "TTM"), ("pb_ratio", pb, "MRQ"))
+    }}
+
+
 class TestScoreDims:
     def test_scissors_penalty(self):
         from src.services.financial_analysis_service import _score_dims
@@ -29,7 +39,7 @@ class TestScoreDims:
             {"year": 2024, "revenue": 100.0, "net_profit": 15.0, "gross_margin": 32.0,
              "roe": 14.0, "debt_ratio": 38.0, "op_cash_flow": 14.0},
         ], "valuation": {"pe_ttm": 20.0, "pb_mrq": 3.0}}
-        out = _score_dims(series, {})
+        out = _score_dims(series, valuation_snapshot(20.0, 3.0))
         assert out["scissors"] == round((10.0 - 15.0) / 15.0 * 100 - 20.0, 2)
         assert out["scissors"] < -10
         assert out["gaps"] == []
@@ -40,7 +50,7 @@ class TestScoreDims:
         series = {"years": [{"year": 2025, "revenue": 100.0, "net_profit": -5.0,
                              "gross_margin": 10.0, "roe": -5.0, "debt_ratio": 60.0}],
                   "valuation": {"pe_ttm": -8.0, "pb_mrq": 2.0}}
-        out = _score_dims(series, {})
+        out = _score_dims(series, valuation_snapshot(-8.0, 2.0))
         assert "PB" in out["valuation"]["summary"]
 
 
