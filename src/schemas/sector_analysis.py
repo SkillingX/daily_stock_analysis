@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +143,19 @@ class ProsperityPillar(_StrictBase):
     activity: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     capital: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     breadth: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-    rank_of: Optional[int] = Field(default=None, ge=1, le=200)
-    total_boards: Optional[int] = Field(default=None, ge=1, le=200)
+    rank_of: Optional[int] = Field(default=None, ge=1)
+    total_boards: Optional[int] = Field(default=None, ge=1)
     row: ProsperityRow = Field(default_factory=ProsperityRow)
     gaps: List[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
         default_factory=list,
         max_length=10,
     )
+
+    @model_validator(mode="after")
+    def validate_rank(self) -> ProsperityPillar:
+        if self.rank_of is not None and self.total_boards is not None and self.rank_of > self.total_boards:
+            raise ValueError("Board rank cannot exceed the observed board population")
+        return self
 
 
 class SectorAnalysisWeights(_StrictBase):

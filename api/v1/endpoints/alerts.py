@@ -46,6 +46,9 @@ def _not_found(exc: Exception) -> HTTPException:
 
 
 def _internal_error(message: str, exc: Exception) -> HTTPException:
+    from src.core.market_policy import MarketDisabledError
+    if isinstance(exc, MarketDisabledError):
+        return _bad_request(exc, error="market_disabled")
     logger.error("%s: %s", message, exc, exc_info=True)
     return HTTPException(
         status_code=500,

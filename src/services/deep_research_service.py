@@ -40,7 +40,8 @@ def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
     dims 指纹：省钱模式下不同维度子集各自独立缓存，避免全量/子集报告互相串包。
     """
     dims_fp = ",".join(sorted(d for d in (dims or []) if d)) or "full"
-    return f"{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
+    from src.config import get_config
+    return f"{get_config().data_source_contract}:{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）
@@ -138,6 +139,9 @@ def normalize_a_share(raw_code: str) -> str:
     A 股 = 归一化后 6 位纯数字（沪深京：60xxxx/00xxxx/30xxxx/688xxx/920xxx/430xxx/83xxxx）。
     非 A 股抛 ``DeepResearchInputError``（endpoint 转为 HTTP 400）。
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(raw_code)
+
     if not raw_code or not str(raw_code).strip():
         raise DeepResearchInputError("股票代码不能为空")
 
@@ -186,7 +190,7 @@ class DeepResearchService:
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
-            if cached:
+            if cached and cached[2].get("status") in ("success", "ok"):
                 cached_id, cached_ts, cached_result = cached
                 logger.info(
                     "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
@@ -325,6 +329,9 @@ class DeepResearchService:
             # 清理超额（事务内删元数据，事务外删文件）
             self._prune_and_clean_files(_max_reports())
 
+        # Use the same saved-report presentation as detail and download.
+        from src.deep_research_dims.render import normalize_saved_markdown
+        markdown = normalize_saved_markdown(markdown)
         done_event: Dict[str, Any] = {
             "type": "done",
             "report_id": report_id if write_ok else None,
@@ -368,7 +375,7 @@ class DeepResearchService:
             )
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
-        if write_ok and return_dict.get("markdown"):
+        if write_ok and return_dict.get("markdown") and return_dict.get("status") in ("success", "ok"):
             cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:
@@ -396,7 +403,7 @@ class DeepResearchService:
         if record is None:
             return None
         data = record.to_dict()
-        # 读取 Markdown 正文
+        from src.deep_research_dims.render import normalize_saved_markdown
         markdown = ""
         try:
             md_path = Path(record.md_path)
@@ -404,7 +411,7 @@ class DeepResearchService:
                 markdown = md_path.read_text(encoding="utf-8")
         except OSError as exc:
             logger.warning("[DeepResearch] 读取报告正文失败 %s: %s", record.md_path, exc)
-        data["markdown"] = markdown
+        data["markdown"] = normalize_saved_markdown(markdown)
         return data
 
     def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:
@@ -461,11 +468,12 @@ class DeepResearchService:
         path = self._dim_report_path(report_id, dim_id)
         if path is None:
             return None
+        from src.deep_research_dims.render import normalize_saved_markdown
         try:
             return {
                 "dim": dim_id,
                 "path": str(path),
-                "markdown": path.read_text(encoding="utf-8"),
+                "markdown": normalize_saved_markdown(path.read_text(encoding="utf-8")),
             }
         except OSError as exc:
             logger.warning("[DeepResearch] 读维度子报告失败 %s: %s", path, exc)
@@ -531,7 +539,8 @@ class DeepResearchService:
         md_path = Path(record.md_path)
         if not md_path.exists():
             return None
-        markdown = md_path.read_text(encoding="utf-8")
+        from src.deep_research_dims.render import normalize_saved_markdown
+        markdown = normalize_saved_markdown(md_path.read_text(encoding="utf-8"))
         pdf_path = str(md_path.with_suffix(".pdf"))
 
         result_path = markdown_to_pdf_file(markdown, pdf_path)

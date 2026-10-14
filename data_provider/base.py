@@ -15,6 +15,7 @@
 """
 
 import logging
+import json
 import os
 import random
 import re
@@ -688,16 +689,18 @@ class DataFetcherManager:
         # first use. Only spin it up when both endpoint and token are
         # configured; tests that do not mock ``_tushare_ifind_adapter``
         # get a no-op adapter and stay network-free.
+        from src.config import get_config
+        choice_profile = get_config().data_source_profile == "choice"
         ifind_source: Optional[Any] = None
         try:
-            if os.getenv("IFIND_MCP_TOKEN") and os.getenv("IFIND_MCP_ENDPOINT"):
+            if not choice_profile and os.getenv("IFIND_MCP_TOKEN") and os.getenv("IFIND_MCP_ENDPOINT"):
                 ifind_source = IfindSource(fetcher=IfindFetcher.get_instance())
         except Exception:  # noqa: BLE001
             ifind_source = None
         self._tushare_ifind_adapter = TushareIfindFundamentalAdapter(
             ifind_source=ifind_source, tushare_token=tushare_token
         )
-        self._mx_source = MXSource()
+        self._mx_source = None if choice_profile else MXSource()
         self._tickflow_fetcher = None
         self._tickflow_api_key: Optional[str] = None
         self._tickflow_lock = RLock()
@@ -2874,7 +2877,7 @@ class DataFetcherManager:
                     from dataclasses import replace
                     reading = replace(reading, is_stale=True)
                 from data_provider.cross_source_validator import AnchorQuality
-                quality = AnchorQuality(status="conflict") if (record.get("quality") or {}).get("status") == "conflict" else None
+                quality = AnchorQuality.model_validate_json(json.dumps(record.get("quality") or {}))
                 metadata[field] = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
         return {
             "status": status,
@@ -3135,6 +3138,11 @@ class DataFetcherManager:
     def _should_cache_fundamental_context(context: Any) -> bool:
         if not isinstance(context, dict):
             return False
+        if context.get("market") == "cn":
+            valuation = (context.get("valuation") or {}).get("data") or {}
+            growth = (context.get("growth") or {}).get("data") or {}
+            if any(valuation.get(key) is None for key in ("pe_ratio", "pb_ratio")) or any(growth.get(key) is None for key in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")):
+                return False
         status = str(context.get("status", "")).strip().lower()
         if status == "ok":
             return True
@@ -3296,7 +3304,7 @@ class DataFetcherManager:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
-                    if age <= cache_ttl:
+                    if age <= cache_ttl and self._should_cache_fundamental_context(cache_item.get("context")):
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         result_ctx: Dict[str, Any] = {
@@ -3586,6 +3594,9 @@ class DataFetcherManager:
                 budget_seconds=budget_seconds,
             )
 
+        if getattr(config, "data_source_profile", "legacy") == "choice":
+            return self._build_choice_fundamental_context(stock_code, budget_seconds)
+
         stage_timeout = float(
             budget_seconds
             if budget_seconds is not None
@@ -3608,7 +3619,7 @@ class DataFetcherManager:
                 cache_item = self._fundamental_cache.get(cache_key)
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
-                    if age <= cache_ttl:
+                    if age <= cache_ttl and self._should_cache_fundamental_context(cache_item.get("context")):
                         return cast(Dict[str, Any], cache_item.get("context", {}))
 
         remaining_seconds = stage_timeout
@@ -3634,7 +3645,7 @@ class DataFetcherManager:
             remaining_seconds = max(0.0, min(remaining_seconds - consumed_ms / 1000.0, stage_deadline - time.monotonic()))
 
         mx_reserved = min(fetch_timeout, stage_timeout / 3) if self._mx_source.available else 0.0
-        valuation_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
+        valuation_timeout = min(fetch_timeout, stage_timeout / 3, max(0.0, remaining_seconds - mx_reserved))
         if valuation_timeout > 0:
             quote_payload, valuation_err, valuation_ms = self._run_with_retry(
                 lambda: self.get_realtime_quote(stock_code),
@@ -3706,7 +3717,7 @@ class DataFetcherManager:
         else:
             bundle_timeout = min(fetch_timeout, max(0.0, remaining_seconds - mx_reserved))
             bundle_payload, bundle_err_msg, bundle_ms = self._run_with_retry(
-                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code),
+                lambda: self._fundamental_adapter.get_financial_indicators(stock_code),
                 bundle_timeout,
                 "fundamental_bundle",
             )
@@ -3864,7 +3875,9 @@ class DataFetcherManager:
                     _mx_bundle = _mx_payload if isinstance(_mx_payload, dict) else None
                     if _mx_error:
                         bundle_errors.append(_mx_error)
-                    if isinstance(_mx_bundle, dict):
+                    if isinstance(_mx_bundle, dict) and _mx_bundle.get("error"):
+                        bundle_errors.append(str(_mx_bundle["error"]))
+                    if isinstance(_mx_bundle, dict) and not _mx_bundle.get("error"):
                         _mx_period_raw = _mx_bundle.get("_mx_period")
                         from data_provider.cross_source_validator import adopted_field_record
                         for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin"):
@@ -3876,8 +3889,9 @@ class DataFetcherManager:
                             record = adopted_field_record(field, reading, selection_reason="fallback")
                             self._fill_growth_fields(growth_payload, {field: record["value"], "field_meta": {field: record}}, "fallback_mx")
                             _mx_filled = _mx_filled or growth_payload.get(field) is not None
-                except Exception:  # noqa: BLE001 — fail-open
-                    _mx_bundle = None
+                except Exception as exc:  # noqa: BLE001 — isolated source failure
+                    bundle_errors.append(str(exc))
+                    _mx_bundle = {"error": str(exc)}
 
                 # If batch query missed any field, fall back to per-field read()
                 for _mx_field in (
@@ -3886,7 +3900,7 @@ class DataFetcherManager:
                     "roe",
                     "gross_margin",
                 ):
-                    if growth_payload.get(_mx_field) is None:
+                    if growth_payload.get(_mx_field) is None and not (_mx_bundle or {}).get("error"):
                         try:
                             _mx_ar, _mx_error, _ = self._run_with_timeout(
                                 lambda field=_mx_field: self._mx_source.read(stock_code, field, deadline=mx_deadline),
@@ -3902,8 +3916,8 @@ class DataFetcherManager:
                                     _mx_filled = True
                                     if _mx_ar.period and not _mx_period_raw:
                                         _mx_period_raw = _mx_ar.period
-                        except Exception:  # noqa: BLE001 — fail-open
-                            pass
+                        except Exception as exc:  # noqa: BLE001 — isolated source failure
+                            bundle_errors.append(str(exc))
 
                 mx_valuation_filled = False
                 for field in ("pe_ratio", "pb_ratio"):
@@ -3950,6 +3964,24 @@ class DataFetcherManager:
                         result_ctx["as_of"] = (
                             f"{mx_period_norm[:4]}-{mx_period_norm[4:6]}-{mx_period_norm[6:8]}"
                         )
+
+        # Auxiliary calls may time out; core financials have already been retained.
+        _consume_budget(0)
+        if remaining_seconds > 0:
+            auxiliary, auxiliary_error, auxiliary_ms = self._run_with_timeout(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(stock_code, financials={
+                    "status": bundle_status, "growth": growth_payload, "earnings": earnings_payload,
+                    "institution": institution_payload, "source_chain": [], "errors": [],
+                }), min(fetch_timeout, remaining_seconds), "fundamental_auxiliary",
+            )
+            _consume_budget(auxiliary_ms)
+            if isinstance(auxiliary, dict):
+                earnings_payload = auxiliary.get("earnings", earnings_payload)
+                institution_payload = auxiliary.get("institution", institution_payload)
+                bundle_errors.extend(auxiliary.get("errors") or [])
+                bundle_chain.extend(self._normalize_source_chain(auxiliary.get("source_chain", []), "fundamental_auxiliary", auxiliary.get("status", "partial"), auxiliary_ms))
+            if auxiliary_error:
+                bundle_errors.append(auxiliary_error)
 
         # Derive TTM dividend yield from already-fetched quote price; avoid extra quote calls.
         earnings_extra_errors: List[str] = []
@@ -4142,6 +4174,77 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
+    def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float]) -> Dict[str, Any]:
+        from src.config import get_config
+        from data_provider.choice_adapter import ChoiceAdapter
+        from data_provider.mx_data_adapter import financial_refresh
+        config = get_config()
+        budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
+        deadline = time.monotonic() + budget
+        key = f"{ChoiceAdapter.contract_version}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        refresh = financial_refresh.get()
+        self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
+        if not (refresh and refresh[0] == code):
+            with self._fundamental_cache_lock:
+                cached = self._fundamental_cache.get(key)
+                if cached is not None:
+                    return cast(Dict[str, Any], cached["context"])
+        if _is_etf_code(code):
+            return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline)
+        errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
+        # Only attempt licensed public supplements for holes, within the same deadline.
+        missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
+        if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline:
+            bundle, error, _ = self._run_with_timeout(
+                lambda: self._tushare_ifind_adapter.get_fundamental_bundle(code, snapshot["report_date"], fields=missing, include_institution=False, deadline=deadline),
+                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_supplement",
+            )
+            if error:
+                errors.append(error)
+            elif isinstance(bundle, dict):
+                from data_provider.cross_source_validator import reading_from_field_record, reading_input_reasons
+                growth = bundle.get("growth") or {}
+                for field in missing:
+                    record = (growth.get("field_meta") or {}).get(field) or {}
+                    reading = reading_from_field_record(growth.get(field), record)
+                    if reading is not None and not reading_input_reasons(reading, field) and reading.period == snapshot["report_date"] and reading.statement_scope == "consolidated" and reading.adjustment == "restated" and reading.raw_currency == "CNY":
+                        snapshot["growth"][field] = reading.value
+                        snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
+        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": ChoiceAdapter.contract_version,
+                                  "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
+        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
+            payload = dict(snapshot[block])
+            payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
+            status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
+            chain = [{"provider": "choice", "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)}]
+            result[block] = self._build_fundamental_block(status, payload, chain, errors)
+            result["source_chain"].extend(chain)
+        seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
+        auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
+            lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),
+            min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_details",
+        )
+        auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+        auxiliary_errors = auxiliary.get("errors", []) + ([auxiliary_error] if auxiliary_error else [])
+        errors.extend(auxiliary_errors)
+        for block in ("earnings", "institution"):
+            payload = auxiliary.get(block) or {}
+            status = "partial" if self._has_meaningful_payload(payload) else "failed" if auxiliary_errors else "not_supported"
+            chain = self._normalize_source_chain(auxiliary.get("source_chain", []), "public_details", status, cost_ms)
+            result[block] = self._build_fundamental_block(status, payload, chain, auxiliary_errors)
+        for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
+            result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
+            errors.extend(result[block].get("errors") or [])
+        result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()))
+        errors.extend(result["capital_flow"].get("errors") or [])
+        result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
+        result["status"] = "partial"
+        if not errors and self._should_cache_fundamental_context(result):
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "context": result}
+        return result
+
     def get_capital_flow_context(
         self, stock_code: str, budget_seconds: Optional[float] = None
     ) -> Dict[str, Any]:
@@ -4181,6 +4284,21 @@ class DataFetcherManager:
                     }
                 ],
                 ["fundamental stage timeout"],
+            )
+        if config.data_source_profile == "choice":
+            from data_provider.capital_flow_provider import get_main_inflow_cumulative
+            deadline = time.monotonic() + timeout
+            stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline)
+            # Sector flows have their own definition; retain their public path.
+            sector, sector_error, cost_ms = self._run_with_timeout(
+                lambda: self._fundamental_adapter.get_capital_flow(stock_code, include_stock=False),
+                max(0.0, deadline - time.monotonic()), "capital_sector",
+            )
+            sector = sector if isinstance(sector, dict) else {}
+            return self._build_fundamental_block(
+                "ok" if stock_flow["status"] == "ok" and not sector_error and not sector.get("errors") else "partial", {"stock_flow": stock_flow, "sector_rankings": sector.get("sector_rankings", {})},
+                [{"provider": "choice", "result": stock_flow["status"], "duration_ms": cost_ms}],
+                stock_flow["errors"] + sector.get("errors", []) + ([sector_error] if sector_error else []),
             )
         payload, err, cost_ms = self._run_with_retry(
             lambda: self._fundamental_adapter.get_capital_flow(stock_code),

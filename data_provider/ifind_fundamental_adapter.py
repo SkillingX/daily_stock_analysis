@@ -34,7 +34,7 @@ import threading
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
+from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +297,10 @@ def _parse_ifind_response(
         if isinstance(resp_json, dict)
         else str(raw_text)
     )
+    if any(term in answer for term in ("用量已耗尽", "调用次数已达到上限", "额度耗尽")):
+        raise SourceReadError("ifind", "quota_exhausted")
+    if any(term in answer for term in ("未认证", "无权限", "权限不足", "Token已过期")):
+        raise SourceReadError("ifind", "authentication_failed")
     table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords, field=field)
     if not table:
         return None
@@ -431,13 +435,13 @@ class IfindFetcher:
         try:
             future = asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] submit failed: %s", exc)
+            logger.debug("[IfindFetcher] submit failed: %s", source_failure_reason(exc))
             return None
         try:
             wait = timeout if timeout is not None else self._timeout + 2.0
             return future.result(timeout=wait)
         except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] future failed: %s", exc)
+            logger.debug("[IfindFetcher] future failed: %s", source_failure_reason(exc))
             return None
 
     def fetch(
@@ -460,8 +464,8 @@ class IfindFetcher:
             call = self._async_fetch(code, field, period, deadline=deadline)
             return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] fetch %s/%s failed: %s", code, field, exc)
-            return None
+            logger.debug("[IfindFetcher] fetch %s/%s failed: %s", code, field, source_failure_reason(exc))
+            raise SourceReadError("ifind", source_failure_reason(exc)) from None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，Phase 1 已验证连通性
         self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
@@ -522,17 +526,19 @@ class IfindFetcher:
                 )
                 return _parse_ifind_response(raw_text, keywords, field, period)
             except Exception as exc:  # noqa: BLE001 — fail-open
-                last_error = str(exc)
+                last_error = source_failure_reason(exc)
                 logger.debug(
                     "[IfindFetcher] attempt %d failed for %s/%s: %s",
                     attempt + 1,
                     code,
                     field,
-                    exc,
+                    source_failure_reason(exc),
                 )
+                if isinstance(exc, SourceReadError):
+                    raise
                 continue
-        logger.debug("[IfindFetcher] giving up on %s/%s: %s", code, field, last_error)
-        return None
+        raise SourceReadError("ifind", last_error or "source_error")
+
 
     async def _ensure_session(self) -> Any:
         """Open the shared MCP session on first use; reuse thereafter.
@@ -600,7 +606,7 @@ class IfindFetcher:
             call = self._async_fetch_series(code, days, deadline=deadline)
             return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
         except Exception as exc:  # pragma: no cover  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] series %s failed: %s", code, exc)
+            logger.debug("[IfindFetcher] series %s failed: %s", code, source_failure_reason(exc))
             return None
 
     async def _async_fetch_series(  # pragma: no cover — 真实 MCP 调用
@@ -681,8 +687,8 @@ class IfindSource:
         try:
             reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindSource] read %s/%s failed: %s", code, field, exc)
-            return None
+            logger.debug("[IfindSource] read %s/%s failed: %s", code, field, source_failure_reason(exc))
+            raise SourceReadError("ifind", source_failure_reason(exc)) from None
         if reading is None:
             return None
         return replace(reading, source="ifind", requested_period=reading.requested_period if reading.requested_period is not None else period if field in _PERIOD_FIELDS else None)

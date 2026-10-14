@@ -46,7 +46,7 @@ class TestFundamentalContext(unittest.TestCase):
         adapter outcome since yfinance has no equivalent feed for those blocks.
         """
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=0,
             fundamental_stage_timeout_seconds=1.5,
@@ -82,7 +82,7 @@ class TestFundamentalContext(unittest.TestCase):
     def test_offshore_market_populates_blocks_when_adapter_has_data(self) -> None:
         """US/HK fundamental context surfaces yfinance bundle into growth/earnings/belong_boards."""
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=0,
             fundamental_stage_timeout_seconds=2.0,
@@ -172,7 +172,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_etf_market_downgrades_to_partial_or_not_supported(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -202,6 +202,10 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value=bundle,
+            ),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value=bundle,
@@ -244,7 +248,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_fundamental_context_aggregates_blocks(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -298,7 +302,7 @@ class TestFundamentalContext(unittest.TestCase):
         self,
     ) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -316,6 +320,11 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value={"status": "not_supported", "growth": {}, "earnings": {}, "errors": []},
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value={
@@ -366,7 +375,7 @@ class TestFundamentalContext(unittest.TestCase):
         self,
     ) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -384,6 +393,11 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value={"status": "not_supported", "growth": {}, "earnings": {}, "errors": []},
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value={
@@ -429,7 +443,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_non_etf_board_budget_not_forced_to_zero(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -483,6 +497,11 @@ class TestFundamentalContext(unittest.TestCase):
         with (
             patch("src.config.get_config", return_value=cfg),
             patch.object(manager, "get_realtime_quote", return_value=quote),
+            patch(
+                "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_financial_indicators",
+                return_value=bundle,
+            ),
+            patch.object(manager, "_tushare_ifind_adapter", SimpleNamespace(available=False)),
             patch(
                 "data_provider.fundamental_adapter.AkshareFundamentalAdapter.get_fundamental_bundle",
                 return_value=bundle,
@@ -552,7 +571,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_valuation_all_none_fields_should_not_be_ok(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -598,7 +617,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_board_context_empty_rankings_mark_failed(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,
@@ -619,7 +638,7 @@ class TestFundamentalContext(unittest.TestCase):
 
     def test_capital_flow_not_supported_status(self) -> None:
         manager = DataFetcherManager(fetchers=[])
-        cfg = SimpleNamespace(
+        cfg = SimpleNamespace(data_source_profile="legacy",
             enable_fundamental_pipeline=True,
             fundamental_cache_ttl_seconds=120,
             fundamental_stage_timeout_seconds=1.5,

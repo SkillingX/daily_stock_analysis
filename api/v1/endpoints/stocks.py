@@ -371,6 +371,9 @@ def add_to_watchlist(
     request: WatchlistRequest,
     service: SystemConfigService = Depends(get_system_config_service),
 ) -> WatchlistResponse:
+    from src.core.market_policy import require_stock_market
+    require_stock_market(request.stock_code)
+
     try:
         validated = _validate_and_normalize_stock_code(request.stock_code)
         codes = _read_watchlist_codes(service)
@@ -454,6 +457,9 @@ def get_stock_quote(stock_code: str) -> StockQuote:
     Raises:
         HTTPException: 404 - 股票不存在
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     try:
         service = StockService()
 
@@ -528,6 +534,9 @@ def get_stock_history(
     Returns:
         StockHistoryResponse: 历史行情数据
     """
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     try:
         service = StockService()
 

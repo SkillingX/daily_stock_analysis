@@ -77,6 +77,11 @@ def add_error_handlers(app) -> None:
     """
     from fastapi import HTTPException
     from fastapi.exceptions import RequestValidationError
+    from src.core.market_policy import MarketDisabledError
+
+    @app.exception_handler(MarketDisabledError)
+    async def market_disabled_handler(request: Request, exc: MarketDisabledError) -> JSONResponse:
+        return JSONResponse(status_code=400, content={"error": "market_disabled", "message": str(exc), "detail": None})
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):

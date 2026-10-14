@@ -9,7 +9,7 @@
 2. 提供统一的响应格式
 """
 
-from typing import Optional, Any
+from typing import Optional, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,7 @@ class HealthResponse(BaseModel):
     
     status: str = Field(..., description="服务状态", json_schema_extra={"example": "ok"})
     timestamp: Optional[str] = Field(None, description="时间戳")
+    enabled_markets: list[Literal["cn", "hk", "us"]] = Field(default_factory=lambda: ["cn", "hk", "us"], description="本部署开放的新个股操作市场")
     
     model_config = ConfigDict(json_schema_extra={
         "example": {

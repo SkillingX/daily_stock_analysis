@@ -60,6 +60,8 @@ def reset_validator() -> None:
 
 def _build_sources(config: Any, primary_mx_source: Optional[SourceAdapter] = None) -> List[SourceAdapter]:
     """构建数据源列表：MX 主源 + iFinD/Choice MCP/fuyao 验证源（按需启用）。"""
+    if getattr(config, "data_source_profile", "legacy") == "choice":
+        return []
     from data_provider.mx_data_adapter import MXSource
 
     sources: List[SourceAdapter] = [primary_mx_source if primary_mx_source is not None else MXSource()]
@@ -108,7 +110,7 @@ def _get_validator() -> Optional[CrossSourceValidator]:
     from src.config import get_config
 
     config = get_config()
-    if not getattr(config, "deep_research_cross_validate", False):
+    if getattr(config, "data_source_profile", "legacy") == "choice" or not getattr(config, "deep_research_cross_validate", False):
         return None
     if _validator_instance is not None:
         return _validator_instance

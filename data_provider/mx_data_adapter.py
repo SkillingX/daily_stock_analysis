@@ -180,7 +180,7 @@ def _post(
         try:
             r = requests.post(url, headers=headers, json=body, timeout=remaining)
             if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                last_err = "authentication_failed" if r.status_code in (401, 403) else "quota_exhausted" if r.status_code == 429 else f"http_{r.status_code}"
                 if r.status_code in (401, 403):  # key 问题不重试
                     break
                 if i + 1 < attempts:
@@ -191,7 +191,8 @@ def _post(
                 continue
             return cast(Dict[str, Any], r.json())
         except Exception as exc:  # noqa: BLE001 — 网络/解析错误统一捕获
-            last_err = f"{type(exc).__name__}: {str(exc)[:200]}"
+            from .cross_source_validator import source_failure_reason
+            last_err = source_failure_reason(exc)
             if i + 1 < attempts:
                 pause = 1.0 * (i + 1)
                 if deadline is not None and deadline - time.monotonic() <= pause:
@@ -206,8 +207,11 @@ def _extract_first_table_row(result: Any, period: Optional[str] = None, field: O
     按 headName 的实际日期选列，不假设源列顺序；_mx_period 是所选响应列，
     无法辨认的日期保持未知。非期间型的单值表保留既有首观测读取行为。
     """
-    if not isinstance(result, dict) or result.get("error"):
+    if not isinstance(result, dict):
         return {}
+    if result.get("error"):
+        from .cross_source_validator import SourceReadError
+        return {"error": str(SourceReadError("mx", str(result["error"]).split(":")[-1]))}
     if result.get("status") not in (0, None):
         return {}
     data = result.get("data") or {}
@@ -295,8 +299,13 @@ class MXClient:
                 return cast(Dict[str, Any], hit[1])
         # 锁外执行 HTTP（不阻塞其他 query 的缓存读）
         result = _post(QUERY_URL, {"toolQuery": tool_query}, self.api_key, self.timeout, **({"deadline": deadline} if deadline is not None else {}))
-        with self._cache_lock:
-            self._cache[tool_query] = [now, result, refresh_id]
+        if result.get("success") is False or result.get("status") not in (0, None) or result.get("code") not in (0, None):
+            code = result.get("status", result.get("code"))
+            reason = "quota_exhausted" if code == 113 else "business_error"
+            return {"error": f"mx:{reason}"}
+        if not result.get("error"):
+            with self._cache_lock:
+                self._cache[tool_query] = [now, result, refresh_id]
         return result
 
     def fetch_snapshot(self, code: str, *, deadline: Optional[float] = None) -> Dict[str, Any]:
@@ -364,11 +373,14 @@ class MXSource:
                 return None
             return self.read_bundle(bundle, field, period)
         except Exception as exc:  # noqa: BLE001 — 单个源异常不影响其他源
-            logger.debug("[MXSource] read %s/%s failed: %s", code, field, exc)
-            return None
+            from .cross_source_validator import SourceReadError, source_failure_reason
+            raise SourceReadError(self.name, source_failure_reason(exc)) from None
 
     def read_bundle(self, bundle: Dict[str, Any], field: str, period: Optional[str] = None) -> Optional[AnchorReading]:
         """Parse an acquired bundle without issuing another request."""
+        if bundle.get("error"):
+            from .cross_source_validator import SourceReadError
+            raise SourceReadError(self.name, str(bundle["error"]).split(":")[-1])
         keywords = _SNAPSHOT_FIELDS.get(field) or _FINANCIAL_FIELDS.get(field) or _GROWTH_FIELDS.get(field) or _CAPITAL_FIELDS.get(field)
         if not keywords:
             return None

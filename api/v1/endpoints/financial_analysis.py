@@ -8,7 +8,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -35,11 +35,17 @@ def _validate_id(report_id: str) -> str:
 
 
 @router.post("/generate", response_model=FinancialAnalysisGenerateResponse)
-async def generate(stock_code: str, stock_name: Optional[str] = None):
+async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false"):
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     try:
         raw = await asyncio.to_thread(
-            financial_analysis_service.generate_report, stock_code, stock_name
+            financial_analysis_service.generate_report, stock_code, stock_name, force_refresh == "true"
         )
+    except financial_analysis_service.FinancialReportInProgressError as exc:
+        from api.v1.errors import api_error
+        raise api_error(409, "report_in_progress", str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001

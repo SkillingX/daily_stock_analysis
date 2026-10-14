@@ -330,7 +330,7 @@ class TestCacheHygieneRegressions:
         assert after == before, "缓存命中不得刷新 saved_at（TTL 滑动语义）"
 
     def test_cache_exclude_skips_scenarios_but_writes_others(self, monkeypatch, tmp_path):
-        """B2：cache_exclude=scenarios 时探索/评分维度照写、scenarios 不写。"""
+        """探索资料仍缓存，依赖本次行情的评分/情景重新计算。"""
         import json
         import os
 
@@ -344,15 +344,15 @@ class TestCacheHygieneRegressions:
         names = set(os.listdir(str(tmp_path)))
         assert "600519_scenarios.json" not in names, "被排除维度不得写缓存"
         assert "600519_supply_chain.json" in names, "探索维度照写（次日命中省探索 Agent）"
-        assert "600519_six_dim.json" in names, "评分维度照写"
+        assert "600519_six_dim.json" not in names, "行情派生评分不固化为下次输入"
         # 写出的 supply_chain payload 叙述无关（skip_narrations 不污染）
         sc = json.loads(open(os.path.join(str(tmp_path), "600519_supply_chain.json"), encoding="utf-8").read())
         assert sc["payload"]["supply_chain"]["company_position"] == "白酒"
 
 
 class TestFinalConclusion:
-    def test_conclusion_generated_with_fake_adapter(self, monkeypatch, tmp_path):
-        """终读结论：fake adapter 产出文本进报告段一与 result 字段。"""
+    def test_conclusion_preserves_degraded_evidence_in_report_and_payload(self, monkeypatch, tmp_path):
+        """无资格财务快照不能由模型重写为完整投资结论。"""
         from datetime import date, timedelta
 
         from src.agent.deep_research import orchestrator as orch
@@ -379,20 +379,19 @@ class TestFinalConclusion:
                 import json as _json
 
                 facts = _json.loads(messages[1]["content"])
-                captured.update(facts)
+                if "3-5 句的中文投资结论" in messages[0]["content"]:
+                    captured.update(facts)
 
                 class _R:
                     content = "总评分 50 分，建议观望。论据：估值合理。风险：需求疲弱。关注三季报。"
                 return _R()
 
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=_Adapter(), force_refresh=True)
-        assert "总评分 50 分" in result.final_conclusion
-        # v2：终读结论文本进「一、结论」（template v2 重构后 §1 = 结论）
-        assert "总评分 50 分" in result.markdown
+        assert "依据不完整" in result.final_conclusion
+        assert result.final_conclusion in result.markdown
+        assert "总评分 50 分" not in result.markdown
         assert "## 一、结论" in result.markdown
-        # 数字注入式：事实面含评分与行动
-        assert captured.get("total_score") is not None
-        assert captured.get("action") in ("建仓", "加仓", "持有", "减仓", "止损", "观察")
+        assert captured == {}
 
     def test_conclusion_skipped_when_no_adapter(self, monkeypatch, tmp_path):
         from datetime import date, timedelta
@@ -502,5 +501,7 @@ class TestSkipNarrationsPropagation:
             "600519", "贵州茅台", llm_adapter=None,
             force_refresh=True, skip_narrations=True,
         )
-        assert result.status == "success", {key: dim.degraded_reason for key, dim in result.dims.items() if dim.status == "degraded"}
+        assert result.status == "partial"
+        assert result.dims['scenarios'].status == result.dims['conclusion'].status == result.dims['signal'].status == 'degraded'
+        assert result.dims['scenarios'].expected_value is None
         assert len(result.dims) == len(DIM_IDS) == 19

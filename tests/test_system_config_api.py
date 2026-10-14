@@ -111,6 +111,76 @@ class SystemConfigApiTestCase(unittest.TestCase):
         self.assertEqual(item_map["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(item_map["GEMINI_API_KEY"]["is_masked"])
 
+    def test_choice_credentials_masked_in_config_responses_and_preserved_on_save(self) -> None:
+        credentials = {"CHOICE_USERNAME": "fixture-choice-user", "CHOICE_PASSWORD": "fixture-choice-password"}
+        for source in ("file", "runtime"):
+            for include_schema in (False, True):
+                with self.subTest(source=source, include_schema=include_schema):
+                    lines = ["STOCK_LIST=600519", "ADMIN_AUTH_ENABLED=true"]
+                    if source == "file":
+                        lines.extend(f"{key}={value}" for key, value in credentials.items())
+                    self._rewrite_env(*lines)
+                    with patch.dict(os.environ, credentials):
+                        payload = system_config.get_system_config(
+                            include_schema=include_schema, service=self.service
+                        ).model_dump(by_alias=True)
+                        items = {item["key"]: item for item in payload["items"]}
+                        for key, secret in credentials.items():
+                            self.assertEqual(items[key]["value"], payload["mask_token"])
+                            self.assertTrue(items[key]["is_masked"])
+                            self.assertEqual(items[key]["raw_value_exists"], source == "file")
+                            self.assertNotIn(secret, str(payload))
+                        result = system_config.update_system_config(
+                            request=UpdateSystemConfigRequest(
+                                config_version=payload["config_version"],
+                                mask_token=payload["mask_token"], reload_now=False,
+                                items=[{"key": key, "value": items[key]["value"]} for key in credentials]
+                                + [{"key": "LOG_LEVEL", "value": "WARNING"}],
+                            ), service=self.service,
+                        ).model_dump()
+                    self.assertTrue(result["success"])
+                    saved = self.manager.read_config_map()
+                    self.assertEqual(saved["LOG_LEVEL"], "WARNING")
+                    for key, secret in credentials.items():
+                        if source == "file":
+                            self.assertEqual(saved[key], secret)
+                        else:
+                            self.assertNotIn(key, saved)
+
+    def test_config_interpolation_cannot_copy_choice_password_to_visible_field(self) -> None:
+        for source in ("file", "runtime"):
+            with self.subTest(source=source):
+                secret = "fixture-interpolated-password"
+                lines = ["STOCK_LIST=600519", "ADMIN_AUTH_ENABLED=true"]
+                if source == "file":
+                    lines.append(f"CHOICE_PASSWORD={secret}")
+                self._rewrite_env(*lines)
+                with patch.dict(os.environ, {"CHOICE_PASSWORD": secret}):
+                    current = self.service.get_config()
+                    system_config.update_system_config(
+                        request=UpdateSystemConfigRequest(
+                            config_version=current["config_version"], reload_now=False,
+                            items=[{"key": "LOG_DIR", "value": "prefix-${CHOICE_PASSWORD}"}],
+                        ), service=self.service,
+                    )
+                    # Runtime consumers retain dotenv expansion; only display is literal.
+                    self.assertEqual(self.manager.read_config_map()["LOG_DIR"], f"prefix-{secret}")
+                    for include_schema in (False, True):
+                        payload = system_config.get_system_config(
+                            include_schema=include_schema, service=self.service
+                        ).model_dump()
+                        self.assertNotIn(secret, str(payload))
+                        items = {item["key"]: item for item in payload["items"]}
+                        self.assertEqual(items["LOG_DIR"]["value"], "prefix-${CHOICE_PASSWORD}")
+
+    def test_unconfigured_choice_credentials_remain_empty(self) -> None:
+        with patch.dict(os.environ, {"CHOICE_USERNAME": "", "CHOICE_PASSWORD": ""}):
+            payload = system_config.get_system_config(include_schema=True, service=self.service).model_dump()
+        items = {item["key"]: item for item in payload["items"]}
+        for key in ("CHOICE_USERNAME", "CHOICE_PASSWORD"):
+            self.assertEqual(items[key]["value"], "")
+            self.assertFalse(items[key]["is_masked"])
+
     def test_get_config_masks_llm_usage_hmac_secret(self) -> None:
         self._rewrite_env(
             "STOCK_LIST=600519,000001",

@@ -51,7 +51,8 @@ router = APIRouter()
 
 
 def _bad_request(exc: Exception) -> HTTPException:
-    return api_error(400, "validation_error", str(exc))
+    from src.core.market_policy import MarketDisabledError
+    return api_error(400, "market_disabled" if isinstance(exc, MarketDisabledError) else "validation_error", str(exc))
 
 
 def _internal_error(message: str, exc: Exception) -> HTTPException:

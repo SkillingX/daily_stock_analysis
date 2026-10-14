@@ -34,7 +34,7 @@ import os
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from .cross_source_validator import AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
+from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
 from .ifind_fundamental_adapter import _apply_mcp_request_deadline, _safe_float
 
 logger = logging.getLogger(__name__)
@@ -350,7 +350,7 @@ class MxMcpFetcher:
             logger.debug(
                 "[MxMcpFetcher] fetch %s/%s failed: %s", code, field, exc
             )
-            return None
+            raise SourceReadError("mx_mcp", source_failure_reason(exc)) from None
 
     async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，CI 不覆盖
         self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
@@ -396,19 +396,19 @@ class MxMcpFetcher:
                 )
                 return _parse_mx_mcp_response(raw_text, keywords, field, period)
             except Exception as exc:  # noqa: BLE001 — fail-open
-                last_error = str(exc)
+                last_error = source_failure_reason(exc)
                 logger.debug(
                     "[MxMcpFetcher] attempt %d failed for %s/%s: %s",
                     attempt + 1,
                     code,
                     field,
-                    exc,
+                    source_failure_reason(exc),
                 )
+                if isinstance(exc, SourceReadError):
+                    raise
                 continue
-        logger.debug(
-            "[MxMcpFetcher] giving up on %s/%s: %s", code, field, last_error
-        )
-        return None
+        raise SourceReadError("mx_mcp", last_error or "source_error")
+
 
 
 # ------------------------------------------------------------------
@@ -444,8 +444,8 @@ class MxMcpSource:
         try:
             reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
         except Exception as exc:  # noqa: BLE001 — fail-open：MX 异常不影响其他源
-            logger.debug("[MxMcpSource] read %s/%s failed: %s", code, field, exc)
-            return None
+            logger.debug("[MxMcpSource] read %s/%s failed: %s", code, field, source_failure_reason(exc))
+            raise SourceReadError("mx_mcp", source_failure_reason(exc)) from None
         if reading is None:
             return None
         return replace(reading, source=self.name, requested_period=reading.requested_period if reading.requested_period is not None else period if field in _PERIOD_FIELDS else None)

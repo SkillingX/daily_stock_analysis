@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
 from .ifind_fundamental_adapter import IfindSource
-from .cross_source_validator import AnchorReading, adopted_field_record
+from .cross_source_validator import AnchorReading, adopted_field_record, source_failure_reason
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ class TushareIfindFundamentalAdapter:
         anchor_results = self._read_growth_fields_concurrent(
             [(key, anchor) for key, anchor in _FIELD_TO_IFIND_ANCHOR.items() if fields is None or key in fields], ts_code, as_of, deadline
         )
-        for bundle_key, anchor, reading in anchor_results:
+        for bundle_key, anchor, reading, error in anchor_results:
             if reading is not None:
                 growth[bundle_key] = reading.value
                 field_meta[anchor] = adopted_field_record(anchor, reading, selection_reason="fallback")
@@ -170,7 +170,7 @@ class TushareIfindFundamentalAdapter:
                     }
                 )
             else:
-                errors.append(f"ifind:{anchor}=None")
+                errors.append(f"ifind:{anchor}={error or 'None'}")
 
         # Earnings summary: Tushare express / iFinD does not expose a clean
         # summary string, so we leave the bundle empty here. The orchestrator
@@ -225,32 +225,26 @@ class TushareIfindFundamentalAdapter:
         ts_code: str,
         period: str,
         deadline: Optional[float] = None,
-    ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
+    ) -> List[Tuple[str, str, Optional[AnchorReading], Optional[str]]]:
         """Read multiple growth anchors concurrently via iFinD.
 
-        Returns a list of ``(bundle_key, anchor, value)`` tuples in the same
-        order as ``items``. When the iFinD source is unavailable, falls
-        back to serial ``_read_growth_field``.
+        Returns a list of ``(bundle_key, anchor, reading, failure_reason)`` tuples in the same
+        order as ``items``. An unavailable source returns missing readings;
+        worker failures retain safe reason codes without aborting the bundle.
         """
         if not items:
             return []
         if self._ifind is None or not self._ifind.available:
             return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
+                (bk, anchor, None, None)
                 for bk, anchor in items
             ]
         try:
             return self._gather_growth_reads(items, ts_code, period, deadline)
-        except Exception as exc:  # noqa: BLE001 — fall back to serial
-            logger.debug(
-                "[TushareIfindFallback] concurrent read failed: %s, "
-                "falling back to serial",
-                exc,
-            )
-            return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
-                for bk, anchor in items
-            ]
+        except Exception as exc:  # noqa: BLE001 — preserve aggregate isolation
+            reason = source_failure_reason(exc)
+            logger.debug("[TushareIfindFallback] concurrent read failed: %s", reason)
+            return [(bk, anchor, None, reason) for bk, anchor in items]
 
     def _gather_growth_reads(
         self,
@@ -258,7 +252,7 @@ class TushareIfindFundamentalAdapter:
         ts_code: str,
         period: str,
         deadline: Optional[float] = None,
-    ) -> List[Tuple[str, str, Optional[AnchorReading]]]:
+    ) -> List[Tuple[str, str, Optional[AnchorReading], Optional[str]]]:
         """Read growth anchors in parallel via a ThreadPoolExecutor.
 
         Each worker thread calls ``IfindSource.read`` synchronously. The
@@ -268,7 +262,7 @@ class TushareIfindFundamentalAdapter:
         """
         if self._ifind is None:
             return [
-                (bk, anchor, self._read_growth_field(anchor, ts_code, period, deadline))
+                (bk, anchor, None, None)
                 for bk, anchor in items
             ]
 
@@ -281,15 +275,21 @@ class TushareIfindFundamentalAdapter:
             futures[anchor] = future
         concurrent.futures.wait(list(futures.values()), timeout=None if deadline is None else max(0.0, deadline - monotonic()))
         values: Dict[str, Optional[AnchorReading]] = {}
+        errors: Dict[str, str] = {}
+        for _, anchor in items:
+            if anchor not in futures:
+                errors[anchor] = "timeout"
         for anchor, future in futures.items():
             if not future.done():
                 future.cancel()
+                errors[anchor] = "timeout"
                 continue
             try:
                 values[anchor] = future.result()
             except Exception as exc:
-                logger.debug("[TushareIfindFallback] %s failed: %s", anchor, type(exc).__name__)
-        return [(key, anchor, values.get(anchor)) for key, anchor in items]
+                errors[anchor] = source_failure_reason(exc)
+                logger.debug("[TushareIfindFallback] %s failed: %s", anchor, errors[anchor])
+        return [(key, anchor, values.get(anchor), errors.get(anchor)) for key, anchor in items]
 
     def _read_top10_holders(self, ts_code: str, period: str) -> Optional[float]:
         # Tushare top10_holders is restricted on basic-plan tokens; we still

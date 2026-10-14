@@ -134,12 +134,15 @@ def _compact_fundamental_context(fundamental_context: dict[str, Any]) -> dict[st
         "market": fundamental_context.get("market"),
         "status": fundamental_context.get("status"),
         "coverage": fundamental_context.get("coverage", {}),
+        "research": fundamental_context.get("research", {}),
+        "errors": list(fundamental_context.get("errors") or []),
     }
     for block in blocks:
         payload = fundamental_context.get(block, {})
         if isinstance(payload, dict):
             compact[block] = {
                 "status": payload.get("status"),
+                "errors": list(payload.get("errors") or []),
                 "data": payload.get("data", {}),
                 "field_meta": dict(payload.get("field_meta") or {}),
             }
@@ -367,6 +370,9 @@ def _compact_portfolio_risk(risk: dict[str, Any], top_n: int = 10) -> dict[str, 
 
 def _handle_get_realtime_quote(stock_code: str) -> dict[str, Any]:
     """Get real-time stock quote."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     quote = manager.get_realtime_quote(stock_code)
     if quote is None:
@@ -450,6 +456,9 @@ get_realtime_quote_tool = ToolDefinition(
 
 def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]:
     """Get daily OHLCV history data."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     effective_days, metadata = _normalize_history_days(days)
 
     from src.services.history_loader import load_history_df
@@ -587,6 +596,9 @@ def _estimate_chip_from_history(
 
 def _handle_get_chip_distribution(stock_code: str) -> dict[str, Any]:
     """Get chip distribution data."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     chip = manager.get_chip_distribution(stock_code)
 
@@ -729,6 +741,9 @@ def _fallback_valuation_from_quote(
 
 def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None) -> dict[str, Any]:
     """Get stock fundamental information through unified fundamental context."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     manager = _get_fetcher_manager()
     from src.config import get_config
     deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_stage_timeout_seconds
@@ -747,7 +762,7 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
     valuation = compact_context.get("valuation", {}).get("data", {})
     valuation_meta = dict(compact_context.get("valuation", {}).get("field_meta") or {})
     # fail-open：fundamental valuation 受严格超时易缺失，用 get_realtime_quote 兜底估值
-    if any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
+    if get_config().data_source_profile != "choice" and any(valuation.get(field) is None for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv")):
         valuation = _fallback_valuation_from_quote(manager, stock_code, valuation, valuation_meta, deadline=deadline)
     compact_context["valuation"] = {**compact_context.get("valuation", {}), "data": valuation, "field_meta": valuation_meta}
     primary_readings = {}
@@ -992,6 +1007,9 @@ ALL_DATA_TOOLS = [
 
 def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
     """Get main-force capital flow data for a stock."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
     from src.config import get_config
     deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     manager = _get_fetcher_manager()
@@ -1040,6 +1058,9 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
         },
         "errors": errors,
     }
+    if get_config().data_source_profile == "choice":
+        result.update({key: stock_flow.get(key) for key in ("latest_date", "expected_date", "coverage", "source", "source_unit", "currency")})
+        result["note"] = "Choice 个股主力净流入金额单位：人民币元；按交易日历和最近已收盘日期计算日/5日/10日窗口，窗口缺数据时金额为空。单源数据，未做独立跨源核验。"
     if note:
         result["note"] = note
     # opt-in 交叉验证：主力净流入/融资余额 MX↔iFinD 双源验证（方向+量级）；开关关 → _cv None，零回归。

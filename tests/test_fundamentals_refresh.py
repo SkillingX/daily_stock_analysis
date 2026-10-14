@@ -75,7 +75,7 @@ def test_real_source_manager_snapshot_and_same_day_caches_are_bypassed(refresh_i
     dim_cache.save_snapshot("stage0_unrelated_000001", {"sentinel": True})
     first = svc.generate_fundamentals_report("600519", "样本")
     assert first["status"] == "partial" and first["dims"]["financial"]["profitability"]["roe"]["value"] is None
-    assert state["manager"]._fundamental_cache
+    assert not state["manager"]._fundamental_cache  # incomplete manager snapshots remain retryable
     before = len(state["calls"])
     business_file = Path(dim_cache._CACHE_DIR) / "600519_business.json"
     business_bytes = business_file.read_bytes()
@@ -96,7 +96,9 @@ def test_real_source_manager_snapshot_and_same_day_caches_are_bypassed(refresh_i
     assert business_file.read_bytes() == business_bytes
     count = len(state["calls"])
     state["client"].query_financials("000001", None)
-    assert len(state["calls"]) == count
+    assert len(state["calls"]) == count + int(initial_error)  # failed raw replies were never cached
+    if initial_error:
+        assert "000001" in state["calls"][-1]
     latest = svc.generate_fundamentals_report("600519", "样本")
     assert latest["report_id"] == refreshed["report_id"]
     assert get_db().get_fundamentals_report(first["report_id"])

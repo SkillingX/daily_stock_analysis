@@ -2987,6 +2987,9 @@ class StockAnalysisPipeline:
         Returns:
             AnalysisResult 或 None
         """
+        from src.core.market_policy import require_stock_market
+        require_stock_market(code, self.config.enabled_markets)
+
         logger.info(f"========== 开始处理 {code} ==========")
 
         from src.services.history_loader import (

@@ -184,7 +184,8 @@ def test_code_only_resolved_name_reaches_sector_rules(monkeypatch: pytest.Monkey
     out = svc.generate_fundamentals_report('600036')
     try:
         assert out['stock_name'] == ctx.stock_name == '招商银行'
-        assert out['dims']['sector']['sector_hint'] == '招商银行'
+        assert out['dims']['sector']['sector_hint'] == ''
+        assert out['dims']['sector']['status'] == 'degraded'
         assert out['dims']['sector']['base_rate_basis'] == 'industry_base_rate:银行'
         assert out['status'] == 'partial' and out['report_id']
     finally:

@@ -38,24 +38,32 @@
 
 本仓库采用 **Ponytail** 极简主义原则，在保持质量和安全护栏的前提下，尽可能减少不必要的代码。
 
+### 方案与施工的复杂度边界
+
+- 设计方案、拆分工单和实际施工都选择能完整解决当前问题的最小路径；先说明问题、验收条件和需要改变的现有入口，再决定实现方式。
+- 优先复用现有模块和契约；不为假设中的未来需求新增框架、服务、配置开关、通用抽象或平行实现。新增这些结构必须有当前需求或实测限制作为依据。
+- 对尚未验证的第三方授权、SDK 或数据口径，先用小范围真实调用验证关键假设，再扩大接入；demo 不建设独立产品或第二套业务逻辑，保留可复用的调用样例和验证证据。
+- 工单按可独立验证的完整行为拆分，不为了分层或文件数量过度拆票。完成后检查并删除本次改动中需求不需要的内容，不扩展为无关清理。
+- 简洁不能以丢失数据语义、吞掉错误、取消必要的类型/边界校验或跳过真实风险路径验证为代价。
+
 ### 核心规则
 
-**永远不要添加**：
+**没有当前需求依据时不要添加**：
 - ❌ 工具函数库（`utils.py`, `helpers.py`）—— 标准库已够用
 - ❌ 抽象基类（只有 1 个实现者）
 - ❌ 设计模式（无实际使用场景）
-- ❌ 包装器（包装已有标准库或依赖）
+- ❌ 只转发调用的包装器（必要的数据源认证、字段转换和错误处理属于适配职责）
 - ❌ 类型别名（只有一处使用时）
 - ❌ 单独的常量文件（直接内联）
 
-**永远要删除**：
+**在本次改动范围内清理**：
 - ✅ 未使用的导入
 - ✅ 死代码（未调用函数、未使用变量）
-- ✅ 调试代码（`print`, `console.log`, 注释掉的代码）
+- ✅ 临时调试输出和注释掉的代码（保留 CLI 正常输出及必要日志）
 - ✅ 冗余注释（代码本身已说明意图）
 - ✅ 过时的 TODO（已不再是计划）
 
-### 安全区（不可删除）
+### 安全区（不得为减少代码量而移除有效防护）
 
 | 类型 | 原因 |
 |------|------|
@@ -104,8 +112,8 @@ Pydantic/类型注解 ─┘         │
 所有新增 / 修改代码必须遵守 `docs/type-contract-data-defense.md` 的「类型-契约-数据」三层防御体系（CI 门禁 `.github/workflows/type-safety.yml` 跑 pyright + mypy + 契约测试强制）。**每层只管自己该管的事，不重复校验**：
 
 - **Layer 1 类型（mypy / pyright）**：所有公开函数加类型注解；不用裸 `tuple` / `dict` / `list`（必须 `tuple[str, ...]` / `dict[str, int]`）；`Any` 尽量收窄，跨模块用 `TYPE_CHECKING` + 字符串注解避免循环 import。
-- **Layer 2 契约（icontract）**：复杂业务公式 / 跨字段不变式用 `@require` / `@ensure`；金融、风控、量化场景必加。契约测试放 `tests/test_*_contract.py`，CI 用 `ICONTRACT_SLOW=true` 跑。
-- **Layer 3 数据（Pydantic v2）**：API 请求 / 响应等 I/O 边界用 Pydantic + `model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)` + `Annotated[..., Field(...)]`（pattern / 范围）+ `Literal` 枚举；畸形输入解析期直接 422。
+- **Layer 2 契约（icontract）**：复杂业务公式 / 跨字段不变式用 `@require` / `@ensure`；金融、风控、量化中的这类逻辑必加，纯字段搬运不机械叠加契约。契约测试放 `tests/test_*_contract.py`，CI 用 `ICONTRACT_SLOW=true` 跑工作流指定的契约测试；新增契约需确认验证入口覆盖。
+- **Layer 3 数据（Pydantic v2）**：API 请求 / 响应等 I/O 边界用 Pydantic + `model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)` + `Annotated[..., Field(...)]`（pattern / 范围）+ `Literal` 枚举；API 请求校验失败返回 422，供应商响应异常按数据源错误契约处理，不误报为用户请求错误。
 
 **决策**：纯 CRUD / 只校验类型范围 → 只用 Pydantic；复杂业务公式 / 多参数依赖 → 加 icontract；API 入口 + 复杂逻辑 + 金融计算 → 三层全用。
 **陷阱**：Pydantic 已管的字段范围 icontract 不得再查（重复校验）；金融计算用 `Decimal`，不用 `float`。
@@ -161,6 +169,10 @@ python main.py --dry-run
 python main.py --stocks 600519,hk00700,AAPL
 python main.py --market-review
 python main.py --schedule
+python main.py --serve
+python main.py --serve-only
+uvicorn server:app --reload --host 127.0.0.1 --port 8000
+```
 
 ### 定时任务（自选股 & 大盘复盘）
 
@@ -183,11 +195,7 @@ curl -X POST "http://localhost:8000/api/v1/schedule/trigger?task=market_review"
 curl "http://localhost:8000/api/v1/schedule/logs?page=1&page_size=10"
 ```
 
-> 代码更新后**必须重启**调度进程（`sudo systemctl restart dsa-scheduler`）；`.env` 配置变更则由调度器热加载自动生效，无需重启。
-python main.py --serve
-python main.py --serve-only
-uvicorn server:app --reload --host 0.0.0.0 --port 8000
-```
+> 代码更新后必须重启实际运行的调度进程。进程内调度任务会在执行前重新加载配置，但这不代表所有常驻客户端、SDK 会话和 Web 进程都已重建；变更配置时核对对应入口的重载行为，必要时重启该进程。仅对配置了 `dsa-scheduler` unit 的部署使用 `sudo systemctl restart dsa-scheduler`。
 
 ### 后端验证
 
@@ -195,7 +203,7 @@ uvicorn server:app --reload --host 0.0.0.0 --port 8000
 pip install -r requirements.txt
 pip install flake8 pytest
 ./scripts/ci_gate.sh
-python -m pytest -m "not network"
+python -m pytest tests -m "not network"
 python -m py_compile <changed_python_files>
 ```
 
@@ -224,8 +232,12 @@ gh run view <run_id> --log-failed
 
 使用 `scripts/start-dev.sh` 脚本启动前后端服务：
 
+当前脚本的启动和停止操作都会按进程名称终止匹配的 uvicorn / Vite，尚未按工作区隔离。仅在确认没有其他同类服务时使用；多项目并行时，应核对目标进程的工作目录和 PID 后单独操作。
+
 ```bash
-cd /Users/jie/code/daily_stock_analysis
+# 在项目根目录执行；示例使用已创建的项目虚拟环境
+export VENV_PATH="$PWD/.venv"
+export BACKEND_HOST=127.0.0.1
 
 # 启动前后端
 ./scripts/start-dev.sh
@@ -240,22 +252,16 @@ cd /Users/jie/code/daily_stock_analysis
 ./scripts/start-dev.sh stop
 ```
 
-**访问地址：**
+**默认端口对应的访问地址（可用 `BACKEND_PORT` / `FRONTEND_PORT` 覆盖）：**
 - 前端：http://localhost:5173
 - 后端 API：http://localhost:8000
 - 后端 API 文档：http://localhost:8000/docs
 
 **日志文件：**
 - 后端日志：`logs/backend.log`
-- 前端日志：`apps/dsa-web/frontend.log`
+- 前端日志：`logs/frontend.log`
 
-**Python 虚拟环境：** `~/dsa-venv`（使用 uv 创建）
-
-**手动停止服务：**
-```bash
-pkill -f "uvicorn server:app"
-pkill -f vite
-```
+**Python 虚拟环境：** 脚本通过 `VENV_PATH` 选择，未设置时默认 `~/dsa-venv`；上例显式选择项目 `.venv`。确认依赖已安装，并通过健康检查和日志核实服务已就绪，不能仅依据脚本退出码判断启动成功。
 
 ## 5. 默认工作流
 
@@ -286,8 +292,9 @@ pkill -f vite
 | `backend-gate` | `.github/workflows/ci.yml` | 执行 `./scripts/ci_gate.sh` | 是 |
 | `docker-build` | `.github/workflows/ci.yml` | Docker 构建与关键模块导入 smoke | 是 |
 | `web-gate` | `.github/workflows/ci.yml` | 前端改动时执行 `npm run lint` + `npm run build` | 是（触发时） |
+| `Type-Safety-Contract-Gate` | `.github/workflows/type-safety.yml` | pyright、mypy 和工作流指定的契约测试 | 是（触发时） |
 | `network-smoke` | `.github/workflows/network-smoke.yml` | `pytest -m network` + `scripts/test.sh quick` | 否，观测项 |
-| `pr-review` | `.github/workflows/pr-review.yml` | PR 静态检查 + AI 审查 + 自动标签 | 否，辅助项 |
+| `pr-review` | `.github/workflows/pr-review.yml` | 只读 PR 静态检查；标签/说明独立运行；AI 审查仅维护者显式启用且同仓库 PR 时执行，跳过不等于通过 | 否，辅助项 |
 
 若 PR 上已有对应 CI 结果，可直接引用 CI 结论；若 CI 未覆盖改动面，或本地与 CI 环境差异较大，需要补充说明本地验证与缺口。
 
@@ -444,19 +451,19 @@ CI 通过只能说明自动检查通过，不能替代人工语义收敛，也�
 
   ## 一切产物可复用、可快改
 
-  - 做过一次的事就沉淀成可重跑的东西：脚本、函数、make/just 目标。下次同类任务先复用再新写。
+  - 需要重复执行或作为验收依据的操作，优先复用现有脚本、函数、make/just 目标；没有现成入口时再补最小可重跑入口。一次性查询可保留命令，不强制新建脚本。
   - 参数写在头部或读环境变量，不埋在逻辑里。改一个值不需要读懂全文。
   - 脚本幂等：重复跑不出错、不重复副作用。
-  - 一个文件一件事，命名说人话，开头三行注释写清：干什么、怎么跑，需要什么。
-  - 部署和测试也是脚本：部署写成可重跑的 deploy 脚本，API 测试写成可保存的请求脚本（curl/httpie 皆可），跑完留在项目里。
+  - 文件职责清晰，命名表达用途；新增独立脚本说明用途、运行方法和前置条件，不机械要求所有文件添加三行注释。
+  - 部署和验收优先复用现有入口；确需新增时保存可重跑脚本或请求样例。临时证据放 `.claude/reviews/` 等非入库位置，不提交凭据和一次性截图。
 
   ## 执行风格
 
   - 做完再汇报。汇报只说：产出了什么、怎么跑、有什么副作用。
   - 不确定就按最合理的假设做，标一行"假设：X；不对就说"。
   - 报错自己修，修不动再来找我，附上试过什么。
-  - 出错 fail fast：大声报错退出，不吞异常，不静默降级。
-  - 最小实现：不加防御性分支，不为单次使用做抽象，不写需求外的功能。写完自问：这里面有几行是任务不需要的？删掉。
+  - 启动前置条件或不可恢复错误应明确失败；单一数据源/通知渠道失败按既有隔离与降级契约处理，披露原因，不吞异常或伪装成功。
+  - 最小实现：不为未经证实的风险堆叠分支，不为单次使用做抽象，不写需求外功能；保留必要的输入校验、超时和错误处理。写完自问：这里面有几行是任务不需要的？删掉。
 
   ## 只有三种情况停下来问我
 

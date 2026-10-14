@@ -93,6 +93,13 @@ def build_data_dim(ctx: SharedContext) -> DataDim:
     ma250_dev = round((current - ma250) / ma250 * 100, 2) if ma250 else None
 
     alignment = _ma_alignment(closes)
+    assert ma5 is not None and ma10 is not None and ma20 is not None
+    price_levels = sorted((("现价", current), ("MA5", ma5), ("MA10", ma10), ("MA20", ma20)), key=lambda item: item[1])
+    price_order = ""
+    for index, (name, value) in enumerate(price_levels):
+        if index:
+            price_order += " = " if value == price_levels[index-1][1] else " < "
+        price_order += f"{name}（{value:.4f}）"
     trend_score = {"多头排列": 75, "纠缠": 50, "空头排列": 30}.get(alignment, 50)
     if bias is not None:
         trend_score += 10 if bias > 3 else -10 if bias < -5 else 0
@@ -122,7 +129,7 @@ def build_data_dim(ctx: SharedContext) -> DataDim:
         ma250_deviation_pct=ma250_dev,
         distance_from_52w_high_pct=dist_high,
         narrative=(
-            f"均线{alignment}，现价 {current}，偏离 MA5 {bias}%，"
+            f"均线{alignment}；{price_order}。偏离 MA5 {bias}%，"
             f"距 52 周高点 {dist_high}%。" if dist_high is not None else f"均线{alignment}。"
         ),
     )

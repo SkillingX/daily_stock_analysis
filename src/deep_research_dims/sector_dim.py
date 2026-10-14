@@ -22,8 +22,10 @@ def build_sector_dim(
     position_text：产业链定位文本（含行业关键词，如"白酒酿造商"），用于行业提示
     缺失时提高基率/政策倾向命中率。
     """
-    hint = str(ctx.fundamental.get("industry_hint") or "") or ctx.stock_name
+    hint = str(ctx.fundamental.get("industry_hint") or "")
     gaps: list[str] = []
+    if not hint:
+        gaps.append("所属行业未取得")
 
     policy_lean = None
     try:
@@ -41,9 +43,9 @@ def build_sector_dim(
         # 名称匹配失败时用定位文本单独再试一次（如"贵州茅台"→"白酒酿造商"）
         base_rate, basis = lookup_base_rate(str(position_text))
 
-    rankings: Dict[str, Any] = {}
-    # 板块实时排行本期不接（数据源超时链 ~40s 且仅原文截取无结构化价值）→ 按纪律记缺口
-    gaps.append("板块实时排行（本期未接数据源）")
+    rankings: Dict[str, Any] = ctx.fundamental.get("sector_rankings") or {}
+    if not rankings:
+        gaps.append("板块资金排行未取得")
 
     score_parts = [_score_policy_lean(policy_lean)]
     if base_rate is not None:
@@ -52,6 +54,8 @@ def build_sector_dim(
     sector_score = round(sum(available) / len(available), 2) if available else None
 
     return SectorDim(
+        status="ok" if hint else "degraded",
+        degraded_reason=None if hint else "所属行业未取得，不能用公司名代替板块",
         sector_hint=hint,
         policy_lean=policy_lean,
         base_rate=base_rate,
@@ -60,7 +64,7 @@ def build_sector_dim(
         data_gaps=gaps,
         sector_score=sector_score,
         narrative=(
-            f"板块「{hint}」：政策倾向 {policy_lean or '未知'}，行业基率 {base_rate}（{basis}）；"
+            f"板块「{hint or '未识别'}」：政策倾向 {policy_lean or '未知'}，行业基率 {base_rate}（{basis}）；"
             f"板块得分 {sector_score or '缺数据'}。"
         ),
     )

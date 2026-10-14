@@ -120,6 +120,8 @@ class SystemConfigService:
         }
     }
     _SERVER_MASKED_CONFIG_KEYS: Set[str] = {
+        "CHOICE_USERNAME",
+        "CHOICE_PASSWORD",
         "ALPHASIFT_INSTALL_SPEC",
         "LLM_USAGE_HMAC_SECRET",
     }
@@ -375,7 +377,7 @@ class SystemConfigService:
     ) -> Dict[str, Any]:
         """Return display config values with mask metadata for server-masked fields."""
         saved_config_map = self._build_display_config_map(
-            self._manager.read_config_map()
+            self._manager.read_config_map(interpolate=False)
         )
         runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
         config_map = {
@@ -1561,6 +1563,14 @@ class SystemConfigService:
             raise ConfigValidationError(issues=errors)
 
         previous_map = self._manager.read_config_map()
+        from src.core.market_policy import require_stock_market
+        from data_provider.base import canonical_stock_code
+        existing_codes = {canonical_stock_code(code) for code in self._split_csv(previous_map.get("STOCK_LIST") or "")}
+        for item in items:
+            if item["key"].upper() == "STOCK_LIST":
+                for code in self._split_csv(item["value"]):
+                    if canonical_stock_code(code) not in existing_codes:
+                        require_stock_market(code)
         submitted_keys: Set[str] = set()
         updates: List[Tuple[str, str]] = []
         sensitive_keys: Set[str] = set()

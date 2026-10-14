@@ -53,6 +53,9 @@ def narrate(
 
     LLM 被明确要求只写叙述、复述数字时不得改动；任何异常/空响应返回 default_sentence。
     """
+    # Prices, comparisons and the valuation method already have rule-written prose.
+    if dim_id in {"data", "scenarios", "signal"}:
+        return default_sentence
     prompt = load_dim_prompt(dim_id)
     if not prompt or llm_adapter is None:
         return default_sentence

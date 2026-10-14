@@ -96,7 +96,7 @@ def _make_pipeline(enable_realtime_quote: bool, realtime_quote=None) -> StockAna
 
 @patch("src.config.get_config")
 def test_manager_does_not_warn_when_fallback_source_succeeds(mock_get_config, caplog):
-    mock_get_config.return_value = SimpleNamespace(
+    mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
         enable_realtime_quote=True,
         realtime_source_priority="efinance,akshare_em",
     )
@@ -120,7 +120,7 @@ def test_manager_does_not_warn_when_fallback_source_succeeds(mock_get_config, ca
 
 @patch("src.config.get_config")
 def test_manager_supplement_does_not_mark_fallback_from(mock_get_config):
-    mock_get_config.return_value = SimpleNamespace(
+    mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
         enable_realtime_quote=True,
         realtime_source_priority="efinance,akshare_em",
     )
@@ -144,7 +144,7 @@ def test_manager_supplement_does_not_mark_fallback_from(mock_get_config):
 
 @patch("src.config.get_config")
 def test_manager_fallback_from_records_highest_priority_failed_source(mock_get_config):
-    mock_get_config.return_value = SimpleNamespace(
+    mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
         enable_realtime_quote=True,
         realtime_source_priority="efinance,tushare,akshare_em",
     )
@@ -166,7 +166,7 @@ def test_manager_fallback_from_records_highest_priority_failed_source(mock_get_c
 
 @patch("src.config.get_config")
 def test_manager_drops_invalid_provider_timestamp_before_return(mock_get_config):
-    mock_get_config.return_value = SimpleNamespace(
+    mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
         enable_realtime_quote=True,
         realtime_source_priority="efinance",
         realtime_cache_ttl=600,
@@ -211,7 +211,7 @@ def test_pipeline_warns_once_when_all_realtime_sources_fail(caplog):
 def test_event_monitor_keeps_manager_failure_summary_for_direct_quote_call(mock_get_config, caplog):
     from src.agent.events import EventMonitor, PriceAlert
 
-    mock_get_config.return_value = SimpleNamespace(
+    mock_get_config.return_value = SimpleNamespace(data_source_profile="legacy",
         enable_realtime_quote=True,
         realtime_source_priority="efinance",
     )

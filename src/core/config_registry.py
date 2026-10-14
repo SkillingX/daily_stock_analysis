@@ -85,6 +85,33 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "CHOICE_USERNAME": {
+        "title": "Choice API账号", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
+    "CHOICE_PASSWORD": {
+        "title": "Choice API密码", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
+    "DATA_SOURCE_PROFILE": {
+        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/iFinD/Choice MCP/Fuyao。安装 SDK 后配置账号密码（服务器推荐）；未配置账密时使用本机已激活设备文件。修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "select",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "legacy", "options": ["legacy", "choice"],
+        "validation": {"enum": ["legacy", "choice"]}, "display_order": 12,
+    },
+    "ENABLED_MARKETS": {
+        "title": "开放个股市场",
+        "description": "非空 cn/hk/us 子集。部署为 cn 时仅接受沪深京新请求；历史可读。修改后重启分析、API 与调度进程。",
+        "category": "base", "data_type": "array", "ui_control": "text",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "cn,hk,us", "options": [],
+        "validation": {"min_items": 1, "allowed_values": ["cn", "hk", "us"], "delimiter": ","}, "display_order": 11,
+    },
     "STOCK_LIST": {
         "title": "Stock List",
         "description": "Comma-separated watchlist stock codes.",

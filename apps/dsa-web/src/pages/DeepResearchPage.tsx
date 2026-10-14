@@ -95,7 +95,7 @@ export function DeepResearchPage() {
     : dimsInfo;
 
   const dimsOkCount = effectiveDims
-    ? DUAL_TRACK_DIMS.length - effectiveDims.dimsDegraded.length
+    ? DUAL_TRACK_DIMS.length - new Set([...effectiveDims.dimsDegraded, ...effectiveDims.dimsSkipped]).size
     : 0;
 
   const loadHistory = useCallback(async () => {
@@ -271,8 +271,7 @@ export function DeepResearchPage() {
               </div>
               {isDualTrackItem(item) ? (
                 <span className="mt-1 inline-block rounded bg-cyan/15 px-1.5 py-0.5 text-[10px] text-cyan">
-                  维度 {DUAL_TRACK_DIMS.length - (item.missing_layers?.length ?? 0)}/
-                  {DUAL_TRACK_DIMS.length}
+                  {item.status === 'partial' ? '部分可用' : '双轨报告'}
                 </span>
               ) : (
                 item.status === 'partial' && (
@@ -536,7 +535,7 @@ export function DeepResearchPage() {
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     <span className="rounded bg-cyan/15 px-2 py-0.5 text-cyan">
-                      双轨引擎 · 维度 {dimsOkCount}/{DUAL_TRACK_DIMS.length}
+                      双轨引擎 · 正常维度 {dimsOkCount}/{DUAL_TRACK_DIMS.length}（非资料覆盖率）
                     </span>
                     {dualTrack.cacheHit && (
                       <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-400">

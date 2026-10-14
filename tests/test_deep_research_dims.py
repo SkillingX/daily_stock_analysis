@@ -168,14 +168,17 @@ class TestValuationBasis:
         ctx = _ctx()
         ctx.fundamental = {"pe_ttm": -3.0}
         dim = build_scenarios_dim(ctx, current_price=13.0)
-        assert dim.valuation_basis == "PB"
+        assert dim.valuation_basis == "none"
+        assert dim.status == "degraded"
 
     def test_profit_maker_uses_pe(self):
         ctx = _ctx()
         ctx.fundamental["field_meta"] = {"pe_ratio": {"source": "mx", "value": ctx.fundamental["pe_ttm"], "caliber": "TTM", "unit": "multiple"}}
         dim = build_scenarios_dim(ctx, current_price=13.0)
-        assert dim.valuation_basis == "PE_TTM"
-        assert dim.probability_sum == pytest.approx(1.0)
+        assert dim.valuation_basis == "none"
+        assert dim.current_pe_ttm == ctx.fundamental["pe_ttm"]
+        assert dim.probability_sum == 0
+        assert dim.expected_value is None
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +609,10 @@ class TestSnapshotCache:
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
-        dim_cache.save_snapshot(f"stage0_fund_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {"pe_ttm": 19.09})
+        dim_cache.save_snapshot(f"stage0_fund_legacy_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {
+            "pe_ttm": 19.09, "pb": 2.0, "roe": 18.0, "gross_margin": 40.0,
+            "revenue_growth": 10.0, "net_profit_yoy": 10.0, "market_cap": 10000.0,
+        })
 
         def _boom(*a, **k):
             raise AssertionError("命中快照不应调用 fetcher")
@@ -637,7 +643,7 @@ class TestNarrateHardening:
                 return _R()
 
         out = narrate(
-            _ThinkAdapter(), "data", {"a": 1}, "默认句", timeout=1
+            _ThinkAdapter(), "phase", {"a": 1}, "默认句", timeout=1
         )
         assert "<think>" not in out
         assert out.startswith("均线空头排列")

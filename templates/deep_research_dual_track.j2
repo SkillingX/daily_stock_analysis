@@ -21,10 +21,8 @@
 
 **怎么在这只票上赚到钱**：{{ signal.one_sentence }}
 
-<details>
-<summary>术语速查（点击展开）：评分=六维加权总分(0-100，越高越好)；先验=六维映射的初始胜率估计；Edge=我们与市场定价的认知差；EV=三情景概率加权目标价；LR=证据强度（似然比）</summary>
+**术语速查**：评分=六维加权总分(0-100，越高越好)；先验=六维映射的初始胜率估计；Edge=我们与市场定价的认知差；EV=三情景概率加权目标价；LR=证据强度（似然比）
 
-</details>
 
 **操作指令（模拟盘记录，非实盘建议）**：
 {% if conclusion.conclusion %}
@@ -319,19 +317,19 @@
 {% if ownership.top_holders %}
 **前十大股东**：
 {% for h in ownership.top_holders %}
-- {{ h }}
+- {{ h | holder }}
 {% endfor %}
 {% endif %}
 {% if ownership.executives %}
 **核心高管**：
 {% for e in ownership.executives %}
-- {{ e }}
+- {{ e | holder }}
 {% endfor %}
 {% endif %}
 {% if ownership.recent_changes %}
 **近一年变动**：
 {% for c in ownership.recent_changes %}
-- {{ c }}
+- {{ c | holder }}
 {% endfor %}
 {% endif %}
 {% if ownership.data_gaps %}

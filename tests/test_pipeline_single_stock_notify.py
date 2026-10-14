@@ -83,6 +83,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
     @staticmethod
     def _build_batch_pipeline() -> StockAnalysisPipeline:
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.max_workers = 2
         pipeline.fetcher_manager = MagicMock()
         pipeline.db = MagicMock()
@@ -91,6 +92,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         pipeline._save_local_report = MagicMock()
         pipeline._send_notifications = MagicMock()
         pipeline.config = SimpleNamespace(
+            enabled_markets=("cn", "hk", "us"),
             stock_list=["000001", "600519"],
             refresh_stock_list=lambda: None,
             single_stock_notify=True,
@@ -133,6 +135,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
 
     def test_process_single_stock_direct_path_keeps_notify_compatibility(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
         pipeline.analyze_stock = MagicMock(return_value=_make_result("600519"))
         pipeline.notifier = _TrackingNotifier()
@@ -158,6 +161,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
 
     def test_process_single_stock_updates_saved_diagnostics_after_notification(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
         pipeline.analyze_stock = MagicMock(return_value=_make_result("600519"))
         pipeline.notifier = _TrackingNotifier()
@@ -181,9 +185,10 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
 
     def test_send_notifications_patches_saved_diagnostics_when_push_is_skipped(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.save_context_snapshot = True
         pipeline.db = MagicMock()
-        pipeline.config = SimpleNamespace(stock_email_groups=[])
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"), stock_email_groups=[])
         pipeline.notifier = MagicMock()
         pipeline.notifier.generate_aggregate_report.return_value = "report"
         results = [_make_result("000001"), _make_result("600519")]
@@ -202,6 +207,7 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
 
     def test_process_single_stock_direct_path_does_not_notify_when_failed(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
+        pipeline.config = SimpleNamespace(enabled_markets=("cn", "hk", "us"))
         pipeline.fetch_and_save_stock_data = MagicMock(return_value=(True, None))
         pipeline.analyze_stock = MagicMock(return_value=_make_result("600519", success=False))
         pipeline.notifier = _TrackingNotifier()

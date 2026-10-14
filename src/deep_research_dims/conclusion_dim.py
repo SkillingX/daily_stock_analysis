@@ -35,9 +35,16 @@ def build_conclusion_dim(
     six_total = float(framework.get("dimension_total") or 50.0)
     posterior = float(bay.get("posterior_p") or 0.5)
     edge = float(bay.get("edge") or 0.0)
-    action = _map_action(posterior, edge, six_total)
+    valuation_available = scenarios_payload.get("status") == "ok" and (scenarios_payload.get("target_price") is not None or scenarios_payload.get("expected_value") is not None)
+    action = _map_action(posterior, edge, six_total) if valuation_available else "观察"
+    target = scenarios_payload.get("target_price") or scenarios_payload.get("expected_value")
+    current = ctx.quote.get("price")
+    if action in {"建仓", "加仓"} and (not isinstance(current, (int, float)) or not isinstance(target, (int, float)) or current <= 0 or target <= current):
+        action = "观察"
 
     horizons = ((scenarios_payload or {}).get("scenarios") or {}).get("horizons") or {}
+    if not valuation_available:
+        horizons = {}
     conclusion = InvestmentConclusion(
         prior_p=bay.get("prior_p"),
         market_implied_p=bay.get("market_implied_p"),
@@ -50,6 +57,8 @@ def build_conclusion_dim(
         rationale="",
     )
     return ConclusionDim(
+        status="ok" if valuation_available else "degraded",
+        degraded_reason=None if valuation_available else "估值依据不足，无法形成估值驱动的行动结论",
         conclusion=conclusion,
         rationale="",
         narrative=(

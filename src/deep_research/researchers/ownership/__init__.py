@@ -5,9 +5,11 @@
 """
 
 from __future__ import annotations
+from typing import Any
 
 from src.agent.deep_research.explore_agents import run_ownership_agent
 from src.deep_research.researchers.base import generic_parse
+from src.schemas.deep_research_dims import OwnershipDim
 
 DIM_ID = "ownership"
 DISPLAY_NAME = "股权高管研究员"
@@ -19,5 +21,10 @@ SCORE_KEY = 'score'
 runner_fn = run_ownership_agent
 
 
-def parse(parsed, steps):
-    return generic_parse(DIM_ID, parsed, steps)
+def parse(parsed: dict[str, Any], steps: int) -> tuple[OwnershipDim, int]:
+    dim, used = generic_parse(DIM_ID, parsed, steps)
+    assert isinstance(dim, OwnershipDim)
+    missing = [label for label, value in (("实际控制人信息", dim.controller), ("十大股东", dim.top_holders), ("核心高管", dim.executives)) if not value]
+    if missing or dim.data_gaps:
+        dim = dim.model_copy(update={"status": "degraded", "score": None, "degraded_reason": "股权资料不足，已有内容仅供部分参考", "data_gaps": list(dict.fromkeys([*dim.data_gaps, *missing]))})
+    return dim, used
