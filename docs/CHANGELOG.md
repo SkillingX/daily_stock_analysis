@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] iFinD分产品收入、成本与毛利资料按真实证券/财期/排名接入现有主营章节，保留Choice资料及模型失败后的有效明细；覆盖和单位缺口如实披露，不新增评分。
+
 - [新功能] Choice主源下可显式启用iFinD六项当前财务补值及默认独立核验，基本面/财务/深度投研保留主值、对照证据和失败原因；按本部署约定将A股“元”视为人民币，报表/调整口径不足仍标不可比，不改年度评分。
 
 - [文档] 形成 iFinD 补充 Choice 的正式规格，明确默认六项财务核验、主营/股东范围、数据资格与报告验收边界，并完成独立 reader testing。

@@ -409,7 +409,7 @@ _BUSINESS_TOOLS = {"search_comprehensive_intel"}
 def run_business_agent(
     stock_code: str, stock_name: str, llm_adapter: Any,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    max_steps: int = 8, *, deadline: Optional[float] = None,
+    max_steps: int = 8, *, deadline: Optional[float] = None, research: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与龙头对比。"""
     task = (
@@ -422,16 +422,28 @@ def run_business_agent(
     if get_config().data_source_profile == "choice":
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
-        info = _handle_get_stock_info(stock_code, deadline=deadline)
-        research = (info.get("fundamental_context") or {}).get("research") or {}
-        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
+        if research is None:
+            info = _handle_get_stock_info(stock_code, deadline=deadline)
+            research = (info.get("fundamental_context") or {}).get("research") or {}
+        research = research or {}
+        if get_config().enable_ifind_mcp:
+            from src.agent.tools.data_tools import _get_fetcher_manager
+            research = {**research, "product_segments": _get_fetcher_manager().get_ifind_research_context(stock_code, "products", deadline=deadline)}
+        task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
     else:
         research = {}
     out = _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
     company = research.get("company") or {}
-    if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT")):
-        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为Choice结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
+    products = research.get("product_segments")
+    if out.get("ok"):
+        out["data"].pop("product_segments", None)
+    if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT") or (products or {}).get("items")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为已取得供应商结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
         for field, indicator in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
             if company.get(indicator):
                 out["data"][field] = {"value": company[indicator], "source": f"Choice {indicator}，截至{research.get('as_of')}"}
+    if out.get("ok") and products:
+        out["data"]["product_segments"] = products
+        if products.get("errors"):
+            out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), *products["errors"]]))
     return out

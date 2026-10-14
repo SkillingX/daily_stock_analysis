@@ -560,10 +560,10 @@ def run_dual_track(
         (d, globals()[RUNNER_NAMES[d]]) for d in researcher_dim_ids if d in selected
     ]
     if active_researchers:
-        def run_researcher(runner: Callable[..., Dict[str, Any]]) -> Dict[str, Any]:
+        def run_researcher(runner: Callable[..., Dict[str, Any]], dim_id: str) -> Dict[str, Any]:
             token = financial_refresh.set(refresh_marker) if refresh_marker else None
             try:
-                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
+                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps, **({"research": ctx.fundamental.get("research")} if dim_id == "business" else {}))
             finally:
                 if token is not None:
                     financial_refresh.reset(token)
@@ -578,7 +578,7 @@ def run_dual_track(
                 start_dim(dim_id)
                 futures[
                     pool.submit(
-                        run_researcher, runner,
+                        run_researcher, runner, dim_id,
                     )
                 ] = dim_id
 

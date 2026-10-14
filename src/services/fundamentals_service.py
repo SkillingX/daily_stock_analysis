@@ -64,7 +64,7 @@ def _position_text(business_payload: Dict[str, Any]) -> str:
     return " ".join(parts)[:400]
 
 
-def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None, force_refresh: bool = False) -> Dict[str, Any]:
+def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None, force_refresh: bool = False, research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """跑一个研究员（带维度缓存），失败返回降级占位。"""
     from src.deep_research.researchers import REGISTRY, RUNNER_NAMES
     import src.agent.deep_research.orchestrator as orch
@@ -85,7 +85,7 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
     try:
         runner = getattr(orch, RUNNER_NAMES[dim_id])
         from src.services.deep_research_service import _get_dual_track_adapter
-        out = runner(code, name, _get_dual_track_adapter(), None, 8, deadline=deadline)
+        out = runner(code, name, _get_dual_track_adapter(), None, 8, deadline=deadline, **({"research": research} if dim_id == "business" else {}))
         if out.get("ok"):
             dim, _ = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
             payload = dim.model_dump()
@@ -122,8 +122,11 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                     contract = get_config().data_source_contract
                     if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
                         continue
-                    financial = json.loads(full.get("dims_json") or "{}").get("financial") or {}
-                    if any(field.get("source_errors") for field in (financial.get("financial_snapshot") or {}).values()):
+                    dims = json.loads(full.get("dims_json") or "{}")
+                    financial = dims.get("financial") or {}
+                    if contract != "legacy" and any(field.get("source_errors") for field in (financial.get("financial_snapshot") or {}).values()):
+                        continue
+                    if ((dims.get("business") or {}).get("product_segments") or {}).get("errors"):
                         continue
                     return full
     except Exception:  # noqa: BLE001
@@ -194,12 +197,12 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
     token = financial_refresh.set((code, uuid4().hex) if force_refresh else None)
     try:
         ctx = build_shared_context(code, name, deadline=deadline)
+        if name == code and ctx.quote.get("name"):
+            name = str(ctx.quote["name"])
+            ctx.stock_name = name
+        business = _research_dim("business", code, name, deadline=deadline, force_refresh=force_refresh, research=ctx.fundamental.get("research"))
     finally:
         financial_refresh.reset(token)
-    if name == code and ctx.quote.get("name"):
-        name = str(ctx.quote["name"])
-        ctx.stock_name = name
-    business = _research_dim("business", code, name, deadline=deadline, force_refresh=force_refresh)
     dims = {
         "business": business,
         "sector": _rule_dim("sector", code, name, ctx, _position_text(business)),

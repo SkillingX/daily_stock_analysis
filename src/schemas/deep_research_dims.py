@@ -30,6 +30,7 @@ from src.schemas.report_schema import (
     SniperPoints,
 )
 from src.schemas.research_framework import ResearchFramework
+from data_provider.ifind_fundamental_adapter import ProductSegments
 from src.schemas.supply_chain import SupplyChain
 from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
@@ -433,6 +434,7 @@ class BusinessDim(DimEnvelope):
     dim: Literal["business"] = "business"
     business_model: Dict[str, Any] = Field(default_factory=dict)
     main_products: Dict[str, Any] = Field(default_factory=dict)
+    product_segments: ProductSegments | None = None
     competitive_position: Dict[str, Any] = Field(default_factory=dict)
     vs_market_leader: Dict[str, Any] = Field(default_factory=dict)
     score: Optional[float] = Field(None, ge=0, le=100)

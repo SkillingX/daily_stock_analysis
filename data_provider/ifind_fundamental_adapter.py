@@ -14,11 +14,11 @@ import json
 import logging
 import os
 import re
-from dataclasses import replace
-from datetime import datetime, timezone
-from decimal import Decimal
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timezone
+from decimal import Decimal, DecimalException
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period, normalize_report_period
 
@@ -274,6 +274,93 @@ class IfindReply(BaseModel):
     data: IfindData | None = None
 
 
+class ProductSegment(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    name: Annotated[str, Field(min_length=1)]
+    rank: Annotated[int, Field(ge=1)]
+    report_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+    revenue: AnchorReading | None = None
+    cost: AnchorReading | None = None
+    gross_profit: AnchorReading | None = None
+    gross_margin: AnchorReading | None = None
+
+
+class ProductSegments(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    source: Literal["ifind"] = "ifind"
+    coverage: Literal["partial"] = "partial"
+    items: list[ProductSegment] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    disclosed_at: str | None = None
+    original_url: str | None = None
+
+
+@dataclass(frozen=True)
+class _RankedCell:
+    raw: str
+    label: str
+    params: dict[str, str | int | float | None]
+
+
+def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[dict[tuple[str, int], dict[str, _RankedCell]], list[str]]:
+    """Join ranked supplier cells only by returned security, explicit period and rank."""
+    from data_provider.choice_adapter import ChoiceAdapter
+    expected = ChoiceAdapter.stock_code(code)
+    joined: dict[tuple[str, int], dict[str, _RankedCell]] = {}
+    rejected: set[tuple[str, int]] = set()
+    errors: list[str] = []
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if row.get("证券代码") != expected:
+                continue
+            row_period = normalize_report_period(row.get("日期") or row.get("报告期"))[0]
+            for label, raw in row.items():
+                stem = re.sub(r"[（(][^()（）]*(?:排名|单位)[^()（）]*[）)]", "", label).strip()
+                field = next((name for name, prefix in fields.items() if stem == prefix), None)
+                rank_match = re.search(r"第(\d+)名", label)
+                if field is None or rank_match is None or not raw.strip():
+                    continue
+                rank = int(rank_match[1])
+                if rank < 1:
+                    errors.append("invalid_rank")
+                    continue
+                options = [params for key, params in data.indicators_params.items() if key.split("__")[0] == stem and str(params.get("排名") or params.get("大股东排名")) == f"第{rank}名"]
+                if len(options) > 1:
+                    errors.append("ambiguous_indicator")
+                    continue
+                params = options[0] if options else {}
+                parameter_period = normalize_report_period(params.get("报告期") or params.get("截止日期"))[0]
+                period = row_period or parameter_period
+                if period is None:
+                    errors.append("period_unknown")
+                    continue
+                key = period, rank
+                if row_period and parameter_period and row_period != parameter_period:
+                    rejected.add(key)
+                    errors.append("period_conflict")
+                    continue
+                cell = _RankedCell(raw, label, params)
+                existing = joined.setdefault(key, {}).get(field)
+                if existing is not None and existing != cell:
+                    rejected.add(key)
+                    errors.append("duplicate_rank_conflict")
+                else:
+                    joined[key][field] = cell
+    return {key: cells for key, cells in joined.items() if key not in rejected}, list(dict.fromkeys(errors))
+
+
+def _detail_reading(cell: _RankedCell, period: str, field: str) -> AnchorReading | None:
+    unit = str(cell.params.get("单位") or "").strip() or None
+    raw_currency = str(cell.params.get("币种") or "").strip() or None
+    currency = raw_currency or ("CNY" if unit == "元" else None)
+    value, normalized, currency, error = _ifind_number(cell.raw, cell.label, unit, field, currency)
+    if value is None:
+        return None
+    return AnchorReading("ifind", value, period=period, unit=normalized, currency=currency,
+                         raw_value=cell.raw, raw_label=cell.label, raw_unit=unit, raw_currency=raw_currency,
+                         normalization_error=error, fetched_at=datetime.now(timezone.utc).isoformat())
+
+
 def _ifind_data(raw: object) -> IfindData:
     try:
         reply = IfindReply.model_validate(raw)
@@ -299,7 +386,10 @@ def _ifind_number(raw: str, label: str, unit: str | None, field: str, currency: 
     declared = (unit or "").strip()
     if match and (declared in {"元", "股"} or not declared and re.search(r"单位[：:]\s*(元|股)[）)]", label)):
         scale = {"万亿": 10**12, "千亿": 10**11, "百亿": 10**10, "十亿": 10**9, "百万": 10**6, "亿": 10**8, "万": 10**4, "千": 10**3}[match[2]]
-        text = str(Decimal(match[1]) * scale)
+        try:
+            text = str(Decimal(match[1]) * scale)
+        except DecimalException:
+            return None, None, currency, "invalid_value"
     value, normalized, currency, error = normalize_anchor_value(field, text, label, unit=declared or None, currency=currency)
     return value, normalized, currency, error
 
@@ -460,6 +550,26 @@ class IfindFetcher:
         if not readings:
             raise SourceReadError("ifind", "invalid_response")
         return readings
+
+    def product_segments(self, code: str, period: str | None = None, *, deadline: float | None = None) -> ProductSegments:
+        target = period or f"{date.today().year - 1}-12-31"
+        data = self.query("get_stock_financials", f"{code} 报告期{target} 主营构成(按产品)：项目名称、收入、成本、毛利金额、毛利率，列出排名与实际财期、各字段单位、披露日期及原文链接；空值不要推算。", deadline=deadline)
+        cells, errors = _ranked_cells(data, code, {"name": "主营构成-项目名称(按产品)", "revenue": "主营构成-项目收入(按产品)", "cost": "主营构成-项目成本(按产品)", "gross_profit": "主营构成-项目毛利(按产品)", "gross_margin": "主营构成-项目毛利率(按产品)"})
+        if not cells and not errors:
+            raise SourceReadError("ifind", "invalid_response")
+        names = [(period, row["name"].raw) for (period, rank), row in cells.items() if "name" in row]
+        items = []
+        for (actual, rank), row in sorted(cells.items()):
+            name = row.get("name")
+            if name is None or names.count((actual, name.raw)) != 1:
+                errors.append("product_identity_missing_or_duplicate")
+                continue
+            values = {field: _detail_reading(row[field], actual, "gross_margin" if field == "gross_margin" else "revenue") for field in ("revenue", "cost", "gross_profit", "gross_margin") if field in row}
+            if not any(value is not None for value in values.values()):
+                errors.append("product_values_missing")
+                continue
+            items.append(ProductSegment(name=name.raw, rank=rank, report_date=actual, **values))
+        return ProductSegments(items=items, errors=list(dict.fromkeys(errors)))
 
     def fetch(self, code: str, field: str, period: str | None = None, *, deadline: float | None = None) -> AnchorReading | None:
         if not self.available or field not in _IFIND_ANCHOR_QUERIES:

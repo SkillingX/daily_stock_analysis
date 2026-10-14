@@ -25,7 +25,7 @@ from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any, cast
+from typing import Literal, Callable, Optional, List, Tuple, Dict, Any, cast
 
 import pandas as pd
 import numpy as np
@@ -4282,6 +4282,34 @@ class DataFetcherManager:
         result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
         result["status"] = "partial"
         if not errors and self._should_cache_fundamental_context(result):
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "context": result}
+        return result
+
+    def get_ifind_research_context(self, stock_code: str, section: Literal["products"], *, period: Optional[str] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
+        """Optional research facts reuse the existing cache, refresh marker and budget."""
+        from src.config import get_config
+        from data_provider.ifind_fundamental_adapter import IfindFetcher
+        from data_provider.cross_source_validator import SourceReadError
+        from data_provider.mx_data_adapter import financial_refresh
+        config = get_config()
+        if config.data_source_profile != "choice" or not config.enable_ifind_mcp:
+            return {}
+        stock_code = normalize_stock_code(stock_code)
+        key = f"{config.data_source_contract}|ifind_{section}|{stock_code}|{period or 'latest_annual'}"
+        refresh = financial_refresh.get()
+        self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
+        with self._fundamental_cache_lock:
+            cached = self._fundamental_cache.get(key)
+            if cached is not None and not (refresh and refresh[0] == stock_code):
+                return cast(Dict[str, Any], cached["context"])
+        deadline = min(deadline, time.monotonic() + config.ifind_mcp_timeout_seconds) if deadline is not None else time.monotonic() + config.ifind_mcp_timeout_seconds
+        try:
+            fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+            result = fetcher.product_segments(stock_code, period, deadline=deadline).model_dump(mode="json")
+        except SourceReadError as exc:
+            return {"source": "ifind", "coverage": "partial", "items": [], "errors": [str(exc)]}
+        if result["items"] and not result["errors"]:
             with self._fundamental_cache_lock:
                 self._fundamental_cache[key] = {"ts": time.time(), "context": result}
         return result

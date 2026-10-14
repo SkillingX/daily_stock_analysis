@@ -286,6 +286,7 @@
 {%- if s.env.main_products %}
 {{ s.env.main_products | cn }}
 {% endif %}
+{% if s.env.product_segments %}{% with products=s.env.product_segments %}{% include 'product_segments.j2' %}{% endwith %}{% endif %}
 {%- if s.env.competitive_position %}
 {{ s.env.competitive_position | cn }}
 {% endif %}
