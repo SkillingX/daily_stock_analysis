@@ -122,6 +122,9 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                     contract = get_config().data_source_contract
                     if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
                         continue
+                    financial = json.loads(full.get("dims_json") or "{}").get("financial") or {}
+                    if any(field.get("source_errors") for field in (financial.get("financial_snapshot") or {}).values()):
+                        continue
                     return full
     except Exception:  # noqa: BLE001
         pass

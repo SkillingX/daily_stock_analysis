@@ -85,8 +85,32 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "ENABLE_IFIND_MCP": {
+        "title": "iFinD 补充与财务核验", "description": "Choice策略下显式启用六项财务补值/默认核验及主营、股东补充；需endpoint与token，旧深度投研核验开关不再控制此组合。修改后重启进程。",
+        "category": "data_source", "data_type": "boolean", "ui_control": "switch",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "false", "options": [], "validation": {}, "display_order": 14,
+    },
+    "IFIND_MCP_ENDPOINT": {
+        "title": "iFinD MCP地址", "description": "供应商A股专用Streamable HTTP地址，修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "text",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 15,
+    },
+    "IFIND_MCP_TOKEN": {
+        "title": "iFinD MCP密钥", "description": "仅本机私有.env或部署凭据注入，修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 16,
+    },
+    "IFIND_MCP_TIMEOUT_SECONDS": {
+        "title": "iFinD请求超时", "description": "同批MCP请求总等待上限，仍受报告剩余预算约束。",
+        "category": "data_source", "data_type": "number", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "30", "options": [], "validation": {"min": 0.1}, "display_order": 17,
+    },
     "DATA_SOURCE_PROFILE": {
-        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/iFinD/Choice MCP/Fuyao。安装 SDK 并完成设备激活后重启进程，账号凭据只保留在官方 SDK。",
+        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生SDK，停止 MX/Choice MCP/Fuyao；iFinD需显式ENABLE_IFIND_MCP启用。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
         "default_value": "legacy", "options": ["legacy", "choice"],

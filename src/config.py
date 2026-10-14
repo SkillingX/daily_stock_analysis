@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 配置管理模块
 
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -746,9 +747,10 @@ class Config:
     # === 深度投研多源交叉验证（MX Data 主源 + iFinD 验证；opt-in，默认关）===
     data_source_profile: str = "legacy"
     mx_apikey: Optional[str] = None  # 东财妙想 API key（MX_APIKEY）
+    enable_ifind_mcp: bool = False  # Choice profile: supplement + default financial verification
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
-    ifind_mcp_timeout_seconds: float = 8.0  # iFinD MCP 调用超时
+    ifind_mcp_timeout_seconds: float = 30.0  # iFinD MCP 调用超时
     deep_research_cross_validate: bool = False  # 深度投研锚点双源验证开关
     mx_call_budget: int = 50  # 单次报告 MX 调用上限（控配额）
 
@@ -1261,6 +1263,11 @@ class Config:
         _log = logging.getLogger(__name__)
         if self.data_source_profile not in {"legacy", "choice"}:
             raise ValueError("DATA_SOURCE_PROFILE must be legacy or choice")
+        if self.enable_ifind_mcp and self.data_source_profile == "choice":
+            if not (self.ifind_mcp_endpoint or '').strip() or not (self.ifind_mcp_token or '').strip():
+                raise ValueError("ENABLE_IFIND_MCP requires IFIND_MCP_ENDPOINT and IFIND_MCP_TOKEN")
+            if not math.isfinite(self.ifind_mcp_timeout_seconds) or self.ifind_mcp_timeout_seconds <= 0:
+                raise ValueError("IFIND_MCP_TIMEOUT_SECONDS must be finite and positive")
         if not self.enabled_markets or set(self.enabled_markets) - {"cn", "hk", "us"}:
             raise ValueError("ENABLED_MARKETS must be a nonempty subset of cn,hk,us")
         if self.agent_arch not in self._VALID_AGENT_ARCH:
@@ -1729,10 +1736,11 @@ class Config:
             longbridge_access_token=os.getenv("LONGBRIDGE_ACCESS_TOKEN") or None,
             longbridge_oauth_client_id=os.getenv("LONGBRIDGE_OAUTH_CLIENT_ID") or None,
             mx_apikey=os.getenv("MX_APIKEY") or None,
+            enable_ifind_mcp=parse_env_bool(os.getenv("ENABLE_IFIND_MCP"), default=False),
             ifind_mcp_endpoint=os.getenv("IFIND_MCP_ENDPOINT") or None,
             ifind_mcp_token=os.getenv("IFIND_MCP_TOKEN") or None,
             ifind_mcp_timeout_seconds=float(
-                os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "8.0"
+                os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "30.0"
             ),
             deep_research_cross_validate=parse_env_bool(
                 os.getenv("DEEP_RESEARCH_CROSS_VALIDATE"), default=False
@@ -2934,7 +2942,7 @@ class Config:
     def data_source_contract(self) -> str:
         if self.data_source_profile == "choice":
             from data_provider.choice_adapter import ChoiceAdapter
-            return ChoiceAdapter.contract_version
+            return ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "")
         return "legacy"
 
     def get_effective_news_window_days(self) -> int:

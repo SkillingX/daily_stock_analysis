@@ -219,7 +219,6 @@ class TestIfindSource(unittest.TestCase):
 
 
 class TestIfindFetcher(unittest.TestCase):
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
     def test_no_token_unavailable(self):
         f = IfindFetcher(endpoint="", token="")
         self.assertFalse(f.available)
@@ -368,7 +367,6 @@ class TestParseIfindMarkdownSeries(unittest.TestCase):
 class TestIfindFetcherSeries(unittest.TestCase):
     """fetch_main_inflow_series：无 token → None（真实 MCP 路径 # pragma: no cover）。"""
 
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
     def test_unavailable_returns_none(self):
         f = IfindFetcher(endpoint="", token="")
         self.assertFalse(f.available)

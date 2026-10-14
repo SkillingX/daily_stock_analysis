@@ -135,6 +135,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "market_cap": next(
                 (valuation[k] for k in ("total_mv", "market_cap", "total_market_cap") if valuation.get(k) is not None), None
             ),
+            "revenue": financial.get("revenue"),
+            "net_profit": financial.get("net_profit"),
             "roe": financial.get("roe"),
             "revenue_growth": next(
                 (financial[k] for k in ("revenue_yoy", "revenue_growth") if financial.get(k) is not None), None
@@ -153,7 +155,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         }
         from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
         from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
-        aliases = {"pe_ratio": "pe_ttm", "pb_ratio": "pb", "roe": "roe", "gross_margin": "gross_margin", "revenue_yoy": "revenue_growth", "net_profit_yoy": "net_profit_yoy"}
+        aliases = {"revenue": "revenue", "net_profit": "net_profit", "pe_ratio": "pe_ttm", "pb_ratio": "pb", "roe": "roe", "gross_margin": "gross_margin", "revenue_yoy": "revenue_growth", "net_profit_yoy": "net_profit_yoy"}
         records = result["field_meta"]
         primary = {}
         for field, key in aliases.items():
@@ -162,7 +164,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                 primary[field] = reading
                 previous = records.get(field) or {}
                 conflict = previous.get("value") == reading.value and (previous.get("quality") or {}).get("status") == "conflict"
-                records[field] = adopted_field_record(field, reading, AnchorQuality(status="conflict" if conflict else "single_source" if config.data_source_profile == "choice" else "unverified"), previous_record=previous)
+                if config.data_source_profile != "choice":
+                    records[field] = adopted_field_record(field, reading, AnchorQuality(status="conflict" if conflict else "unverified"), previous_record=previous)
         # Reuse the same supplier adapter for missing fields and verification.
         if config.data_source_profile != "choice" and config.enable_fuyao and config.fuyao_api_key:
             from data_provider.fuyao_adapter import FuyaoFetcher, FuyaoSource
@@ -186,9 +189,12 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                     record = adopted_field_record(field, reading, selection_reason="fuyao_fallback")
                     if record["rule_eligible"]:
                         result[key], primary[field], records[field] = record["value"], reading, record
-        cross_validation = build_cross_validation_block(code, aliases, primary_readings=primary, deadline=deadline)
+        cross_validation = compact.get("cross_validation") if config.data_source_profile == "choice" else build_cross_validation_block(code, aliases, primary_readings=primary, deadline=deadline)
         if cross_validation:
             result["cross_validation"] = cross_validation
+        # Choice's manager already qualified supplements against the snapshot period.
+        # Retain rejected candidates as comparison evidence, not newly adopted values.
+        if cross_validation and config.data_source_profile != "choice":
             for field, anchor in cross_validation["anchors"].items():
                 record = field_record_from_validation(field, anchor)
                 if record is None and not result.get(aliases[field]):

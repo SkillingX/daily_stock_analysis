@@ -34,6 +34,15 @@ _report_cache: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}  # key→(repor
 _cache_lock = threading.Lock()
 
 
+def _cacheable_report(result: Dict[str, Any]) -> bool:
+    """Do not freeze a failed optional verification as a successful day cache."""
+    return result.get("status") in ("success", "ok") and not any(
+        field.get("source_errors")
+        for dim in (result.get("dimensions") or {}).values()
+        for field in (dim.get("financial_snapshot") or {}).values()
+    )
+
+
 def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
     """返回今日缓存 key（按自然日 + 维度子集指纹，同一天同子集复用同一报告）。
 
@@ -190,7 +199,7 @@ class DeepResearchService:
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
-            if cached and cached[2].get("status") in ("success", "ok"):
+            if cached and _cacheable_report(cached[2]):
                 cached_id, cached_ts, cached_result = cached
                 logger.info(
                     "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
@@ -375,7 +384,7 @@ class DeepResearchService:
             )
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
-        if write_ok and return_dict.get("markdown") and return_dict.get("status") in ("success", "ok"):
+        if write_ok and return_dict.get("markdown") and _cacheable_report(return_dict):
             cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:

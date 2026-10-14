@@ -289,6 +289,8 @@ class FinancialFieldQuality(BaseModel):
     rule_eligible: bool = False
     input_reasons: tuple[str, ...] = ()
     selection_reason: str = "unknown"
+    comparison_readings: tuple[AnchorReading, ...] = ()
+    source_errors: tuple[str, ...] = ()
 
 
 class FinancialDataQuality(BaseModel):
@@ -311,6 +313,7 @@ class FundamentalDim(DimEnvelope):
 
     dim: Literal["fundamental"] = "fundamental"
     data_quality: Optional[FinancialDataQuality] = None
+    financial_snapshot: dict[str, FinancialFieldQuality] = Field(default_factory=dict)
     profitability: Dict[str, Any] = Field(default_factory=dict)
     growth_quality: Dict[str, Any] = Field(default_factory=dict)
     financial_safety: Dict[str, Any] = Field(default_factory=dict)

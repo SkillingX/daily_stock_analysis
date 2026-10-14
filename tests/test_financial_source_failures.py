@@ -90,7 +90,7 @@ def test_ifind_series_timeout_keeps_existing_capital_flow_contract(monkeypatch):
     from data_provider.ifind_fundamental_adapter import IfindFetcher
     from data_provider.capital_flow_provider import get_main_inflow_cumulative
     fetcher = IfindFetcher(endpoint='https://fixture', token='fixture')
-    monkeypatch.setattr(fetcher, '_async_fetch_series', AsyncMock(side_effect=TimeoutError('private-failure')))
+    monkeypatch.setattr(fetcher, '_async_query', AsyncMock(side_effect=TimeoutError('private-failure')))
     monkeypatch.setattr(IfindFetcher, 'get_instance', classmethod(lambda cls: fetcher))
     assert get_main_inflow_cumulative('300260') == {}
 

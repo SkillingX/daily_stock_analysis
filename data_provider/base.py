@@ -23,6 +23,7 @@ import time
 from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional, List, Tuple, Dict, Any, cast
 
@@ -4181,7 +4182,7 @@ class DataFetcherManager:
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
-        key = f"{ChoiceAdapter.contract_version}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         if not (refresh and refresh[0] == code):
@@ -4191,7 +4192,8 @@ class DataFetcherManager:
                     return cast(Dict[str, Any], cached["context"])
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
-        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline)
+        verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp else 0.0
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         # Only attempt licensed public supplements for holes, within the same deadline.
         missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
@@ -4211,9 +4213,48 @@ class DataFetcherManager:
                     if reading is not None and not reading_input_reasons(reading, field) and reading.period == snapshot["report_date"] and reading.statement_scope == "consolidated" and reading.adjustment == "restated" and reading.raw_currency == "CNY":
                         snapshot["growth"][field] = reading.value
                         snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
-        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": ChoiceAdapter.contract_version,
+        cross_validation = None
+        if config.enable_ifind_mcp:
+            from data_provider.ifind_fundamental_adapter import IfindFetcher, IfindSource
+            from data_provider.cross_source_validator import CrossSourceValidator, SourceReadError, adopted_field_record, reading_from_field_record, reading_input_reasons
+            from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
+            fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+            readings, source_error = {}, None
+            try:
+                readings = fetcher.financial_snapshot(code, snapshot.get("report_date"), deadline=deadline)
+            except SourceReadError as exc:
+                source_error = exc.reason_code
+                errors.append(str(exc))
+            primary = {}
+            candidate_periods = {reading.period for reading in readings.values() if reading.period}
+            supplement_period = snapshot.get("report_date") or (next(iter(candidate_periods)) if len(candidate_periods) == 1 else None)
+            for field in fetcher.financial_fields:
+                reading = reading_from_field_record(snapshot["growth"].get(field), snapshot["field_meta"].get(field))
+                if reading is not None:
+                    primary[field] = reading
+                candidate = readings.get(field)
+                if candidate is not None:
+                    reason = "statement_scope_unknown" if candidate.statement_scope is None else "adjustment_unknown" if candidate.adjustment is None else None
+                    if reason:
+                        readings[field] = replace(candidate, normalization_error=candidate.normalization_error or reason)
+                    if snapshot["growth"].get(field) is None and not reading_input_reasons(readings[field], field) and readings[field].period == supplement_period and supplement_period and readings[field].period_basis != "unknown" and readings[field].statement_scope == "consolidated" and readings[field].adjustment == "restated":
+                        snapshot["growth"][field] = readings[field].value
+                        snapshot["field_meta"][field] = adopted_field_record(field, readings[field], selection_reason="ifind_supplement")
+            validator = CrossSourceValidator([IfindSource(readings=readings, error=source_error)])
+            try:
+                cross_validation = build_cross_validation_block(code, fetcher.financial_fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
+            finally:
+                validator.close()
+            if cross_validation:
+                for field, anchor in cross_validation["anchors"].items():
+                    record = field_record_from_validation(field, anchor)
+                    if record is not None and record["value"] == snapshot["growth"].get(field):
+                        snapshot["field_meta"][field] = record
+        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.data_source_contract,
                                   "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
-        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
+        if cross_validation:
+            result["cross_validation"] = cross_validation
+        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
             payload = dict(snapshot[block])
             payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"

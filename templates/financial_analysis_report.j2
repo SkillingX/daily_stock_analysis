@@ -13,6 +13,11 @@
 {{ loop.index }}. {{ red(label) }}：{{ a.dims[key].score if a.dims[key].score is not none else '—' }} 分 —— {{ a.dims[key].label }}
 {% endfor %}
 
+{% if a.financial_snapshot %}
+{% set snapshot = a.financial_snapshot %}
+{% include "financial_snapshot.j2" %}
+{% endif %}
+
 ## 二、盈利质量（ROE / 毛利率）
 
 {% if a.years %}

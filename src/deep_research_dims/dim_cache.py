@@ -79,7 +79,7 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
     if dim in _FUNDAMENTAL_MAPPING_DIMS:
         from src.config import get_config
-        if get_config().deep_research_cross_validate:
+        if get_config().deep_research_cross_validate or (get_config().data_source_profile == "choice" and get_config().enable_ifind_mcp):
             return None  # 本次核验依赖当前读数，不能复用以前的high或派生评分
         if record.get("cross_validation_enabled") != bool(get_config().deep_research_cross_validate):
             return None

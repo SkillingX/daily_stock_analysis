@@ -594,6 +594,12 @@ def _pair_reasons(left: AnchorReading, right: AnchorReading, spec: AnchorSpec) -
             return ("period_mismatch",)
         if left.period_basis != right.period_basis:
             return ("period_basis_mismatch",)
+        if left.statement_scope is not None or right.statement_scope is not None:
+            if left.statement_scope != right.statement_scope:
+                return ("statement_scope_mismatch",)
+        if left.adjustment is not None or right.adjustment is not None:
+            if left.adjustment != right.adjustment:
+                return ("adjustment_mismatch",)
     if (spec.caliber_aware or spec.field in FINANCIAL_ANCHORS) and left.caliber != right.caliber:
         return ("caliber_mismatch",)
     return ()
@@ -763,6 +769,10 @@ class CrossSourceValidator:
         self._max_workers = max(1, int(max_workers))
         self._pool = ThreadPoolExecutor(max_workers=self._max_workers)
         self._slots = BoundedSemaphore(self._max_workers)
+
+    def close(self) -> None:
+        """Release an owned batch's executor without extending its deadline."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def verify(
         self,

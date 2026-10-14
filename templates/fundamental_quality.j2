@@ -1,3 +1,8 @@
+{% if financial.financial_snapshot %}
+{% set snapshot = financial.financial_snapshot %}
+{% include "financial_snapshot.j2" %}
+{% endif %}
+
 {% if financial.data_quality %}
 {% set quality = financial.data_quality %}
 > 财务数据：取得 {{ quality.obtained_count }}/6 ｜ 规则可用 {{ quality.rule_usable_count }}/6 ｜ 评分组件 {{ quality.health_components }}/5 ｜ {{ quality.state }}

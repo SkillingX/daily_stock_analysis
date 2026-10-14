@@ -94,7 +94,7 @@ class AnnualReport(BaseModel):
 
 def _native_error(code: int, message: str) -> str:
     text = message.lower()
-    if any(word in text for word in ("login", "password", "token", "认证", "登录", "激活")):
+    if any(word in text for word in ("login", "password", "token", "expired", "reactivate", "认证", "登录", "激活")):
         return "authentication_failed"
     if any(word in text for word in ("quota", "限额", "额度", "次数")):
         return "quota_exhausted"
@@ -300,11 +300,14 @@ class ChoiceAdapter:
             out["errors"].append(str(exc))
         if report is not None:
             try:
-                fields = self.css(code, "ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
+                fields = self.css(code, "OPERATEREVENEW,PARENTNETPROFITNEW,ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
                 if fields.get("ACTUALISSUINGDATE"):
                     disclosure = self.report_date(fields["ACTUALISSUINGDATE"])
                 for field, indicator, caliber in (("roe", "ROEWA", "weighted_roe"), ("gross_margin", "GPMARGIN", "gross_margin"), ("revenue_yoy", "YOYOR", "operating_revenue_yoy"), ("net_profit_yoy", "YOYPNI", "parent_net_profit_yoy")):
                     self._adopt(out, "growth", field, fields.get(indicator), "percentage_point", caliber, report, disclosure, "restated", indicator,
+                                None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
+                for field, indicator, caliber in (("revenue", "OPERATEREVENEW", "operating_revenue"), ("net_profit", "PARENTNETPROFITNEW", "parent_net_profit")):
+                    self._adopt(out, "growth", field, fields.get(indicator), "currency_base", caliber, report, disclosure, "restated", indicator,
                                 None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
                 out["growth"].update(report_date=report, disclosure_date=disclosure)
             except SourceReadError as exc:
@@ -397,7 +400,7 @@ class ChoiceAdapter:
         if number is None:
             out["field_meta"][field] = {"quality": {"status": "missing", "reason_codes": ["null_value"]}}
             return
-        reading = AnchorReading(self.name, number, caliber=caliber, period=period, observed_at=observed,
+        reading = AnchorReading(self.name, number, caliber=caliber, period=period, period_basis="annual" if period and period.endswith("12-31") else "YTD" if period else "unknown", observed_at=observed,
                                 fetched_at=datetime.now(timezone.utc).isoformat(), unit=unit, currency="CNY" if unit == "currency_base" else None,
                                 raw_value=str(value), raw_label=indicator, normalization_error=error,
                                 statement_scope="consolidated", adjustment=adjustment, disclosed_at=observed if block == "growth" else None)

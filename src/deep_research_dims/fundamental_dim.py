@@ -21,14 +21,17 @@ _FUNDAMENTAL_FIELDS = {"pe_ratio": "pe_ttm", "pb_ratio": "pb", "roe": "roe", "gr
 def financial_field_quality(fund: Dict[str, Any], field: str) -> FinancialFieldQuality:
     """Reuse the current adopted record; a legacy scalar supplies no semantic proof."""
     metadata = (fund.get("field_meta") or {}).get(field) or {}
-    if metadata.get("value", fund.get(_FUNDAMENTAL_FIELDS[field])) != fund.get(_FUNDAMENTAL_FIELDS[field]):
+    comparison = ((fund.get("cross_validation") or {}).get("anchors") or {}).get(field) or {}
+    readings = tuple(reading for item in comparison.get("readings", []) if (reading := reading_from_field_record(item.get("value"), item)) is not None)
+    failures = tuple(f"{item['source']}:{item['reason_code']}" for item in comparison.get("source_errors", []))
+    if metadata.get("value", fund.get(_FUNDAMENTAL_FIELDS.get(field, field))) != fund.get(_FUNDAMENTAL_FIELDS.get(field, field)):
         metadata = {}
-    reading = reading_from_field_record(fund.get(_FUNDAMENTAL_FIELDS[field]), metadata)
+    reading = reading_from_field_record(fund.get(_FUNDAMENTAL_FIELDS.get(field, field)), metadata)
     if reading is None:
-        return FinancialFieldQuality(quality=AnchorQuality(status="missing", reason_codes=tuple((metadata.get("quality") or {}).get("reason_codes") or ())))
+        return FinancialFieldQuality(quality=AnchorQuality(status="missing", reason_codes=tuple((metadata.get("quality") or {}).get("reason_codes") or ())), comparison_readings=readings, source_errors=failures)
     quality = AnchorQuality.model_validate_json(json.dumps(metadata.get("quality") or {"status": "unverified"})) if reading.normalization_error != "metadata_invalid" else AnchorQuality()
     record = adopted_field_record(field, reading, quality, selection_reason=metadata.get("selection_reason", "unknown"))
-    return FinancialFieldQuality(reading=reading, quality=quality, rule_eligible=record["rule_eligible"], input_reasons=tuple(record["input_reasons"]), selection_reason=record["selection_reason"])
+    return FinancialFieldQuality(reading=reading, quality=quality, rule_eligible=record["rule_eligible"], input_reasons=tuple(record["input_reasons"]), selection_reason=record["selection_reason"], comparison_readings=readings, source_errors=failures)
 
 
 def eligible_financial_value(fund: Dict[str, Any], field: str) -> Optional[float]:
@@ -157,6 +160,7 @@ def build_fundamental_dim(
         status="ok" if complete else "degraded",
         degraded_reason=None if complete else "财务指标缺失或存在不可用于规则的输入",
         data_quality=quality,
+        financial_snapshot={field: financial_field_quality(fund, field) for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")} if fund.get("cross_validation") else {},
         profitability=profitability,
         growth_quality=growth_quality,
         financial_safety=financial_safety,
