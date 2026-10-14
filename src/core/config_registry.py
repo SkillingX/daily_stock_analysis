@@ -85,6 +85,18 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "CHOICE_USERNAME": {
+        "title": "Choice API账号", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
+    "CHOICE_PASSWORD": {
+        "title": "Choice API密码", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
     "ENABLE_IFIND_MCP": {
         "title": "iFinD 补充与财务核验", "description": "Choice策略下显式启用六项财务补值/默认核验及主营、股东补充；需endpoint与token，旧深度投研核验开关不再控制此组合。修改后重启进程。",
         "category": "data_source", "data_type": "boolean", "ui_control": "switch",
@@ -110,7 +122,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "30", "options": [], "validation": {"min": 0.1}, "display_order": 17,
     },
     "DATA_SOURCE_PROFILE": {
-        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生SDK，停止 MX/Choice MCP/Fuyao；iFinD需显式ENABLE_IFIND_MCP启用。修改后重启进程。",
+        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/Choice MCP/Fuyao；iFinD需显式ENABLE_IFIND_MCP启用。安装 SDK 后配置账号密码（服务器推荐）；未配置账密时使用本机已激活设备文件。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
         "default_value": "legacy", "options": ["legacy", "choice"],
