@@ -78,12 +78,12 @@ class ConfigManager:
         """Return active `.env` path."""
         return self._env_path
 
-    def read_config_map(self) -> Dict[str, str]:
-        """Read key-value mapping from `.env` file."""
+    def read_config_map(self, *, interpolate: bool = True) -> Dict[str, str]:
+        """Read `.env`; display callers disable expansion to avoid exposing referenced secrets."""
         if not self._env_path.exists():
             return {}
 
-        values = dotenv_values(self._env_path)
+        values = dotenv_values(self._env_path, interpolate=interpolate)
         return {
             str(key): "" if value is None else str(value)
             for key, value in values.items()
