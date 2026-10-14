@@ -1,5 +1,6 @@
 """Real supplier tables survive business research failure and report rendering."""
 import pytest
+from markdown2 import markdown
 from data_provider.ifind_fundamental_adapter import IfindFetcher
 from tests.test_ifind_choice_integration import ifind_transport
 from tests.test_choice_integration import choice_transport
@@ -106,6 +107,10 @@ def test_fundamental_force_refresh_updates_supplier_products(ifind_transport, fu
     assert '1511150168.69' in fresh['markdown']
     saved = database.get_fundamentals_report(fresh['report_id'])
     assert service.report_markdown(saved) == fresh['markdown']
+    html = markdown(service.report_markdown(saved), extras=['tables'])
+    products = html.split('主营分产品明细（iFinD）', 1)[1].split('</table>', 1)[0]
+    body = products.split('<tbody>', 1)[1].split('</tbody>', 1)[0]
+    assert body.count('<tr>') == 4
 
 
 def test_product_failure_does_not_prevent_same_day_recovery(ifind_transport, fundamentals_runtime, monkeypatch):

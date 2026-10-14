@@ -7,7 +7,7 @@
 | 产品 | 实际财期 | 收入 | 成本 | 毛利金额 | 毛利率 |
 | --- | --- | ---: | ---: | ---: | ---: |
 {% for item in rows %}
-| {{ item.name }} | {{ item.report_date }} |{% for field in ('revenue','cost','gross_profit','gross_margin') %}{% set r = item[field] %} {{ r.value if r else '缺失' }}{% if r %}（{{ r.unit or '单位未知' }}{% if r.currency %} / {{ r.currency }}{% endif %}{% if r.normalization_error %}；{{ r.normalization_error }}{% endif %}）{% endif %} |{% endfor %}
+| {{ item.name }} | {{ item.report_date }} |{% for field in ('revenue','cost','gross_profit','gross_margin') %}{% set r = item[field] %} {{ r.value if r else '缺失' }}{% if r %}（{{ r.unit or '单位未知' }}{% if r.currency %} / {{ r.currency }}{% endif %}{% if r.normalization_error %}；{{ r.normalization_error }}{% endif %}）{% endif %} |{% endfor +%}
 {% endfor %}
 {% else %}
 分产品资料未取得或证券、财期、排名无法匹配。
