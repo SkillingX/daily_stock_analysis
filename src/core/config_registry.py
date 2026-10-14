@@ -85,8 +85,20 @@ WEB_SETTINGS_HIDDEN_FROM_UI = {
 }
 
 _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "CHOICE_USERNAME": {
+        "title": "Choice API账号", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
+    "CHOICE_PASSWORD": {
+        "title": "Choice API密码", "description": "两项同时配置；不支持逗号或换行。仅部署配置，修改后重启SDK所属进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 13,
+    },
     "DATA_SOURCE_PROFILE": {
-        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/iFinD/Choice MCP/Fuyao。安装 SDK 并完成设备激活后重启进程，账号凭据只保留在官方 SDK。",
+        "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/iFinD/Choice MCP/Fuyao。安装 SDK 后配置账号密码（服务器推荐）；未配置账密时使用本机已激活设备文件。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
         "default_value": "legacy", "options": ["legacy", "choice"],

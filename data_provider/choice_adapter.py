@@ -1,5 +1,5 @@
 """Read Choice native data with one serialized, deadline-bounded SDK session.
-The optional SDK is loaded only in an owned child; no password or forced login.
+The optional SDK is loaded only in an owned child; credentials never cross replies.
 Report mapping stays in this adapter; native hangs terminate the owned process.
 """
 from __future__ import annotations
@@ -118,10 +118,21 @@ def _serve_native(connection: Connection) -> None:
                 break
             method, args, options, seconds = request
             try:
-                if sdk is None:
-                    sdk = importlib.import_module("EmQuantAPI").c
                 if not logged_in:
-                    login = sdk.start(f"ForceLogin=0,RecordLoginInfo=0,HTTPTimeout={max(1, int(seconds))}", logcallback=lambda _: 1)
+                    username = os.getenv("CHOICE_USERNAME", "")
+                    password = os.getenv("CHOICE_PASSWORD", "")
+                    if (username or password) and (
+                        not username.strip() or not password.strip()
+                        or any(char in username + password for char in ",\r\n\x00")
+                    ):
+                        connection.send({"error": "invalid_configuration"})
+                        continue
+                    options_login = f"ForceLogin=0,RecordLoginInfo=0,HTTPTimeout={max(1, int(seconds))}"
+                    if username and password:
+                        options_login += f",UserName={username},PassWord={password}"
+                    if sdk is None:
+                        sdk = importlib.import_module("EmQuantAPI").c
+                    login = sdk.start(options_login, logcallback=lambda _: 1)
                     if login.ErrorCode:
                         connection.send({"error": _native_error(login.ErrorCode, login.ErrorMsg)})
                         continue
