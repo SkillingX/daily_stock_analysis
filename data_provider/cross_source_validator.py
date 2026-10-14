@@ -161,7 +161,7 @@ def normalize_anchor_value(
     canonical, factor = cell if cell[0] is not None else header
     if canonical is None and field in {"pe_ratio", "pb_ratio"} and not number[2].strip() and unit is None:
         canonical = "multiple"
-    expected: Unit = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
+    expected: Unit = "shares" if field == "share_count" else "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
     if canonical != expected:
         error = error or ("unit_unknown" if canonical is None else "unit_incompatible")
     if number[2].strip() and cell[0] is None:

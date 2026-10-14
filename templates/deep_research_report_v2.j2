@@ -387,6 +387,7 @@
 - 替代进度：{{ s.env.substitution | cn }}
 {% endif %}
 {% elif s.id == 'ownership' %}
+{% if s.env.shareholder_details %}{% with holders=s.env.shareholder_details %}{% include 'shareholder_details.j2' %}{% endwith %}{% endif %}
 {% if s.env.controller %}
 - 实际控制人：{{ s.env.controller }}
 

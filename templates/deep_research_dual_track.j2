@@ -315,6 +315,7 @@
 
 {{ dim_links('ownership') }}
 {% if ownership.controller %}- 实际控制人：{{ ownership.controller }}{% endif %}
+{% if ownership.shareholder_details %}{% with holders=ownership.shareholder_details %}{% include 'shareholder_details.j2' %}{% endwith %}{% endif %}
 {% if ownership.top_holders %}
 **前十大股东**：
 {% for h in ownership.top_holders %}

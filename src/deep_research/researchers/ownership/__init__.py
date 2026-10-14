@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 from typing import Any
+import json
+from data_provider.ifind_fundamental_adapter import IfindShareholders
 
 from src.agent.deep_research.explore_agents import run_ownership_agent
 from src.deep_research.researchers.base import generic_parse
@@ -22,9 +24,13 @@ runner_fn = run_ownership_agent
 
 
 def parse(parsed: dict[str, Any], steps: int) -> tuple[OwnershipDim, int]:
-    dim, used = generic_parse(DIM_ID, parsed, steps)
+    payload = dict(parsed)
+    details = payload.pop("shareholder_details", None)
+    dim, used = generic_parse(DIM_ID, payload, steps)
     assert isinstance(dim, OwnershipDim)
-    missing = [label for label, value in (("实际控制人信息", dim.controller), ("十大股东", dim.top_holders), ("核心高管", dim.executives)) if not value]
+    if details is not None:
+        dim = dim.model_copy(update={"shareholder_details": IfindShareholders.model_validate_json(json.dumps(details))})
+    missing = [label for label, value in (("实际控制人信息", dim.controller), ("十大股东", dim.top_holders or (dim.shareholder_details.items if dim.shareholder_details else [])), ("核心高管", dim.executives)) if not value]
     if missing or dim.data_gaps:
         dim = dim.model_copy(update={"status": "degraded", "score": None, "degraded_reason": "股权资料不足，已有内容仅供部分参考", "data_gaps": list(dict.fromkeys([*dim.data_gaps, *missing]))})
     return dim, used

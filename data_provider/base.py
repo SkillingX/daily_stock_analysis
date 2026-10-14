@@ -4286,7 +4286,7 @@ class DataFetcherManager:
                 self._fundamental_cache[key] = {"ts": time.time(), "context": result}
         return result
 
-    def get_ifind_research_context(self, stock_code: str, section: Literal["products"], *, period: Optional[str] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
+    def get_ifind_research_context(self, stock_code: str, section: Literal["products", "holders"], *, period: Optional[str] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
         """Optional research facts reuse the existing cache, refresh marker and budget."""
         from src.config import get_config
         from data_provider.ifind_fundamental_adapter import IfindFetcher
@@ -4306,7 +4306,8 @@ class DataFetcherManager:
         deadline = min(deadline, time.monotonic() + config.ifind_mcp_timeout_seconds) if deadline is not None else time.monotonic() + config.ifind_mcp_timeout_seconds
         try:
             fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
-            result = fetcher.product_segments(stock_code, period, deadline=deadline).model_dump(mode="json")
+            dataset = fetcher.product_segments(stock_code, period, deadline=deadline) if section == "products" else fetcher.shareholders(stock_code, period, deadline=deadline)
+            result = dataset.model_dump(mode="json")
         except SourceReadError as exc:
             return {"source": "ifind", "coverage": "partial", "items": [], "errors": [str(exc)]}
         if result["items"] and not result["errors"]:

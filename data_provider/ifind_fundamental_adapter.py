@@ -295,6 +295,25 @@ class ProductSegments(BaseModel):
     original_url: str | None = None
 
 
+class IfindHolder(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    name: Annotated[str, Field(min_length=1)]
+    rank: Annotated[int, Field(ge=1, le=10)]
+    report_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+    shares: AnchorReading | None = None
+    ratio: AnchorReading | None = None
+
+
+class IfindShareholders(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    source: Literal["ifind"] = "ifind"
+    coverage: Literal["partial", "complete"] = "partial"
+    items: list[IfindHolder] = Field(default_factory=list, max_length=10)
+    errors: list[str] = Field(default_factory=list)
+    disclosed_at: str | None = None
+    original_url: str | None = None
+
+
 @dataclass(frozen=True)
 class _RankedCell:
     raw: str
@@ -390,7 +409,9 @@ def _ifind_number(raw: str, label: str, unit: str | None, field: str, currency: 
             text = str(Decimal(match[1]) * scale)
         except DecimalException:
             return None, None, currency, "invalid_value"
-    value, normalized, currency, error = normalize_anchor_value(field, text, label, unit=declared or None, currency=currency)
+    annotation = re.search(r"单位[：:]\s*([^）)；;]+)", label)
+    numeric_label = f"(单位：{annotation[1]})" if annotation else label
+    value, normalized, currency, error = normalize_anchor_value(field, text, numeric_label, unit=declared or None, currency=currency)
     return value, normalized, currency, error
 
 
@@ -570,6 +591,33 @@ class IfindFetcher:
                 continue
             items.append(ProductSegment(name=name.raw, rank=rank, report_date=actual, **values))
         return ProductSegments(items=items, errors=list(dict.fromkeys(errors)))
+
+    def shareholders(self, code: str, period: str | None = None, *, deadline: float | None = None) -> IfindShareholders:
+        target = period or f"{date.today().year - 1}-12-31"
+        data = self.query("get_stock_shareholders", f"{code} 截止{target} 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际财期、披露日和原文链接，合计比例另列，空值不要推算。", deadline=deadline)
+        cells, errors = _ranked_cells(data, code, {"name": "股东名称", "shares": "股东持股数量", "ratio": "股东持股比例"})
+        if not cells and not errors:
+            raise SourceReadError("ifind", "invalid_response")
+        periods = {actual for (actual, rank), row in cells.items() if "name" in row}
+        actual = max(periods) if periods else None
+        names = [row["name"].raw for (row_period, rank), row in cells.items() if row_period == actual and "name" in row]
+        items = []
+        for (row_period, rank), row in sorted(cells.items()):
+            if row_period != actual or not 1 <= rank <= 10:
+                continue
+            name = row.get("name")
+            if name is None or names.count(name.raw) != 1:
+                errors.append("holder_identity_missing_or_duplicate")
+                continue
+            shares = _detail_reading(row["shares"], row_period, "share_count") if "shares" in row else None
+            ratio = _detail_reading(row["ratio"], row_period, "gross_margin") if "ratio" in row else None
+            if shares is not None and (shares.unit != "shares" or shares.value < 0):
+                shares = replace(shares, normalization_error=shares.normalization_error or "invalid_holder_quantity")
+            if ratio is not None and (ratio.unit != "percentage_point" or not 0 <= ratio.value <= 100):
+                ratio = replace(ratio, normalization_error=ratio.normalization_error or "invalid_holder_ratio")
+            items.append(IfindHolder(name=name.raw, rank=rank, report_date=row_period, shares=shares, ratio=ratio))
+        complete = {item.rank for item in items} == set(range(1, 11)) and all(item.shares is not None and item.ratio is not None and not item.shares.normalization_error and not item.ratio.normalization_error for item in items) and not errors
+        return IfindShareholders(items=items, coverage="complete" if complete else "partial", errors=list(dict.fromkeys(errors)))
 
     def fetch(self, code: str, field: str, period: str | None = None, *, deadline: float | None = None) -> AnchorReading | None:
         if not self.available or field not in _IFIND_ANCHOR_QUERIES:

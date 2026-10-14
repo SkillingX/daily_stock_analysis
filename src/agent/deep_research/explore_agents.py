@@ -356,7 +356,7 @@ def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=N
     return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
 
-def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8, *, deadline: Optional[float] = None, research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """股权高管研究员：实控人/十大股东/高管背景与变动（审计 A2：评分只作参考，不硬塞六维）。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做股权架构与高管背景调查并直接输出 JSON：\n"
@@ -367,16 +367,22 @@ def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         "data_gaps(取不到的数据项数组，禁止编造)、score(治理结构健康度参考分 0-100，可 null)、"
         "narrative(调查结论一段)。所有事实带来源等级标签。"
     )
-    research: dict[str, Any] = {}
     if get_config().data_source_profile == "choice":
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
-        info = _handle_get_stock_info(stock_code)
-        research = (info.get("fundamental_context") or {}).get("research") or {}
-        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
-    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps)
-    if research and not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER")):
-        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为Choice结构化资料；模型研究未完成，不生成治理评分。"}}
+        if research is None:
+            info = _handle_get_stock_info(stock_code, deadline=deadline)
+            research = (info.get("fundamental_context") or {}).get("research") or {}
+        research = research or {}
+        if get_config().enable_ifind_mcp:
+            from src.agent.tools.data_tools import _get_fetcher_manager
+            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=(research.get("holders") or {}).get("period"), deadline=deadline)}
+        task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
+    research = research or {}
+    details = research.get("shareholder_details")
+    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
+    if not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER") or (details or {}).get("items")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为供应商结构化资料；模型研究未完成，不生成治理评分。"}}
     if out.get("ok") and research:
         company = research.get("company") or {}
         if company.get("AHOLDER"):
@@ -385,6 +391,12 @@ def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         names = holders.get("HOLDNAMER")
         if isinstance(names, str) and names.strip():
             out["data"]["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {holders.get('period')}"} for name in names.split(";") if name.strip()]
+    if out.get("ok"):
+        out["data"].pop("shareholder_details", None)
+        if details:
+            out["data"]["shareholder_details"] = details
+            if details.get("errors") or details.get("coverage") != "complete":
+                out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), "iFinD股东资料覆盖不完整", *(details.get("errors") or [])]))
     return out
 
 

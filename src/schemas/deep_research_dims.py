@@ -30,7 +30,7 @@ from src.schemas.report_schema import (
     SniperPoints,
 )
 from src.schemas.research_framework import ResearchFramework
-from data_provider.ifind_fundamental_adapter import ProductSegments
+from data_provider.ifind_fundamental_adapter import IfindShareholders, ProductSegments
 from src.schemas.supply_chain import SupplyChain
 from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
@@ -417,6 +417,7 @@ class OwnershipDim(DimEnvelope):
     dim: Literal["ownership"] = "ownership"
     controller: str = ""
     top_holders: List[HolderInfo] = Field(default_factory=list)
+    shareholder_details: IfindShareholders | None = None
     executives: List[HolderInfo] = Field(default_factory=list)
     recent_changes: List[HolderInfo] = Field(default_factory=list)
     data_gaps: List[str] = Field(default_factory=list)
