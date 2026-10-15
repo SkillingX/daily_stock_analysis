@@ -34,7 +34,8 @@ class TestFundamentalsService:
         monkeypatch.setattr(svc, "_research_dim", _fake_research)
         monkeypatch.setattr(svc, "_rule_dim", lambda dim_id, code, name, ctx, position_text="": _fake_research(dim_id, code, name))
         import src.deep_research_dims.context as ctx_mod
-        monkeypatch.setattr(ctx_mod, "build_shared_context", lambda code, name, **kwargs: object())
+        from types import SimpleNamespace
+        monkeypatch.setattr(ctx_mod, "build_shared_context", lambda code, name, **kwargs: SimpleNamespace(fundamental={}))
         out = svc.generate_fundamentals_report("600519", "贵州茅台")
         assert out["report_id"] == "fd_test001"
         md = out["markdown"]

@@ -219,6 +219,8 @@ def _score_llm_indicators(
             temperature=0.2,
             timeout=90.0,
         )
+        if getattr(response, "provider", "") == "error" or getattr(response, "finish_reason", None) in {"length", "content_filter"}:
+            return results
         import re
 
         text = (response.content or "").strip()

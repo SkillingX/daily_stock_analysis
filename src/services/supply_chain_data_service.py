@@ -13,6 +13,8 @@ import re
 from datetime import datetime, timezone
 from typing import cast, Any, Dict, List, Optional, Tuple
 
+from src.llm.concurrency import limited_completion
+
 logger = logging.getLogger(__name__)
 
 
@@ -543,7 +545,7 @@ class SupplyChainDataService:
         try:
             from litellm import completion
 
-            response = completion(
+            response = limited_completion(completion,
                 model=self._llm_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,

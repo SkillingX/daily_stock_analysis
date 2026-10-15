@@ -24,6 +24,9 @@
 
 {{ business.main_products|cn }}
 {% endif %}
+{% if business.product_segments %}
+{% with products=business.product_segments %}{% include 'product_segments.j2' %}{% endwith %}
+{% endif %}
 
 ## 二、行业地位与竞争格局
 

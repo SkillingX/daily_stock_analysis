@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 
 from .ifind_fundamental_adapter import IfindSource
 from .cross_source_validator import AnchorReading, adopted_field_record, source_failure_reason
+from src.core.research_run import current_research, ResearchStopped
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,8 @@ class TushareIfindFundamentalAdapter:
             if fallback_period != period:
                 candidates.append(fallback_period)
         for candidate in candidates:
+            if run := current_research.get():
+                run.check()
             if deadline is not None and deadline <= monotonic():
                 return None
             budget = {"deadline": deadline} if deadline is not None and "deadline" in signature(self._ifind.read).parameters else {}
@@ -241,6 +244,8 @@ class TushareIfindFundamentalAdapter:
             ]
         try:
             return self._gather_growth_reads(items, ts_code, period, deadline)
+        except ResearchStopped:
+            raise
         except Exception as exc:  # noqa: BLE001 — preserve aggregate isolation
             reason = source_failure_reason(exc)
             logger.debug("[TushareIfindFallback] concurrent read failed: %s", reason)
@@ -267,11 +272,20 @@ class TushareIfindFundamentalAdapter:
             ]
 
         futures = {}
+        run = current_research.get()
         for _, anchor in items:
+            if run is not None:
+                run.check()
             if (deadline is not None and deadline <= monotonic()) or not self._slots.acquire(blocking=False):
                 continue
-            future = self._pool.submit(copy_context().run, self._read_growth_field, anchor, ts_code, period, deadline)
+            try:
+                future = self._pool.submit(copy_context().run, self._read_growth_field, anchor, ts_code, period, deadline)
+            except BaseException:
+                self._slots.release()
+                raise
             future.add_done_callback(lambda _: self._slots.release())
+            if run is not None:
+                run.track(future)
             futures[anchor] = future
         concurrent.futures.wait(list(futures.values()), timeout=None if deadline is None else max(0.0, deadline - monotonic()))
         values: Dict[str, Optional[AnchorReading]] = {}
@@ -286,6 +300,8 @@ class TushareIfindFundamentalAdapter:
                 continue
             try:
                 values[anchor] = future.result()
+            except ResearchStopped:
+                raise
             except Exception as exc:
                 errors[anchor] = source_failure_reason(exc)
                 logger.debug("[TushareIfindFallback] %s failed: %s", anchor, errors[anchor])

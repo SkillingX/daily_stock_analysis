@@ -219,7 +219,6 @@ class TestIfindSource(unittest.TestCase):
 
 
 class TestIfindFetcher(unittest.TestCase):
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
     def test_no_token_unavailable(self):
         f = IfindFetcher(endpoint="", token="")
         self.assertFalse(f.available)
@@ -368,7 +367,6 @@ class TestParseIfindMarkdownSeries(unittest.TestCase):
 class TestIfindFetcherSeries(unittest.TestCase):
     """fetch_main_inflow_series：无 token → None（真实 MCP 路径 # pragma: no cover）。"""
 
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
     def test_unavailable_returns_none(self):
         f = IfindFetcher(endpoint="", token="")
         self.assertFalse(f.available)
@@ -377,3 +375,98 @@ class TestIfindFetcherSeries(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("returned,accepted", [("000001.SZ", True), ("000001", True), ("000001.SH", False), ("000001.BJ", False), ("300260.SZ", False)])
+@pytest.mark.parametrize("value", ["0", "-123"])
+def test_financial_identity_rejects_explicit_exchange_conflicts(returned, accepted, value):
+    import json
+    raw = {"code": 1, "data": {
+        "answer": f"|证券代码|报告期|营业收入（单位：元）|\n|---|---|---|\n|{returned}|20260630|{value}|",
+        "indicators_params": {"营业收入": {"单位": "元", "币种": "CNY", "报表类型": "合并报表(调整)", "报告期": "20260630"}},
+    }}
+    reading = _parse_ifind_response(json.dumps(raw), ["营业收入"], "revenue", None, code="000001", a_share_contract=True)
+    assert (reading is not None) == accepted
+    if reading is not None:
+        assert reading.value == float(value)
+        assert reading.period == "2026-06-30"
+
+
+def test_disclosure_identity_does_not_cross_explicit_exchange_or_period():
+    import json
+    answer = "|证券代码|报告期|营业收入（单位：元）|\n|---|---|---|\n|000001.SZ|20260630|100|\n\n"
+    answer += "|证券代码|报告期|定期报告实际披露日期|\n|---|---|---|\n|000001.SH|20260630|20260801|\n|000001.SZ|20251231|20260401|\n|000001|20260630|20260829|"
+    raw = {"code": 1, "data": {"answer": answer, "indicators_params": {
+        "营业收入": {"单位": "元", "币种": "CNY", "报表类型": "合并报表(调整)", "报告期": "20260630"},
+        "定期报告实际披露日期": {"报告期": "20260630"},
+    }}}
+    reading = _parse_ifind_response(json.dumps(raw), ["营业收入"], "revenue", None, code="000001", a_share_contract=True)
+    assert reading is not None
+    assert reading.disclosed_at == "2026-08-29"
+
+
+def test_ifind_query_preserves_research_stop_instead_of_supplier_error(monkeypatch):
+    from src.core.research_run import ResearchRun, ResearchStopped
+    run = ResearchRun(5)
+
+    async def cancelled(*args, **kwargs):
+        run.stop("cancelled")
+        run.check()
+
+    monkeypatch.setattr(IfindFetcher, "_async_query", cancelled)
+    with run.bind(), pytest.raises(ResearchStopped):
+        IfindFetcher("https://fixture.invalid/mcp", "test-only").query("get_stock_financials", "fixture")
+
+
+def test_ifind_does_not_dispatch_after_cancellation(monkeypatch):
+    from src.core.research_run import ResearchRun, ResearchStopped
+    run = ResearchRun(5)
+    run.stop("cancelled")
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("Cancelled research must not start a fresh MCP session")
+
+    monkeypatch.setattr(IfindFetcher, "_async_query", forbidden)
+    with run.bind(), pytest.raises(ResearchStopped):
+        IfindFetcher("https://fixture.invalid/mcp", "test-only").query("get_stock_financials", "fixture")
+
+
+@pytest.mark.parametrize("requested,expected", [(None, "2026-06-30"), ("2025-12-31", "2025-12-31")])
+def test_financial_batch_requests_dated_periods_and_selects_real_latest(monkeypatch, requested, expected):
+    """Public iFinD reply: the later empty row is not an eligible report period."""
+    import json
+    from datetime import date
+    from pathlib import Path
+    from time import monotonic
+    from data_provider.ifind_fundamental_adapter import IfindData
+    raw = json.loads((Path(__file__).parent / "fixtures/ifind_financial_periods.json").read_text())
+    questions = []
+
+    def query(self, tool, question, **kwargs):
+        questions.append(question)
+        return IfindData.model_validate(raw["data"])
+
+    monkeypatch.setattr(IfindFetcher, "query", query)
+    readings = IfindFetcher("https://fixture.invalid/mcp", "test-only").financial_snapshot("300260", requested, deadline=monotonic() + 5)
+    assert {reading.period for reading in readings.values()} == {expected}
+    assert readings["revenue"].value == (1545840000 if requested is None else 2997710000)
+    assert readings["net_profit_yoy"].value < 0
+    assert readings["roe"].adjustment is None  # Do not infer adjustment metadata from the request.
+    if requested is None:
+        today = date.today()
+        assert date(today.year - 1, today.month, 1).isoformat() in questions[0]
+        assert today.isoformat() in questions[0]
+        assert "每个" in questions[0]
+    else:
+        assert requested in questions[0]
+    assert len(questions) == 1
+
+
+def test_requesting_dates_does_not_fabricate_missing_response_period(monkeypatch):
+    from time import monotonic
+    from data_provider.ifind_fundamental_adapter import IfindData
+    data = IfindData(answer="|证券代码|营业收入（单位：元）|\n|---|---|\n|300260.SZ|0|", indicators_params={"营业收入": {"报告期": "最新一期(MRQ)", "单位": "元", "报表类型": "合并报表(调整)"}})
+    monkeypatch.setattr(IfindFetcher, "query", lambda *a, **k: data)
+    readings = IfindFetcher("https://fixture.invalid/mcp", "test-only").financial_snapshot("300260", None, deadline=monotonic() + 5)
+    assert readings["revenue"].period is None
+    assert readings["revenue"].value == 0

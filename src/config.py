@@ -12,6 +12,7 @@ A股自选股智能分析系统 - 配置管理模块
 
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -212,6 +213,31 @@ def parse_env_int(
         )
         parsed = maximum
     return parsed
+
+
+def parse_model_concurrency(value: Optional[str]) -> int:
+    """Reject unsafe model limits instead of silently expanding capacity."""
+    if value is None or not value.strip():
+        return 3
+    try:
+        result = int(value)
+    except ValueError:
+        raise ValueError("DEEP_RESEARCH_LLM_CONCURRENCY must be a positive integer") from None
+    if result <= 0:
+        raise ValueError("DEEP_RESEARCH_LLM_CONCURRENCY must be a positive integer")
+    return result
+
+
+def parse_research_timeout(value: Optional[str]) -> float:
+    if value is None or not value.strip():
+        return 2400.0
+    try:
+        result = float(value)
+    except ValueError:
+        raise ValueError("DEEP_RESEARCH_TIMEOUT_SECONDS must be finite and positive") from None
+    if not math.isfinite(result) or result <= 0:
+        raise ValueError("DEEP_RESEARCH_TIMEOUT_SECONDS must be finite and positive")
+    return result
 
 
 def parse_env_float(
@@ -746,9 +772,11 @@ class Config:
     # === 深度投研多源交叉验证（MX Data 主源 + iFinD 验证；opt-in，默认关）===
     data_source_profile: str = "legacy"
     mx_apikey: Optional[str] = None  # 东财妙想 API key（MX_APIKEY）
+    enable_ifind_mcp: bool = False  # Choice profile: supplement + default financial verification
+    financial_primary_source: str = "choice"  # Current six-field snapshot only; annual reports remain Choice.
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
-    ifind_mcp_timeout_seconds: float = 8.0  # iFinD MCP 调用超时
+    ifind_mcp_timeout_seconds: float = 30.0  # iFinD MCP 调用超时
     deep_research_cross_validate: bool = False  # 深度投研锚点双源验证开关
     mx_call_budget: int = 50  # 单次报告 MX 调用上限（控配额）
 
@@ -840,7 +868,9 @@ class Config:
     anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
-    tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
+    tavily_api_keys: List[str] = field(default_factory=list)  # Retired; ignored by search.
+    coding_plan_search_provider: Literal["minimax", "zhipu"] = "minimax"
+    zhipu_api_key: Optional[str] = None  # Reuses LLM_ZHIPU_API_KEY; explicit search opt-in.
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(
@@ -1168,8 +1198,10 @@ class Config:
     deep_research_engine: str = "dual_track"
     # 双轨引擎：探索型维度（S3/L4）的 ReAct 步数上限
     deep_research_dim_max_steps: int = 8
-    # 双轨引擎：全局 LLM 并发上限（MiniMax code plan 有限流；所有研究员探索循环共用信号量）
+    # 同一进程所有模块的实际模型请求上限；启动读取，重启生效。
     deep_research_llm_concurrency: int = 3
+    # Finite total deadline including data, queueing, research and finalization.
+    deep_research_timeout_seconds: float = 2400.0
     # 每日分析长线段接入双轨引擎（A 股收敛单实现，见 src/services/longtrack_bridge.py；
     # 默认关，开启后 A 股自选股长线五段式由双轨长线子集产出，失败自动回退内嵌路径）
     enable_longtrack_dual_track: bool = False
@@ -1259,8 +1291,21 @@ class Config:
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
+        if self.coding_plan_search_provider not in {"minimax", "zhipu"}:
+            raise ValueError("CODING_PLAN_SEARCH_PROVIDER must be minimax or zhipu")
+        if self.coding_plan_search_provider == "zhipu" and not (self.zhipu_api_key or "").strip():
+            raise ValueError("CODING_PLAN_SEARCH_PROVIDER=zhipu requires LLM_ZHIPU_API_KEY")
         if self.data_source_profile not in {"legacy", "choice"}:
             raise ValueError("DATA_SOURCE_PROFILE must be legacy or choice")
+        if self.financial_primary_source not in {"choice", "ifind"}:
+            raise ValueError("FINANCIAL_PRIMARY_SOURCE must be choice or ifind")
+        if self.financial_primary_source == "ifind" and (self.data_source_profile != "choice" or not self.enable_ifind_mcp):
+            raise ValueError("FINANCIAL_PRIMARY_SOURCE=ifind requires DATA_SOURCE_PROFILE=choice and ENABLE_IFIND_MCP=true")
+        if self.enable_ifind_mcp and self.data_source_profile == "choice":
+            if not (self.ifind_mcp_endpoint or '').strip() or not (self.ifind_mcp_token or '').strip():
+                raise ValueError("ENABLE_IFIND_MCP requires IFIND_MCP_ENDPOINT and IFIND_MCP_TOKEN")
+            if not math.isfinite(self.ifind_mcp_timeout_seconds) or self.ifind_mcp_timeout_seconds <= 0:
+                raise ValueError("IFIND_MCP_TIMEOUT_SECONDS must be finite and positive")
         if not self.enabled_markets or set(self.enabled_markets) - {"cn", "hk", "us"}:
             raise ValueError("ENABLED_MARKETS must be a nonempty subset of cn,hk,us")
         if self.agent_arch not in self._VALID_AGENT_ARCH:
@@ -1729,10 +1774,12 @@ class Config:
             longbridge_access_token=os.getenv("LONGBRIDGE_ACCESS_TOKEN") or None,
             longbridge_oauth_client_id=os.getenv("LONGBRIDGE_OAUTH_CLIENT_ID") or None,
             mx_apikey=os.getenv("MX_APIKEY") or None,
+            enable_ifind_mcp=parse_env_bool(os.getenv("ENABLE_IFIND_MCP"), default=False),
+            financial_primary_source=os.getenv("FINANCIAL_PRIMARY_SOURCE", "choice").strip().lower(),
             ifind_mcp_endpoint=os.getenv("IFIND_MCP_ENDPOINT") or None,
             ifind_mcp_token=os.getenv("IFIND_MCP_TOKEN") or None,
             ifind_mcp_timeout_seconds=float(
-                os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "8.0"
+                os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "30.0"
             ),
             deep_research_cross_validate=parse_env_bool(
                 os.getenv("DEEP_RESEARCH_CROSS_VALIDATE"), default=False
@@ -1854,6 +1901,8 @@ class Config:
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
+            coding_plan_search_provider=cast(Literal["minimax", "zhipu"], os.getenv("CODING_PLAN_SEARCH_PROVIDER", "minimax").strip().lower()),
+            zhipu_api_key=os.getenv("LLM_ZHIPU_API_KEY", "").strip() or None,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
@@ -2374,11 +2423,11 @@ class Config:
             deep_research_engine=(
                 os.getenv("DEEP_RESEARCH_ENGINE", "dual_track").strip() or "dual_track"
             ),
-            deep_research_llm_concurrency=parse_env_int(
-                os.getenv("DEEP_RESEARCH_LLM_CONCURRENCY", "3"),
-                3,
-                field_name="deep_research_llm_concurrency",
-                minimum=1,
+            deep_research_llm_concurrency=parse_model_concurrency(
+                os.getenv("DEEP_RESEARCH_LLM_CONCURRENCY")
+            ),
+            deep_research_timeout_seconds=parse_research_timeout(
+                os.getenv("DEEP_RESEARCH_TIMEOUT_SECONDS")
             ),
             deep_research_dim_max_steps=parse_env_int(
                 os.getenv("DEEP_RESEARCH_DIM_MAX_STEPS", "8"),
@@ -2934,7 +2983,7 @@ class Config:
     def data_source_contract(self) -> str:
         if self.data_source_profile == "choice":
             from data_provider.choice_adapter import ChoiceAdapter
-            return ChoiceAdapter.contract_version
+            return ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
         return "legacy"
 
     def get_effective_news_window_days(self) -> int:
@@ -3036,8 +3085,7 @@ class Config:
         return bool(
             self.anspire_api_keys
             or self.bocha_api_keys
-            or self.minimax_api_keys
-            or self.tavily_api_keys
+            or (self.minimax_api_keys if self.coding_plan_search_provider == "minimax" else self.zhipu_api_key)
             or self.brave_api_keys
             or self.serpapi_keys
             or self.has_searxng_enabled()
@@ -3334,7 +3382,7 @@ class Config:
             issues.append(
                 ConfigIssue(
                     severity="info",
-                    message="未配置搜索引擎能力 (Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
+                    message="未配置搜索引擎能力 (Bocha/套餐搜索/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
                     field="BOCHA_API_KEYS",
                 )
             )

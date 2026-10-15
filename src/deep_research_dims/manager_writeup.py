@@ -295,6 +295,8 @@ def _call_wave(
         temperature=0.4,
         timeout=timeout,
     )
+    if getattr(resp, "provider", "") == "error" or getattr(resp, "finish_reason", None) in {"length", "content_filter"}:
+        return {}
     return _extract_json((resp.content or "").strip())
 
 

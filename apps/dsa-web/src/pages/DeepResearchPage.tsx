@@ -30,6 +30,7 @@ interface SelectedStock {
 
 /** 双轨引擎维度产物的本地视图（新生成报告来自 done 事件，历史报告来自 /dims 端点） */
 interface DimsInfo {
+  dimensions: Record<string, unknown>;
   guardrailEvents: DeepResearchGuardrailEvent[];
   dimsDegraded: string[];
   dimsSkipped: string[];
@@ -43,6 +44,8 @@ function skippedFromDimensions(
     .filter(([, v]) => (v as { status?: string })?.status === 'skipped')
     .map(([k]) => k);
 }
+
+const dimName = (id: string) => DUAL_TRACK_DIMS.find((dim) => dim.id === id)?.label ?? (id || '报告生成');
 
 const DIM_ID_SET = new Set(DUAL_TRACK_DIMS.map((d) => d.id));
 
@@ -79,15 +82,16 @@ export function DeepResearchPage() {
     useDeepResearch();
 
   const [dimsInfo, setDimsInfo] = useState<DimsInfo | null>(null);
-  // 省钱模式：维度子集（默认全选；非全选时传 dims，后端自动补依赖闭包）
+  // 分析范围：维度子集（默认全选；非全选时传 dims，后端自动补依赖闭包）
   const [selectedDims, setSelectedDims] = useState<string[]>(DUAL_TRACK_DIMS.map((d) => d.id));
   const [forceRefresh, setForceRefresh] = useState(false);
 
-  const isGenerating = status === 'generating';
+  const isGenerating = status === 'generating' || status === 'cancelling';
 
   // 当前展示的维度信息：新生成报告用 done 事件字段，历史报告用 dimsInfo
   const effectiveDims: DimsInfo | null = isDualTrackDetail(report)
     ? {
+        dimensions: dualTrack.dimensions ?? {},
         guardrailEvents: dualTrack.guardrailEvents,
         dimsDegraded: dualTrack.dimsDegraded,
         dimsSkipped: skippedFromDimensions(dualTrack.dimensions),
@@ -95,8 +99,13 @@ export function DeepResearchPage() {
     : dimsInfo;
 
   const dimsOkCount = effectiveDims
-    ? DUAL_TRACK_DIMS.length - new Set([...effectiveDims.dimsDegraded, ...effectiveDims.dimsSkipped]).size
+    ? Object.values(effectiveDims.dimensions).filter((dim) => typeof dim === 'object' && dim !== null && 'status' in dim && dim.status === 'ok').length
     : 0;
+
+  const reliableCounts = effectiveDims && DUAL_TRACK_DIMS.every(({ id }) => {
+    const dim = effectiveDims.dimensions[id];
+    return typeof dim === 'object' && dim !== null && 'status' in dim && ['ok', 'degraded', 'skipped'].includes(String(dim.status));
+  });
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -127,7 +136,7 @@ export function DeepResearchPage() {
 
   // 生成完成后刷新历史列表
   useEffect(() => {
-    if (status === 'done' && reportId) {
+    if ((status === 'done' || status === 'cancelled') && reportId) {
       loadHistory();
     }
   }, [status, reportId, loadHistory]);
@@ -159,6 +168,7 @@ export function DeepResearchPage() {
         setDimsInfo(
           dims
             ? {
+                dimensions: dims.dimensions || {},
                 guardrailEvents: dims.guardrail_events || [],
                 dimsDegraded: Object.entries(dims.dimensions || {})
                   .filter(([, v]) => (v as { status?: string })?.status === 'degraded')
@@ -369,16 +379,17 @@ export function DeepResearchPage() {
             {isGenerating && (
               <button
                 onClick={cancel}
+                disabled={status === 'cancelling'}
                 className="inline-flex h-11 items-center gap-1.5 rounded-xl border border-white/10 px-3 text-sm text-muted-text hover:text-secondary-text"
               >
-                <X className="h-4 w-4" /> 取消
+                <X className="h-4 w-4" /> {status === 'cancelling' ? '正在取消…' : '取消'}
               </button>
             )}
           </div>
           {inputError && <p className="text-sm text-red-400">{inputError}</p>}
           <details className="rounded-lg border border-white/8 bg-white/2 px-3 py-2">
             <summary className="cursor-pointer text-xs text-muted-text hover:text-secondary-text">
-              省钱模式：自选维度生成（默认全选；未选维度跳过计算，依赖维度自动补齐）
+              分析范围：自选维度生成（默认全选；未选维度跳过计算，依赖维度自动补齐）
             </summary>
             <div className="mt-2 space-y-2">
               <div className="flex flex-wrap gap-1.5">
@@ -433,7 +444,7 @@ export function DeepResearchPage() {
                   onChange={(e) => setForceRefresh(e.target.checked)}
                   className="accent-cyan"
                 />
-                强制刷新（跳过维度缓存，全额重算）
+                强制刷新（跳过维度缓存，重新研究）
               </label>
             </div>
           </details>
@@ -445,7 +456,7 @@ export function DeepResearchPage() {
             <div className="space-y-4">
               <div className="flex items-center gap-3 text-secondary-text">
                 <Loader2 className="h-5 w-5 animate-spin text-cyan" />
-                <span>正在执行双轨多维深度分析（短线六件套 × 长线五段式），请勿关闭页面...</span>
+                <span>{status === 'cancelling' ? '正在停止后续研究并保留有效资料；在途工作结束后完成取消。' : '正在生成深度投研报告。关闭页面后仍会继续，可稍后到历史记录查看。'}</span>
               </div>
               {/* 双轨维度徽章进度 */}
               <div className="flex flex-wrap gap-1.5">
@@ -460,6 +471,7 @@ export function DeepResearchPage() {
                         st === 'degraded' &&
                           'border-amber-500/30 bg-amber-500/10 text-amber-400',
                         st === 'running' && 'border-cyan/30 bg-cyan/10 text-cyan',
+                        st === 'queued' && 'border-cyan/15 bg-white/2 text-muted-text',
                         st === 'pending' && 'border-white/10 bg-white/2 text-muted-text',
                         st === 'skipped' && 'border-dashed border-white/15 bg-white/2 text-muted-text/60 line-through',
                       )}
@@ -467,14 +479,14 @@ export function DeepResearchPage() {
                       {st === 'running' && <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />}
                       {st === 'ok' && <span aria-hidden="true">✓</span>}
                       {st === 'degraded' && <AlertTriangle className="h-3 w-3" aria-hidden="true" />}
-                      {d.label}
+                      {d.label}{st === 'queued' ? ' · 等待模型' : ''}
                     </span>
                   );
                 })}
               </div>
               <details className="rounded-lg border border-white/8 bg-white/2 p-3" open>
                 <summary className="cursor-pointer text-sm font-medium text-muted-text">
-                  分析步骤（{progressSteps.length}）
+                  最近步骤（{progressSteps.length}）
                 </summary>
                 <div className="mt-2 max-h-60 space-y-1 overflow-y-auto text-xs text-muted-text">
                   {progressSteps.map((s, i) => (
@@ -485,9 +497,13 @@ export function DeepResearchPage() {
                         {s.type === 'tool_start' && `调用工具：${s.display_name || s.tool}`}
                         {s.type === 'tool_done' && `完成：${s.display_name || s.tool}`}
                         {s.type === 'generating' && s.message}
-                        {s.type === 'dim_start' && `维度启动：${s.dim}`}
+                        {s.type === 'dim_queued' && `等待研究：${dimName(s.dim || '')}`}
+                        {s.type === 'model_queued' && `等待模型额度：${dimName(s.dim || '')}`}
+                        {s.type === 'model_start' && `模型正在研究：${dimName(s.dim || '')}`}
+                        {s.type === 'model_done' && `模型请求结束：${dimName(s.dim || '')}`}
+                        {s.type === 'dim_start' && `开始研究：${dimName(s.dim || '')}`}
                         {s.type === 'dim_done' &&
-                          `维度完成：${s.dim}${s.status === 'degraded' ? '（降级）' : ''}`}
+                          `${dimName(s.dim || '')}：${s.status === 'degraded' ? '已有结果待补充' : s.status === 'skipped' ? '本次未选' : '本节完成'}`}
                       </span>
                     </div>
                   ))}
@@ -496,6 +512,10 @@ export function DeepResearchPage() {
             </div>
           )}
 
+          {status === 'cancelled' && !report?.markdown && (
+            <p className="py-8 text-center text-secondary-text">本次生成已取消，尚未形成可保存的有效资料。</p>
+          )}
+          {isGenerating && error && <p role="alert" className="text-sm text-amber-400">{error}</p>}
           {/* 错误 */}
           {status === 'error' && (
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
@@ -522,11 +542,11 @@ export function DeepResearchPage() {
           {/* 报告展示 */}
           {showReport && displayReport && (
             <div className="space-y-3">
-              {displayReport.missing_layers && displayReport.missing_layers.length > 0 && (
+              {!effectiveDims && displayReport.missing_layers && displayReport.missing_layers.length > 0 && (
                 <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
                   <AlertTriangle className="h-4 w-4 flex-shrink-0" />
                   <span>
-                    以下层次分析不充分：{displayReport.missing_layers.join('、')}
+                    以下章节待补充，请结合已取得的资料阅读：{displayReport.missing_layers.map(dimName).join('、')}
                   </span>
                 </div>
               )}
@@ -535,7 +555,7 @@ export function DeepResearchPage() {
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center gap-2 text-xs">
                     <span className="rounded bg-cyan/15 px-2 py-0.5 text-cyan">
-                      双轨引擎 · 正常维度 {dimsOkCount}/{DUAL_TRACK_DIMS.length}（非资料覆盖率）
+                      {reliableCounts ? `本次研究：正常 ${dimsOkCount} 项 · 未完整完成 ${effectiveDims.dimsDegraded.length} 项 · 主动未选 ${effectiveDims.dimsSkipped.length} 项` : '历史章节状态记录不完整，完成计数不可用'}
                     </span>
                     {dualTrack.cacheHit && (
                       <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-400">
@@ -544,7 +564,7 @@ export function DeepResearchPage() {
                     )}
                     {effectiveDims.dimsDegraded.length > 0 && (
                       <span className="rounded bg-amber-500/15 px-2 py-0.5 text-amber-400">
-                        降级：{effectiveDims.dimsDegraded.join('、')}
+                        待补充：{effectiveDims.dimsDegraded.map(dimName).join('、')}
                       </span>
                     )}
                     {effectiveDims.dimsSkipped.length > 0 && (
@@ -553,12 +573,13 @@ export function DeepResearchPage() {
                       </span>
                     )}
                     <span className="rounded bg-white/8 px-2 py-0.5 text-muted-text">
-                      护栏触发 {effectiveDims.guardrailEvents.length} 条
+                      结论限制 {effectiveDims.guardrailEvents.length} 条
                     </span>
                     <span className="text-muted-text">
-                      数据截至：{displayReport.created_at?.slice(0, 16).replace('T', ' ') ?? '见报告头部'}
+                      生成时间：{displayReport.created_at?.slice(0, 16).replace('T', ' ') ?? '见报告头部'}
                     </span>
                   </div>
+                  <p className="text-xs text-muted-text">章节状态表示本次研究进度，不代表数据准确率或股票质量。各项资料的来源与核验状态见正文。</p>
                   {/* 逐维度子报告：直接查看（新标签页）/ 下载 */}
                   {displayId && (
                     <div className="flex flex-wrap items-center gap-1.5">
@@ -588,7 +609,7 @@ export function DeepResearchPage() {
                   {effectiveDims.guardrailEvents.length > 0 && (
                     <details className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                       <summary className="cursor-pointer text-sm font-medium text-amber-300">
-                        决策护栏事件表（{effectiveDims.guardrailEvents.length}）
+                        结论限制详情（{effectiveDims.guardrailEvents.length}）
                       </summary>
                       <div className="mt-2 overflow-x-auto text-xs">
                         <table className="w-full text-left">
@@ -604,7 +625,7 @@ export function DeepResearchPage() {
                             {effectiveDims.guardrailEvents.map((e, i) => (
                               <tr key={i} className="border-t border-white/5 text-secondary-text">
                                 <td className="py-1 pr-3 font-mono">{e.rule_id}</td>
-                                <td className="py-1 pr-3">{e.dim}</td>
+                                <td className="py-1 pr-3">{dimName(e.dim)}</td>
                                 <td className="py-1 pr-3">{e.action}</td>
                                 <td className="py-1">{e.reason}</td>
                               </tr>
@@ -661,9 +682,9 @@ export function DeepResearchPage() {
                     <RefreshCw className="h-4 w-4" /> 重新生成
                   </button>
                 )}
-                {displayReport.quality_score != null && (
+                {!effectiveDims && displayReport.quality_score != null && (
                   <span className="ml-auto text-xs text-muted-text">
-                    质量评分：{displayReport.quality_score}/100
+                    结构校验评分：{displayReport.quality_score}/100（非数据准确率）
                   </span>
                 )}
               </div>

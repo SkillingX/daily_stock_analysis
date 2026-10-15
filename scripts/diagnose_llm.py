@@ -506,7 +506,7 @@ def _analyze_single_record(
                 code=code,
                 severity="P1",
                 category="data_missing",
-                message="news 搜索 0 结果（Tavily 限流 / SearXNG 失败）→ "
+                message="news 搜索 0 结果（搜索渠道限流 / SearXNG 失败）→ "
                 "事件面信号缺失，LLM 风险/催化字段退化为技术面模板",
                 details={"news_size": diagnosis.news_size},
             )

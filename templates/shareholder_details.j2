@@ -1,0 +1,18 @@
+{% import 'financial_display.j2' as display %}
+#### 前十大股东明细（iFinD）
+
+{% set rows = holders['items'] if holders is mapping else holders.items %}
+> {{ '已取得十名股东的数量及比例' if holders.coverage == 'complete' else '部分覆盖，名单或数量/比例存在缺项' }}；供应商资料，不代表独立双源核验。比例为各股东比例，未把前十合计比例分摊给个体。披露日 {{ holders.disclosed_at or '未提供' }}；原文链接 {{ holders.original_url or '未提供' }}，不据此推导实控人、关联关系或高管背景。
+
+{% if rows %}
+| 排名 | 股东 | 实际财期 | 持股数量（股） | 持股比例（%） |
+| ---: | --- | --- | ---: | ---: |
+{% for item in rows %}
+| {{ item.rank }} | {{ item.name }} | {{ item.report_date }} | {{ item.shares.value if item.shares and item.shares.unit == 'shares' and not item.shares.normalization_error else '缺失或单位异常' }} | {{ item.ratio.value if item.ratio and item.ratio.unit == 'percentage_point' and not item.ratio.normalization_error else '缺失或单位异常' }} |
+{% endfor %}
+{% else %}
+未取得可关联的股东明细。
+{% endif %}
+{% if holders.errors %}
+- 股东资料缺口：{{ display.reasons(holders.errors) }}。
+{% endif %}

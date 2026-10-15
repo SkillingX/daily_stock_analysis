@@ -4,6 +4,7 @@ import { createApiError, isApiRequestError, parseApiError } from './error';
 import { downloadPdfFromUrl } from './download';
 
 export interface DeepResearchGenerateRequest {
+  run_id?: string;
   stock_code: string;
   stock_name?: string;
   report_type?: string;
@@ -36,6 +37,8 @@ export interface DeepResearchReportDetail extends DeepResearchReportItem {
   provider?: string;
   error?: string;
   engine?: 'legacy' | 'dual_track';
+  run_id?: string;
+  end_reason?: 'report_budget' | 'cancelled' | null;
 }
 
 /** 双轨引擎 done 事件的护栏事件（规则 id / 维度 / 处置 / 理由） */
@@ -53,7 +56,24 @@ export interface DeepResearchGuardrailEvent {
  * 与 chat 类 API 的差异：generate 是 SSE 流式一次性生成（非多轮对话），
  * reports 是历史报告 CRUD（元数据在 SQLite，正文/PDF 在文件）。
  */
+export interface DeepResearchRunStatus {
+  run_id: string;
+  status: 'running' | 'cancelling' | 'finishing' | 'finished';
+  end_reason: 'report_budget' | 'cancelled' | null;
+  report_id?: string | null;
+}
+
 export const deepResearchApi = {
+  async cancelRun(runId: string): Promise<DeepResearchRunStatus> {
+    const response = await apiClient.post<DeepResearchRunStatus>(`/api/v1/deep-research/runs/${runId}/cancel`);
+    return response.data;
+  },
+
+  async getRun(runId: string): Promise<DeepResearchRunStatus> {
+    const response = await apiClient.get<DeepResearchRunStatus>(`/api/v1/deep-research/runs/${runId}`);
+    return response.data;
+  },
+
   async getReports(limit = 50, offset = 0): Promise<DeepResearchReportItem[]> {
     const response = await apiClient.get<{
       success: boolean;

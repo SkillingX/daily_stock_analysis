@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from typing import Any
+import json
+from data_provider.ifind_fundamental_adapter import ProductSegments
 
 from src.agent.deep_research.explore_agents import run_business_agent
 from src.deep_research.researchers.base import generic_parse
@@ -36,8 +38,12 @@ def _strip_noise_keys(value: Any) -> Any:
 
 
 def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
-    dim, used = generic_parse(DIM_ID, _strip_noise_keys(parsed or {}), steps)
+    payload = _strip_noise_keys(parsed or {})
+    products = payload.pop("product_segments", None)
+    dim, used = generic_parse(DIM_ID, payload, steps)
     assert isinstance(dim, BusinessDim)
+    if products is not None:
+        dim = dim.model_copy(update={"product_segments": ProductSegments.model_validate_json(json.dumps(products))})
     if dim.data_gaps or not any((dim.business_model, dim.main_products, dim.competitive_position, dim.vs_market_leader)):
-        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": "业务资料不足，已有内容仅供部分参考"})
+        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": dim.degraded_reason or "业务资料不足，已有内容仅供部分参考"})
     return dim, used

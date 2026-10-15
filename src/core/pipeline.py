@@ -177,7 +177,6 @@ class StockAnalysisPipeline:
         try:
             self.search_service: Optional[SearchService] = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
-                tavily_keys=self.config.tavily_api_keys,
                 anspire_keys=self.config.anspire_api_keys,
                 x_keys=[self.config.social_sentiment_api_key]
                 if self.config.social_sentiment_api_key
@@ -186,6 +185,8 @@ class StockAnalysisPipeline:
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
+                coding_plan_search_provider=self.config.coding_plan_search_provider,
+                zhipu_api_key=self.config.zhipu_api_key,
                 searxng_base_urls=self.config.searxng_base_urls,
                 searxng_public_instances_enabled=self.config.searxng_public_instances_enabled,
                 news_max_age_days=self.config.news_max_age_days,

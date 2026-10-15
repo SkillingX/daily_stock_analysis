@@ -19,21 +19,8 @@ from src.deep_research_dims.narrate import load_constitution, load_dim_prompt
 
 logger = logging.getLogger(__name__)
 
-import threading
-
 from src.config import get_config
-
-_LLM_SEMAPHORE: "threading.Semaphore | None" = None
-
-
-def _llm_semaphore() -> "threading.Semaphore":
-    """全局 LLM 并发上限（MiniMax code plan 有限流）：所有研究员探索循环共用。"""
-    global _LLM_SEMAPHORE
-    if _LLM_SEMAPHORE is None:
-        limit = int(getattr(get_config(), "deep_research_llm_concurrency", 3) or 3)
-        _LLM_SEMAPHORE = threading.Semaphore(max(1, limit))
-    return _LLM_SEMAPHORE
-
+from src.core.research_run import current_research
 
 _INTEL_TOOLS = {
     "search_stock_news",
@@ -81,7 +68,12 @@ def _run_explore(
     deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """在共同截止时间内研究；仅成功响应的 JSON 格式错误允许修复。"""
-    deadline = deadline if deadline is not None else monotonic() + 480.0
+    run = current_research.get()
+    if run is not None:
+        reserve = min(180.0, run.timeout_seconds * 0.15)
+        deadline = min(deadline, run.deadline - reserve) if deadline is not None else run.deadline - reserve
+    else:
+        deadline = deadline if deadline is not None else monotonic() + 480.0
     prompt = load_dim_prompt(dim_id)
     if dim_id == "business" and not prompt.strip():
         return {"ok": False, "error": "业务画像提示词缺失，无法执行研究"}
@@ -105,39 +97,44 @@ def _run_explore(
                                       description="Search company business, products and competitors; returns evidence with URLs and dates."))
 
     # Reserve two thirds for the substantive response; never reset on JSON repair.
-    research_deadline = monotonic() + max(0.0, deadline - monotonic()) / 3 if dim_id == "business" else None
+    research_deadline = monotonic() + max(0.0, deadline - monotonic()) * (1 / 3 if dim_id == "business" else 2 / 3)
     last_error = ""
     for attempt in range(retry + 1):
         if attempt and research_deadline is not None:
             research_deadline = min(research_deadline, monotonic())
         remaining = deadline - monotonic()
-        semaphore = _llm_semaphore()
-        if remaining <= 0 or not semaphore.acquire(timeout=remaining):
-            return {"ok": False, "error": "研究时限耗尽（等待模型并发额度）"}
-        try:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return {"ok": False, "error": "研究时限耗尽"}
-            loop = run_agent_loop(
-                messages=messages,
-                tool_registry=registry,
-                llm_adapter=llm_adapter,
-                max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
-                **({"research_deadline": research_deadline} if research_deadline is not None else {}),
-                progress_callback=progress_callback,
-                max_wall_clock_seconds=remaining,
-                stock_scope=None,
-            )
-        finally:
-            semaphore.release()
+        if remaining <= 0:
+            return {"ok": False, "error": "研究时限耗尽"}
+        loop = run_agent_loop(
+            messages=messages,
+            tool_registry=registry,
+            llm_adapter=llm_adapter,
+            max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
+            **({"research_deadline": research_deadline} if research_deadline is not None else {}),
+            progress_callback=progress_callback,
+            max_wall_clock_seconds=remaining,
+            stock_scope=None,
+        )
         # Only a successful response with malformed JSON warrants format repair.
         if not loop.success:
-            timeout = any(marker in (loop.error or "").lower() for marker in ("timeout", "timed out", "时限"))
-            error = "研究时限耗尽" if timeout else "模型调用失败或研究步数耗尽"
-            if "length" in (loop.error or ""):
+            original = loop.error or "模型调用未完成"
+            lowered = original.lower()
+            if run is not None and run.stop_reason:
+                error = run.reason_text
+            elif "等待模型额度" in original:
+                error = "等待模型额度超时，尚未发送模型请求"
+            elif "Agent timed out" in original or "insufficient budget" in lowered:
+                error = "本维度研究预算不足，保留已取得资料"
+            elif "timeout" in lowered or "timed out" in lowered:
+                error = "模型请求超时，未完成本维度研究"
+            elif "max steps" in lowered:
+                error = "研究步数已用完"
+            elif "length" in lowered:
                 error = "模型输出被截断（length）"
-            elif "content_filter" in (loop.error or ""):
+            elif "content_filter" in lowered:
                 error = "模型输出被服务商过滤（content_filter）"
+            else:
+                error = "模型调用失败，未完成本维度研究"
             return {"ok": False, "error": error, "steps": loop.total_steps}
         parsed = _extract_json(loop.content)
         if parsed:
@@ -258,6 +255,8 @@ _US_CHINA_TOOLS = {"search_comprehensive_intel", "verify_supply_chain_evidence"}
 
 def _chanlun_engine_facts(stock_code: str) -> str:
     """P0-1：缠论引擎真实结构（优先数据源）。引擎不可用时返回空串，LLM 退回工具取数。"""
+    if run := current_research.get():
+        run.check()
     try:
         import pandas as pd
 
@@ -315,8 +314,16 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
         import json
         from src.agent.tools.data_tools import _handle_get_capital_flow, _handle_get_stock_info
         deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+        if run := current_research.get():
+            run.check()
         flow = _handle_get_capital_flow(stock_code)
+        if run := current_research.get():
+            run.retain("get_capital_flow", flow)
+        if run := current_research.get():
+            run.check()
         info = _handle_get_stock_info(stock_code, deadline=deadline)
+        if run := current_research.get():
+            run.retain("get_stock_info", info)
         institution = (info.get("fundamental_context") or {}).get("institution") or {}
         institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
         tools = tools - {"get_capital_flow", "get_stock_info"}
@@ -356,7 +363,7 @@ def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=N
     return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
 
-def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8, *, deadline: Optional[float] = None, research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """股权高管研究员：实控人/十大股东/高管背景与变动（审计 A2：评分只作参考，不硬塞六维）。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做股权架构与高管背景调查并直接输出 JSON：\n"
@@ -367,16 +374,30 @@ def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         "data_gaps(取不到的数据项数组，禁止编造)、score(治理结构健康度参考分 0-100，可 null)、"
         "narrative(调查结论一段)。所有事实带来源等级标签。"
     )
-    research: dict[str, Any] = {}
     if get_config().data_source_profile == "choice":
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
-        info = _handle_get_stock_info(stock_code)
-        research = (info.get("fundamental_context") or {}).get("research") or {}
-        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
-    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps)
-    if research and not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER")):
-        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为Choice结构化资料；模型研究未完成，不生成治理评分。"}}
+        if research is None:
+            if run := current_research.get():
+                run.check()
+            info = _handle_get_stock_info(stock_code, deadline=deadline)
+            research = (info.get("fundamental_context") or {}).get("research") or {}
+        research = research or {}
+        if run := current_research.get():
+            run.retain_vendor("ownership", research)
+        if get_config().enable_ifind_mcp and not research.get("shareholder_details"):
+            from src.agent.tools.data_tools import _get_fetcher_manager
+            if run := current_research.get():
+                run.check()
+            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=None if get_config().financial_primary_source == "ifind" else (research.get("holders") or {}).get("period"), deadline=deadline)}
+        task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
+    research = research or {}
+    details = research.get("shareholder_details")
+    if run := current_research.get():
+        run.retain_vendor("ownership", research)
+    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
+    if not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER") or (details or {}).get("items")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": str(out.get("error") or "研究模型未完成") + "；保留已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为供应商结构化资料；模型研究未完成，不生成治理评分。"}}
     if out.get("ok") and research:
         company = research.get("company") or {}
         if company.get("AHOLDER"):
@@ -385,6 +406,13 @@ def run_ownership_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         names = holders.get("HOLDNAMER")
         if isinstance(names, str) and names.strip():
             out["data"]["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {holders.get('period')}"} for name in names.split(";") if name.strip()]
+    if out.get("ok"):
+        out["data"].pop("shareholder_details", None)
+        if details:
+            out["data"]["shareholder_details"] = details
+            if details.get("errors") or details.get("coverage") != "complete":
+                out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), "iFinD股东资料覆盖不完整", *(details.get("errors") or [])]))
+    out["vendor_research"] = research
     return out
 
 
@@ -409,9 +437,11 @@ _BUSINESS_TOOLS = {"search_comprehensive_intel"}
 def run_business_agent(
     stock_code: str, stock_name: str, llm_adapter: Any,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
-    max_steps: int = 8, *, deadline: Optional[float] = None,
+    max_steps: int = 8, *, deadline: Optional[float] = None, research: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """基本面研究员（业务画像）：经营模式/主营产品/竞争地位/与龙头对比。"""
+    if not load_dim_prompt("business").strip():
+        return {"ok": False, "error": "业务画像提示词缺失，无法执行研究"}
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做业务画像与竞争地位分析并直接输出 JSON：\n"
         "1) 用 search_comprehensive_intel 一次调研主营业务、产品和竞争地位；资料不足标缺失，不重复搜索；\n"
@@ -422,16 +452,37 @@ def run_business_agent(
     if get_config().data_source_profile == "choice":
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
-        info = _handle_get_stock_info(stock_code, deadline=deadline)
-        research = (info.get("fundamental_context") or {}).get("research") or {}
-        task += "\nChoice 原生公司资料（供应商汇总，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
+        if research is None:
+            if run := current_research.get():
+                run.check()
+            info = _handle_get_stock_info(stock_code, deadline=deadline)
+            research = (info.get("fundamental_context") or {}).get("research") or {}
+        research = research or {}
+        if run := current_research.get():
+            run.retain_vendor("business", research)
+        if get_config().enable_ifind_mcp and not research.get("product_segments"):
+            from src.agent.tools.data_tools import _get_fetcher_manager
+            if run := current_research.get():
+                run.check()
+            research = {**research, "product_segments": _get_fetcher_manager().get_ifind_research_context(stock_code, "products", deadline=deadline)}
+        task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
     else:
         research = {}
+    if run := current_research.get():
+        run.retain_vendor("business", research)
     out = _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
     company = research.get("company") or {}
-    if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT")):
-        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": "研究模型未完成，保留Choice已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为Choice结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
+    products = research.get("product_segments")
+    if out.get("ok"):
+        out["data"].pop("product_segments", None)
+    if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT") or (products or {}).get("items")):
+        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": str(out.get("error") or "研究模型未完成") + "；保留已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为已取得供应商结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
         for field, indicator in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
             if company.get(indicator):
                 out["data"][field] = {"value": company[indicator], "source": f"Choice {indicator}，截至{research.get('as_of')}"}
+    if out.get("ok") and products:
+        out["data"]["product_segments"] = products
+        if products.get("errors"):
+            out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), *products["errors"]]))
+    out["vendor_research"] = research
     return out

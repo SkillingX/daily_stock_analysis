@@ -161,7 +161,7 @@ def normalize_anchor_value(
     canonical, factor = cell if cell[0] is not None else header
     if canonical is None and field in {"pe_ratio", "pb_ratio"} and not number[2].strip() and unit is None:
         canonical = "multiple"
-    expected: Unit = "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
+    expected: Unit = "shares" if field == "share_count" else "percentage_point" if field in PERCENTAGE_ANCHORS else "multiple" if field in {"pe_ratio", "pb_ratio"} else "currency_base"
     if canonical != expected:
         error = error or ("unit_unknown" if canonical is None else "unit_incompatible")
     if number[2].strip() and cell[0] is None:
@@ -439,6 +439,48 @@ class SourceAdapter(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class SnapshotSource:
+    """Verify an acquired supplier batch without issuing another request."""
+
+    name: str
+    readings: dict[str, AnchorReading]
+    error: Optional[str] = None
+
+    def read(self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None) -> Optional[AnchorReading]:
+        if self.error:
+            raise SourceReadError(self.name, self.error)
+        return self.readings.get(field)
+
+
+def has_current_financial_period(reading: AnchorReading) -> bool:
+    """Known cumulative period, excluding explicit future/disputed period evidence."""
+    today = date.today().isoformat()
+    disclosed, _basis = normalize_report_period(reading.disclosed_at)
+    return (reading.period is not None and reading.period <= today
+            and reading.period_basis in {"annual", "YTD"}
+            and reading.normalization_error not in {"period_conflict", "metadata_invalid"}
+            and (disclosed is None or disclosed <= today))
+
+
+@ensure(lambda result: all(reading.period == result[0] for reading in result[1].values()), "Current financial snapshot cannot mix reporting periods")
+def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str, AnchorReading]) -> tuple[Optional[str], dict[str, AnchorReading]]:
+    """Latest confirmed cumulative period wins; supplier priority applies within it."""
+    periods = [reading.period for reading in (*ifind.values(), *choice.values())
+               if has_current_financial_period(reading) and reading.period is not None]
+    period = max(periods) if periods else None
+    selected = {}
+    for field in dict.fromkeys((*ifind, *choice)):
+        for reading in (ifind.get(field), choice.get(field)):
+            if (reading is not None and period is not None and reading.period == period
+                    and has_current_financial_period(reading)
+                    and not reading_input_reasons(reading, field)
+                    and reading.statement_scope == "consolidated" and reading.adjustment == "restated"):
+                selected[field] = reading
+                break
+    return period, selected
+
+
 # ------------------------------------------------------------------
 # 判定纯函数
 # ------------------------------------------------------------------
@@ -486,6 +528,9 @@ def _magnitude_tier(value: float) -> int:
 
 def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]:
     """Intrinsic input validity; unknown financial periods still allow limited local use."""
+    disclosed, _basis = normalize_report_period(reading.disclosed_at)
+    if disclosed is not None and disclosed > date.today().isoformat():
+        return ("disclosure_in_future",)
     if not math.isfinite(reading.value):
         return ("invalid_value",)
     if reading.is_stale:
@@ -594,6 +639,12 @@ def _pair_reasons(left: AnchorReading, right: AnchorReading, spec: AnchorSpec) -
             return ("period_mismatch",)
         if left.period_basis != right.period_basis:
             return ("period_basis_mismatch",)
+        if left.statement_scope is not None or right.statement_scope is not None:
+            if left.statement_scope != right.statement_scope:
+                return ("statement_scope_mismatch",)
+        if left.adjustment is not None or right.adjustment is not None:
+            if left.adjustment != right.adjustment:
+                return ("adjustment_mismatch",)
     if (spec.caliber_aware or spec.field in FINANCIAL_ANCHORS) and left.caliber != right.caliber:
         return ("caliber_mismatch",)
     return ()
@@ -764,6 +815,10 @@ class CrossSourceValidator:
         self._pool = ThreadPoolExecutor(max_workers=self._max_workers)
         self._slots = BoundedSemaphore(self._max_workers)
 
+    def close(self) -> None:
+        """Release an owned batch's executor without extending its deadline."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
+
     def verify(
         self,
         code: str,
@@ -807,14 +862,20 @@ class CrossSourceValidator:
         """并行收集各源读数。任一源异常/返回 None 都被隔离（fail-open）。"""
         if not self._sources:
             return (), ()
+        from src.core.research_run import current_research, ResearchStopped
+        run = current_research.get()
 
         def _safe_read(source: SourceAdapter) -> tuple[Optional[AnchorReading], Optional[str]]:
             try:
+                if run is not None and not isinstance(source, SnapshotSource):
+                    run.check()
                 if deadline is not None and deadline <= monotonic():
                     return None, "timeout"
                 kwargs = {"deadline": deadline} if deadline is not None and "deadline" in signature(source.read).parameters else {}
                 reading = source.read(code, field, period, **kwargs)
                 return reading, None if reading is not None else "timeout" if deadline is not None and deadline <= monotonic() else "missing"
+            except ResearchStopped:
+                raise
             except Exception as exc:  # noqa: BLE001 — fail-open：源异常不影响其他源
                 logger.debug(
                     "[CrossValidate] source %s read %s failed: %s",
@@ -829,11 +890,19 @@ class CrossSourceValidator:
         futures = []
         busy_errors = []
         for source in self._sources:
+            if run is not None and not isinstance(source, SnapshotSource):
+                run.check()
             if not self._slots.acquire(blocking=False):
                 busy_errors.append((source.name, "source_busy"))
                 continue
-            future = self._pool.submit(copy_context().run, _safe_read, source)
+            try:
+                future = self._pool.submit(copy_context().run, _safe_read, source)
+            except BaseException:
+                self._slots.release()
+                raise
             future.add_done_callback(lambda _: self._slots.release())
+            if run is not None:
+                run.track(future)
             futures.append((source, future))
         wait([future for _, future in futures], timeout=None if deadline is None else max(0.0, deadline - monotonic()))
         readings: list[AnchorReading] = []

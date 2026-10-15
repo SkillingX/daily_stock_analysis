@@ -34,6 +34,15 @@ _report_cache: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}  # key→(repor
 _cache_lock = threading.Lock()
 
 
+def _cacheable_report(result: Dict[str, Any]) -> bool:
+    """Do not freeze a failed optional verification as a successful day cache."""
+    return result.get("status") in ("success", "ok") and not any(
+        field.get("source_errors")
+        for dim in (result.get("dimensions") or {}).values()
+        for field in (dim.get("financial_snapshot") or {}).values()
+    )
+
+
 def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
     """返回今日缓存 key（按自然日 + 维度子集指纹，同一天同子集复用同一报告）。
 
@@ -157,6 +166,9 @@ def normalize_a_share(raw_code: str) -> str:
     return normalized
 
 
+from src.core.research_run import ResearchRun, current_research
+
+
 class DeepResearchService:
     """深度投研报告编排服务（无状态，方法可独立调用）。"""
 
@@ -165,6 +177,21 @@ class DeepResearchService:
     # ------------------------------------------------------------------
 
     def generate_report(
+        self, raw_code: str, raw_name: Optional[str] = None, report_type: str = "deep",
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        dims: Optional[List[str]] = None, force_refresh: bool = False,
+        run: Optional["ResearchRun"] = None,
+    ) -> Dict[str, Any]:
+        from src.core.research_run import ResearchRun
+        run = run or ResearchRun(get_config().deep_research_timeout_seconds)
+        run.progress = progress_callback
+        with run.bind():
+            try:
+                return self._generate_report(raw_code, raw_name, report_type, progress_callback, dims, force_refresh)
+            finally:
+                run.finish()
+
+    def _generate_report(
         self,
         raw_code: str,
         raw_name: Optional[str] = None,
@@ -178,9 +205,10 @@ class DeepResearchService:
         dims：维度子集（省钱模式），None/空 = 全部；force_refresh：跳过维度缓存。
         30min 内同一股票重复查询直接返回缓存（报告完全一致）。
         """
+        run = current_research.get()
         code = normalize_a_share(raw_code)
         name = (raw_name or "").strip()
-        if not name:
+        if not name and (run is None or (run.stop_reason is None and run.remaining() > 0)):
             # 前端未传名称时反查真实中文名，避免元数据 stock_name 退化成代码
             name = _lookup_stock_name(code) or code
 
@@ -190,7 +218,7 @@ class DeepResearchService:
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
-            if cached and cached[2].get("status") in ("success", "ok"):
+            if cached and _cacheable_report(cached[2]):
                 cached_id, cached_ts, cached_result = cached
                 logger.info(
                     "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
@@ -277,6 +305,8 @@ class DeepResearchService:
 
         # 写 Markdown 文件（即使 partial 也写，保证有产物）
         markdown = result.markdown or ""
+        if markdown and run is not None and run.stop_reason:
+            markdown = f"> 本次研究结束原因：{run.reason_text}。已取得的有效资料保留如下。\n\n" + markdown
         write_ok = False
         if markdown:
             try:
@@ -300,6 +330,8 @@ class DeepResearchService:
                         {
                             "report_id": report_id,
                             "engine": "dual_track",
+                            "run_id": run.run_id if run is not None else None,
+                            "end_reason": run.stop_reason if run is not None else None,
                             "guardrail_events": guardrail_events,
                             "dimensions": dims_payload,
                         },
@@ -334,6 +366,8 @@ class DeepResearchService:
         markdown = normalize_saved_markdown(markdown)
         done_event: Dict[str, Any] = {
             "type": "done",
+            "run_id": run.run_id if run is not None else None,
+            "end_reason": run.stop_reason if run is not None else None,
             "report_id": report_id if write_ok else None,
             "status": result.status,
             "quality_score": result.quality_score,
@@ -352,6 +386,8 @@ class DeepResearchService:
             progress_callback(done_event)
 
         return_dict: Dict[str, Any] = {
+            "run_id": run.run_id if run is not None else None,
+            "end_reason": run.stop_reason if run is not None else None,
             "report_id": report_id if write_ok else None,
             "stock_code": code,
             "stock_name": name,
@@ -375,7 +411,7 @@ class DeepResearchService:
             )
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
-        if write_ok and return_dict.get("markdown") and return_dict.get("status") in ("success", "ok"):
+        if write_ok and return_dict.get("markdown") and _cacheable_report(return_dict):
             cache_key = _date_key(code, dims)
             now = time.time()
             with _cache_lock:
@@ -412,6 +448,11 @@ class DeepResearchService:
         except OSError as exc:
             logger.warning("[DeepResearch] 读取报告正文失败 %s: %s", record.md_path, exc)
         data["markdown"] = normalize_saved_markdown(markdown)
+        payload = self.get_dims_payload(report_id)
+        if payload is not None:
+            for key in ("engine", "dimensions", "guardrail_events", "run_id", "end_reason"):
+                if key in payload:
+                    data[key] = payload[key]
         return data
 
     def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:

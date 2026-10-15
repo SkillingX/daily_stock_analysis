@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -31,7 +32,7 @@ from src.agent.deep_research.explore_agents import (  # noqa: F401
 )
 from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
-from src.deep_research_dims.context import build_shared_context
+from src.deep_research_dims.context import SharedContext, build_shared_context
 from src.deep_research_dims.data_dim import build_data_dim
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim
 from src.deep_research_dims.sector_dim import build_sector_dim
@@ -56,6 +57,8 @@ from src.schemas.deep_research_dims import (
 )
 from src.schemas.report_schema import Intelligence
 from src.schemas.supply_chain import SupplyChain
+
+from src.core.research_run import ResearchRun, ResearchStopped, current_research, research_dimension
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +269,8 @@ def _generate_final_conclusion(
             temperature=0.3,
             timeout=120.0,
         )
+        if getattr(resp, "provider", "") == "error" or getattr(resp, "finish_reason", None) in {"length", "content_filter"}:
+            return ""
         text = (resp.content or "").strip()
         text = re.sub(
             r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL | re.IGNORECASE
@@ -393,7 +398,7 @@ def _parse_researcher(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[
 # 注意：注册表在 run_dual_track 内延迟导入（防循环：researchers → explore_agents → 本包 → researchers）
 
 
-def run_dual_track(
+def _run_dual_track(
     stock_code: str,
     stock_name: str,
     llm_adapter: Any,
@@ -408,7 +413,8 @@ def run_dual_track(
 ) -> DualTrackResult:
     """执行一次双轨深度投研分析。"""
     result = DualTrackResult()
-    dims: Dict[str, DimEnvelope] = {}
+    run = current_research.get()
+    dims: Dict[str, DimEnvelope] = run.dimensions if run is not None else {}
     _perf_t0 = time.time()
     _perf_marks: List[Tuple[str, float]] = []
 
@@ -425,6 +431,8 @@ def run_dual_track(
         _emit(progress_callback, {"type": "dim_done", "dim": dim_id, "status": status})
 
     def start_dim(dim_id: str) -> None:
+        if run is not None:
+            run.check()
         _emit(progress_callback, {"type": "dim_start", "dim": dim_id})
 
     from src.deep_research_dims.dim_cache import (
@@ -462,7 +470,7 @@ def run_dual_track(
         web 端缓存命中会拿到无叙述 payload）；可复用探索资料允许写入，
         行情派生维度每次按当前快照计算。
         """
-        if not write_cache:
+        if not write_cache or run is not None and (run.stop_reason is not None or run.remaining() <= 0):
             return
         if cache_exclude and dim_id in cache_exclude:
             return
@@ -476,7 +484,11 @@ def run_dual_track(
     refresh_marker = (stock_code, uuid4().hex) if force_refresh else None
     refresh_token = financial_refresh.set(refresh_marker) if refresh_marker else None
     try:
+        if run is not None:
+            run.check()
         ctx = build_shared_context(stock_code, stock_name)
+        if run is not None:
+            run.context = ctx
     finally:
         if refresh_token is not None:
             financial_refresh.reset(refresh_token)
@@ -486,6 +498,8 @@ def run_dual_track(
     # ---- 波次 1：探索 Agent 线程池 + 主线程纯规则 ----
     _emit(progress_callback, {"type": "thinking", "step": 1, "message": "并行执行情报/产业链探索与规则维度..."})
 
+    if run is not None:
+        run.check()
     steps_total = 0
 
     def _run_rule_dims() -> None:
@@ -560,57 +574,89 @@ def run_dual_track(
         (d, globals()[RUNNER_NAMES[d]]) for d in researcher_dim_ids if d in selected
     ]
     if active_researchers:
-        def run_researcher(runner: Callable[..., Dict[str, Any]]) -> Dict[str, Any]:
+        def run_researcher(runner: Callable[..., Dict[str, Any]], dim_id: str) -> Dict[str, Any]:
             token = financial_refresh.set(refresh_marker) if refresh_marker else None
+            dim_token = research_dimension.set(dim_id)
             try:
-                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps)
+                if run is not None:
+                    run.check()
+                start_dim(dim_id)
+                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps, **({"research": ctx.fundamental.get("research")} if dim_id in {"business", "ownership"} else {}))
             finally:
+                research_dimension.reset(dim_token)
                 if token is not None:
                     financial_refresh.reset(token)
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
-            futures: Dict[Any, str] = {}
+        def collect_researcher(fut: Future[Dict[str, Any]], dim_id: str) -> None:
+            nonlocal steps_total
+            research = dict(ctx.fundamental.get("research") or {})
+            try:
+                out = run.wait_for(fut) if run is not None else fut.result(timeout=600)
+                research.update(out.get("vendor_research") or {})
+                if out.get("ok"):
+                    if dim_id == "intel":
+                        dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
+                    elif dim_id == "supply_chain":
+                        dim, used = _parse_supply_chain(out["data"], int(out.get("steps") or 0))
+                    else:
+                        dim, used = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
+                    dims[dim_id] = dim
+                    store_cache(dim_id, dim)
+                    steps_total += used
+                else:
+                    dims[dim_id] = DIM_MODELS[dim_id](
+                        status="degraded", degraded_reason=str(out.get("error"))
+                    )
+            except Exception as exc:  # noqa: BLE001
+                dims[dim_id] = DIM_MODELS[dim_id](
+                    status="degraded", degraded_reason=f"研究员异常: {exc}"
+                )
+            if run is not None:
+                research.update(run.vendor_research.get(dim_id, {}))
+            dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
+            if run is not None and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
+                from src.schemas.deep_research_dims import parse_dim
+                payload = dims[dim_id].model_dump()
+                payload["retained_evidence"] = list(run.evidence.get(dim_id, []))
+                payload["retained_facts"] = list(run.facts.get(dim_id, []))
+                dims[dim_id] = parse_dim(dim_id, payload)
+            emit_dim(dim_id, dims[dim_id].status)
+
+        pool = ThreadPoolExecutor(max_workers=5)
+        futures: Dict[Future[Dict[str, Any]], str] = {}
+        try:
             for dim_id, runner in active_researchers:
                 cached = try_cache(dim_id)
                 if cached is not None:
                     dims[dim_id] = cached
                     continue
-                start_dim(dim_id)
+                _emit(progress_callback, {"type": "dim_queued", "dim": dim_id})
                 futures[
                     pool.submit(
-                        run_researcher, runner,
+                        copy_context().run, run_researcher, runner, dim_id,
                     )
                 ] = dim_id
+            if run is not None:
+                for future in futures:
+                    run.track(future)
 
             data_dim = _build_data_dim()
             _run_rule_dims()
 
             for fut, dim_id in futures.items():
-                try:
-                    out = fut.result(timeout=600)
-                    if out.get("ok"):
-                        if dim_id == "intel":
-                            dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
-                        elif dim_id == "supply_chain":
-                            dim, used = _parse_supply_chain(out["data"], int(out.get("steps") or 0))
-                        else:
-                            dim, used = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
-                        dims[dim_id] = dim
-                        store_cache(dim_id, dim)
-                        steps_total += used
-                    else:
-                        dims[dim_id] = DIM_MODELS[dim_id](
-                            status="degraded", degraded_reason=str(out.get("error"))
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    dims[dim_id] = DIM_MODELS[dim_id](
-                        status="degraded", degraded_reason=f"研究员异常: {exc}"
-                    )
-                emit_dim(dim_id, dims[dim_id].status)
+                collect_researcher(fut, dim_id)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+            # Preserve work already complete before freezing an interrupted report.
+            for fut, dim_id in futures.items():
+                if dim_id not in dims and fut.done() and not fut.cancelled():
+                    collect_researcher(fut, dim_id)
     else:
         data_dim = _build_data_dim()
         _run_rule_dims()
 
+    if run is not None:
+        run.check()
     _perf_mark("wave1_done")
 
     # ---- 波次 2：F2 板块（带产业链定位文本）→ L1 六维 v2 → L2 贝叶斯 ----
@@ -678,6 +724,8 @@ def run_dual_track(
         dims["bayesian"] = bayesian_dim
         emit_dim("bayesian", bayesian_dim.status)
 
+    if run is not None:
+        run.check()
     _perf_mark("wave2_done")
 
     # ---- 波次 3：L5 → L3 → S4 → S1 ----
@@ -733,40 +781,6 @@ def run_dual_track(
         dims["signal"] = signal_dim
         emit_dim("signal", signal_dim.status)
 
-    # 四个维度的 LLM 叙述并行化：串行实测 ~89s（4 个独立 roundtrip），并行 ≈ 最慢一个
-    narrate_jobs: List[Tuple[str, Any]] = []
-    if not skip_narrations and scenarios_dim is not None and not scenarios_from_cache:
-        narrate_jobs.append(("scenarios", scenarios_dim))
-    if conclusion_dim is not None:
-        narrate_jobs.append(("conclusion", conclusion_dim))
-    if plan_dim is not None:
-        narrate_jobs.append(("plan", plan_dim))
-    if signal_dim is not None:
-        narrate_jobs.append(("signal", signal_dim))
-    if narrate_jobs and not skip_narrations:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            fut_map = {
-                pool.submit(
-                    narrate, llm_adapter, dim_id, dim.model_dump(), dim.narrative
-                ): (dim_id, dim)
-                for dim_id, dim in narrate_jobs
-            }
-            for fut, (dim_id, dim) in fut_map.items():
-                try:
-                    narrated = fut.result(timeout=180)
-                    updated = dim.model_copy(update={"narrative": narrated})
-                except Exception as exc:  # noqa: BLE001 - 单维度叙述失败只降级
-                    logger.warning("[DualTrack] 叙述并行任务失败 %s: %s", dim_id, exc)
-                    updated = dim
-                if dim_id == "scenarios":
-                    scenarios_dim = updated
-                elif dim_id == "conclusion":
-                    conclusion_dim = updated
-                elif dim_id == "plan":
-                    plan_dim = updated
-                else:
-                    signal_dim = updated
-
     if scenarios_dim is not None and not scenarios_from_cache:
         store_cache("scenarios", scenarios_dim)
         emit_dim("scenarios", scenarios_dim.status)
@@ -786,6 +800,8 @@ def run_dual_track(
 
     _perf_mark("wave3_done")
 
+    if run is not None:
+        run.check()
     # ---- 护栏层（override 后叙述修订 + 契约重解析）----
     payloads = {d: m.model_dump() for d, m in dims.items()}
     events, adjusted = apply_guardrails(payloads)
@@ -822,6 +838,8 @@ def run_dual_track(
 
     _perf_mark("guardrail_done")
 
+    if run is not None:
+        run.check()
     # ---- 终读结论（需求 3：通读报告级总结；数字注入式，批量/无 LLM 时回退空串）----
     final_conclusion = ""
     if not skip_narrations and llm_adapter is not None:
@@ -861,7 +879,8 @@ def run_dual_track(
     executed = [d for d, m in dims.items() if m.status != "skipped"]
     degraded = [d for d, m in dims.items() if m.status == "degraded"]
     ok_count = len(executed) - len(degraded)
-    status = "success" if not degraded else "partial" if ok_count >= max(2, len(executed) // 2) else "failed"
+    valid = _has_useful_data(dims)
+    status = "success" if not degraded else "partial" if valid else "failed"
 
     result.success = status != "failed" and bool(markdown.strip())
     result.status = status
@@ -882,3 +901,120 @@ def run_dual_track(
         "[DualTrack][perf] total=%.1fs stages: %s", time.time() - _perf_t0, _perf_summary
     )
     return result
+
+
+def _has_useful_data(dims: dict[str, Any]) -> bool:
+    """Use the same acquired-data criterion for normal and interrupted reports."""
+    for dim in dims.values():
+        if dim.status == "skipped":
+            continue
+        if dim.status == "ok" or dim.retained_evidence or dim.retained_facts:
+            return True
+        if any(getattr(dim, field, None) for field in ("business_model", "main_products", "controller", "top_holders")):
+            return True
+        if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments", "shareholder_details")):
+            return True
+    financial = dims.get("fundamental")
+    if financial is None or financial.status == "skipped":
+        return False
+    return bool(
+        financial.data_quality and financial.data_quality.obtained_count > 0
+        or any(field.reading is not None for field in financial.financial_snapshot.values())
+        or financial.valuation_detail.get("market_cap") is not None
+        or financial.financial_safety.get("leverage") is not None
+    )
+
+
+def restore_vendor_facts(dim_id: str, dim: DimEnvelope, research: dict[str, Any]) -> DimEnvelope:
+    """Restore only supplier fields after failed research, keeping strict validation."""
+    from src.schemas.deep_research_dims import parse_dim
+    if dim_id not in {"business", "ownership"} or dim.status == "ok":
+        return dim
+    payload = dim.model_dump()
+    company = research.get("company") or {}
+    if dim_id == "business":
+        for field, key in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
+            if company.get(key):
+                payload[field] = {"value": company[key], "source": f"Choice {key}，截至 {research.get('as_of')}"}
+        if research.get("product_segments"):
+            payload["product_segments"] = research["product_segments"]
+    elif dim_id == "ownership":
+        if company.get("AHOLDER"):
+            payload["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
+        names = (research.get("holders") or {}).get("HOLDNAMER")
+        if isinstance(names, str) and names.strip():
+            payload["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {(research.get('holders') or {}).get('period')}"} for name in names.split(";") if name.strip()]
+        if research.get("shareholder_details"):
+            payload["shareholder_details"] = research["shareholder_details"]
+    try:
+        return parse_dim(dim_id, payload)
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.warning("Retained vendor evidence did not pass %s contract: %s", dim_id, type(exc).__name__)
+    return dim
+
+
+def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, selected: set[str], report_id: str | None) -> DualTrackResult:
+    """Freeze completed results and render without starting any new model/tool work."""
+    from datetime import datetime
+    from src.schemas.deep_research_dims import parse_dim
+    dims = dict(run.dimensions)
+    ctx = run.context or SharedContext(stock_code, stock_name, datetime.now().isoformat(timespec="seconds"))
+    # Stage zero can have facts even if cancellation preceded rule dimension assembly.
+    if "fundamental" in selected and "fundamental" not in dims:
+        dims["fundamental"] = build_fundamental_dim(ctx).model_copy(update={"status": "degraded", "degraded_reason": run.reason_text})
+    if "data" in selected and "data" not in dims:
+        from src.core.research_run import retained_tool_facts
+        facts = retained_tool_facts("get_realtime_quote", ctx.quote)
+        facts += retained_tool_facts("get_daily_history", {"data": ctx.history})
+        dims["data"] = DIM_MODELS["data"](status="degraded", degraded_reason=run.reason_text, retained_facts=facts)
+    for dim_id in DIM_IDS:
+        if dim_id not in dims:
+            dims[dim_id] = DIM_MODELS[dim_id](
+                status="degraded" if dim_id in selected else "skipped",
+                degraded_reason=run.reason_text if dim_id in selected else "本次分析范围未选择",
+                retained_evidence=run.evidence.get(dim_id, []),
+                retained_facts=run.facts.get(dim_id, []),
+            )
+        elif dim_id in selected and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
+            payload = dims[dim_id].model_dump()
+            payload["retained_evidence"] = run.evidence.get(dim_id, [])
+            existing_facts = payload.get("retained_facts", [])
+            payload["retained_facts"] = [
+                *existing_facts,
+                *(fact for fact in run.facts.get(dim_id, []) if fact not in existing_facts),
+            ][-30:]
+            dims[dim_id] = parse_dim(dim_id, payload)
+    for dim_id in selected & {"business", "ownership"}:
+        research = {**(ctx.fundamental.get("research") or {}), **run.vendor_research.get(dim_id, {})}
+        dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
+    events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})
+    dims = {key: parse_dim(key, value) for key, value in adjusted.items()}
+    view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")
+    markdown = render_markdown(view)
+    valid = _has_useful_data(dims)
+    return DualTrackResult(success=bool(valid), status="partial" if valid else "failed", markdown=markdown if valid else "",
+                           dims=dims, dims_payload={key: value.model_dump(mode="json") for key, value in dims.items()},
+                           guardrail_events=events, error=run.reason_text)
+
+
+def run_dual_track(
+    stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: ProgressCb = None,
+    explore_max_steps: int = 8, force_refresh: bool = False, dims_filter: Optional[set[str]] = None,
+    skip_narrations: bool = False, write_cache: bool = True,
+    cache_exclude: Optional[frozenset[str]] = None, report_id: Optional[str] = None,
+) -> DualTrackResult:
+    from src.config import get_config
+    existing = current_research.get()
+    run = existing or ResearchRun(get_config().deep_research_timeout_seconds)
+    with run.bind():
+        try:
+            result = _run_dual_track(stock_code, stock_name, llm_adapter, progress_callback,
+                                     explore_max_steps, force_refresh, dims_filter, skip_narrations,
+                                     write_cache, cache_exclude, report_id)
+            run.check()
+            return result
+        except ResearchStopped:
+            return _interrupted_result(run, stock_code, stock_name, expand_dim_selection(dims_filter), report_id)
+        finally:
+            if existing is None:
+                run.finish()

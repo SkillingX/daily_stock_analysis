@@ -59,11 +59,12 @@ def build_market_review_runtime(
     if callable(has_search_capability) and has_search_capability():
         search_service = SearchService(
             bocha_keys=getattr(config, "bocha_api_keys", None),
-            tavily_keys=getattr(config, "tavily_api_keys", None),
             anspire_keys=getattr(config, "anspire_api_keys", None),
             brave_keys=getattr(config, "brave_api_keys", None),
             serpapi_keys=getattr(config, "serpapi_keys", None),
             minimax_keys=getattr(config, "minimax_api_keys", None),
+            coding_plan_search_provider=getattr(config, "coding_plan_search_provider", "minimax"),
+            zhipu_api_key=getattr(config, "zhipu_api_key", None),
             searxng_base_urls=getattr(config, "searxng_base_urls", None),
             searxng_public_instances_enabled=getattr(
                 config,

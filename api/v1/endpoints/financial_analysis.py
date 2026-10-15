@@ -35,7 +35,7 @@ def _validate_id(report_id: str) -> str:
 
 
 @router.post("/generate", response_model=FinancialAnalysisGenerateResponse)
-async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false"):
+async def generate(stock_code: str, stock_name: Optional[str] = None, force_refresh: Literal["true", "false"] = "false") -> FinancialAnalysisGenerateResponse:
     from src.core.market_policy import require_stock_market
     require_stock_market(stock_code)
 
@@ -52,14 +52,14 @@ async def generate(stock_code: str, stock_name: Optional[str] = None, force_refr
         logger.error("[FinAnalysis] 生成失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"生成失败：{exc}")
     # 走 Pydantic 校验（response_model 会再做一次）
-    return FinancialAnalysisGenerateResponse.model_validate({
+    return FinancialAnalysisGenerateResponse.model_validate_json(json.dumps({
         "report_id": raw.get("report_id"),
         "stock_code": raw["stock_code"],
         "stock_name": raw["stock_name"],
         "status": raw["status"],
         "markdown": raw["markdown"],
         "analysis": raw["analysis"],
-    })
+    }))
 
 
 @router.get("/reports", response_model=FinancialAnalysisListResponse)

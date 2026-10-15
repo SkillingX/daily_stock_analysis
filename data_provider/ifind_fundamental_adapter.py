@@ -1,40 +1,23 @@
 # -*- coding: utf-8 -*-
-"""iFinD 适配器 —— 同花顺 iFinD MCP（验证数据源）。
-
-通过同花顺 iFinD MCP server（streamablehttp）获取专业结构化数据，作为
-MX Data（主源）的交叉验证源。
-
-设计（KISS · 高内聚低耦合）：
-- :class:`IfindSource` 实现 :class:`SourceAdapter`，通过依赖注入 fetcher 解耦。
-  字段映射 / 口径 / 报告期逻辑是纯同步代码，**100% 可单测**（注入同步假 fetcher）。
-- :class:`IfindFetcher` 封装真实 async MCP 调用（``fetch`` 同步包装 ``_async_fetch``）。
-  进程级单例复用连接（避免 MCP 冷启动）。
-
-Phase 0 探测结果（2026-06-25）：
-- iFinD stock MCP 所有工具参数均为 ``query`` 自然语言字符串，非结构化字段。
-- 返回格式：``{"code":1,"data":{"answer":"<markdown table>"}}``，需解析 Markdown 表格。
-- 主力净流入返回值为「股」单位但量级异常（-37631 股 = -3.76 万元，不合理，
-  实际可能是「万/十万」单位刻度），方向验证可参考但不建议严格量级比对。
-
-配置：``IFIND_MCP_ENDPOINT`` / ``IFIND_MCP_TOKEN`` / ``IFIND_MCP_TIMEOUT_SECONDS``。
+"""iFinD MCP adapter: bounded calls and evidence-preserving table mapping.
+Choice uses one financial batch; legacy single-anchor/series interfaces remain available.
 """
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
-from inspect import signature
-from functools import partial
 from time import monotonic
 import json
 import logging
 import os
 import re
-import threading
-from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timezone
+from decimal import Decimal, DecimalException
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
-from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
+from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period, normalize_report_period
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +71,7 @@ _IFIND_ANCHOR_QUERIES: Dict[str, Tuple[str, str, List[str]]] = {
         "get_stock_financials",
         "{code} {period} 营业收入同比增长率",
         [
+            "营业收入(同比增长率)",
             "营业收入同比增长率（单位：%）",
             "营业收入同比增长率",
             "营业收入同比增长",
@@ -135,37 +119,31 @@ _PERIOD_FIELDS = {
 # ------------------------------------------------------------------
 
 
-def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
-    """从 iFinD ``data.answer`` Markdown 表格中提取「表头: 值」映射。
-
-    表格格式（Phase 0 实测）：``|表头1|表头2|...|\n|---|---|---|\n|值1|值2|...|``
-    指期优先，否则选已确认最新期；没有期间证据时保留首个独立观测且不推断日期。
-    """
-    lines = text.strip().splitlines()
-    if not lines:
-        return {}
-    # 找第一个分隔行（|---|）确定表头
-    sep_idx = -1
-    for i, line in enumerate(lines):
-        if re.match(r"^\|[\s\-:|]+\|$", line) or re.match(r"^\|[\s\-]+", line):
-            sep_idx = i
-            break
-    if sep_idx < 0:
-        return {}
-    headers = [h.strip() for h in lines[sep_idx - 1].strip().strip("|").split("|")]
-    rows: List[Dict[str, str]] = []
-    for row in lines[sep_idx + 1 :]:
-        if not row.strip().startswith("|"):
+def _ifind_tables(text: str) -> list[list[dict[str, str]]]:
+    """Preserve separate tables and empty cells; reject ragged rows."""
+    tables: list[list[dict[str, str]]] = []
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if index == 0 or not re.fullmatch(r"\s*\|[\s\-:|]+\|\s*", line):
             continue
-        cells = [c.strip() for c in row.strip().strip("|").split("|")]
-        if not cells or cells[0] in (
-            "# 指标参数信息",
-            "# 行情衍生指标日期提示",
-            "注:",
-            "",
-        ):
-            continue  # pragma: no cover — Phase 0 响应参数段在表格外，数据行先触发 break
-        rows.append(dict(zip(headers, cells)))
+        headers = [cell.strip() for cell in lines[index - 1].strip().strip("|").split("|")]
+        if len(set(headers)) != len(headers):
+            raise SourceReadError("ifind", "invalid_response")
+        rows = []
+        for row in lines[index + 1:]:
+            if not row.strip().startswith("|") or re.fullmatch(r"\s*\|[\s\-:|]+\|\s*", row):
+                break
+            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+            if len(cells) != len(headers) or cells == headers:
+                break
+            rows.append(dict(zip(headers, cells)))
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keywords: Optional[List[str]] = None, field: Optional[str] = None) -> Dict[str, str]:
+    rows = [row for table in _ifind_tables(text) for row in table]
     if keywords is not None:
         rows = [row for row in rows if _extract_ifind_value(row, keywords, field=field)[0] is not None]
     selected = select_report_period([report_period_from_fields(row) for row in rows], period)
@@ -255,7 +233,7 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _extract_ifind_value(
-    table: Dict[str, str], keywords: List[str], field: Optional[str] = None
+    table: Dict[str, str], keywords: List[str], field: Optional[str] = None, *, cumulative_only: bool = False,
 ) -> Tuple[Optional[float], str]:
     """从解析后的表中按关键词取数值。
 
@@ -266,6 +244,8 @@ def _extract_ifind_value(
     for kw in keywords:
         for col, val in table.items():
             if kw in col:
+                if cumulative_only and field in _PERIOD_FIELDS and ("单季" in col or "单季度" in col):
+                    continue
                 v = normalize_anchor_value(field, val, col)[0] if field is not None else _safe_float(val)
                 if v is not None:
                     if field is None:
@@ -278,110 +258,248 @@ def _extract_ifind_value(
     return fallback
 
 
-def _parse_ifind_response(
-    raw_text: str, keywords: List[str], field: str, period: Optional[str]
-) -> Optional[AnchorReading]:
-    """从 iFinD MCP ``call_tool`` 返回的原始文本解析出 AnchorReading（纯函数）。
+class IfindData(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
+    answer: str
+    indicators_params: dict[str, dict[str, str | int | float | None]] = Field(default_factory=dict)
 
-    输入：``content[0].text``（JSON 字符串，内含 ``data.answer`` Markdown 表格）。
-    解析失败/无匹配值 → None。
-    """
-    if not raw_text:
+
+class IfindReply(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
+    code: int
+    msg: str = ""
+    data: IfindData | None = None
+
+
+class ProductSegment(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    name: Annotated[str, Field(min_length=1)]
+    rank: Annotated[int, Field(ge=1)]
+    report_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+    revenue: AnchorReading | None = None
+    cost: AnchorReading | None = None
+    gross_profit: AnchorReading | None = None
+    gross_margin: AnchorReading | None = None
+
+
+class ProductSegments(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    source: Literal["ifind"] = "ifind"
+    coverage: Literal["partial"] = "partial"
+    items: list[ProductSegment] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    disclosed_at: str | None = None
+    original_url: str | None = None
+
+
+class IfindHolder(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    name: Annotated[str, Field(min_length=1)]
+    rank: Annotated[int, Field(ge=1, le=10)]
+    report_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")]
+    shares: AnchorReading | None = None
+    ratio: AnchorReading | None = None
+
+
+class IfindShareholders(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    source: Literal["ifind"] = "ifind"
+    coverage: Literal["partial", "complete"] = "partial"
+    items: list[IfindHolder] = Field(default_factory=list, max_length=10)
+    errors: list[str] = Field(default_factory=list)
+    disclosed_at: str | None = None
+    original_url: str | None = None
+
+
+@dataclass(frozen=True)
+class _RankedCell:
+    raw: str
+    label: str
+    params: dict[str, str | int | float | None]
+
+
+def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[dict[tuple[str, int], dict[str, _RankedCell]], list[str]]:
+    """Join ranked supplier cells only by returned security, explicit period and rank."""
+    joined: dict[tuple[str, int], dict[str, _RankedCell]] = {}
+    rejected: set[tuple[str, int]] = set()
+    errors: list[str] = []
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if not _same_security(row.get("证券代码"), code):
+                continue
+            row_period = normalize_report_period(row.get("日期") or row.get("报告期"))[0]
+            for label, raw in row.items():
+                stem = re.sub(r"[（(][^()（）]*(?:排名|单位)[^()（）]*[）)]", "", label).strip()
+                field = next((name for name, prefix in fields.items() if stem == prefix), None)
+                rank_match = re.search(r"第(\d+)名", label)
+                if field is None or rank_match is None or not raw.strip():
+                    continue
+                rank = int(rank_match[1])
+                if rank < 1:
+                    errors.append("invalid_rank")
+                    continue
+                options = [params for key, params in data.indicators_params.items() if key.split("__")[0] == stem and str(params.get("排名") or params.get("大股东排名")) == f"第{rank}名"]
+                if len(options) > 1:
+                    errors.append("ambiguous_indicator")
+                    continue
+                params = options[0] if options else {}
+                parameter_period = normalize_report_period(params.get("报告期") or params.get("截止日期"))[0]
+                period = row_period or parameter_period
+                if period is None:
+                    errors.append("period_unknown")
+                    continue
+                key = period, rank
+                if row_period and parameter_period and row_period != parameter_period:
+                    rejected.add(key)
+                    errors.append("period_conflict")
+                    continue
+                cell = _RankedCell(raw, label, params)
+                existing = joined.setdefault(key, {}).get(field)
+                if existing is not None and existing != cell:
+                    rejected.add(key)
+                    errors.append("duplicate_rank_conflict")
+                else:
+                    joined[key][field] = cell
+    return {key: cells for key, cells in joined.items() if key not in rejected}, list(dict.fromkeys(errors))
+
+
+def _same_security(returned: str | None, requested: str) -> bool:
+    """Accept a bare A-share code, but never an explicitly different exchange."""
+    from data_provider.choice_adapter import ChoiceAdapter
+    expected = ChoiceAdapter.stock_code(requested)
+    return returned in {expected, expected.split(".")[0]}
+
+
+def _detail_reading(cell: _RankedCell, period: str, field: str) -> AnchorReading | None:
+    unit = str(cell.params.get("单位") or "").strip() or None
+    raw_currency = str(cell.params.get("币种") or "").strip() or None
+    currency = raw_currency or ("CNY" if unit == "元" else None)
+    value, normalized, currency, error = _ifind_number(cell.raw, cell.label, unit, field, currency)
+    if value is None:
         return None
+    return AnchorReading("ifind", value, period=period, unit=normalized, currency=currency,
+                         raw_value=cell.raw, raw_label=cell.label, raw_unit=unit, raw_currency=raw_currency,
+                         normalization_error=error, fetched_at=datetime.now(timezone.utc).isoformat())
+
+
+def _ifind_data(raw: object) -> IfindData:
     try:
-        resp_json = json.loads(raw_text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    answer = (
-        resp_json.get("data", {}).get("answer", "")
-        if isinstance(resp_json, dict)
-        else str(raw_text)
-    )
-    if any(term in answer for term in ("用量已耗尽", "调用次数已达到上限", "额度耗尽")):
+        reply = IfindReply.model_validate(raw)
+    except ValidationError:
+        raise SourceReadError("ifind", "invalid_response") from None
+    message = reply.msg + (reply.data.answer if reply.data else "")
+    if any(term in message for term in ("用量已耗尽", "调用次数已达到上限", "额度耗尽", "quota")):
         raise SourceReadError("ifind", "quota_exhausted")
-    if any(term in answer for term in ("未认证", "无权限", "权限不足", "Token已过期")):
+    if any(term in message for term in ("未认证", "无权限", "权限不足", "Token已过期", "token invalid")):
         raise SourceReadError("ifind", "authentication_failed")
-    table = _parse_ifind_markdown_table(answer, period=period, keywords=keywords, field=field)
-    if not table:
+    if reply.code != 1:
+        raise SourceReadError("ifind", "business_error")
+    if reply.data is None or not reply.data.answer.strip():
+        raise SourceReadError("ifind", "invalid_response")
+    return reply.data
+
+
+def _ifind_number(raw: str, label: str, unit: str | None, field: str, currency: str | None = None) -> tuple[float | None, str | None, str | None, str | None]:
+    # The cell's scale abbreviates a value in base units: 元 + 1.2亿 is 1.2e8元.
+    # A non-base declared scale (万元 + 1.2亿) is ambiguous and stays a conflict.
+    text = raw.strip().replace(",", "")
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(万亿|千亿|百亿|十亿|百万|亿|万|千)", text)
+    declared = (unit or "").strip()
+    if match and (declared in {"元", "股"} or not declared and re.search(r"单位[：:]\s*(元|股)[）)]", label)):
+        scale = {"万亿": 10**12, "千亿": 10**11, "百亿": 10**10, "十亿": 10**9, "百万": 10**6, "亿": 10**8, "万": 10**4, "千": 10**3}[match[2]]
+        try:
+            text = str(Decimal(match[1]) * scale)
+        except DecimalException:
+            return None, None, currency, "invalid_value"
+    annotation = re.search(r"单位[：:]\s*([^）)；;]+)", label)
+    numeric_label = f"(单位：{annotation[1]})" if annotation else label
+    value, normalized, currency, error = normalize_anchor_value(field, text, numeric_label, unit=declared or None, currency=currency)
+    return value, normalized, currency, error
+
+
+def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period: Optional[str], *, code: str | None = None, a_share_contract: bool = False) -> Optional[AnchorReading]:
+    try:
+        raw = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
         return None
-    value, col = _extract_ifind_value(table, keywords, field=field)
-    if value is None:
+    # Historical parser fixtures may contain only the data envelope; wire replies are validated in query().
+    data = IfindData.model_validate(raw["data"]) if isinstance(raw, dict) and "code" not in raw and "data" in raw else _ifind_data(raw)
+    candidates: list[AnchorReading] = []
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if code and not _same_security(row.get("证券代码"), code):
+                continue
+            value, col = _extract_ifind_value(row, keywords, field=field, cumulative_only=a_share_contract)
+            if value is None or field in _PERIOD_FIELDS and caliber_from_label(field, col) is None:
+                continue
+            bare = re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", col).strip()
+            params = data.indicators_params.get(bare, {})
+            unit = str(params["单位"]).strip() if params.get("单位") else row.get("unit")
+            currency = str(params.get("币种") or row.get("currency") or "").strip() or None
+            currency = {"人民币": "CNY", "人民币元": "CNY", "美元": "USD", "港币": "HKD"}.get(currency, currency)
+            raw_currency = currency
+            # Explicit deployment decision for this A-share MCP batch, not supplier metadata.
+            if a_share_contract and currency is None and (unit == "元" or re.search(r"单位[：:]\s*元[）)]", col)):
+                currency = "CNY"
+            actual, basis = report_period_from_fields(row, col)
+            if actual is None and field in _PERIOD_FIELDS:
+                actual, basis = normalize_report_period(row.get("日期"))
+            parameter_period, parameter_basis = normalize_report_period(params.get("报告期"))
+            error = None
+            if actual and parameter_period and actual != parameter_period:
+                error = "period_conflict"
+            actual = actual or parameter_period
+            if basis == "unknown":
+                basis = parameter_basis
+            # Financial statement totals are cumulative; single-quarter columns remain distinct.
+            if actual and basis == "unknown" and field in _PERIOD_FIELDS:
+                basis = "single_quarter" if "单季度" in col or "单季" in col else "annual" if actual.endswith("12-31") else "YTD"
+            scope = str(params.get("报表类型") or row.get("报表类型") or "")
+            adjustment = str(params.get("调整口径") or params.get("数据调整") or row.get("调整口径") or "")
+            number, normalized_unit, currency, number_error = _ifind_number(row[col], col, unit, field, currency)
+            if number is None:
+                continue
+            disclosure_period = normalize_report_period(data.indicators_params.get("定期报告实际披露日期", {}).get("报告期"))[0]
+            disclosed = next((r.get("定期报告实际披露日期") for t in _ifind_tables(data.answer) for r in t
+                              if r.get("定期报告实际披露日期") and (not code or _same_security(r.get("证券代码"), code))
+                              and (report_period_from_fields(r)[0] or disclosure_period) == actual
+                              and (not disclosure_period or disclosure_period == actual)), None)
+            candidates.append(AnchorReading(
+                "ifind", number, caliber=caliber_from_label(field, col),
+                period=actual if field in _PERIOD_FIELDS else None, period_basis=basis if field in _PERIOD_FIELDS else "unknown",
+                requested_period=period if field in _PERIOD_FIELDS else None,
+                observed_at=None if field in _PERIOD_FIELDS else observation_time_from_fields(row) or str(params.get("交易日期") or "") or None,
+                fetched_at=datetime.now(timezone.utc).isoformat(), unit=normalized_unit, currency=currency,
+                raw_value=row[col], raw_label=col, raw_unit=unit, raw_currency=raw_currency,
+                normalization_error=error or number_error,
+                statement_scope="consolidated" if scope in {"合并报表", "合并报表(调整)", "合并报表（调整）"} else "parent" if scope == "母公司报表" else "consolidated" if a_share_contract and not scope and field in {"roe", "gross_margin", "revenue_yoy", "net_profit_yoy"} else None,
+                adjustment="restated" if adjustment in {"重述", "重述后", "调整后"} or scope in {"合并报表(调整)", "合并报表（调整）"} else "unadjusted" if adjustment in {"调整前", "未调整"} else None,
+                disclosed_at=normalize_report_period(disclosed)[0],
+            ))
+    from .cross_source_validator import has_current_financial_period
+    selected = select_report_period([(r.period, r.period_basis) if not a_share_contract or has_current_financial_period(r) else (None, "unknown") for r in candidates], period)
+    if not candidates:
         return None
-    actual, basis = report_period_from_fields(table, col)
-    value, unit, currency, error = normalize_anchor_value(field, table[col], col, unit=table.get("unit"), currency=table.get("currency"))
-    if value is None:
-        return None
-    return AnchorReading(
-        source="ifind",
-        value=value,
-        caliber=caliber_from_label(field, col),
-        period=actual if field in _PERIOD_FIELDS else None,
-        period_basis=basis if field in _PERIOD_FIELDS else "unknown",
-        requested_period=period if field in _PERIOD_FIELDS else None,
-        observed_at=observation_time_from_fields(table), fetched_at=table.get("fetched_at"),
-        unit=unit, currency=currency, raw_value=table[col], raw_label=col, normalization_error=error,
-        raw_unit=table.get("unit"), raw_currency=table.get("currency"),
-    )
-
-
-# ------------------------------------------------------------------
-# IfindFetcher —— async MCP client（单例）
-# ------------------------------------------------------------------
-
-
-async def _apply_mcp_request_deadline(request: Any, *, deadline: float) -> None:
-    """SDK hook: reject expired wire calls and cap each request's own timeout."""
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        raise TimeoutError("financial MCP deadline exhausted")
-    configured = request.extensions.get("timeout") or {}
-    request.extensions["timeout"] = {
-        part: min(value, remaining) if isinstance(value, (int, float)) else remaining
-        for part in ("connect", "read", "write", "pool")
-        for value in [configured.get(part)]
-    }
+    reading = candidates[selected if selected is not None else 0]
+    identity = (reading.period, reading.period_basis, reading.caliber, reading.observed_at)
+    evidence = (reading.value, reading.unit, reading.currency, reading.statement_scope, reading.adjustment, reading.normalization_error)
+    if any((other.period, other.period_basis, other.caliber, other.observed_at) == identity
+           and (other.value, other.unit, other.currency, other.statement_scope, other.adjustment, other.normalization_error) != evidence
+           for other in candidates):
+        raise SourceReadError("ifind", "invalid_response")
+    return reading
 
 
 class IfindFetcher:
-    """iFinD MCP 客户端（async，``fetch`` 同步包装 ``_async_fetch``）。
-
-    Phase 1 改进：常驻 daemon 线程 + 独立事件循环，复用 ``ClientSession``。
-    每次 ``fetch`` 通过 ``asyncio.run_coroutine_threadsafe`` 把协程投递到
-    那个 loop 上，避免 ``asyncio.run`` 反复启停 loop + 重建 streamablehttp
-    连接（实测可让"4 个 anchor 并发拉取"从 16s 缩到 4-6s，并消除
-    "GET stream disconnected, reconnecting in 1s" 循环）。
-
-    fail-open 行为保持不变：无 token / 协程异常 / 超时 → 返回 None。
-    """
-
+    """One fresh MCP session per bounded batch; no background loop or hidden retry."""
     _instance: Optional["IfindFetcher"] = None
+    financial_fields = ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")
+    contract_version = "ifind-financial-v1"
 
-    def __init__(
-        self,
-        endpoint: Optional[str] = None,
-        token: Optional[str] = None,
-        timeout_seconds: float = 30.0,
-    ) -> None:
-        self._endpoint = (endpoint or os.getenv("IFIND_MCP_ENDPOINT") or "").strip()
-        self._token = (token or os.getenv("IFIND_MCP_TOKEN") or "").strip()
-        # iFinD MCP is slow under load (5-15s per anchor in practice);
-        # we keep a generous default so a single retry round can complete.
-        self._timeout = float(
-            timeout_seconds
-            if timeout_seconds
-            else float(os.getenv("IFIND_MCP_TIMEOUT_SECONDS", "30") or 30)
-        )
-        # Daemon loop (lazy): ``_ensure_loop()`` starts it on first fetch.
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._loop_thread: Optional[threading.Thread] = None
-        self._loop_lock = threading.Lock()
-        # Shared ``ClientSession``: opened once via the daemon loop and
-        # reused by every subsequent ``call_tool``. The ``session_lock``
-        # serialises session recreation / teardown across threads.
-        self._session: Any = None
-        self._session_context: Any = None
-        self._session_ready: bool = False
-        self._session_lock = threading.Lock()
+    def __init__(self, endpoint: str | None = None, token: str | None = None, timeout_seconds: float | None = None) -> None:
+        self._endpoint = (os.getenv("IFIND_MCP_ENDPOINT", "") if endpoint is None else endpoint).strip()
+        self._token = (os.getenv("IFIND_MCP_TOKEN", "") if token is None else token).strip()
+        self._timeout = float(os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "30") if timeout_seconds is None else timeout_seconds
 
     @property
     def available(self) -> bool:
@@ -389,275 +507,120 @@ class IfindFetcher:
 
     @classmethod
     def get_instance(cls) -> "IfindFetcher":
-        """进程级单例（复用连接，避免 MCP 冷启动）。"""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
 
-    def _ensure_loop(self) -> Optional[asyncio.AbstractEventLoop]:
-        """Start a daemon thread that hosts an event loop. Idempotent."""
+    def query(self, tool: str, question: str, *, deadline: float | None = None) -> IfindData:
+        from src.core.research_run import current_research, ResearchStopped
+        if run := current_research.get():
+            run.check()
         if not self.available:
-            return None
-        with self._loop_lock:
-            if self._loop is not None and self._loop.is_running():
-                return self._loop
-
-            ready = threading.Event()
-
-            def _run_loop() -> None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                self._loop = loop
-                ready.set()
-                try:
-                    loop.run_forever()
-                finally:
-                    loop.close()
-
-            self._loop_thread = threading.Thread(
-                target=_run_loop,
-                name="ifind-mcp-loop",
-                daemon=True,
-            )
-            self._loop_thread.start()
-            ready.wait(timeout=2.0)
-            return self._loop
-
-    def _submit(self, coro: Any, timeout: Optional[float] = None) -> Any:
-        """Run ``coro`` on the daemon loop and wait for the result.
-
-        Returns the coroutine result, or ``None`` on any error / timeout.
-        Never raises.
-        """
-        loop = self._ensure_loop()
-        if loop is None:
-            return None
+            raise SourceReadError("ifind", "invalid_configuration")
+        timeout = min(self._timeout, deadline - monotonic()) if deadline is not None else self._timeout
+        if timeout <= 0:
+            raise SourceReadError("ifind", "timeout")
         try:
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] submit failed: %s", source_failure_reason(exc))
-            return None
-        try:
-            wait = timeout if timeout is not None else self._timeout + 2.0
-            return future.result(timeout=wait)
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] future failed: %s", source_failure_reason(exc))
-            return None
-
-    def fetch(
-        self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
-    ) -> Optional[AnchorReading]:
-        """同步获取（封装 async MCP）。无 token/失败 → None。
-
-        Per-call ``asyncio.run`` so each fetch gets a clean event loop
-        and the MCP receive-loop semantics work as designed. The
-        fallback adapter fans out across anchors via
-        ``ThreadPoolExecutor``; each worker thread is responsible for
-        driving its own event loop here.
-        """
-        if not self.available:
-            return None
-        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
-        if remaining is not None and remaining <= 0:
-            return None
-        try:
-            call = self._async_fetch(code, field, period, deadline=deadline)
-            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
-        except Exception as exc:  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] fetch %s/%s failed: %s", code, field, source_failure_reason(exc))
+            raw = asyncio.run(asyncio.wait_for(self._async_query(tool, question, deadline=deadline), timeout))
+            return _ifind_data(raw)
+        except ResearchStopped:
+            raise
+        except Exception as exc:
+            if run := current_research.get():
+                run.check()
             raise SourceReadError("ifind", source_failure_reason(exc)) from None
 
-    async def _async_fetch(  # pragma: no cover — 真实 MCP 调用，Phase 1 已验证连通性
-        self, code: str, field: str, period: Optional[str], *, deadline: Optional[float] = None
-    ) -> Optional[AnchorReading]:
-        """Execute one iFinD MCP call.
+    async def _async_query(self, tool: str, question: str, *, deadline: float | None = None) -> object:
+        from src.services.mcp_client import call_mcp_tool
+        from src.core.research_run import current_research
+        if run := current_research.get():
+            run.check()
+        result = await call_mcp_tool(self._endpoint, self._token, tool, {"query": question}, timeout_seconds=self._timeout, deadline=deadline)
+        if getattr(result, "is_error", getattr(result, "isError", False)):
+            raise SourceReadError("ifind", "business_error")
+        structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
+        if structured is not None:
+            return structured
+        for block in result.content:
+            if getattr(block, "text", None):
+                return json.loads(block.text)
+        raise SourceReadError("ifind", "invalid_response")
 
-        We open a fresh ``streamablehttp_client`` + ``ClientSession`` per
-        call. Earlier we tried a daemon-hosted shared session
-        (``_ensure_session``) but the MCP receive-loop semantics did
-        not survive ``run_coroutine_threadsafe`` cleanly when four
-        growth anchors were issued back-to-back: the second call would
-        hang because the receive loop was still draining the first
-        call's response. Per-call sessions are slower (1-2s handshake
-        each) but reliable, and the fallback adapter already runs four
-        anchors in parallel via ``ThreadPoolExecutor`` so the wall
-        clock stays around 2-4s for a fresh batch.
-        """
-        if field not in _IFIND_ANCHOR_QUERIES:
-            return None
-        tool, query_tpl, keywords = _IFIND_ANCHOR_QUERIES[field]
-        query = query_tpl.format(code=code, period=period or "")
-        from mcp import ClientSession
-        from mcp.client import streamable_http
-        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
+    def financial_snapshot(self, code: str, period: str | None, *, deadline: float) -> dict[str, AnchorReading]:
+        from data_provider.choice_adapter import ChoiceAdapter
+        today = date.today()
+        target = f"报告期{period}" if period else f"查询{date(today.year - 1, today.month, 1)}至{today}每个报告期"
+        query = f"{ChoiceAdapter.stock_code(code)} {target}的营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率，合并报表（调整）。结果每行列出证券代码、实际报告期，未披露期不输出；同时查询各期定期报告实际披露日期。明确单位、币种、报表类型、调整口径；无数据请保留空值，不推算。"
+        data = self.query("get_stock_financials", query, deadline=deadline)
+        raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
+        readings = {}
+        for field in self.financial_fields:
+            reading = _parse_ifind_response(raw, _IFIND_ANCHOR_QUERIES[field][2], field, period, code=code, a_share_contract=True)
+            if reading is not None:
+                readings[field] = reading
+        if not readings:
+            raise SourceReadError("ifind", "invalid_response")
+        return readings
 
-        headers = {"Authorization": self._token}
-        last_error: Optional[str] = None
-        for attempt in range(2):
-            timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
-            if timeout <= 0:
-                return None
-            try:
-                async with AsyncExitStack() as stack:
-                    close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
-                    if "http_client" in signature(transport).parameters:
-                        from mcp.shared._httpx_utils import create_mcp_http_client
-                        client = create_mcp_http_client(headers=headers)
-                        client.timeout = timeout
-                        if deadline is not None:
-                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
-                        await stack.enter_async_context(client)
-                        streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
-                    else:
-                        streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
-                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
-                    await session.initialize()
-                    result = await session.call_tool(tool, {"query": query})
-                # Parsing happens after the context manager closes so
-                # we are not holding a connection while doing regex work.
-                content = getattr(result, "content", None) or []
-                raw_text = next(
-                    (
-                        getattr(b, "text", "")
-                        for b in content
-                        if getattr(b, "text", None)
-                    ),
-                    "",
-                )
-                return _parse_ifind_response(raw_text, keywords, field, period)
-            except Exception as exc:  # noqa: BLE001 — fail-open
-                last_error = source_failure_reason(exc)
-                logger.debug(
-                    "[IfindFetcher] attempt %d failed for %s/%s: %s",
-                    attempt + 1,
-                    code,
-                    field,
-                    source_failure_reason(exc),
-                )
-                if isinstance(exc, SourceReadError):
-                    raise
+    def product_segments(self, code: str, period: str | None = None, *, deadline: float | None = None) -> ProductSegments:
+        target = period or f"{date.today().year - 1}-12-31"
+        data = self.query("get_stock_financials", f"{code} 报告期{target} 主营构成(按产品)：项目名称、收入、成本、毛利金额、毛利率，列出排名与实际财期、各字段单位、披露日期及原文链接；空值不要推算。", deadline=deadline)
+        cells, errors = _ranked_cells(data, code, {"name": "主营构成-项目名称(按产品)", "revenue": "主营构成-项目收入(按产品)", "cost": "主营构成-项目成本(按产品)", "gross_profit": "主营构成-项目毛利(按产品)", "gross_margin": "主营构成-项目毛利率(按产品)"})
+        if not cells and not errors:
+            raise SourceReadError("ifind", "invalid_response")
+        names = [(period, row["name"].raw) for (period, rank), row in cells.items() if "name" in row]
+        items = []
+        for (actual, rank), row in sorted(cells.items()):
+            name = row.get("name")
+            if name is None or names.count((actual, name.raw)) != 1:
+                errors.append("product_identity_missing_or_duplicate")
                 continue
-        raise SourceReadError("ifind", last_error or "source_error")
+            values = {field: _detail_reading(row[field], actual, "gross_margin" if field == "gross_margin" else "revenue") for field in ("revenue", "cost", "gross_profit", "gross_margin") if field in row}
+            if not any(value is not None for value in values.values()):
+                errors.append("product_values_missing")
+                continue
+            items.append(ProductSegment(name=name.raw, rank=rank, report_date=actual, **values))
+        return ProductSegments(items=items, errors=list(dict.fromkeys(errors)))
 
+    def shareholders(self, code: str, period: str | None = None, *, deadline: float | None = None) -> IfindShareholders:
+        target = period or "最新已披露财期"
+        data = self.query("get_stock_shareholders", f"{code} 截止{target} 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际财期、披露日和原文链接，合计比例另列，空值不要推算。", deadline=deadline)
+        cells, errors = _ranked_cells(data, code, {"name": "股东名称", "shares": "股东持股数量", "ratio": "股东持股比例"})
+        if not cells and not errors:
+            raise SourceReadError("ifind", "invalid_response")
+        periods = {actual for (actual, rank), row in cells.items() if "name" in row}
+        actual = max(periods) if periods else None
+        names = [row["name"].raw for (row_period, rank), row in cells.items() if row_period == actual and "name" in row]
+        items = []
+        for (row_period, rank), row in sorted(cells.items()):
+            if row_period != actual or not 1 <= rank <= 10:
+                continue
+            name = row.get("name")
+            if name is None or names.count(name.raw) != 1:
+                errors.append("holder_identity_missing_or_duplicate")
+                continue
+            shares = _detail_reading(row["shares"], row_period, "share_count") if "shares" in row else None
+            ratio = _detail_reading(row["ratio"], row_period, "gross_margin") if "ratio" in row else None
+            if shares is not None and (shares.unit != "shares" or shares.value < 0):
+                shares = replace(shares, normalization_error=shares.normalization_error or "invalid_holder_quantity")
+            if ratio is not None and (ratio.unit != "percentage_point" or not 0 <= ratio.value <= 100):
+                ratio = replace(ratio, normalization_error=ratio.normalization_error or "invalid_holder_ratio")
+            items.append(IfindHolder(name=name.raw, rank=rank, report_date=row_period, shares=shares, ratio=ratio))
+        complete = {item.rank for item in items} == set(range(1, 11)) and all(item.shares is not None and item.ratio is not None and not item.shares.normalization_error and not item.ratio.normalization_error for item in items) and not errors
+        return IfindShareholders(items=items, coverage="complete" if complete else "partial", errors=list(dict.fromkeys(errors)))
 
-    async def _ensure_session(self) -> Any:
-        """Open the shared MCP session on first use; reuse thereafter.
+    def fetch(self, code: str, field: str, period: str | None = None, *, deadline: float | None = None) -> AnchorReading | None:
+        if not self.available or field not in _IFIND_ANCHOR_QUERIES:
+            return None
+        tool, template, keywords = _IFIND_ANCHOR_QUERIES[field]
+        data = self.query(tool, template.format(code=code, period=period or ""), deadline=deadline)
+        return _parse_ifind_response(json.dumps({"code": 1, "data": data.model_dump()}), keywords, field, period, code=code)
 
-        The session lives on the daemon loop, so it is only safe to
-        touch from coroutines running on that loop. A second concurrent
-        caller will await ``_session_ready`` and pick up the same
-        session once the first caller has finished ``initialize()``.
-        """
-        with self._session_lock:
-            if self._session is not None and self._session_ready:
-                return self._session
-            # ``streamablehttp_client`` returns an async context manager.
-            # We hold it in ``self._session_context`` so the underlying
-            # HTTP transport is only torn down on explicit close.
-            from mcp import ClientSession  # type: ignore
-            from mcp.client.streamable_http import streamablehttp_client  # type: ignore
-
-            headers = {"Authorization": self._token}
-            self._session_context = streamablehttp_client(
-                self._endpoint,
-                headers=headers,
-                timeout=self._timeout,
-            )
-            read, write, _ = await self._session_context.__aenter__()
-            self._session = ClientSession(read, write)
-            await self._session.initialize()
-            self._session_ready = True
-            return self._session
-
-    async def _close_session(self) -> None:
-        """Tear down the shared session so the next call reconnects."""
-        with self._session_lock:
-            if self._session is not None:
-                try:
-                    await self._session.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._session = None
-                self._session_ready = False
-            if self._session_context is not None:
-                try:
-                    await self._session_context.__aexit__(None, None, None)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._session_context = None
-
-    def fetch_main_inflow_series(
-        self, code: str, days: int = 12, *, deadline: Optional[float] = None
-    ) -> Optional[List[Tuple[str, float]]]:
-        """取近 ``days`` 日主力净流入额序列（最新在前）。无 token/失败 → None。
-
-        iFinD ``get_stock_performance`` 对 ``"{code} 近{days}个交易日主力净流入额"`` 返回
-        多行每日金额表（实测 688486 近10个交易日→11行；金额列单位在值内「万/元」由
-        ``_safe_float`` 换算）。供 capital_flow_provider 算 5/10 日累计，作为 akshare
-        ``push2his`` 不可达时的稳定多日源。注：「近{days}日」措辞会被折叠为最新单值，
-        故用「个交易日」。
-        """
+    def fetch_main_inflow_series(self, code: str, days: int = 12, *, deadline: float | None = None) -> Optional[List[Tuple[str, float]]]:
         if not self.available:
             return None
-        remaining = None if deadline is None else min(self._timeout, deadline - monotonic())
-        if remaining is not None and remaining <= 0:
-            return None
-        try:  # pragma: no cover — 真实 MCP 调用（已实测连通）
-            call = self._async_fetch_series(code, days, deadline=deadline)
-            return asyncio.run(asyncio.wait_for(call, remaining)) if remaining is not None else asyncio.run(call)
-        except Exception as exc:  # pragma: no cover  # noqa: BLE001 — fail-open
-            logger.debug("[IfindFetcher] series %s failed: %s", code, source_failure_reason(exc))
-            return None
-
-    async def _async_fetch_series(  # pragma: no cover — 真实 MCP 调用
-        self, code: str, days: int, *, deadline: Optional[float] = None
-    ) -> Optional[List[Tuple[str, float]]]:
-        """执行一次 iFinD MCP 调用，解析多行序列。"""
-        from mcp import ClientSession
-        from mcp.client import streamable_http
-        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
-
-        # Phase 0 实测：「近{days}日主力净流入额」会被 iFinD 折叠为「最新」单值；
-        # 改用「近{days}个交易日」措辞才返回多行每日序列（实测近10个交易日→11行）。
-        query = f"{code} 近{days}个交易日主力净流入额"
-        headers = {"Authorization": self._token}
-        timeout = self._timeout if deadline is None else min(self._timeout, deadline - monotonic())
-        if timeout <= 0:
-            return None
-        async with AsyncExitStack() as stack:
-            close_options = {"terminate_on_close": False} if deadline is not None and "terminate_on_close" in signature(transport).parameters else {}
-            if "http_client" in signature(transport).parameters:
-                from mcp.shared._httpx_utils import create_mcp_http_client
-                client = create_mcp_http_client(headers=headers)
-                client.timeout = timeout
-                if deadline is not None:
-                    client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
-                await stack.enter_async_context(client)
-                streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
-            else:
-                streams = await stack.enter_async_context(transport(self._endpoint, headers=headers, timeout=timeout, **close_options))
-            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
-            await session.initialize()
-            result = await session.call_tool("get_stock_performance", {"query": query})
-        content = getattr(result, "content", None) or []
-        raw_text = next(
-            (getattr(b, "text", "") for b in content if getattr(b, "text", None)), ""
-        )
-        try:
-            resp_json = json.loads(raw_text)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        answer = (
-            resp_json.get("data", {}).get("answer", "")
-            if isinstance(resp_json, dict)
-            else ""
-        )
-        return _parse_ifind_markdown_series(answer, "主力净流入额")
-
-
-# ------------------------------------------------------------------
-# IfindSource —— SourceAdapter 实现
-# ------------------------------------------------------------------
+        data = self.query("get_stock_performance", f"{code} 近{days}个交易日主力净流入额", deadline=deadline)
+        return _parse_ifind_markdown_series(data.answer, "主力净流入额")
 
 
 class IfindSource:
@@ -669,8 +632,10 @@ class IfindSource:
 
     name = "ifind"
 
-    def __init__(self, fetcher: Optional[IfindFetcher] = None) -> None:
+    def __init__(self, fetcher: Optional[IfindFetcher] = None, *, readings: dict[str, AnchorReading] | None = None, error: str | None = None) -> None:
         self._fetcher = fetcher
+        self._readings = readings
+        self._error = error
 
     @property
     def available(self) -> bool:
@@ -680,12 +645,19 @@ class IfindSource:
         self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None
     ) -> Optional[AnchorReading]:
         """同步读取。无 fetcher / 未知字段 / 失败 → None（fail-open）。"""
+        if self._error:
+            raise SourceReadError("ifind", self._error)
+        if self._readings is not None:
+            return self._readings.get(field)
         if self._fetcher is None:
             return None
         if field not in _IFIND_ANCHOR_QUERIES:
             return None
+        from src.core.research_run import ResearchStopped
         try:
             reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
+        except ResearchStopped:
+            raise
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindSource] read %s/%s failed: %s", code, field, source_failure_reason(exc))
             raise SourceReadError("ifind", source_failure_reason(exc)) from None
