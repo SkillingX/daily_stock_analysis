@@ -439,6 +439,48 @@ class SourceAdapter(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class SnapshotSource:
+    """Verify an acquired supplier batch without issuing another request."""
+
+    name: str
+    readings: dict[str, AnchorReading]
+    error: Optional[str] = None
+
+    def read(self, code: str, field: str, period: Optional[str] = None, *, deadline: Optional[float] = None) -> Optional[AnchorReading]:
+        if self.error:
+            raise SourceReadError(self.name, self.error)
+        return self.readings.get(field)
+
+
+def has_current_financial_period(reading: AnchorReading) -> bool:
+    """Known cumulative period, excluding explicit future/disputed period evidence."""
+    today = date.today().isoformat()
+    disclosed, _basis = normalize_report_period(reading.disclosed_at)
+    return (reading.period is not None and reading.period <= today
+            and reading.period_basis in {"annual", "YTD"}
+            and reading.normalization_error not in {"period_conflict", "metadata_invalid"}
+            and (disclosed is None or disclosed <= today))
+
+
+@ensure(lambda result: all(reading.period == result[0] for reading in result[1].values()), "Current financial snapshot cannot mix reporting periods")
+def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str, AnchorReading]) -> tuple[Optional[str], dict[str, AnchorReading]]:
+    """Latest confirmed cumulative period wins; supplier priority applies within it."""
+    periods = [reading.period for reading in (*ifind.values(), *choice.values())
+               if has_current_financial_period(reading) and reading.period is not None]
+    period = max(periods) if periods else None
+    selected = {}
+    for field in dict.fromkeys((*ifind, *choice)):
+        for reading in (ifind.get(field), choice.get(field)):
+            if (reading is not None and period is not None and reading.period == period
+                    and has_current_financial_period(reading)
+                    and not reading_input_reasons(reading, field)
+                    and reading.statement_scope == "consolidated" and reading.adjustment == "restated"):
+                selected[field] = reading
+                break
+    return period, selected
+
+
 # ------------------------------------------------------------------
 # 判定纯函数
 # ------------------------------------------------------------------
@@ -486,6 +528,9 @@ def _magnitude_tier(value: float) -> int:
 
 def reading_input_reasons(reading: AnchorReading, field: str) -> tuple[str, ...]:
     """Intrinsic input validity; unknown financial periods still allow limited local use."""
+    disclosed, _basis = normalize_report_period(reading.disclosed_at)
+    if disclosed is not None and disclosed > date.today().isoformat():
+        return ("disclosure_in_future",)
     if not math.isfinite(reading.value):
         return ("invalid_value",)
     if reading.is_stale:

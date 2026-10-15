@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 产品及股东明细经过深度投研护栏后，复用 JSON 严格契约校验恢复数值记录，避免字典与数据类不兼容导致重解析失败。
+
+- [改进] 停用 Tavily；支持显式复用智谱 Coding Plan Key 替代 MiniMax Web Search 对应位置，保留其他搜索工具顺序、失败回退和历史报告来源；设置接口脱敏只读 iFinD 与遗留 Tavily 凭据。
+
+- [新功能] 支持显式选择 iFinD 为六项当前财务主源，按最新有效财期由 Choice 同期补缺和核验；来源、资格与缓存同步，年报、估值、资金和目标价保留 Choice，主营及股东明细沿用 iFinD。
+
 - [文档] 记录供应商对 iFinD 加权 ROE 不输出合并报表参数的说明，区分指标参数缺省、数值缺失与调整口径未知，不要求接口补造不存在的参数。
 
 - [文档] 明确 iFinD 常驻服务的持久配置：本机自动读取私有根 `.env`，生产使用部署环境或凭据配置，无需每次启动临时注入 token。

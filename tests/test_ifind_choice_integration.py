@@ -58,6 +58,133 @@ def test_real_multi_table_response_reaches_snapshot_and_verification(ifind_trans
     assert calls
 
 
+def test_ifind_primary_reaches_report_with_choice_verification(ifind_transport, monkeypatch):
+    from src.agent.tools import data_tools
+    from src.deep_research_dims.context import SharedContext, _safe_fundamental
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    for params in response['data']['indicators_params'].values():
+        params.update({'币种': 'CNY', '报表类型': '合并报表(调整)', '报告期': '20251231'})
+    manager = DataFetcherManager()
+    monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', manager)
+    ctx = SharedContext('300260', '新莱应材', '2026-10-15')
+    ctx.fundamental = _safe_fundamental('300260', ctx)
+    snapshot = build_fundamental_dim(ctx).financial_snapshot
+    assert snapshot['revenue'].reading.source == 'ifind'
+    assert snapshot['revenue'].reading.value == 2997710000
+    assert snapshot['revenue'].quality.status == 'verified'
+    assert snapshot['revenue'].rule_eligible
+    assert '最新已披露财期' in calls[0][1]
+
+
+@pytest.mark.parametrize('ifind_period,choice_period,expected_source', [
+    ('20260630', '20251231', 'ifind'),
+    ('20251231', '20260630', 'choice'),
+    ('20271231', '20251231', 'choice'),
+])
+def test_primary_snapshot_uses_latest_real_period_not_supplier_order(ifind_transport, monkeypatch, ifind_period, choice_period, expected_source):
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    response['data']['answer'] = response['data']['answer'].replace('20251231', ifind_period)
+    for params in response['data']['indicators_params'].values():
+        params.update({'币种': 'CNY', '报表类型': '合并报表(调整)', '报告期': ifind_period})
+    native = ChoiceAdapter._native_request
+
+    def sdk(method, args, options, deadline):
+        raw = native(method, args, options, deadline)
+        if method == 'css' and 'LATESTREPORTNEW' in raw['indicators']:
+            raw['data'][args[0]][raw['indicators'].index('LATESTREPORTNEW')] = f'{choice_period[:4]}/{choice_period[4:6]}/{choice_period[6:]}'
+        return raw
+
+    monkeypatch.setattr(ChoiceAdapter, '_native_request', staticmethod(sdk))
+    result = DataFetcherManager().get_fundamental_context('300260', budget_seconds=30)
+    record = result['growth']['field_meta']['revenue']
+    expected = ifind_period if expected_source == 'ifind' else choice_period
+    assert record['source'] == expected_source
+    assert record['period'] == f'{expected[:4]}-{expected[4:6]}-{expected[6:]}'
+    assert result['cross_validation']['anchors']['revenue']['quality']['status'] != 'verified'
+
+
+def test_new_period_unknown_ratios_are_not_filled_with_older_choice_values(ifind_transport):
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    response.clear()
+    response.update(json.loads((Path(__file__).parent / 'fixtures/ifind_current_financials.json').read_text()))
+    result = DataFetcherManager().get_fundamental_context('300260', budget_seconds=30)
+    growth = result['growth']
+    assert growth['data']['report_date'] == '2026-06-30'
+    assert growth['field_meta']['revenue']['source'] == 'ifind'
+    assert growth['data']['roe'] is None
+    assert growth['data']['gross_margin'] is None
+    assert 'balance_sheet' not in growth['data']
+    assert result['cross_validation']['anchors']['roe']['readings']
+
+
+def test_future_row_cannot_hide_valid_latest_period_in_same_batch(ifind_transport):
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    response['data']['answer'] = '| 证券代码 | 报告期 | 营业收入（单位：元） |\n| --- | --- | --- |\n| 300260.SZ | 20271231 | 9999999 |\n| 300260.SZ | 20260630 | 123456 |'
+    response['data']['indicators_params'] = {'营业收入': {'单位':'元', '币种':'CNY', '报表类型':'合并报表(调整)'}}
+    result = DataFetcherManager().get_fundamental_context('300260', budget_seconds=30)
+    assert result['growth']['data']['report_date'] == '2026-06-30'
+    assert result['growth']['data']['revenue'] == 123456
+    assert result['growth']['field_meta']['revenue']['source'] == 'ifind'
+
+
+def test_future_disclosure_cannot_verify_current_choice_value(ifind_transport, monkeypatch):
+    from src.agent.tools import data_tools
+    from src.deep_research_dims.context import SharedContext, _safe_fundamental
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    for params in response['data']['indicators_params'].values():
+        params.update({'币种':'CNY', '报表类型':'合并报表(调整)', '报告期':'20251231'})
+    response['data']['answer'] += '\n\n| 证券代码 | 定期报告实际披露日期 |\n| --- | --- |\n| 300260.SZ | 20270101 |'
+    response['data']['indicators_params']['定期报告实际披露日期'] = {'报告期':'20251231'}
+    monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', DataFetcherManager())
+    ctx = SharedContext('300260', '新莱应材', '2026-10-15')
+    ctx.fundamental = _safe_fundamental('300260', ctx)
+    field = build_fundamental_dim(ctx).financial_snapshot['revenue']
+    assert field.reading.source == 'choice'
+    assert field.reading.value == 2997710000
+    assert field.quality.status != 'verified'
+    assert 'disclosure_in_future' in field.quality.reason_codes
+
+
+def test_ifind_primary_conflict_blocks_rules_without_replacing_main_value(ifind_transport, monkeypatch):
+    from src.agent.tools import data_tools
+    from src.deep_research_dims.context import SharedContext, _safe_fundamental
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    for params in response['data']['indicators_params'].values():
+        params.update({'币种': 'CNY', '报表类型': '合并报表(调整)', '报告期': '20251231'})
+    response['data']['answer'] = response['data']['answer'].replace('29.9771亿', '49.9771亿')
+    monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', DataFetcherManager())
+    ctx = SharedContext('300260', '新莱应材', '2026-10-15')
+    ctx.fundamental = _safe_fundamental('300260', ctx)
+    snapshot = build_fundamental_dim(ctx).financial_snapshot
+    assert snapshot['revenue'].reading.source == 'ifind'
+    assert snapshot['revenue'].reading.value == 4997710000
+    assert snapshot['revenue'].quality.status == 'conflict'
+    assert not snapshot['revenue'].rule_eligible
+
+
+def test_changing_primary_strategy_does_not_reuse_old_field_sources(ifind_transport):
+    config, response, calls = ifind_transport
+    for params in response['data']['indicators_params'].values():
+        params.update({'币种': 'CNY', '报表类型': '合并报表(调整)', '报告期': '20251231'})
+    manager = DataFetcherManager()
+    old = manager.get_fundamental_context('300260', budget_seconds=30)
+    config.financial_primary_source = 'ifind'
+    new = manager.get_fundamental_context('300260', budget_seconds=30)
+    assert old['data_contract'] != new['data_contract']
+    assert old['growth']['field_meta']['revenue']['source'] == 'choice'
+    assert new['growth']['field_meta']['revenue']['source'] == 'ifind'
+
+
 def test_explicit_metadata_verifies_and_conflict_reaches_report(ifind_transport):
     from src.deep_research_dims.context import SharedContext, _safe_fundamental
     from src.deep_research_dims.fundamental_dim import build_fundamental_dim
@@ -213,6 +340,17 @@ def test_enabled_configuration_rejects_invalid_deadlines(seconds):
                ifind_mcp_timeout_seconds=seconds)
 
 
+@pytest.mark.parametrize('settings', [
+    {'financial_primary_source': 'unknown'},
+    {'financial_primary_source': 'ifind'},
+    {'financial_primary_source': 'ifind', 'data_source_profile': 'choice'},
+])
+def test_ifind_primary_requires_explicit_profile_and_enabled_credentials(settings):
+    from src.config import Config
+    with pytest.raises(ValueError, match='FINANCIAL_PRIMARY_SOURCE'):
+        Config(**settings)
+
+
 def test_real_current_amounts_verify_with_explicit_cny_deployment_policy(ifind_transport, monkeypatch):
     config, response, calls = ifind_transport
     actual = json.loads((Path(__file__).parent / 'fixtures/ifind_current_financials.json').read_text())
@@ -238,13 +376,17 @@ def test_real_current_amounts_verify_with_explicit_cny_deployment_policy(ifind_t
         assert anchors[field]['quality']['status'] == 'not_comparable'
 
 
-def test_financial_report_api_accepts_real_snapshot_and_roundtrip(ifind_transport, monkeypatch, tmp_path):
+@pytest.mark.parametrize('primary_source', ['choice', 'ifind'])
+def test_financial_report_api_accepts_real_snapshot_and_roundtrip(ifind_transport, monkeypatch, tmp_path, primary_source):
     from src.agent.tools import data_tools
     from src.storage import DatabaseManager
     from src.services import financial_analysis_service as service
     from api.v1.endpoints import financial_analysis as endpoint
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+    ifind_transport[0].financial_primary_source = primary_source
+    for params in ifind_transport[1]['data']['indicators_params'].values():
+        params.update({'币种': 'CNY', '报表类型': '合并报表(调整)', '报告期': '20251231'})
     monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', DataFetcherManager())
     database = DatabaseManager('sqlite:///'+str(tmp_path/'reports.db'))
     monkeypatch.setattr(service, '_REPORT_DIR', tmp_path/'reports')
@@ -258,12 +400,13 @@ def test_financial_report_api_accepts_real_snapshot_and_roundtrip(ifind_transpor
         assert generated.status_code == 200, generated.text
         body = generated.json()
         assert body['analysis']['financial_snapshot']['revenue']['reading']['value'] == 2997710000
+        assert body['analysis']['financial_snapshot']['revenue']['reading']['source'] == primary_source
         rid = body['report_id']
         reread = client.get(f'/api/v1/financial-analysis/reports/{rid}').json()
         downloaded = client.get(f'/api/v1/financial-analysis/reports/{rid}/markdown?download=1')
         assert body['markdown'] == reread['data']['markdown'] == downloaded.text
         import re
-        assert re.search(r'29\.9771\s*亿', body['markdown'])
+        assert re.search(r'2997710000|29\.9771\s*亿', body['markdown'])
 
 
 def test_agent_stock_info_reuses_current_snapshot_quality(ifind_transport, monkeypatch):

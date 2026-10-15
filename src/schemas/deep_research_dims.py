@@ -485,7 +485,7 @@ def parse_dim(dim: str, payload: Dict[str, Any]) -> DimEnvelope:
     model = DIM_MODELS.get(dim)
     if model is None:
         raise ValueError(f"未知维度: {dim}")
-    return model.model_validate_json(to_json(payload)) if dim == "fundamental" else model.model_validate(payload)
+    return model.model_validate_json(to_json(payload)) if dim in {"fundamental", "business", "ownership"} else model.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------

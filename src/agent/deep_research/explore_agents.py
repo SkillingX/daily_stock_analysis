@@ -376,7 +376,7 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
         research = research or {}
         if get_config().enable_ifind_mcp:
             from src.agent.tools.data_tools import _get_fetcher_manager
-            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=(research.get("holders") or {}).get("period"), deadline=deadline)}
+            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=None if get_config().financial_primary_source == "ifind" else (research.get("holders") or {}).get("period"), deadline=deadline)}
         task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
     research = research or {}
     details = research.get("shareholder_details")

@@ -149,7 +149,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "balance_sheet": financial.get("balance_sheet") or {},
             "sector_rankings": (((compact.get("capital_flow") or {}).get("data") or {}).get("sector_rankings") or {}),
             "stock_name": raw.get("stock_name"),
-            "source": "choice" if config.data_source_profile == "choice" else "fundamental_context",
+            "source": raw.get("source", "choice") if config.data_source_profile == "choice" else "fundamental_context",
             "errors": list(compact.get("errors") or []),
             "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
         }

@@ -4192,9 +4192,22 @@ class DataFetcherManager:
                     return cast(Dict[str, Any], cached["context"])
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
-        verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp else 0.0
+        from data_provider.cross_source_validator import AnchorReading, SourceReadError
+        prefer_ifind = config.financial_primary_source == "ifind"
+        readings: dict[str, AnchorReading] = {}
+        source_error = None
+        if prefer_ifind:
+            try:
+                readings = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).financial_snapshot(
+                    code, None, deadline=deadline - budget / 2,
+                )
+            except SourceReadError as exc:
+                source_error = exc.reason_code
+        verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
         snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
+        if source_error:
+            errors.append(f"ifind:{source_error}")
         # Only attempt licensed public supplements for holes, within the same deadline.
         missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
         if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline:
@@ -4215,40 +4228,72 @@ class DataFetcherManager:
                         snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
         cross_validation = None
         if config.enable_ifind_mcp:
-            from data_provider.ifind_fundamental_adapter import IfindFetcher, IfindSource
-            from data_provider.cross_source_validator import CrossSourceValidator, SourceReadError, adopted_field_record, reading_from_field_record, reading_input_reasons
+            from data_provider.cross_source_validator import CrossSourceValidator, SnapshotSource, adopted_field_record, reading_from_field_record, reading_input_reasons, select_current_financials
             from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
             fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
-            readings, source_error = {}, None
-            try:
-                readings = fetcher.financial_snapshot(code, snapshot.get("report_date"), deadline=deadline)
-            except SourceReadError as exc:
-                source_error = exc.reason_code
-                errors.append(str(exc))
+            if not prefer_ifind:
+                try:
+                    readings = fetcher.financial_snapshot(code, snapshot.get("report_date"), deadline=deadline)
+                except SourceReadError as exc:
+                    source_error = exc.reason_code
+                    errors.append(str(exc))
             primary = {}
+            choice_readings = {}
             candidate_periods = {reading.period for reading in readings.values() if reading.period}
             supplement_period = snapshot.get("report_date") or (next(iter(candidate_periods)) if len(candidate_periods) == 1 else None)
             for field in fetcher.financial_fields:
                 reading = reading_from_field_record(snapshot["growth"].get(field), snapshot["field_meta"].get(field))
                 if reading is not None:
-                    primary[field] = reading
+                    primary[field] = choice_readings[field] = reading
                 candidate = readings.get(field)
                 if candidate is not None:
                     reason = "statement_scope_unknown" if candidate.statement_scope is None else "adjustment_unknown" if candidate.adjustment is None else None
                     if reason:
                         readings[field] = replace(candidate, normalization_error=candidate.normalization_error or reason)
-                    if snapshot["growth"].get(field) is None and not reading_input_reasons(readings[field], field) and readings[field].period == supplement_period and supplement_period and readings[field].period_basis != "unknown" and readings[field].statement_scope == "consolidated" and readings[field].adjustment == "restated":
+                    if not prefer_ifind and snapshot["growth"].get(field) is None and not reading_input_reasons(readings[field], field) and readings[field].period == supplement_period and supplement_period and readings[field].period_basis != "unknown" and readings[field].statement_scope == "consolidated" and readings[field].adjustment == "restated":
                         snapshot["growth"][field] = readings[field].value
                         snapshot["field_meta"][field] = adopted_field_record(field, readings[field], selection_reason="ifind_supplement")
-            validator = CrossSourceValidator([IfindSource(readings=readings, error=source_error)])
-            try:
-                cross_validation = build_cross_validation_block(code, fetcher.financial_fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
-            finally:
-                validator.close()
-            if cross_validation:
-                for field, anchor in cross_validation["anchors"].items():
+            if prefer_ifind:
+                supplement_period, primary = select_current_financials(readings, choice_readings)
+                snapshot["report_date"] = snapshot["growth"]["report_date"] = supplement_period
+                snapshot["growth"]["disclosure_date"] = next((r.disclosed_at for r in primary.values() if r.disclosed_at), None)
+                if (snapshot["growth"].get("balance_sheet") or {}).get("period") != supplement_period:
+                    snapshot["growth"].pop("balance_sheet", None)
+                for field in fetcher.financial_fields:
+                    selected = primary.get(field)
+                    snapshot["growth"][field] = selected.value if selected is not None else None
+                    snapshot["field_meta"][field] = adopted_field_record(field, selected, selection_reason="primary" if selected.source == "ifind" else "choice_supplement") if selected is not None else {"quality": {"status": "missing", "reason_codes": ["no_eligible_current_value"]}}
+                # Keep rejected periods as evidence; they cannot become automatic main values.
+                for dataset in (readings, choice_readings):
+                    for field, reading in dataset.items():
+                        if reading.period != supplement_period or supplement_period is None:
+                            dataset[field] = replace(reading, normalization_error=reading.normalization_error or "period_mismatch")
+            groups: dict[str, list[str]] = {}
+            for field in fetcher.financial_fields:
+                source = primary[field].source if field in primary else "missing"
+                groups.setdefault(source, []).append(field)
+            anchors = {}
+            for source, fields in groups.items():
+                sources = []
+                if source != "ifind":
+                    sources.append(SnapshotSource("ifind", readings, source_error))
+                if prefer_ifind and source in {"ifind", "missing"}:
+                    choice_error = next((e.rsplit(":", 1)[-1] for e in snapshot["errors"] if e.startswith("choice:")), None) if not choice_readings else None
+                    sources.append(SnapshotSource("choice", choice_readings, choice_error))
+                validator = CrossSourceValidator(sources)
+                try:
+                    block = build_cross_validation_block(code, fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
+                    if block:
+                        anchors.update(block["anchors"])
+                finally:
+                    validator.close()
+            if anchors:
+                agreed = sum(anchor["quality"]["status"] == "verified" for anchor in anchors.values())
+                cross_validation = {"enabled": True, "anchors": anchors, "summary": f"{agreed}/{len(fetcher.financial_fields)} 锚点取得独立来源佐证"}
+                for field, anchor in anchors.items():
                     record = field_record_from_validation(field, anchor)
-                    if record is not None and record["value"] == snapshot["growth"].get(field):
+                    selected = snapshot["field_meta"].get(field) or {}
+                    if record is not None and record["value"] == snapshot["growth"].get(field) and record["source"] == selected.get("source"):
                         snapshot["field_meta"][field] = record
         result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.data_source_contract,
                                   "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
@@ -4258,9 +4303,12 @@ class DataFetcherManager:
             payload = dict(snapshot[block])
             payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
-            chain = [{"provider": "choice", "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)}]
+            providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if block == "growth" and prefer_ifind else "choice"]
+            chain = [{"provider": provider, "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)} for provider in providers]
             result[block] = self._build_fundamental_block(status, payload, chain, errors)
             result["source_chain"].extend(chain)
+        adopted_sources = {item["provider"] for item in result["source_chain"]}
+        result["source"] = next(iter(adopted_sources)) if len(adopted_sources) == 1 else "mixed"
         seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
         auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
             lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),

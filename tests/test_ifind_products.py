@@ -154,3 +154,14 @@ def test_supplier_numeric_overflow_retains_other_facts(ifind_transport, fundamen
     assert product['revenue'] is None
     assert product['cost']['value'] == 1028218656.31
     assert '公司既有资料' in report['markdown']
+
+
+def test_product_evidence_survives_guardrail_contract_roundtrip(ifind_transport, fundamentals_runtime):
+    from src.schemas.deep_research_dims import parse_dim
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    service, manager, database = fundamentals_runtime
+    report = service.generate_fundamentals_report('300260', '新莱应材', force_refresh=True)
+    business = parse_dim('business', report['dims']['business'])
+    assert len(business.product_segments.items) == 4
+    assert business.product_segments.items[0].revenue.source == 'ifind'

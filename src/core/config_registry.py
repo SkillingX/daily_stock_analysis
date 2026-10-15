@@ -103,6 +103,13 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": False, "is_required": False, "is_editable": False,
         "default_value": "false", "options": [], "validation": {}, "display_order": 14,
     },
+    "FINANCIAL_PRIMARY_SOURCE": {
+        "title": "当前财务主数据源", "description": "仅六项当前财务快照。choice保持原主源；ifind需Choice策略和ENABLE_IFIND_MCP=true，最新有效财期内优先iFinD，Choice补缺/核验。年报、估值及资金仍用Choice。修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "select",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "choice", "options": ["choice", "ifind"],
+        "validation": {"enum": ["choice", "ifind"]}, "display_order": 14,
+    },
     "IFIND_MCP_ENDPOINT": {
         "title": "iFinD MCP地址", "description": "供应商A股专用Streamable HTTP地址，修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "text",

@@ -1,8 +1,10 @@
 ---
-status: accepted
+status: superseded-in-part
 ---
 
-# iFinD 补充 Choice 并提供有限范围的独立核验
+# iFinD 与 Choice 的有限双源协作
+
+2026-10-15 修订：用户确认当前六项财务可显式选择 iFinD 优先，Choice 同期补值/核验；主营和个人股东明细优先保留 iFinD。完整年报、估值、资金与机构目标价仍由 Choice 提供，行情沿用原渠道。以最新有效实际财期建快照，在同一期按主源优先；未知调整口径不放宽，旧期不能填新期。复用现有共享上下文、核验和缓存，不建设供应商框架。配置与回退见[接入说明](../ifind-mcp-integration.md)，新工作状态见 [Issue #23](https://github.com/SkillingX/daily_stock_analysis/issues/23)。下文保留原决策背景，其主源顺序由本次修订替代。
 
 2026-10-14，用户确认保留 Choice 为 A 股常规财务/行情主源，恢复 iFinD 的当前财务快照六项指标补值/独立核验、主营分产品和前十大股东资料能力。此决策仅调整 [ADR 0001](0001-choice-native-data-policy.md) 对 iFinD 的停用范围；MX、旧 Choice MCP、Fuyao 继续停用，不通过 legacy 绕过隔离。iFinD 四年完整年报替代、资金流窗口、行情主源切换、目标价及新闻/宏观接入不在本批范围。
 

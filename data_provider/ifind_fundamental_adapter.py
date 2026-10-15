@@ -471,7 +471,8 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
                 adjustment="restated" if adjustment in {"重述", "重述后", "调整后"} or scope in {"合并报表(调整)", "合并报表（调整）"} else "unadjusted" if adjustment in {"调整前", "未调整"} else None,
                 disclosed_at=normalize_report_period(disclosed)[0],
             ))
-    selected = select_report_period([(r.period, r.period_basis) for r in candidates], period)
+    from .cross_source_validator import has_current_financial_period
+    selected = select_report_period([(r.period, r.period_basis) if not a_share_contract or has_current_financial_period(r) else (None, "unknown") for r in candidates], period)
     if not candidates:
         return None
     reading = candidates[selected if selected is not None else 0]
@@ -593,7 +594,7 @@ class IfindFetcher:
         return ProductSegments(items=items, errors=list(dict.fromkeys(errors)))
 
     def shareholders(self, code: str, period: str | None = None, *, deadline: float | None = None) -> IfindShareholders:
-        target = period or f"{date.today().year - 1}-12-31"
+        target = period or "最新已披露财期"
         data = self.query("get_stock_shareholders", f"{code} 截止{target} 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际财期、披露日和原文链接，合计比例另列，空值不要推算。", deadline=deadline)
         cells, errors = _ranked_cells(data, code, {"name": "股东名称", "shares": "股东持股数量", "ratio": "股东持股比例"})
         if not cells and not errors:

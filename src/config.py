@@ -748,6 +748,7 @@ class Config:
     data_source_profile: str = "legacy"
     mx_apikey: Optional[str] = None  # 东财妙想 API key（MX_APIKEY）
     enable_ifind_mcp: bool = False  # Choice profile: supplement + default financial verification
+    financial_primary_source: str = "choice"  # Current six-field snapshot only; annual reports remain Choice.
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
     ifind_mcp_timeout_seconds: float = 30.0  # iFinD MCP 调用超时
@@ -1263,6 +1264,10 @@ class Config:
         _log = logging.getLogger(__name__)
         if self.data_source_profile not in {"legacy", "choice"}:
             raise ValueError("DATA_SOURCE_PROFILE must be legacy or choice")
+        if self.financial_primary_source not in {"choice", "ifind"}:
+            raise ValueError("FINANCIAL_PRIMARY_SOURCE must be choice or ifind")
+        if self.financial_primary_source == "ifind" and (self.data_source_profile != "choice" or not self.enable_ifind_mcp):
+            raise ValueError("FINANCIAL_PRIMARY_SOURCE=ifind requires DATA_SOURCE_PROFILE=choice and ENABLE_IFIND_MCP=true")
         if self.enable_ifind_mcp and self.data_source_profile == "choice":
             if not (self.ifind_mcp_endpoint or '').strip() or not (self.ifind_mcp_token or '').strip():
                 raise ValueError("ENABLE_IFIND_MCP requires IFIND_MCP_ENDPOINT and IFIND_MCP_TOKEN")
@@ -1737,6 +1742,7 @@ class Config:
             longbridge_oauth_client_id=os.getenv("LONGBRIDGE_OAUTH_CLIENT_ID") or None,
             mx_apikey=os.getenv("MX_APIKEY") or None,
             enable_ifind_mcp=parse_env_bool(os.getenv("ENABLE_IFIND_MCP"), default=False),
+            financial_primary_source=os.getenv("FINANCIAL_PRIMARY_SOURCE", "choice").strip().lower(),
             ifind_mcp_endpoint=os.getenv("IFIND_MCP_ENDPOINT") or None,
             ifind_mcp_token=os.getenv("IFIND_MCP_TOKEN") or None,
             ifind_mcp_timeout_seconds=float(
@@ -2942,7 +2948,7 @@ class Config:
     def data_source_contract(self) -> str:
         if self.data_source_profile == "choice":
             from data_provider.choice_adapter import ChoiceAdapter
-            return ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "")
+            return ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
         return "legacy"
 
     def get_effective_news_window_days(self) -> int:

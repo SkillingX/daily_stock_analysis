@@ -26,6 +26,13 @@ def test_real_holder_names_quantities_and_ratios_join(ifind_transport):
     assert result.items[0].ratio.value != 57.68
 
 
+def test_latest_holders_are_not_locked_to_older_choice_period(ifind_transport):
+    holders_response(ifind_transport)
+    result = IfindFetcher('https://fixture.invalid', 'test-only').shareholders('300260')
+    assert '最新已披露财期' in ifind_transport[2][-1][1]
+    assert result.items[0].report_date == '2025-12-31'
+
+
 def test_cross_period_holder_names_cannot_borrow_other_period_values(ifind_transport):
     response = holders_response(ifind_transport)
     for key, params in response['data']['indicators_params'].items():
@@ -50,3 +57,7 @@ def test_model_failure_keeps_details_without_inventing_controller(ifind_transpor
     assert len(dim.shareholder_details.items) == 10
     assert dim.controller == ''
     assert dim.score is None and dim.status == 'degraded'
+    from src.schemas.deep_research_dims import parse_dim
+    restored = parse_dim('ownership', dim.model_dump())
+    assert len(restored.shareholder_details.items) == 10
+    assert restored.shareholder_details.items[0].shares.source == 'ifind'

@@ -1,3 +1,30 @@
+# iFinD 与 Choice 接入：当前财务主源选择
+
+2026-10-15 新决策（工单 #23）：在已接通的六项当前财务、主营分产品和个人股东明细内优先 iFinD，Choice 同期补缺和独立核验。下面原规格记录此前 Choice 优先的施工背景；本节主次规则优先生效，原数据资格与验收护栏继续适用。
+
+## 当前部署配置
+
+本机根目录私有 `.env` 或生产部署配置使用：
+
+```dotenv
+DATA_SOURCE_PROFILE=choice
+ENABLE_IFIND_MCP=true
+FINANCIAL_PRIMARY_SOURCE=ifind
+IFIND_MCP_ENDPOINT=<供应商提供的地址>
+IFIND_MCP_TOKEN=<供应商提供的授权值>
+IFIND_MCP_TIMEOUT_SECONDS=30
+```
+
+配置修改后重启实际后端/分析/调度进程，无需每次启动临时注入。主源默认 `choice`，保持已有部署兼容；选择 `ifind` 必须同时开启上述策略和必要配置。回退设置 `FINANCIAL_PRIMARY_SOURCE=choice`；可进一步关闭 iFinD，停用 MX、旧 Choice MCP 和 Fuyao 的部署策略不变。
+
+当前快照按两源实际返回选最新有效累计/年度财期，不由请求日期补造。同期内合格 iFinD 值优先，Choice 同期补位；更新财期有缺项时不倒退用旧期填充。单独缺披露日保留有效资料，但不因此声称历史时点可得。四个比率缺调整口径时仍不默认重述后，可比性与规则资格继续按字段证据判断。冲突保留已采用主值与两家证据，限制相应确定性评分/动作。
+
+完整年度财报、PE/PB/总市值、资金流和机构目标价仍由 Choice 提供；日线和实时行情沿用原渠道。主营及股东资料保留各自实际财期，不强行跟随财务快照或 Choice 名称表的旧期。混合来源报告按字段标明实际来源。主次策略进入既有缓存身份，切换或强刷不会给新值贴旧核验；历史报告不重标。
+
+本节为中文部署与行为说明；未维护平行英文规格，避免复制两套不断变化的数据契约。英文首页无需扩展。
+
+---
+
 # iFinD 补充 Choice 与核心财务独立核验规格
 
 状态：四项产品决策已确认；两名独立 reader 均通过，正式规格已发布为 [Issue #15](https://github.com/SkillingX/daily_stock_analysis/issues/15)（`ready-for-agent`），已开始施工；各票验收证据见实施记录。实施分支 `feat/ifind-integration` 从本地 `dev`（`1e27128`）创建。以 GitHub Issue 跟踪工作状态，本文保留规格正文；规格修改应同步，不能维护互相竞争的工单状态。

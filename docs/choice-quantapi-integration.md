@@ -1,5 +1,7 @@
 # Choice QuantAPI 接入方案
 
+2026-10-15：当前六项财务可显式选择 iFinD 优先，由 Choice 同期补缺/核验；完整年度财报、估值、资金与目标价仍用 Choice。配置及历史决策修订见 [iFinD 接入说明](ifind-mcp-integration.md)。下文保留 Choice 首批接入背景。
+
 状态：dev 已施工，修复及验收见 [PR #14](https://github.com/SkillingX/daily_stock_analysis/pull/14)；资金流单位已通过公开同口径金额实证确认为人民币元；运行时已接入人民币元金额，最终验收与审查记录见 PR。实施范围以 [Issue #9 正式规格](https://github.com/SkillingX/daily_stock_analysis/issues/9) 为准。本文件保留背景、代码核查和方案依据。施工基线：2026-10-13，dev `4b32467`。本机使用 Choice 原生策略与 A 股准入；未部署生产。
 
 术语见 [GLOSSARY.md](../GLOSSARY.md)，数据源与市场范围决策见 [ADR 0001](adr/0001-choice-native-data-policy.md)。
