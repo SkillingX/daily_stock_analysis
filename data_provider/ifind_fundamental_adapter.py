@@ -6,9 +6,6 @@ Choice uses one financial batch; legacy single-anchor/series interfaces remain a
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
-from inspect import signature
-from functools import partial
 from time import monotonic
 import json
 import logging
@@ -485,19 +482,6 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
     return reading
 
 
-async def _apply_mcp_request_deadline(request: Any, *, deadline: float) -> None:
-    """SDK hook: reject expired wire calls and cap each request's own timeout."""
-    remaining = deadline - monotonic()
-    if remaining <= 0:
-        raise TimeoutError("financial MCP deadline exhausted")
-    configured = request.extensions.get("timeout") or {}
-    request.extensions["timeout"] = {
-        part: min(value, remaining) if isinstance(value, (int, float)) else remaining
-        for part in ("connect", "read", "write", "pool")
-        for value in [configured.get(part)]
-    }
-
-
 class IfindFetcher:
     """One fresh MCP session per bounded batch; no background loop or hidden retry."""
     _instance: Optional["IfindFetcher"] = None
@@ -532,33 +516,17 @@ class IfindFetcher:
             raise SourceReadError("ifind", source_failure_reason(exc)) from None
 
     async def _async_query(self, tool: str, question: str, *, deadline: float | None = None) -> object:
-        from mcp import ClientSession
-        from mcp.client import streamable_http
-        transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
-        timeout = min(self._timeout, deadline - monotonic()) if deadline is not None else self._timeout
-        async with AsyncExitStack() as stack:
-            if "http_client" in signature(transport).parameters:
-                from mcp.shared._httpx_utils import create_mcp_http_client
-                client = create_mcp_http_client(headers={"Authorization": self._token})
-                client.timeout = timeout
-                if deadline is not None:
-                    client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
-                await stack.enter_async_context(client)
-                streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, terminate_on_close=False))
-            else:
-                streams = await stack.enter_async_context(transport(self._endpoint, headers={"Authorization": self._token}, timeout=timeout, terminate_on_close=False))
-            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
-            await session.initialize()
-            result = await session.call_tool(tool, {"query": question})
-            if getattr(result, "is_error", getattr(result, "isError", False)):
-                raise SourceReadError("ifind", "business_error")
-            structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
-            if structured is not None:
-                return structured
-            for block in result.content:
-                if getattr(block, "text", None):
-                    return json.loads(block.text)
-            raise SourceReadError("ifind", "invalid_response")
+        from src.services.mcp_client import call_mcp_tool
+        result = await call_mcp_tool(self._endpoint, self._token, tool, {"query": question}, timeout_seconds=self._timeout, deadline=deadline)
+        if getattr(result, "is_error", getattr(result, "isError", False)):
+            raise SourceReadError("ifind", "business_error")
+        structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
+        if structured is not None:
+            return structured
+        for block in result.content:
+            if getattr(block, "text", None):
+                return json.loads(block.text)
+        raise SourceReadError("ifind", "invalid_response")
 
     def financial_snapshot(self, code: str, period: str | None, *, deadline: float) -> dict[str, AnchorReading]:
         query = f"{code} 报告期{period or '最新已披露财期'}，合并报表(调整)：营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率。明确实际报告期、单位、币种、报表类型、调整口径、实际披露日期；无数据请保留空值，不推算。"

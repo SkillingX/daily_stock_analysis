@@ -122,6 +122,8 @@ class SystemConfigService:
     _SERVER_MASKED_CONFIG_KEYS: Set[str] = {
         "CHOICE_USERNAME",
         "CHOICE_PASSWORD",
+        "IFIND_MCP_TOKEN",
+        "TAVILY_API_KEYS",
         "ALPHASIFT_INSTALL_SPEC",
         "LLM_USAGE_HMAC_SECRET",
     }

@@ -215,6 +215,7 @@ class TestSearchServiceXRegistration:
         fake_config = SimpleNamespace(
             bocha_api_keys=[], tavily_api_keys=[], anspire_api_keys=[],
             brave_api_keys=[], serpapi_keys=[], minimax_api_keys=[],
+            coding_plan_search_provider="minimax", zhipu_api_key=None,
             searxng_base_urls=[], searxng_public_instances_enabled=False,
             news_max_age_days=3, news_strategy_profile="short",
             social_sentiment_api_key="sk-test",
@@ -235,6 +236,7 @@ class TestSearchServiceXRegistration:
         fake_config = SimpleNamespace(
             bocha_api_keys=[], tavily_api_keys=[], anspire_api_keys=[],
             brave_api_keys=[], serpapi_keys=[], minimax_api_keys=[],
+            coding_plan_search_provider="minimax", zhipu_api_key=None,
             searxng_base_urls=[], searxng_public_instances_enabled=False,
             news_max_age_days=3, news_strategy_profile="short",
             social_sentiment_api_key=None,

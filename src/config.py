@@ -843,7 +843,9 @@ class Config:
     anspire_api_keys: List[str] = field(default_factory=list)  # Anspire Search API Keys
     bocha_api_keys: List[str] = field(default_factory=list)  # Bocha API Keys
     minimax_api_keys: List[str] = field(default_factory=list)  # MiniMax API Keys
-    tavily_api_keys: List[str] = field(default_factory=list)  # Tavily API Keys
+    tavily_api_keys: List[str] = field(default_factory=list)  # Retired; ignored by search.
+    coding_plan_search_provider: Literal["minimax", "zhipu"] = "minimax"
+    zhipu_api_key: Optional[str] = None  # Reuses LLM_ZHIPU_API_KEY; explicit search opt-in.
     brave_api_keys: List[str] = field(default_factory=list)  # Brave Search API Keys
     serpapi_keys: List[str] = field(default_factory=list)  # SerpAPI Keys
     searxng_base_urls: List[str] = field(
@@ -1262,6 +1264,10 @@ class Config:
 
     def __post_init__(self) -> None:
         _log = logging.getLogger(__name__)
+        if self.coding_plan_search_provider not in {"minimax", "zhipu"}:
+            raise ValueError("CODING_PLAN_SEARCH_PROVIDER must be minimax or zhipu")
+        if self.coding_plan_search_provider == "zhipu" and not (self.zhipu_api_key or "").strip():
+            raise ValueError("CODING_PLAN_SEARCH_PROVIDER=zhipu requires LLM_ZHIPU_API_KEY")
         if self.data_source_profile not in {"legacy", "choice"}:
             raise ValueError("DATA_SOURCE_PROFILE must be legacy or choice")
         if self.financial_primary_source not in {"choice", "ifind"}:
@@ -1868,6 +1874,8 @@ class Config:
             bocha_api_keys=bocha_api_keys,
             minimax_api_keys=minimax_api_keys,
             tavily_api_keys=tavily_api_keys,
+            coding_plan_search_provider=cast(Literal["minimax", "zhipu"], os.getenv("CODING_PLAN_SEARCH_PROVIDER", "minimax").strip().lower()),
+            zhipu_api_key=os.getenv("LLM_ZHIPU_API_KEY", "").strip() or None,
             brave_api_keys=brave_api_keys,
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
@@ -3050,8 +3058,7 @@ class Config:
         return bool(
             self.anspire_api_keys
             or self.bocha_api_keys
-            or self.minimax_api_keys
-            or self.tavily_api_keys
+            or (self.minimax_api_keys if self.coding_plan_search_provider == "minimax" else self.zhipu_api_key)
             or self.brave_api_keys
             or self.serpapi_keys
             or self.has_searxng_enabled()
@@ -3348,7 +3355,7 @@ class Config:
             issues.append(
                 ConfigIssue(
                     severity="info",
-                    message="未配置搜索引擎能力 (Bocha/MiniMax/Tavily/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
+                    message="未配置搜索引擎能力 (Bocha/套餐搜索/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
                     field="BOCHA_API_KEYS",
                 )
             )

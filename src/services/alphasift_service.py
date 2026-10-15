@@ -330,14 +330,13 @@ def _hotspot_route_has_external_event(route: Any) -> bool:
 def _has_configured_hotspot_news_source(config: Config) -> bool:
     fields = (
         "bocha_api_keys",
-        "tavily_api_keys",
         "anspire_api_keys",
         "brave_api_keys",
-        "serpapi_api_keys",
-        "minimax_api_keys",
+        "serpapi_keys",
         "searxng_base_urls",
     )
-    return any(bool(getattr(config, field, None)) for field in fields)
+    coding_key = "zhipu_api_key" if getattr(config, "coding_plan_search_provider", "minimax") == "zhipu" else "minimax_api_keys"
+    return any(bool(getattr(config, field, None)) for field in (*fields, coding_key))
 
 
 def _build_hotspot_event_routes_from_search(
@@ -351,11 +350,12 @@ def _build_hotspot_event_routes_from_search(
 
         service = SearchService(
             bocha_keys=getattr(config, "bocha_api_keys", None),
-            tavily_keys=getattr(config, "tavily_api_keys", None),
             anspire_keys=getattr(config, "anspire_api_keys", None),
             brave_keys=getattr(config, "brave_api_keys", None),
-            serpapi_keys=getattr(config, "serpapi_api_keys", None),
+            serpapi_keys=getattr(config, "serpapi_keys", None),
             minimax_keys=getattr(config, "minimax_api_keys", None),
+            coding_plan_search_provider=getattr(config, "coding_plan_search_provider", "minimax"),
+            zhipu_api_key=getattr(config, "zhipu_api_key", None),
             searxng_base_urls=getattr(config, "searxng_base_urls", None),
             searxng_public_instances_enabled=False,
             news_max_age_days=int(getattr(config, "news_max_age_days", 3) or 3),

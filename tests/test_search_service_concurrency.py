@@ -237,6 +237,8 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
             brave_api_keys=[],
             serpapi_keys=[],
             minimax_api_keys=[],
+            coding_plan_search_provider="minimax",
+            zhipu_api_key=None,
             searxng_base_urls=[],
             searxng_public_instances_enabled=False,
             news_max_age_days=3,

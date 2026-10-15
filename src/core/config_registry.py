@@ -107,7 +107,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "当前财务主数据源", "description": "仅六项当前财务快照。choice保持原主源；ifind需Choice策略和ENABLE_IFIND_MCP=true，最新有效财期内优先iFinD，Choice补缺/核验。年报、估值及资金仍用Choice。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
-        "default_value": "choice", "options": ["choice", "ifind"],
+        "default_value": "choice", "options": [{"value": "choice", "label": "Choice 优先"}, {"value": "ifind", "label": "iFinD 优先"}],
         "validation": {"enum": ["choice", "ifind"]}, "display_order": 14,
     },
     "IFIND_MCP_ENDPOINT": {
@@ -132,7 +132,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "title": "研究数据来源策略", "description": "legacy 保持上游兼容；choice 使用原生 SDK，停止 MX/Choice MCP/Fuyao；iFinD需显式ENABLE_IFIND_MCP启用。安装 SDK 后配置账号密码（服务器推荐）；未配置账密时使用本机已激活设备文件。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
-        "default_value": "legacy", "options": ["legacy", "choice"],
+        "default_value": "legacy", "options": [{"value": "legacy", "label": "上游兼容"}, {"value": "choice", "label": "Choice 原生"}],
         "validation": {"enum": ["legacy", "choice"]}, "display_order": 12,
     },
     "ENABLED_MARKETS": {
@@ -760,23 +760,20 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "warning_codes": ["secret_value", "comma_separated_keys"],
     },
     "TAVILY_API_KEYS": {
-        "title": "Tavily API Keys",
-        "description": "Comma-separated Tavily API keys.",
+        "title": "Tavily（已停用）",
+        "description": "Tavily 已停用。历史配置仅兼容读取，残留 Key 不会触发调用。",
         "category": "data_source",
         "data_type": "string",
         "ui_control": "password",
         "is_sensitive": True,
         "is_required": False,
-        "is_editable": True,
+        "is_editable": False,
         "default_value": None,
         "options": [],
         "validation": {"multi_value": True, "delimiter": ","},
         "display_order": 30,
         "help_key": "settings.data_source.search_api_keys",
-        "examples": [
-            "TAVILY_API_KEYS=tvly-xxxx",
-            "TAVILY_API_KEYS=tvly-key-1,tvly-key-2",
-        ],
+        "examples": [],
         "docs": [
             {
                 "label": "完整指南：搜索服务配置",
@@ -829,7 +826,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "MINIMAX_API_KEYS": {
         "title": "MiniMax API Key",
-        "description": "MiniMax API key (search priority: Bocha > Tavily > Brave > SerpAPI > MiniMax > SearXNG).",
+        "description": "MiniMax Coding Plan Web Search key. CODING_PLAN_SEARCH_PROVIDER=zhipu replaces this slot only; other tools keep their order.",
         "category": "data_source",
         "data_type": "string",
         "ui_control": "password",
@@ -840,6 +837,14 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {"multi_value": True, "delimiter": ","},
         "display_order": 53,
+    },
+    "CODING_PLAN_SEARCH_PROVIDER": {
+        "title": "套餐搜索提供方",
+        "description": "仅选择原 MiniMax Web Search 位置的提供方。zhipu 复用 LLM_ZHIPU_API_KEY，走 Coding Plan 专属 MCP；其他搜索工具不变，修改后重启服务。",
+        "category": "data_source", "data_type": "string", "ui_control": "select",
+        "is_sensitive": False, "is_required": False, "is_editable": False,
+        "default_value": "minimax", "options": [{"value": "minimax", "label": "MiniMax Coding Plan"}, {"value": "zhipu", "label": "智谱 Coding Plan"}],
+        "validation": {}, "display_order": 54,
     },
     "SEARXNG_BASE_URLS": {
         "title": "SearXNG Base URLs",
