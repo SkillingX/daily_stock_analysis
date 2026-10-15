@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 import litellm
 from litellm.router import Router
 
+from src.llm.concurrency import limited_completion
 from src.config import (
     extra_litellm_params,
     get_api_keys_for_model,
@@ -659,7 +660,7 @@ class LLMToolAdapter:
             # Channel / YAML path: Router manages all models in its model_list
             router = cast(Router, self._router)
             response = call_litellm_with_param_recovery(
-                lambda kwargs: router.completion(**kwargs),
+                lambda kwargs: limited_completion(router.completion, **kwargs),
                 model=model,
                 call_kwargs=call_kwargs,
                 model_list=recovery_model_list,
@@ -669,7 +670,7 @@ class LLMToolAdapter:
             # Legacy path: Router for primary model multi-key
             router = cast(Router, self._router)
             response = call_litellm_with_param_recovery(
-                lambda kwargs: router.completion(**kwargs),
+                lambda kwargs: limited_completion(router.completion, **kwargs),
                 model=model,
                 call_kwargs=call_kwargs,
                 model_list=recovery_model_list,
@@ -680,7 +681,7 @@ class LLMToolAdapter:
             # providers like groq/ or bedrock/ that are not in the Router
             # model_list even when channel mode is active)
             response = call_litellm_with_param_recovery(
-                lambda kwargs: litellm.completion(**kwargs),
+                lambda kwargs: limited_completion(litellm.completion, **kwargs),
                 model=model,
                 call_kwargs=call_kwargs,
                 model_list=self._config.llm_model_list,

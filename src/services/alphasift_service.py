@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
+from src.llm.concurrency import limited_completion
 from src.auth import COOKIE_NAME, is_auth_enabled, refresh_auth_state, verify_session
 from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, get_configured_llm_models
 
@@ -3260,10 +3261,6 @@ def _build_alphasift_context(
 @contextmanager
 def _alphasift_litellm_headers(config: Config) -> Iterator[None]:
     header_routes = _build_alphasift_litellm_header_routes(config)
-    if not header_routes:
-        yield
-        return
-
     try:
         litellm_module = importlib.import_module("litellm")
     except Exception:
@@ -3304,7 +3301,7 @@ def _alphasift_litellm_headers(config: Config) -> Iterator[None]:
                 elif existing_headers in (None, ""):
                     kwargs = dict(kwargs)
                     kwargs["extra_headers"] = dict(headers)
-        return original_completion(*args, **kwargs)
+        return limited_completion(lambda **values: original_completion(*args, **values), **kwargs)
 
     setattr(completion_with_dsa_headers, _ALPHASIFT_LITELLM_COMPLETION_ATTR, True)
     setattr(

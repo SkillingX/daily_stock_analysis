@@ -19,6 +19,7 @@ import sys
 import time
 from typing import Any, List, Optional, Tuple, cast
 
+from src.llm.concurrency import limited_completion
 from src.config import Config, get_config
 
 logger = logging.getLogger(__name__)
@@ -285,7 +286,7 @@ def _call_litellm_vision(
         import litellm as litellm_module
 
         litellm = litellm_module
-    response = cast(Any, litellm).completion(**call_kwargs)
+    response = limited_completion(cast(Any, litellm).completion, **call_kwargs)
     choices = getattr(response, "choices", None) if response is not None else None
     if choices and choices[0].message.content:
         return cast(str, choices[0].message.content)

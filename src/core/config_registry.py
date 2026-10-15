@@ -3285,6 +3285,17 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": [],
     },
+    "DEEP_RESEARCH_LLM_CONCURRENCY": {
+        "title": "进程内模型并发上限",
+        "description": "同一后端进程所有模块共享的实际模型请求上限；流式持有到关闭。正整数，保存后重启生效。独立CLI、调度和其他后端进程分别计数。",
+        "category": "system", "data_type": "integer", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "3", "options": [], "validation": {"min": 1},
+        "display_order": 48, "help_key": "settings.system.market_review",
+        "examples": ["DEEP_RESEARCH_LLM_CONCURRENCY=1"],
+        "docs": [{"label": "深度投研配置", "href": "https://github.com/SkillingX/daily_stock_analysis/blob/main/docs/deep-research.md"}],
+        "warning_codes": ["restart_required"],
+    },
     "DEEP_RESEARCH_DIM_MAX_STEPS": {
         "title": "Deep Research Dimension Max Steps",
         "description": "双轨引擎中探索型维度（情报/产业链）的 ReAct 最大步数，超步即维度降级，防止单维度失控拖垮整份报告。",

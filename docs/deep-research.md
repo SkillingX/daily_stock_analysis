@@ -49,6 +49,7 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 
 | 环境变量 | 默认 | 说明 |
 |---------|------|------|
+| `DEEP_RESEARCH_LLM_CONCURRENCY` | `3` | 同一进程所有模块的实际模型请求上限；正整数，空值沿用3，非法值启动失败。流式直到关闭才释放；本机可设1。保存后重启生效。独立CLI、调度、Desktop与其他后端分别计数，不是账号级总额度。|
 | `DEEP_RESEARCH_MAX_REPORTS` | `200` | 保留报告数量上限（超出删最旧，含 .md/.pdf 文件；`0` = 不清理）|
 
 **系统依赖**：PDF 生成采用**纯 Python 方案**（`xhtml2pdf` + `reportlab` 内置 CID CJK 字体 `STSong-Light`），`pip install -r requirements.txt` 后即可工作，**无需安装任何系统二进制或字体文件**，macOS / Linux / Docker 全平台一致。渲染失败时优雅降级（返回 404，不影响报告生成）。

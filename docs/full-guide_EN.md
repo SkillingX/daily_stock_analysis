@@ -1469,3 +1469,7 @@ Technical indicator rules use daily-close edge triggers only. Partial-bar handli
 ---
 
 For more questions, please [submit an Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+
+### Process-wide model concurrency
+
+`DEEP_RESEARCH_LLM_CONCURRENCY` applies to actual model requests across all modules and model instances in one process. It accepts a positive integer (unset/empty: `3`; invalid values fail configuration loading). Use `1` for a local account requiring serial requests. Streams retain capacity until consumption ends or the transport closes; data tools and searches do not occupy model capacity. Environment variables take precedence over the local `.env`. Restart the corresponding process after changes; separate CLI, scheduler, Desktop and backend processes have independent limits. This is not an account-wide or cross-process quota.

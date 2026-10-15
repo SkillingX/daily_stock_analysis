@@ -19,21 +19,7 @@ from src.deep_research_dims.narrate import load_constitution, load_dim_prompt
 
 logger = logging.getLogger(__name__)
 
-import threading
-
 from src.config import get_config
-
-_LLM_SEMAPHORE: "threading.Semaphore | None" = None
-
-
-def _llm_semaphore() -> "threading.Semaphore":
-    """全局 LLM 并发上限（MiniMax code plan 有限流）：所有研究员探索循环共用。"""
-    global _LLM_SEMAPHORE
-    if _LLM_SEMAPHORE is None:
-        limit = int(getattr(get_config(), "deep_research_llm_concurrency", 3) or 3)
-        _LLM_SEMAPHORE = threading.Semaphore(max(1, limit))
-    return _LLM_SEMAPHORE
-
 
 _INTEL_TOOLS = {
     "search_stock_news",
@@ -111,25 +97,18 @@ def _run_explore(
         if attempt and research_deadline is not None:
             research_deadline = min(research_deadline, monotonic())
         remaining = deadline - monotonic()
-        semaphore = _llm_semaphore()
-        if remaining <= 0 or not semaphore.acquire(timeout=remaining):
-            return {"ok": False, "error": "研究时限耗尽（等待模型并发额度）"}
-        try:
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return {"ok": False, "error": "研究时限耗尽"}
-            loop = run_agent_loop(
-                messages=messages,
-                tool_registry=registry,
-                llm_adapter=llm_adapter,
-                max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
-                **({"research_deadline": research_deadline} if research_deadline is not None else {}),
-                progress_callback=progress_callback,
-                max_wall_clock_seconds=remaining,
-                stock_scope=None,
-            )
-        finally:
-            semaphore.release()
+        if remaining <= 0:
+            return {"ok": False, "error": "研究时限耗尽"}
+        loop = run_agent_loop(
+            messages=messages,
+            tool_registry=registry,
+            llm_adapter=llm_adapter,
+            max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
+            **({"research_deadline": research_deadline} if research_deadline is not None else {}),
+            progress_callback=progress_callback,
+            max_wall_clock_seconds=remaining,
+            stock_scope=None,
+        )
         # Only a successful response with malformed JSON warrants format repair.
         if not loop.success:
             timeout = any(marker in (loop.error or "").lower() for marker in ("timeout", "timed out", "时限"))
