@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -470,7 +470,7 @@ def _run_dual_track(
         web 端缓存命中会拿到无叙述 payload）；可复用探索资料允许写入，
         行情派生维度每次按当前快照计算。
         """
-        if not write_cache:
+        if not write_cache or run is not None and (run.stop_reason is not None or run.remaining() <= 0):
             return
         if cache_exclude and dim_id in cache_exclude:
             return
@@ -587,9 +587,39 @@ def _run_dual_track(
                 if token is not None:
                     financial_refresh.reset(token)
 
+        def collect_researcher(fut: Future[Dict[str, Any]], dim_id: str) -> None:
+            nonlocal steps_total
+            try:
+                out = run.wait_for(fut) if run is not None else fut.result(timeout=600)
+                if out.get("ok"):
+                    if dim_id == "intel":
+                        dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
+                    elif dim_id == "supply_chain":
+                        dim, used = _parse_supply_chain(out["data"], int(out.get("steps") or 0))
+                    else:
+                        dim, used = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
+                    dims[dim_id] = dim
+                    store_cache(dim_id, dim)
+                    steps_total += used
+                else:
+                    dims[dim_id] = DIM_MODELS[dim_id](
+                        status="degraded", degraded_reason=str(out.get("error"))
+                    )
+            except Exception as exc:  # noqa: BLE001
+                dims[dim_id] = DIM_MODELS[dim_id](
+                    status="degraded", degraded_reason=f"研究员异常: {exc}"
+                )
+            if run is not None and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
+                from src.schemas.deep_research_dims import parse_dim
+                payload = dims[dim_id].model_dump()
+                payload["retained_evidence"] = list(run.evidence.get(dim_id, []))
+                payload["retained_facts"] = list(run.facts.get(dim_id, []))
+                dims[dim_id] = parse_dim(dim_id, payload)
+            emit_dim(dim_id, dims[dim_id].status)
+
         pool = ThreadPoolExecutor(max_workers=5)
+        futures: Dict[Future[Dict[str, Any]], str] = {}
         try:
-            futures: Dict[Any, str] = {}
             for dim_id, runner in active_researchers:
                 cached = try_cache(dim_id)
                 if cached is not None:
@@ -609,35 +639,13 @@ def _run_dual_track(
             _run_rule_dims()
 
             for fut, dim_id in futures.items():
-                try:
-                    out = run.wait_for(fut) if run is not None else fut.result(timeout=600)
-                    if out.get("ok"):
-                        if dim_id == "intel":
-                            dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
-                        elif dim_id == "supply_chain":
-                            dim, used = _parse_supply_chain(out["data"], int(out.get("steps") or 0))
-                        else:
-                            dim, used = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
-                        dims[dim_id] = dim
-                        store_cache(dim_id, dim)
-                        steps_total += used
-                    else:
-                        dims[dim_id] = DIM_MODELS[dim_id](
-                            status="degraded", degraded_reason=str(out.get("error"))
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    dims[dim_id] = DIM_MODELS[dim_id](
-                        status="degraded", degraded_reason=f"研究员异常: {exc}"
-                    )
-                if run is not None and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
-                    from src.schemas.deep_research_dims import parse_dim
-                    payload = dims[dim_id].model_dump()
-                    payload["retained_evidence"] = list(run.evidence.get(dim_id, []))
-                    payload["retained_facts"] = list(run.facts.get(dim_id, []))
-                    dims[dim_id] = parse_dim(dim_id, payload)
-                emit_dim(dim_id, dims[dim_id].status)
+                collect_researcher(fut, dim_id)
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+            # Preserve work already complete before freezing an interrupted report.
+            for fut, dim_id in futures.items():
+                if dim_id not in dims and fut.done() and not fut.cancelled():
+                    collect_researcher(fut, dim_id)
     else:
         data_dim = _build_data_dim()
         _run_rule_dims()
@@ -937,7 +945,11 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         elif dim_id in selected and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
             payload = dims[dim_id].model_dump()
             payload["retained_evidence"] = run.evidence.get(dim_id, [])
-            payload["retained_facts"] = [*payload.get("retained_facts", []), *run.facts.get(dim_id, [])][-30:]
+            existing_facts = payload.get("retained_facts", [])
+            payload["retained_facts"] = [
+                *existing_facts,
+                *(fact for fact in run.facts.get(dim_id, []) if fact not in existing_facts),
+            ][-30:]
             dims[dim_id] = parse_dim(dim_id, payload)
     for dim_id, research in run.vendor_research.items():
         if dim_id not in selected or dims[dim_id].status == "ok":

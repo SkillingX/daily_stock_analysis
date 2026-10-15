@@ -76,7 +76,7 @@ def test_ifind_primary_reaches_report_with_choice_verification(ifind_transport, 
     assert snapshot['revenue'].reading.value == 2997710000
     assert snapshot['revenue'].quality.status == 'verified'
     assert snapshot['revenue'].rule_eligible
-    assert '最新已披露财期' in calls[0][1]
+    assert '每个报告期' in calls[0][1]
 
 
 @pytest.mark.parametrize('ifind_period,choice_period,expected_source', [

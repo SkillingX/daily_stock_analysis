@@ -256,3 +256,77 @@ def test_cancel_between_direct_sources_stops_the_next_prefetch(monkeypatch: pyte
     with run.bind(), pytest.raises(ResearchStopped):
         getattr(explore_agents, f'run_{dim_id}_agent')('600519', '样本', object())
     assert calls == ['first']
+
+
+@pytest.mark.parametrize('reason', ['cancelled', 'report_budget'])
+def test_interrupted_report_keeps_completed_research_without_waiting_for_pending(
+    monkeypatch: pytest.MonkeyPatch, reason: str,
+) -> None:
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from threading import Event
+    from src.agent.deep_research import orchestrator
+    from src.core.research_run import ResearchRun, current_research
+    from src.deep_research_dims.context import SharedContext
+    from src.schemas.deep_research_dims import PhaseDim
+
+    completed: dict[str, Future[dict[str, Any]]] = {}
+    release_pending = Event()
+    pending_started = Event()
+
+    class ObservedExecutor(ThreadPoolExecutor):
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+            future = super().submit(fn, *args, **kwargs)
+            completed[args[-1]] = future
+            return future
+
+    def technical(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        current_research.get().retain('get_daily_history', {
+            'data': [{'date': '2026-10-14', 'open': 49.0, 'close': 50.0}],
+        })
+        return {'ok': True, 'steps': 2, 'data': {
+            'narrative': '已完成的技术研究：支撑49，阻力55。',
+            'score': 70.0, 'support': 49.0, 'resistance': 55.0,
+        }}
+
+    def pending(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        pending_started.set()
+        release_pending.wait(timeout=5)
+        return {'ok': True, 'steps': 1, 'data': {'latest_news': '迟到结果'}}
+
+    run = ResearchRun(60)
+
+    def progress(event: dict[str, Any]) -> None:
+        if event.get('type') == 'dim_start' and event.get('dim') == 'phase':
+            assert completed['technical'].result(timeout=1)['ok']
+            assert pending_started.wait(timeout=1)
+            run.stop(reason)
+
+    monkeypatch.setattr(orchestrator, 'ThreadPoolExecutor', ObservedExecutor)
+    monkeypatch.setattr(orchestrator, 'build_shared_context', lambda *args: SharedContext('600519', '样本', '2026-10-15'))
+    monkeypatch.setattr(orchestrator, 'run_technical_agent', technical)
+    monkeypatch.setattr(orchestrator, 'run_intel_agent', pending)
+    monkeypatch.setattr(orchestrator, 'build_phase_dim', lambda _: PhaseDim(status='ok'))
+    cache_writes: list[str] = []
+    from src.deep_research_dims import dim_cache
+    monkeypatch.setattr(dim_cache, 'save_cached_dim', lambda code, dim, payload: cache_writes.append(dim))
+    try:
+        with run.bind():
+            result = orchestrator.run_dual_track(
+                '600519', '样本', None, progress_callback=progress,
+                dims_filter={'technical', 'intel', 'phase', 'history'},
+                force_refresh=True, skip_narrations=True,
+            )
+        dim = result.dims['technical']
+        assert result.success and result.status == 'partial'
+        assert dim.status == 'ok'
+        assert dim.score == 70.0 and dim.support == 49.0 and dim.resistance == 55.0
+        assert '已完成的技术研究' in result.markdown
+        assert len(dim.retained_facts) == 2
+        assert not completed['intel'].done() and not run.clean
+        assert result.dims['intel'].status == 'degraded'
+        assert '迟到结果' not in result.markdown
+        assert not cache_writes
+    finally:
+        release_pending.set()
+        for future in completed.values():
+            future.result(timeout=2)

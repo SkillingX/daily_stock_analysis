@@ -83,6 +83,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     """
     from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
     from src.config import get_config
+    from src.core.research_run import current_research, ResearchStopped
 
     config = get_config()
     from src.patches.eastmoney_patch import request_deadline
@@ -153,6 +154,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "errors": list(compact.get("errors") or []),
             "field_meta": {**((compact.get("valuation") or {}).get("field_meta") or {}), **((compact.get("growth") or {}).get("field_meta") or {})},
         }
+        ctx.fundamental = result
         from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
         from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
         aliases = {"revenue": "revenue", "net_profit": "net_profit", "pe_ratio": "pe_ttm", "pb_ratio": "pb", "roe": "roe", "gross_margin": "gross_margin", "revenue_yoy": "revenue_growth", "net_profit_yoy": "net_profit_yoy"}
@@ -204,11 +206,15 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                     key = aliases[field]
                     if result.get(key) is None:
                         result[key] = record["value"]
-        if not result.get("errors") and all(result.get(key) is not None for key in financial_keys):
+        run = current_research.get()
+        stopped = run is not None and (bool(run.stop_reason) or run.finalized or run.remaining() <= 0)
+        if not stopped and not result.get("errors") and all(result.get(key) is not None for key in financial_keys):
             save_snapshot(cache_key, result)
-        else:
+        elif not stopped:
             ctx.limitation("基本面数据不完整（快照不缓存，下次重试）")
         return result
+    except ResearchStopped:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 基本面装配失败 %s: %s", code, exc)
         ctx.limitation(f"基本面数据装配失败: {exc}")
@@ -256,13 +262,18 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
     行情、日线和筹码在线程池运行，与本身已限时的财务装配并行。
     各路共用阶段截止时间；超时保留可用数据及失败证据，不占用后续研究预算。
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
+    from src.core.research_run import current_research, ResearchStopped
 
     ctx = SharedContext(
         stock_code=stock_code,
         stock_name=stock_name,
         as_of=datetime.now().isoformat(timespec="seconds"),
     )
+    run = current_research.get()
+    if run is not None:
+        run.context = ctx
+        run.check()
     from concurrent.futures import wait
     from src.config import get_config
 
@@ -277,20 +288,32 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
     if outer := request_deadline.get():
         stage_deadline = min(stage_deadline, outer)
     token = request_deadline.set(stage_deadline)
+    futures: dict[str, Future[Any]] = {}
     try:
         futures = {
             "quote": pool.submit(copy_context().run, _safe_quote, stock_code, workers["quote"]),
             "history": pool.submit(copy_context().run, _safe_history, stock_code, 260, workers["history"]),
             "chip": pool.submit(copy_context().run, _safe_chip, stock_code, workers["chip"]),
         }
-        from src.core.research_run import current_research
-        if run := current_research.get():
+        if run is not None:
             for future in futures.values():
                 run.track(future)
         # Financial IO already has bounded workers/validation. Assemble its timeout
         # evidence here instead of racing its summary against an identical outer timer.
         ctx.fundamental = _safe_fundamental(stock_code, ctx)
-        wait(futures.values(), timeout=max(0.0, stage_deadline - monotonic()))
+        remaining = max(0.0, stage_deadline - monotonic())
+        if run is not None:
+            try:
+                for _ in run.completed(futures.values(), timeout=remaining):
+                    pass
+            except FutureTimeout:
+                pass
+        else:
+            wait(futures.values(), timeout=remaining)
+    except ResearchStopped:
+        # Preserve stage-zero's partial-return contract; the orchestrator checks run.
+        pass
+    finally:
         for key, future in futures.items():
             if future.done():
                 setattr(ctx, key, future.result())
@@ -299,10 +322,10 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
             else:
                 future.cancel()
                 ctx.limitation(f"{key} 装配超时，本次未采用")
-    finally:
         request_deadline.reset(token)
         pool.shutdown(wait=False, cancel_futures=True)
-    ctx.history_reports = _safe_history_reports(stock_code, ctx)
+    if run is None or not run.stop_reason:
+        ctx.history_reports = _safe_history_reports(stock_code, ctx)
     return ctx
 
 

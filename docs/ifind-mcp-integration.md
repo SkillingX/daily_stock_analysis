@@ -19,9 +19,37 @@ IFIND_MCP_TIMEOUT_SECONDS=30
 
 当前快照按两源实际返回选最新有效累计/年度财期，不由请求日期补造。同期内合格 iFinD 值优先，Choice 同期补位；更新财期有缺项时不倒退用旧期填充。单独缺披露日保留有效资料，但不因此声称历史时点可得。四个比率缺调整口径时仍不默认重述后，可比性与规则资格继续按字段证据判断。冲突保留已采用主值与两家证据，限制相应确定性评分/动作。
 
+查询当前财务时，iFinD 使用一次明确日期范围的逐期请求，要求每行实际报告期；“最新一期”参数本身不能证明财期。范围由运行日期计算，不以 Choice 的返回日期锁定 iFinD；未披露期的空行不作为选期依据。若供应商仍未提供实际财期，保留候选和缺口，不从请求补造；这一请求方式不扩展到语义不同的股东截止日期。
+
 完整年度财报、PE/PB/总市值、资金流和机构目标价仍由 Choice 提供；日线和实时行情沿用原渠道。主营及股东资料保留各自实际财期，不强行跟随财务快照或 Choice 名称表的旧期。混合来源报告按字段标明实际来源。主次策略进入既有缓存身份，切换或强刷不会给新值贴旧核验；历史报告不重标。
 
 本节为中文部署与行为说明；未维护平行英文规格，避免复制两套不断变化的数据契约。英文首页无需扩展。
+
+## 从 Choice 单源版本升级的配置变更
+
+代码升级不会自动开启 iFinD、切换模型或覆盖部署凭据。本次取消/证券校验修复不新增配置项；整批版本相对 Choice 单源版本的配置变化如下。生产使用部署平台的环境变量和凭据配置，本机使用被忽略的根 `.env`；已有进程环境变量优先于文件。
+
+| 配置 | 兼容默认 / 变化 | 本次部署的设置 |
+| --- | --- | --- |
+| `DATA_SOURCE_PROFILE` | 沿用既有策略，示例默认 `legacy` | 本部署保持 `choice`，不要通过 `legacy` 恢复退休渠道 |
+| `ENABLE_IFIND_MCP` | 默认 `false`，仅残留 Token 不会启用 | 使用本批能力设为 `true` |
+| `FINANCIAL_PRIMARY_SOURCE` | 新增，默认 `choice` | 本次 iFinD 优先设为 `ifind` |
+| `IFIND_MCP_ENDPOINT` / `IFIND_MCP_TOKEN` | 沿用供应商地址和授权值；服务器不需 iFinD SDK/设备激活 | 两项都必须由部署配置提供，不提交到仓库或镜像 |
+| `IFIND_MCP_TIMEOUT_SECONDS` | 默认由 `8` 秒调整为 `30` 秒 | 可保持 `30`；旧部署显式配置不会被自动改写，仍受阶段总预算限制 |
+| `CODING_PLAN_SEARCH_PROVIDER` | 新增，默认 `minimax` | 线上保留 `minimax`；本地替代原 MiniMax 搜索位置时设 `zhipu` |
+| `LLM_ZHIPU_API_KEY` | 复用已有套餐 Key，仅选智谱搜索时必需 | 本机提供，不另申请搜索 Key；线上继续使用原 MiniMax 配置 |
+| `TAVILY_API_KEYS` | 本版本停用 Tavily，遗留值不再触发调用 | 无需补配；可从部署凭据中移除，其余搜索工具不变 |
+| `DEEP_RESEARCH_LLM_CONCURRENCY` | 默认 `3`；行为改为限制同一进程所有模块的实际模型请求 | 当前共享 Coding Plan 建议显式设 `1`；独立后端、CLI、调度进程分别计数 |
+| `DEEP_RESEARCH_TIMEOUT_SECONDS` | 有限报告总预算默认 `2400` 秒，包含取数、排队、研究与收尾 | 可保持默认；结束预算后保存有效资料，在途资源清理不被伪装成已完成 |
+| `LLM_STREAM_RESPONSE_TIMEOUT` | 既有单次模型响应上限，未统一改默认值 | 本机 GLM 验收用 `180` 秒，依据实测返回耗时；线上按实际模型设置，不机械照搬 |
+| `CHOICE_FORCE_LOGIN` | 新增，默认 `false` | 共享试用账号错峰且明确允许挤掉另一端时才设 `true`；不增加同时登录容量 |
+| `CHOICE_USERNAME` / `CHOICE_PASSWORD`、`ENABLED_MARKETS` | 沿用既有配置 | Choice 保留原登录方式和 SDK；本部署保持 `ENABLED_MARKETS=cn` |
+
+模型仍由原 `LITELLM_CONFIG` / 渠道配置决定。线上 MiniMax 模型入口不因本次升级改变；本机智谱保持套餐入口 `https://open.bigmodel.cn/api/coding/paas/v4`，模型与推理参数见现有 YAML。搜索选择不自动切换模型，失败也不改走智谱普通按量 API；路由本身不作为账单归属证明。套餐搜索细节见[搜索配置](coding-plan-search.md)，模型执行边界见[深度投研说明](deep-research.md)。
+
+上线顺序：先提供上述部署配置及现有 Choice SDK/登录条件，更新代码或镜像，再重启实际 API、分析及调度进程；不要直接复制本机 `.env`。核对生效的主次/搜索/并发配置时只输出非敏感值，Token 和账号密码保持遮罩。启动成功后强刷普通企业及金融行业报告，检查采用源、实际财期、核验状态、有效明细、取消后无新请求及历史/下载一致；Choice 回退可用不等于 iFinD 主源正向验收通过。
+
+回退数据源时设 `FINANCIAL_PRIMARY_SOURCE=choice`、`ENABLE_IFIND_MCP=false` 并重启；智谱搜索可独立恢复 `CODING_PLAN_SEARCH_PROVIDER=minimax`。若需回退代码，revert 对应 PR 并重启，无数据库迁移，原报告与凭据不清空。共享账号的另一端会话不会因代码回滚自动恢复。
 
 ---
 

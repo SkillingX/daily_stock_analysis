@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 
 async def apply_mcp_request_deadline(request: httpx.Request, *, deadline: float) -> None:
+    from src.core.research_run import current_research
+    if run := current_research.get():
+        run.check()
     remaining = deadline - monotonic()
     if remaining <= 0:
         raise TimeoutError("MCP deadline exhausted")
@@ -29,6 +32,10 @@ async def call_mcp_tool(endpoint: str, authorization: str, tool: str, arguments:
     """No retries or background session; callers own response validation and errors."""
     from mcp import ClientSession
     from mcp.client import streamable_http
+    from src.core.research_run import current_research
+    run = current_research.get()
+    if run is not None:
+        run.check()
 
     transport = getattr(streamable_http, "streamable_http_client", None) or getattr(streamable_http, "streamablehttp_client")
     limit = min(deadline, monotonic() + timeout_seconds) if deadline is not None else monotonic() + timeout_seconds
@@ -47,4 +54,6 @@ async def call_mcp_tool(endpoint: str, authorization: str, tool: str, arguments:
             streams = await stack.enter_async_context(transport(endpoint, headers={"Authorization": authorization}, timeout=remaining, terminate_on_close=False))
         session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
         await session.initialize()
+        if run is not None:
+            run.check()
         return await session.call_tool(tool, arguments)

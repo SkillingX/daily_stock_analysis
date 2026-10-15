@@ -320,14 +320,12 @@ class _RankedCell:
 
 def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[dict[tuple[str, int], dict[str, _RankedCell]], list[str]]:
     """Join ranked supplier cells only by returned security, explicit period and rank."""
-    from data_provider.choice_adapter import ChoiceAdapter
-    expected = ChoiceAdapter.stock_code(code)
     joined: dict[tuple[str, int], dict[str, _RankedCell]] = {}
     rejected: set[tuple[str, int]] = set()
     errors: list[str] = []
     for table in _ifind_tables(data.answer):
         for row in table:
-            if row.get("证券代码") != expected:
+            if not _same_security(row.get("证券代码"), code):
                 continue
             row_period = normalize_report_period(row.get("日期") or row.get("报告期"))[0]
             for label, raw in row.items():
@@ -363,6 +361,13 @@ def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[d
                 else:
                     joined[key][field] = cell
     return {key: cells for key, cells in joined.items() if key not in rejected}, list(dict.fromkeys(errors))
+
+
+def _same_security(returned: str | None, requested: str) -> bool:
+    """Accept a bare A-share code, but never an explicitly different exchange."""
+    from data_provider.choice_adapter import ChoiceAdapter
+    expected = ChoiceAdapter.stock_code(requested)
+    return returned in {expected, expected.split(".")[0]}
 
 
 def _detail_reading(cell: _RankedCell, period: str, field: str) -> AnchorReading | None:
@@ -422,8 +427,7 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
     candidates: list[AnchorReading] = []
     for table in _ifind_tables(data.answer):
         for row in table:
-            identity = row.get("证券代码")
-            if code and (not identity or identity.split(".")[0] != code.split(".")[0] or "." in code and identity != code):
+            if code and not _same_security(row.get("证券代码"), code):
                 continue
             value, col = _extract_ifind_value(row, keywords, field=field, cumulative_only=a_share_contract)
             if value is None or field in _PERIOD_FIELDS and caliber_from_label(field, col) is None:
@@ -455,7 +459,11 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
             number, normalized_unit, currency, number_error = _ifind_number(row[col], col, unit, field, currency)
             if number is None:
                 continue
-            disclosed = next((r.get("定期报告实际披露日期") for t in _ifind_tables(data.answer) for r in t if r.get("定期报告实际披露日期") and (not code or r.get("证券代码", code).split(".")[0] == code.split(".")[0]) and normalize_report_period(data.indicators_params.get("定期报告实际披露日期", {}).get("报告期"))[0] == actual), None)
+            disclosure_period = normalize_report_period(data.indicators_params.get("定期报告实际披露日期", {}).get("报告期"))[0]
+            disclosed = next((r.get("定期报告实际披露日期") for t in _ifind_tables(data.answer) for r in t
+                              if r.get("定期报告实际披露日期") and (not code or _same_security(r.get("证券代码"), code))
+                              and (report_period_from_fields(r)[0] or disclosure_period) == actual
+                              and (not disclosure_period or disclosure_period == actual)), None)
             candidates.append(AnchorReading(
                 "ifind", number, caliber=caliber_from_label(field, col),
                 period=actual if field in _PERIOD_FIELDS else None, period_basis=basis if field in _PERIOD_FIELDS else "unknown",
@@ -504,6 +512,9 @@ class IfindFetcher:
         return cls._instance
 
     def query(self, tool: str, question: str, *, deadline: float | None = None) -> IfindData:
+        from src.core.research_run import current_research, ResearchStopped
+        if run := current_research.get():
+            run.check()
         if not self.available:
             raise SourceReadError("ifind", "invalid_configuration")
         timeout = min(self._timeout, deadline - monotonic()) if deadline is not None else self._timeout
@@ -512,11 +523,18 @@ class IfindFetcher:
         try:
             raw = asyncio.run(asyncio.wait_for(self._async_query(tool, question, deadline=deadline), timeout))
             return _ifind_data(raw)
+        except ResearchStopped:
+            raise
         except Exception as exc:
+            if run := current_research.get():
+                run.check()
             raise SourceReadError("ifind", source_failure_reason(exc)) from None
 
     async def _async_query(self, tool: str, question: str, *, deadline: float | None = None) -> object:
         from src.services.mcp_client import call_mcp_tool
+        from src.core.research_run import current_research
+        if run := current_research.get():
+            run.check()
         result = await call_mcp_tool(self._endpoint, self._token, tool, {"query": question}, timeout_seconds=self._timeout, deadline=deadline)
         if getattr(result, "is_error", getattr(result, "isError", False)):
             raise SourceReadError("ifind", "business_error")
@@ -529,7 +547,10 @@ class IfindFetcher:
         raise SourceReadError("ifind", "invalid_response")
 
     def financial_snapshot(self, code: str, period: str | None, *, deadline: float) -> dict[str, AnchorReading]:
-        query = f"{code} 报告期{period or '最新已披露财期'}，合并报表(调整)：营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率。明确实际报告期、单位、币种、报表类型、调整口径、实际披露日期；无数据请保留空值，不推算。"
+        from data_provider.choice_adapter import ChoiceAdapter
+        today = date.today()
+        target = f"报告期{period}" if period else f"查询{date(today.year - 1, today.month, 1)}至{today}每个报告期"
+        query = f"{ChoiceAdapter.stock_code(code)} {target}的营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率，合并报表（调整）。结果每行列出证券代码、实际报告期，未披露期不输出；同时查询各期定期报告实际披露日期。明确单位、币种、报表类型、调整口径；无数据请保留空值，不推算。"
         data = self.query("get_stock_financials", query, deadline=deadline)
         raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
         readings = {}
@@ -632,8 +653,11 @@ class IfindSource:
             return None
         if field not in _IFIND_ANCHOR_QUERIES:
             return None
+        from src.core.research_run import ResearchStopped
         try:
             reading = self._fetcher.fetch(code, field, period, **({"deadline": deadline} if deadline is not None else {}))
+        except ResearchStopped:
+            raise
         except Exception as exc:  # noqa: BLE001 — fail-open
             logger.debug("[IfindSource] read %s/%s failed: %s", code, field, source_failure_reason(exc))
             raise SourceReadError("ifind", source_failure_reason(exc)) from None

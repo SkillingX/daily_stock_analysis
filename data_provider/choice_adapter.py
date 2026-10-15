@@ -196,10 +196,19 @@ class ChoiceAdapter:
 
     @classmethod
     def _native_request(cls, method: Literal["css", "csd", "tradedates"], args: tuple[str, ...], options: str, deadline: float) -> object:
-        remaining = deadline - monotonic()
-        if remaining <= 0 or not cls._lock.acquire(timeout=max(0.0, remaining)):
-            raise SourceReadError(cls.name, "timeout")
+        from src.core.research_run import current_research, ResearchStopped
+        run = current_research.get()
+        while True:
+            if run is not None:
+                run.check()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise SourceReadError(cls.name, "timeout")
+            if cls._lock.acquire(timeout=min(0.05, remaining) if run is not None else remaining):
+                break
         try:
+            if run is not None:
+                run.check()
             if deadline <= monotonic():
                 raise SourceReadError(cls.name, "timeout")
             if cls._process is None or not cls._process.is_alive():
@@ -211,6 +220,10 @@ class ChoiceAdapter:
                 cls._process.start()
                 child.close()
             assert cls._connection is not None
+            if run is not None:
+                run.check()
+            if deadline <= monotonic():
+                raise SourceReadError(cls.name, "timeout")
             cls._connection.send((method, args, options, max(0.0, deadline - monotonic())))
             if not cls._connection.poll(max(0.0, deadline - monotonic())):
                 cls.close()
@@ -219,6 +232,8 @@ class ChoiceAdapter:
             if isinstance(payload, dict) and payload.get("error") == "authentication_failed":
                 cls.close()
             return payload
+        except ResearchStopped:
+            raise
         except (EOFError, BrokenPipeError, OSError) as exc:
             cls.close()
             raise SourceReadError(cls.name, "source_error") from exc
@@ -226,6 +241,9 @@ class ChoiceAdapter:
             cls._lock.release()
 
     def query(self, method: Literal["css", "csd", "tradedates"], args: tuple[str, ...], options: str, *, deadline: float) -> NativeReply:
+        from src.core.research_run import current_research
+        if run := current_research.get():
+            run.check()
         remaining = int(deadline - monotonic())
         if remaining < 1:
             raise SourceReadError(self.name, "timeout")
@@ -307,73 +325,80 @@ class ChoiceAdapter:
     def snapshot(self, code: str, *, deadline: float) -> dict[str, Any]:
         today = date.today()
         out: dict[str, Any] = {"growth": {}, "valuation": {}, "field_meta": {}, "errors": [], "contract": self.contract_version}
+        from src.core.research_run import ResearchStopped
         report, disclosure, trade_day = None, None, None
         try:
-            header = self.css(code, "NAME,LATESTREPORTNEW", f"EndDate={today}", deadline=deadline)
-            out["stock_name"] = header.get("NAME")
-            if header.get("LATESTREPORTNEW"):
-                report = self.report_date(header["LATESTREPORTNEW"])
-            else:
-                out["errors"].append("choice:period_unknown")
-        except SourceReadError as exc:
-            out["errors"].append(str(exc))
-        if report is not None:
             try:
-                fields = self.css(code, "OPERATEREVENEW,PARENTNETPROFITNEW,ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
-                if fields.get("ACTUALISSUINGDATE"):
-                    disclosure = self.report_date(fields["ACTUALISSUINGDATE"])
-                for field, indicator, caliber in (("roe", "ROEWA", "weighted_roe"), ("gross_margin", "GPMARGIN", "gross_margin"), ("revenue_yoy", "YOYOR", "operating_revenue_yoy"), ("net_profit_yoy", "YOYPNI", "parent_net_profit_yoy")):
-                    self._adopt(out, "growth", field, fields.get(indicator), "percentage_point", caliber, report, disclosure, "restated", indicator,
-                                None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
-                for field, indicator, caliber in (("revenue", "OPERATEREVENEW", "operating_revenue"), ("net_profit", "PARENTNETPROFITNEW", "parent_net_profit")):
-                    self._adopt(out, "growth", field, fields.get(indicator), "currency_base", caliber, report, disclosure, "restated", indicator,
-                                None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
-                out["growth"].update(report_date=report, disclosure_date=disclosure)
+                header = self.css(code, "NAME,LATESTREPORTNEW", f"EndDate={today}", deadline=deadline)
+                out["stock_name"] = header.get("NAME")
+                if header.get("LATESTREPORTNEW"):
+                    report = self.report_date(header["LATESTREPORTNEW"])
+                else:
+                    out["errors"].append("choice:period_unknown")
             except SourceReadError as exc:
                 out["errors"].append(str(exc))
+            if report is not None:
+                try:
+                    fields = self.css(code, "OPERATEREVENEW,PARENTNETPROFITNEW,ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
+                    if fields.get("ACTUALISSUINGDATE"):
+                        disclosure = self.report_date(fields["ACTUALISSUINGDATE"])
+                    for field, indicator, caliber in (("roe", "ROEWA", "weighted_roe"), ("gross_margin", "GPMARGIN", "gross_margin"), ("revenue_yoy", "YOYOR", "operating_revenue_yoy"), ("net_profit_yoy", "YOYPNI", "parent_net_profit_yoy")):
+                        self._adopt(out, "growth", field, fields.get(indicator), "percentage_point", caliber, report, disclosure, "restated", indicator,
+                                    None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
+                    for field, indicator, caliber in (("revenue", "OPERATEREVENEW", "operating_revenue"), ("net_profit", "PARENTNETPROFITNEW", "parent_net_profit")):
+                        self._adopt(out, "growth", field, fields.get(indicator), "currency_base", caliber, report, disclosure, "restated", indicator,
+                                    None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
+                    out["growth"].update(report_date=report, disclosure_date=disclosure)
+                except SourceReadError as exc:
+                    out["errors"].append(str(exc))
+                try:
+                    balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
+                    disclosed = self.report_date(balance["ACTUALISSUINGDATE"]) if balance.get("ACTUALISSUINGDATE") else None
+                    if disclosed and report < disclosed <= today.isoformat():
+                        out["growth"]["balance_sheet"] = {"assets": self.number(balance.get("SUMASSETNEW")), "liabilities": self.number(balance.get("SUMLIABNEW")), "period": report, "disclosed_at": disclosed, "source": "choice", "currency": "CNY", "unit": "currency_base", "statement_scope": "consolidated", "adjustment": "restated"}
+                    else:
+                        out["errors"].append("choice:balance_sheet:disclosure_unknown")
+                except SourceReadError as exc:
+                    out["errors"].append(f"choice:balance_sheet:{exc.reason_code}")
             try:
-                balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
-                disclosed = self.report_date(balance["ACTUALISSUINGDATE"]) if balance.get("ACTUALISSUINGDATE") else None
-                if disclosed and report < disclosed <= today.isoformat():
-                    out["growth"]["balance_sheet"] = {"assets": self.number(balance.get("SUMASSETNEW")), "liabilities": self.number(balance.get("SUMLIABNEW")), "period": report, "disclosed_at": disclosed, "source": "choice", "currency": "CNY", "unit": "currency_base", "statement_scope": "consolidated", "adjustment": "restated"}
-                else:
-                    out["errors"].append("choice:balance_sheet:disclosure_unknown")
+                end = self.completed_day()
+                dates = self.trading_dates(end - timedelta(days=14), end, deadline=deadline)
+                if not dates:
+                    raise SourceReadError(self.name, "calendar_unavailable")
+                trade_day = dates[-1]
+                fields = self.css(code, "PETTM,PB,MV", f"TradeDate={trade_day},EndDate={trade_day},type=8,AdjustFlag=1", deadline=deadline)
+                for field, indicator, caliber in (("pe_ratio", "PETTM", "TTM"), ("pb_ratio", "PB", "MRQ"), ("total_mv", "MV", "total_market_cap")):
+                    self._adopt(out, "valuation", field, fields.get(indicator), "currency_base" if field == "total_mv" else "multiple", caliber, None, trade_day, "unadjusted", indicator)
+                out["valuation"]["trade_date"] = trade_day
             except SourceReadError as exc:
-                out["errors"].append(f"choice:balance_sheet:{exc.reason_code}")
-        try:
-            end = self.completed_day()
-            dates = self.trading_dates(end - timedelta(days=14), end, deadline=deadline)
-            if not dates:
-                raise SourceReadError(self.name, "calendar_unavailable")
-            trade_day = dates[-1]
-            fields = self.css(code, "PETTM,PB,MV", f"TradeDate={trade_day},EndDate={trade_day},type=8,AdjustFlag=1", deadline=deadline)
-            for field, indicator, caliber in (("pe_ratio", "PETTM", "TTM"), ("pb_ratio", "PB", "MRQ"), ("total_mv", "MV", "total_market_cap")):
-                self._adopt(out, "valuation", field, fields.get(indicator), "currency_base" if field == "total_mv" else "multiple", caliber, None, trade_day, "unadjusted", indicator)
-            out["valuation"]["trade_date"] = trade_day
-        except SourceReadError as exc:
-            out["errors"].append(str(exc))
+                out["errors"].append(str(exc))
+            out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
+            for name, indicators, options in (
+                ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
+                ("company", "MAINBUSINESS,MAINPRODUCT,COMPROFILE,AHOLDER,AHOLDERTYPE", f"EndDate={today}"),
+                ("targets", "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180"),
+            ):
+                try:
+                    out["research"][name] = self.css(code, indicators, options, deadline=deadline)
+                except SourceReadError as exc:
+                    out["research"]["errors"].append(f"choice:{name}:{exc.reason_code}")
+            out["research"]["target_window_days"] = 180
+            if report and disclosure:
+                try:
+                    holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
+                    out["research"]["holders"] = {**holders, "period": report, "disclosed_at": disclosure,
+                                                  "note": "HOLDPCTR为前十名合计持股比例（%），不可分配为各股东比例"}
+                except SourceReadError as exc:
+                    out["research"]["errors"].append(f"choice:holders:{exc.reason_code}")
+        except ResearchStopped:
+            # A stopped run may still render completed, validated source facts.
+            pass
         out.update(as_of=trade_day, report_date=report, disclosure_date=disclosure)
-        out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
-        for name, indicators, options in (
-            ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
-            ("company", "MAINBUSINESS,MAINPRODUCT,COMPROFILE,AHOLDER,AHOLDERTYPE", f"EndDate={today}"),
-            ("targets", "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180"),
-        ):
-            try:
-                out["research"][name] = self.css(code, indicators, options, deadline=deadline)
-            except SourceReadError as exc:
-                out["research"]["errors"].append(f"choice:{name}:{exc.reason_code}")
-        out["research"]["target_window_days"] = 180
-        if report and disclosure:
-            try:
-                holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
-                out["research"]["holders"] = {**holders, "period": report, "disclosed_at": disclosure,
-                                              "note": "HOLDPCTR为前十名合计持股比例（%），不可分配为各股东比例"}
-            except SourceReadError as exc:
-                out["research"]["errors"].append(f"choice:holders:{exc.reason_code}")
+        out.setdefault("research", {"source": "choice", "as_of": today.isoformat(), "errors": []})
         return out
 
     def annual_reports(self, code: str, limit: int = 4, *, deadline: float) -> dict[str, Any]:
+        from src.core.research_run import ResearchStopped
         if not 1 <= limit <= 4:
             raise ValueError("Annual reports limit must be between one and four")
         today = date.today()
@@ -403,11 +428,15 @@ class ChoiceAdapter:
                 row = AnnualReport(report_date=report_date, disclosure_date=disclosure, **numbers).as_record()
                 out["years"].append(row)
                 out["errors"].extend(f"choice:{report_date}:{reason}" for reason in row.get("errors") or [])
+            except ResearchStopped:
+                break
             except SourceReadError as error:
                 out["errors"].append(f"choice:{report_date}:{error.reason_code}")
                 if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "timeout"}:
                     break
-        out["status"] = "ok" if len(out["years"]) == limit and not out["errors"] and all(row.get(field) is not None for row in out["years"] for field in mapping) else "partial"
+        from src.core.research_run import current_research
+        run = current_research.get()
+        out["status"] = "ok" if not (run and (run.stop_reason or run.finalized or run.remaining() <= 0)) and len(out["years"]) == limit and not out["errors"] and all(row.get(field) is not None for row in out["years"] for field in mapping) else "partial"
         return out
 
     def _adopt(self, out: dict[str, Any], block: str, field: str, value: object, unit: Literal["currency_base", "percentage_point", "multiple"], caliber: str, period: str | None, observed: str | None, adjustment: str, indicator: str, error: str | None = None) -> None:
