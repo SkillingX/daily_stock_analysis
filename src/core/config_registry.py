@@ -3285,6 +3285,17 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         ],
         "warning_codes": [],
     },
+    "DEEP_RESEARCH_TIMEOUT_SECONDS": {
+        "title": "深度投研报告总时限",
+        "description": "完整报告的有限总预算，包含取数、模型排队、研究和收尾；到期保存有效资料为部分报告。单位秒，保存后重启生效。",
+        "category": "system", "data_type": "number", "ui_control": "number",
+        "is_sensitive": False, "is_required": False, "is_editable": True,
+        "default_value": "2400", "options": [], "validation": {"min": 1},
+        "display_order": 48, "help_key": "settings.system.market_review",
+        "examples": ["DEEP_RESEARCH_TIMEOUT_SECONDS=2400"],
+        "docs": [{"label": "深度投研配置", "href": "https://github.com/SkillingX/daily_stock_analysis/blob/main/docs/deep-research.md"}],
+        "warning_codes": ["restart_required"],
+    },
     "DEEP_RESEARCH_LLM_CONCURRENCY": {
         "title": "进程内模型并发上限",
         "description": "同一后端进程所有模块共享的实际模型请求上限；流式持有到关闭。正整数，保存后重启生效。独立CLI、调度和其他后端进程分别计数。",

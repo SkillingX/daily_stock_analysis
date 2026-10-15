@@ -89,6 +89,18 @@ Confidence = Literal["高", "中", "低"]
 # ---------------------------------------------------------------------------
 
 
+class RetainedEvidence(BaseModel):
+    """A retrieved reference retained when model research could not finish."""
+
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    tool: Annotated[str, Field(min_length=1, max_length=100)]
+    title: Annotated[str, Field(min_length=1, max_length=300)]
+    url: Annotated[str, Field(pattern=r"^https?://[^\s]+$", max_length=2000)]
+    source: Annotated[str, Field(min_length=1, max_length=160)]
+    snippet: Annotated[str, Field(max_length=1000)] = ""
+    published_date: Annotated[str, Field(max_length=40)] = ""
+
+
 class DimEnvelope(BaseModel):
     """每个维度产出的统一信封。"""
 
@@ -98,6 +110,7 @@ class DimEnvelope(BaseModel):
     status: DimStatus = "ok"
     as_of: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     degraded_reason: Optional[str] = None
+    retained_evidence: list[RetainedEvidence] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:

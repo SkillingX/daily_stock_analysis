@@ -166,6 +166,9 @@ def normalize_a_share(raw_code: str) -> str:
     return normalized
 
 
+from src.core.research_run import ResearchRun, current_research
+
+
 class DeepResearchService:
     """深度投研报告编排服务（无状态，方法可独立调用）。"""
 
@@ -174,6 +177,21 @@ class DeepResearchService:
     # ------------------------------------------------------------------
 
     def generate_report(
+        self, raw_code: str, raw_name: Optional[str] = None, report_type: str = "deep",
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        dims: Optional[List[str]] = None, force_refresh: bool = False,
+        run: Optional["ResearchRun"] = None,
+    ) -> Dict[str, Any]:
+        from src.core.research_run import ResearchRun
+        run = run or ResearchRun(get_config().deep_research_timeout_seconds)
+        run.progress = progress_callback
+        with run.bind():
+            try:
+                return self._generate_report(raw_code, raw_name, report_type, progress_callback, dims, force_refresh)
+            finally:
+                run.finish()
+
+    def _generate_report(
         self,
         raw_code: str,
         raw_name: Optional[str] = None,
@@ -187,9 +205,10 @@ class DeepResearchService:
         dims：维度子集（省钱模式），None/空 = 全部；force_refresh：跳过维度缓存。
         30min 内同一股票重复查询直接返回缓存（报告完全一致）。
         """
+        run = current_research.get()
         code = normalize_a_share(raw_code)
         name = (raw_name or "").strip()
-        if not name:
+        if not name and (run is None or (run.stop_reason is None and run.remaining() > 0)):
             # 前端未传名称时反查真实中文名，避免元数据 stock_name 退化成代码
             name = _lookup_stock_name(code) or code
 
@@ -286,6 +305,8 @@ class DeepResearchService:
 
         # 写 Markdown 文件（即使 partial 也写，保证有产物）
         markdown = result.markdown or ""
+        if markdown and run is not None and run.stop_reason:
+            markdown = f"> 本次研究结束原因：{run.reason_text}。已取得的有效资料保留如下。\n\n" + markdown
         write_ok = False
         if markdown:
             try:
@@ -309,6 +330,8 @@ class DeepResearchService:
                         {
                             "report_id": report_id,
                             "engine": "dual_track",
+                            "run_id": run.run_id if run is not None else None,
+                            "end_reason": run.stop_reason if run is not None else None,
                             "guardrail_events": guardrail_events,
                             "dimensions": dims_payload,
                         },
@@ -343,6 +366,8 @@ class DeepResearchService:
         markdown = normalize_saved_markdown(markdown)
         done_event: Dict[str, Any] = {
             "type": "done",
+            "run_id": run.run_id if run is not None else None,
+            "end_reason": run.stop_reason if run is not None else None,
             "report_id": report_id if write_ok else None,
             "status": result.status,
             "quality_score": result.quality_score,
@@ -361,6 +386,8 @@ class DeepResearchService:
             progress_callback(done_event)
 
         return_dict: Dict[str, Any] = {
+            "run_id": run.run_id if run is not None else None,
+            "end_reason": run.stop_reason if run is not None else None,
             "report_id": report_id if write_ok else None,
             "stock_code": code,
             "stock_name": name,
@@ -421,6 +448,11 @@ class DeepResearchService:
         except OSError as exc:
             logger.warning("[DeepResearch] 读取报告正文失败 %s: %s", record.md_path, exc)
         data["markdown"] = normalize_saved_markdown(markdown)
+        payload = self.get_dims_payload(report_id)
+        if payload is not None:
+            for key in ("engine", "dimensions", "guardrail_events", "run_id", "end_reason"):
+                if key in payload:
+                    data[key] = payload[key]
         return data
 
     def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:

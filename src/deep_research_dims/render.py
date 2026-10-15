@@ -541,6 +541,7 @@ def build_view(
     ]
 
     return {
+        "retained_evidence": {key: [entry.model_dump() for entry in value.retained_evidence] for key, value in dims.items() if getattr(value, "retained_evidence", None)},
         "stock_name": stock_name,
         "stock_code": stock_code,
         "as_of": as_of,
@@ -684,7 +685,19 @@ def render_markdown(
     env.filters["cn"] = _format_cn
     env.filters["holder"] = _format_holder
     template = env.get_template(template_name or _TEMPLATE_NAME)
-    return _zh_polish(template.render(**view))
+    markdown = _zh_polish(template.render(**view))
+    # Retrieved references remain separate from model conclusions and scoring.
+    retained = view.get("retained_evidence") or {}
+    if retained:
+        lines = ["\n\n## 已取得的参考资料\n", "以下资料已检索到，但相关模型研究或核验尚未完成；不据此补造结论。\n"]
+        for dim_id, items in retained.items():
+            lines.append(f"\n### {dim_id}\n")
+            for item in items:
+                title = str(item["title"]).replace("[", "（").replace("]", "）")
+                url = str(item["url"]).replace(")", "%29").replace("(", "%28")
+                lines.append(f"- [{title}]({url})（{item['source']}）：{item['snippet']}")
+        markdown += "\n".join(lines) + "\n"
+    return markdown
 
 
 def validate_structure(markdown: str) -> List[str]:

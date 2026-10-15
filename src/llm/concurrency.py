@@ -10,6 +10,8 @@ from contextvars import ContextVar
 from time import monotonic
 from typing import Any
 
+from src.core.research_run import current_research, research_dimension
+
 logger = logging.getLogger(__name__)
 _init_lock = threading.Lock()
 _slots: threading.BoundedSemaphore | None = None
@@ -32,6 +34,9 @@ def _get_slots() -> threading.BoundedSemaphore:
 
 
 def _remaining(deadline: float | None) -> float | None:
+    run = current_research.get()
+    if run is not None:
+        run.check()
     if deadline is None:
         return None
     remaining = deadline - monotonic()
@@ -42,7 +47,12 @@ def _remaining(deadline: float | None) -> float | None:
 
 def _deadline(kwargs: dict[str, Any]) -> float | None:
     timeout = kwargs.get("timeout")
-    return monotonic() + timeout if isinstance(timeout, (int, float)) else None
+    deadline = monotonic() + timeout if isinstance(timeout, (int, float)) else None
+    run = current_research.get()
+    if run is not None:
+        run.check()
+        deadline = min(deadline, run.deadline) if deadline is not None else run.deadline
+    return deadline
 
 
 class _LimitedStream(Iterator[Any]):
@@ -88,7 +98,14 @@ def _start_request(slots: threading.BoundedSemaphore, kwargs: dict[str, Any], qu
     with _init_lock:
         _in_flight += 1
         active = _in_flight
-    logger.info("[ModelRequest] start active=%d queue_seconds=%.3f model=%s", active, started - queued_at, kwargs.get("model"))
+    run = current_research.get()
+    identity = run.run_id if run is not None else ""
+    dim = research_dimension.get()
+    if run is not None:
+        run.emit({"type": "model_start", "queue_seconds": started - queued_at})
+    messages = kwargs.get("messages") or []
+    input_chars = sum(len(str(message.get("content") or "")) for message in messages if isinstance(message, dict))
+    logger.info("[ModelRequest] start run=%s dim=%s active=%d queue_seconds=%.3f input_chars=%d model=%s", identity, dim, active, started - queued_at, input_chars, kwargs.get("model"))
 
     def release() -> None:
         global _in_flight
@@ -96,7 +113,9 @@ def _start_request(slots: threading.BoundedSemaphore, kwargs: dict[str, Any], qu
             _in_flight -= 1
             active = _in_flight
         slots.release()
-        logger.info("[ModelRequest] end active=%d model_seconds=%.3f model=%s", active, monotonic() - started, kwargs.get("model"))
+        if run is not None:
+            run.emit({"type": "model_done", "model_seconds": monotonic() - started, "dim": dim})
+        logger.info("[ModelRequest] end run=%s dim=%s active=%d model_seconds=%.3f model=%s", identity, dim, active, monotonic() - started, kwargs.get("model"))
 
     return release
 
@@ -108,8 +127,12 @@ def limited_completion(call: Callable[..., Any], **kwargs: Any) -> Any:
     started = monotonic()
     deadline = _deadline(kwargs)
     slots = _get_slots()
-    if not slots.acquire(timeout=_remaining(deadline)):
-        raise ModelQueueTimeout("等待模型额度超时，尚未发送模型请求")
+    if run := current_research.get():
+        run.emit({"type": "model_queued"})
+    while True:
+        remaining = _remaining(deadline)
+        if slots.acquire(timeout=min(0.05, remaining) if remaining is not None else 0.05):
+            break
     stream_owned = False
     release = slots.release
     token = _admitted.set(True)
@@ -117,6 +140,9 @@ def limited_completion(call: Callable[..., Any], **kwargs: Any) -> Any:
         remaining = _remaining(deadline)
         if remaining is not None:
             kwargs["timeout"] = remaining
+        if current_research.get() is not None:
+            from src.config import get_config
+            kwargs["timeout"] = min(float(kwargs["timeout"]), get_config().llm_stream_response_timeout)
         release = _start_request(slots, kwargs, started)
         response = call(**kwargs)
         if kwargs.get("stream"):
@@ -142,6 +168,9 @@ async def limited_acompletion(call: Callable[..., Awaitable[Any]], **kwargs: Any
         remaining = _remaining(deadline)
         if remaining is not None:
             kwargs["timeout"] = remaining
+        if current_research.get() is not None:
+            from src.config import get_config
+            kwargs["timeout"] = min(float(kwargs["timeout"]), get_config().llm_stream_response_timeout)
         release = _start_request(slots, kwargs, started)
         return await call(**kwargs)
     finally:

@@ -158,7 +158,14 @@ class ToolRegistry:
                 f"Tool '{name}' not found in registry. Available: {self.list_names()}"
             )
 
-        return tool_def.handler(**kwargs)
+        from src.core.research_run import current_research
+        run = current_research.get()
+        if run is not None:
+            run.check()
+        result = tool_def.handler(**kwargs)
+        if run is not None:
+            run.retain(name, result)
+        return result
 
 
 # ============================================================

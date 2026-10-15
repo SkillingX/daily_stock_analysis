@@ -56,10 +56,24 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                             continue
                     return
                 time.sleep(0.2)
+                if state.get("research_mode") == 1 and any(message.get("role") == "tool" for message in request.get("messages", [])):
+                    body = b'{"error":{"message":"controlled provider failure","type":"server_error"}}'
+                    self.send_response(500)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if state.get("research_mode") == 2:
+                    time.sleep(0.6)
+                message: dict[str, Any] = {"role": "assistant", "content": '{"status":"ok"}'}
+                finish = "stop"
+                if state.get("research_mode") == 1:
+                    message = {"role": "assistant", "content": None, "tool_calls": [{"id": "search-1", "type": "function", "function": {"name": "search_comprehensive_intel", "arguments": '{"stock_code":"600519","stock_name":"样本"}'}}]}
+                    finish = "tool_calls"
                 body = json.dumps({
                     "id": "fixture", "object": "chat.completion", "created": 0,
-                    "model": "fixture", "choices": [{"index": 0, "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": '{"status":"ok"}'}}],
+                    "model": "fixture", "choices": [{"index": 0, "finish_reason": finish,
+                    "message": message}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
                 }).encode()
                 self.send_response(200)

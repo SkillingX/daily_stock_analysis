@@ -541,6 +541,8 @@ def run_agent_loop(
         A :class:`RunLoopResult` with the final content, stats, and the
         (mutated) messages list.
     """
+    from src.core.research_run import current_research
+    research_run = current_research.get()
     labels = thinking_labels or _THINKING_TOOL_LABELS
     tool_decls = tool_registry.to_openai_tools()
 
@@ -559,6 +561,10 @@ def run_agent_loop(
     _MIN_STEP_BUDGET_S = 8.0
 
     for step in range(max_steps):
+        if research_run is not None and (research_run.stop_reason or research_run.remaining() <= 0):
+            research_run.stop(research_run.stop_reason or "report_budget")
+            return RunLoopResult(success=False, error=research_run.reason_text, messages=messages,
+                                 total_steps=step, tool_calls_log=tool_calls_log)
         remaining_timeout = _remaining_timeout_seconds(
             start_time, max_wall_clock_seconds
         )
@@ -844,6 +850,7 @@ def _execute_tools(
     """
 
     from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+    from src.core.research_run import current_research
 
     if tool_wait_timeout_seconds is not None:
         eastmoney_patch(budget_only=True)
@@ -924,6 +931,8 @@ def _execute_tools(
             ctx = contextvars.copy_context()
             try:
                 future = pool.submit(ctx.run, _exec_single, tc)
+                if research_run := current_research.get():
+                    research_run.track(future)
                 try:
                     _, result_str, success, dur, cached, guard_result = future.result(
                         timeout=tool_wait_timeout_seconds
@@ -1005,6 +1014,9 @@ def _execute_tools(
                 pool.submit(contextvars.copy_context().run, _exec_single, tc): tc
                 for tc in tool_calls
             }
+            if research_run := current_research.get():
+                for future in futures:
+                    research_run.track(future)
             pending = set(futures)
             for future in as_completed(
                 futures,
