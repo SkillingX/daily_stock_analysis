@@ -130,7 +130,7 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                     if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
                         continue
                     dims = json.loads(full.get("dims_json") or "{}")
-                    if (dims.get("business") or {}).get("status") == "degraded":
+                    if contract != "legacy" and (dims.get("business") or {}).get("status") == "degraded":
                         continue
                     financial = dims.get("financial") or {}
                     if contract != "legacy" and any(field.get("source_errors") for field in (financial.get("financial_snapshot") or {}).values()):

@@ -31,6 +31,7 @@ def vendor_runtime(ifind_transport, monkeypatch, tmp_path):
 
     config, response, calls = ifind_transport
     config.financial_primary_source = "ifind"
+    monkeypatch.setattr(explore_agents, "get_config", lambda: config)
     native = ChoiceAdapter._native_request
 
     def sdk(method, args, options, deadline):
