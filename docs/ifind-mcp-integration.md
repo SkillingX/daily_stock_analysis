@@ -49,7 +49,7 @@ IFIND_MCP_TIMEOUT_SECONDS=30
 
 上线顺序：先提供上述部署配置及现有 Choice SDK/登录条件，更新代码或镜像，再重启实际 API、分析及调度进程；不要直接复制本机 `.env`。核对生效的主次/搜索/并发配置时只输出非敏感值，Token 和账号密码保持遮罩。启动成功后强刷普通企业及金融行业报告，检查采用源、实际财期、核验状态、有效明细、取消后无新请求及历史/下载一致；Choice 回退可用不等于 iFinD 主源正向验收通过。
 
-回退数据源时设 `FINANCIAL_PRIMARY_SOURCE=choice`、`ENABLE_IFIND_MCP=false` 并重启；智谱搜索可独立恢复 `CODING_PLAN_SEARCH_PROVIDER=minimax`。若需回退代码，revert 对应 PR 并重启，无数据库迁移，原报告与凭据不清空。共享账号的另一端会话不会因代码回滚自动恢复。
+优先保留新代码，只回退配置：设 `FINANCIAL_PRIMARY_SOURCE=choice`、`ENABLE_IFIND_MCP=false` 并重启；智谱搜索可独立恢复 `CODING_PLAN_SEARCH_PROVIDER=minimax`。完整代码回滚会恢复旧版 Tavily 入口，必须保留 Tavily 退休变更，或先停用所有运行环境及 Actions 中的 `TAVILY_API_KEYS` 注入，再 revert 对应 PR 并重启；不能假定残留 Key 在旧代码中仍无效。无数据库迁移，原报告与其他凭据不清空。共享账号的另一端会话不会因代码回滚自动恢复。
 
 ---
 
