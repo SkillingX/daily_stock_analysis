@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [文档] 记录供应商对 iFinD 加权 ROE 不输出合并报表参数的说明，区分指标参数缺省、数值缺失与调整口径未知，不要求接口补造不存在的参数。
+
 - [文档] 明确 iFinD 常驻服务的持久配置：本机自动读取私有根 `.env`，生产使用部署环境或凭据配置，无需每次启动临时注入 token。
 
 - [修复] 保留 iFinD 主营分产品表的逐行换行，避免基本面及深度投研报告把多条产品记录合并为一行；回归覆盖保存后报告的实际表格行数。
