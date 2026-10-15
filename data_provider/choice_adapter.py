@@ -93,6 +93,8 @@ class AnnualReport(BaseModel):
 
 
 def _native_error(code: int, message: str) -> str:
+    if code in {10001001, 10001009, 10001011}:
+        return "authentication_failed"
     text = message.lower()
     if any(word in text for word in ("login", "password", "token", "expired", "reactivate", "认证", "登录", "激活")):
         return "authentication_failed"
@@ -127,7 +129,11 @@ def _serve_native(connection: Connection) -> None:
                     ):
                         connection.send({"error": "invalid_configuration"})
                         continue
-                    options_login = f"ForceLogin=0,RecordLoginInfo=0,HTTPTimeout={max(1, int(seconds))}"
+                    force_login = os.getenv("CHOICE_FORCE_LOGIN", "false").strip().lower() or "false"
+                    if force_login not in {"true", "false", "1", "0"}:
+                        connection.send({"error": "invalid_configuration"})
+                        continue
+                    options_login = f"ForceLogin={int(force_login in {'true', '1'})},RecordLoginInfo=0,HTTPTimeout={max(1, int(seconds))}"
                     if username and password:
                         options_login += f",UserName={username},PassWord={password}"
                     if sdk is None:
@@ -210,6 +216,8 @@ class ChoiceAdapter:
                 cls.close()
                 raise SourceReadError(cls.name, "timeout")
             payload: object = cls._connection.recv()
+            if isinstance(payload, dict) and payload.get("error") == "authentication_failed":
+                cls.close()
             return payload
         except (EOFError, BrokenPipeError, OSError) as exc:
             cls.close()

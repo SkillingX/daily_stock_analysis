@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [改进] Choice 支持默认关闭的强制登录配置，供共享测试账号错峰使用；认证失效释放本地会话，后续请求重新登录，保持凭据脱敏和既有超时边界。
+
 - [修复] 产品及股东明细经过深度投研护栏后，复用 JSON 严格契约校验恢复数值记录，避免字典与数据类不兼容导致重解析失败。
 
 - [改进] 停用 Tavily；支持显式复用智谱 Coding Plan Key 替代 MiniMax Web Search 对应位置，保留其他搜索工具顺序、失败回退和历史报告来源；设置接口脱敏只读 iFinD 与遗留 Tavily 凭据。
