@@ -120,6 +120,8 @@ class SystemConfigService:
         }
     }
     _SERVER_MASKED_CONFIG_KEYS: Set[str] = {
+        "CHOICE_USERNAME",
+        "CHOICE_PASSWORD",
         "ALPHASIFT_INSTALL_SPEC",
         "LLM_USAGE_HMAC_SECRET",
     }
@@ -375,7 +377,7 @@ class SystemConfigService:
     ) -> Dict[str, Any]:
         """Return display config values with mask metadata for server-masked fields."""
         saved_config_map = self._build_display_config_map(
-            self._manager.read_config_map()
+            self._manager.read_config_map(interpolate=False)
         )
         runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
         config_map = {
