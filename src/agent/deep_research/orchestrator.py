@@ -589,8 +589,10 @@ def _run_dual_track(
 
         def collect_researcher(fut: Future[Dict[str, Any]], dim_id: str) -> None:
             nonlocal steps_total
+            research = dict(ctx.fundamental.get("research") or {})
             try:
                 out = run.wait_for(fut) if run is not None else fut.result(timeout=600)
+                research.update(out.get("vendor_research") or {})
                 if out.get("ok"):
                     if dim_id == "intel":
                         dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))
@@ -609,6 +611,9 @@ def _run_dual_track(
                 dims[dim_id] = DIM_MODELS[dim_id](
                     status="degraded", degraded_reason=f"研究员异常: {exc}"
                 )
+            if run is not None:
+                research.update(run.vendor_research.get(dim_id, {}))
+            dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
             if run is not None and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
                 from src.schemas.deep_research_dims import parse_dim
                 payload = dims[dim_id].model_dump()
@@ -920,6 +925,34 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
     )
 
 
+def restore_vendor_facts(dim_id: str, dim: DimEnvelope, research: dict[str, Any]) -> DimEnvelope:
+    """Restore only supplier fields after failed research, keeping strict validation."""
+    from src.schemas.deep_research_dims import parse_dim
+    if dim_id not in {"business", "ownership"} or dim.status == "ok":
+        return dim
+    payload = dim.model_dump()
+    company = research.get("company") or {}
+    if dim_id == "business":
+        for field, key in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
+            if company.get(key):
+                payload[field] = {"value": company[key], "source": f"Choice {key}，截至 {research.get('as_of')}"}
+        if research.get("product_segments"):
+            payload["product_segments"] = research["product_segments"]
+    elif dim_id == "ownership":
+        if company.get("AHOLDER"):
+            payload["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
+        names = (research.get("holders") or {}).get("HOLDNAMER")
+        if isinstance(names, str) and names.strip():
+            payload["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {(research.get('holders') or {}).get('period')}"} for name in names.split(";") if name.strip()]
+        if research.get("shareholder_details"):
+            payload["shareholder_details"] = research["shareholder_details"]
+    try:
+        return parse_dim(dim_id, payload)
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.warning("Retained vendor evidence did not pass %s contract: %s", dim_id, type(exc).__name__)
+    return dim
+
+
 def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, selected: set[str], report_id: str | None) -> DualTrackResult:
     """Freeze completed results and render without starting any new model/tool work."""
     from datetime import datetime
@@ -951,29 +984,9 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
                 *(fact for fact in run.facts.get(dim_id, []) if fact not in existing_facts),
             ][-30:]
             dims[dim_id] = parse_dim(dim_id, payload)
-    for dim_id, research in run.vendor_research.items():
-        if dim_id not in selected or dims[dim_id].status == "ok":
-            continue
-        payload = dims[dim_id].model_dump()
-        company = research.get("company") or {}
-        if dim_id == "business":
-            for field, key in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
-                if company.get(key):
-                    payload[field] = {"value": company[key], "source": f"Choice {key}，截至 {research.get('as_of')}"}
-            if research.get("product_segments"):
-                payload["product_segments"] = research["product_segments"]
-        elif dim_id == "ownership":
-            if company.get("AHOLDER"):
-                payload["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
-            names = (research.get("holders") or {}).get("HOLDNAMER")
-            if isinstance(names, str) and names.strip():
-                payload["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {(research.get('holders') or {}).get('period')}"} for name in names.split(";") if name.strip()]
-            if research.get("shareholder_details"):
-                payload["shareholder_details"] = research["shareholder_details"]
-        try:
-            dims[dim_id] = parse_dim(dim_id, payload)
-        except (ValidationError, ValueError, TypeError) as exc:
-            logger.warning("Retained vendor evidence did not pass %s contract: %s", dim_id, type(exc).__name__)
+    for dim_id in selected & {"business", "ownership"}:
+        research = {**(ctx.fundamental.get("research") or {}), **run.vendor_research.get(dim_id, {})}
+        dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
     events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})
     dims = {key: parse_dim(key, value) for key, value in adjusted.items()}
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")

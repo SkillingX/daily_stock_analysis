@@ -412,6 +412,7 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
             out["data"]["shareholder_details"] = details
             if details.get("errors") or details.get("coverage") != "complete":
                 out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), "iFinD股东资料覆盖不完整", *(details.get("errors") or [])]))
+    out["vendor_research"] = research
     return out
 
 
@@ -483,4 +484,5 @@ def run_business_agent(
         out["data"]["product_segments"] = products
         if products.get("errors"):
             out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), *products["errors"]]))
+    out["vendor_research"] = research
     return out

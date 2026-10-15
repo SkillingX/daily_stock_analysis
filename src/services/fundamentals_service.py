@@ -12,7 +12,7 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional
 from uuid import uuid4
 from time import monotonic
 
@@ -65,7 +65,7 @@ def _position_text(business_payload: Dict[str, Any]) -> str:
 
 
 def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float] = None, force_refresh: bool = False, research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """跑一个研究员（带维度缓存），失败返回降级占位。"""
+    """跑一个研究员；失败时保留供应商事实，降级章节不写成功缓存。"""
     from src.deep_research.researchers import REGISTRY, RUNNER_NAMES
     import src.agent.deep_research.orchestrator as orch
 
@@ -82,16 +82,19 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
         except Exception:  # noqa: BLE001
             pass
     reason = "研究员不可用"
+    vendor_research = dict(research or {})
     try:
         runner = getattr(orch, RUNNER_NAMES[dim_id])
         from src.services.deep_research_service import _get_dual_track_adapter
         out = runner(code, name, _get_dual_track_adapter(), None, 8, deadline=deadline, **({"research": research} if dim_id == "business" else {}))
+        vendor_research.update(out.get("vendor_research") or {})
         if out.get("ok"):
             dim, _ = REGISTRY[dim_id].parser(out["data"], int(out.get("steps") or 0))
+            dim = orch.restore_vendor_facts(dim_id, dim, vendor_research)
             payload = dim.model_dump()
             if dim.status == "ok":
                 save_cached_dim(code, dim_id, payload)
-            return cast(Dict[str, Any], payload)
+            return payload
         error = str(out.get("error") or "")
         reason = "模型未成功完成研究，业务画像未完成"
         for marker, explanation in (("时限", "研究时限耗尽"), ("length", "模型输出被截断"),
@@ -101,7 +104,10 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
                 break
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
-    return cast(Dict[str, Any], {"dim": dim_id, "status": "degraded", "degraded_reason": reason})
+        reason = f"研究员异常: {exc}"
+    from src.schemas.deep_research_dims import DIM_MODELS
+    dim = orch.restore_vendor_facts(dim_id, DIM_MODELS[dim_id](status="degraded", degraded_reason=reason), vendor_research)
+    return dim.model_dump()
 
 
 def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
@@ -123,6 +129,8 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                     if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
                         continue
                     dims = json.loads(full.get("dims_json") or "{}")
+                    if (dims.get("business") or {}).get("status") == "degraded":
+                        continue
                     financial = dims.get("financial") or {}
                     if contract != "legacy" and any(field.get("source_errors") for field in (financial.get("financial_snapshot") or {}).values()):
                         continue
