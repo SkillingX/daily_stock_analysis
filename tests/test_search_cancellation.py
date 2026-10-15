@@ -73,9 +73,16 @@ def test_comprehensive_retains_successful_dimension_before_later_cancellation(mo
 
 
 def test_requests_dispatch_checks_cancellation_after_auth_preparation(monkeypatch):
+    import socket
     from src.patches import eastmoney_patch as patch
     run = ResearchRun(5)
     sent = []
+    # Install this test's real HTTP seam independently of earlier test ordering.
+    monkeypatch.setattr(patch, "_patch_sign", patch.PatchSign())
+    monkeypatch.setattr(patch, "original_request", patch.original_request)
+    monkeypatch.setattr(patch, "_read_budget_installed", patch._read_budget_installed)
+    monkeypatch.setattr(requests.Session, "request", requests.Session.request)
+    monkeypatch.setattr(socket.SocketIO, "readinto", socket.SocketIO.readinto)
     patch.eastmoney_patch(budget_only=True)
     monkeypatch.setattr(patch, "_auth_patch_enabled", True)
     monkeypatch.setattr(patch, "_get_nid", lambda *a: None)
