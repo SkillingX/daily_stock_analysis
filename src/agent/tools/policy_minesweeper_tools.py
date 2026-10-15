@@ -183,7 +183,7 @@ def _handle_search_company_announcements(
 ) -> Dict[str, Any]:
     """检索公司公告（腾讯证券/新浪证券/巨潮/交易所/公司官网），返回带原文地址的结果。
 
-    复用共享 ``SearchService`` 的 provider（配置 ``TAVILY_API_KEYS`` 等后可用），走其
+    复用共享 ``SearchService`` 的 provider（配置 ``SERPAPI_API_KEYS`` 等后可用），走其
     原生 ``.search()`` 保留一手公告源；每条结果含 ``url``（公告原文地址，可直接填入
     证据）与 ``is_official`` 标注。服务不可用或检索失败时返回 ``error``，α 据此标注
     「待核验」而非编造。
@@ -191,7 +191,7 @@ def _handle_search_company_announcements(
     provider = _pick_search_provider(_get_announcement_search_service())
     if provider is None:
         return {
-            "error": "搜索引擎不可用（未配置 TAVILY_API_KEYS 等），无法检索公司公告，请将相关判断标注「待核验」",
+            "error": "搜索引擎不可用（未配置 SERPAPI_API_KEYS 等），无法检索公司公告，请将相关判断标注「待核验」",
             "stock_code": stock_code,
         }
 
@@ -237,7 +237,7 @@ search_company_announcements_tool = ToolDefinition(
     description=(
         "检索一只 A 股的公司公告（来自腾讯证券/新浪证券/巨潮资讯/交易所/公司官网等），"
         "返回标题/摘要/**公告原文地址 url**/来源/日期，并标注是否一手披露源（is_official）。"
-        "用于『排雷 300750』『查 XX 最近公告/增发/回购/业绩预告』。配置 TAVILY_API_KEYS 后可用。"
+        "用于『排雷 300750』『查 XX 最近公告/增发/回购/业绩预告』。配置 SERPAPI_API_KEYS 后可用。"
     ),
     parameters=[
         ToolParameter(name="stock_code", type="string",

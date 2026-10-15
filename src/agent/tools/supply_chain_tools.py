@@ -287,14 +287,14 @@ def _handle_search_semianalysis(
 ) -> Dict[str, Any]:
     """检索 SemiAnalysis（semianalysis.com）半导体/AI 一级研究文章，返回带原文 url 的结果。
 
-    复用共享 ``SearchService`` 的 provider（配置 ``TAVILY_API_KEYS`` 等后可用），query
+    复用共享 ``SearchService`` 的 provider（配置 ``SERPAPI_API_KEYS`` 等后可用），query
     前缀 ``site:semianalysis.com`` 做站点限定；每条结果含 ``url``（可直接填入证据）。
     服务不可用 / 检索失败时返回 ``error``，agent 据此标注「待核验」而非编造。
     """
     provider = _pick_search_provider(_get_search_service())
     if provider is None:
         return {
-            "error": "搜索引擎不可用（未配置 TAVILY_API_KEYS 等），无法检索 SemiAnalysis，请将相关判断标注「待核验」",
+            "error": "搜索引擎不可用（未配置 SERPAPI_API_KEYS 等），无法检索 SemiAnalysis，请将相关判断标注「待核验」",
             "keywords": keywords,
         }
 
@@ -347,7 +347,7 @@ search_semianalysis_tool = ToolDefinition(
         "返回标题/摘要/**原文地址 url**/来源/日期。**半导体 / AI 主题必调**（芯片/SoC、HBM/存储、"
         "先进封装/CoWoS、光刻/设备/材料、晶圆代工、GPU/AI 加速卡、数据中心 AI 硬件、硅光子/CPO/"
         "薄膜铌酸锂、电源/散热等），按主题或卡点环节构造关键词（如『HBM3E supply』『CoWoS capacity』"
-        "『Blackwell GB200』『薄膜铌酸锂 CPO』）。配置 TAVILY_API_KEYS 后可用。"
+        "『Blackwell GB200』『薄膜铌酸锂 CPO』）。配置 SERPAPI_API_KEYS 后可用。"
     ),
     parameters=[
         ToolParameter(
@@ -416,7 +416,7 @@ def _handle_search_clue_hype(
 ) -> Dict[str, Any]:
     """跨国内财经媒体检索「供应链线索」，返回每源提及情况 + 题材炒作信号强度。
 
-    复用共享 ``SearchService`` provider（配置 ``TAVILY_API_KEYS`` 等后可用）。逐源用
+    复用共享 ``SearchService`` provider（配置 ``SERPAPI_API_KEYS`` 等后可用）。逐源用
     ``site:`` 限定（全网源不限）调用 ``provider.search()``；**单源异常/失败不拖垮整体**，
     该源计 0 提及、继续其它源。任一源提及线索即题材炒作加分项；提及源越多 hype_signal 越强。
     服务不可用时返回 ``error``，agent 据此标注「待核验」。
@@ -425,7 +425,7 @@ def _handle_search_clue_hype(
     provider = _pick_search_provider(_get_search_service())
     if provider is None:
         return {
-            "error": "搜索引擎不可用（未配置 TAVILY_API_KEYS 等），无法跨源检索线索，请将炒作信号标注「待核验」",
+            "error": "搜索引擎不可用（未配置 SERPAPI_API_KEYS 等），无法跨源检索线索，请将炒作信号标注「待核验」",
             "clue": clue_text,
         }
 

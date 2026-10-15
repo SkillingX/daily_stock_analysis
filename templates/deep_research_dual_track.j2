@@ -158,6 +158,7 @@
 {% if business.narrative %}{{ business.narrative }}{% else %}（基本面研究员未产出）{% endif %}
 {% if business.business_model %}- 经营模式：{{ business.business_model }}{% endif %}
 {% if business.main_products %}- 主营产品：{{ business.main_products }}{% endif %}
+{% if business.product_segments %}{% with products=business.product_segments %}{% include 'product_segments.j2' %}{% endwith %}{% endif %}
 {% if business.competitive_position %}- 行业地位：{{ business.competitive_position }}{% endif %}
 {% if business.vs_market_leader %}- 与龙头/大盘对比：{{ business.vs_market_leader }}{% endif %}
 
@@ -314,6 +315,7 @@
 
 {{ dim_links('ownership') }}
 {% if ownership.controller %}- 实际控制人：{{ ownership.controller }}{% endif %}
+{% if ownership.shareholder_details %}{% with holders=ownership.shareholder_details %}{% include 'shareholder_details.j2' %}{% endwith %}{% endif %}
 {% if ownership.top_holders %}
 **前十大股东**：
 {% for h in ownership.top_holders %}

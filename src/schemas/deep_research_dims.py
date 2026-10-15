@@ -30,6 +30,7 @@ from src.schemas.report_schema import (
     SniperPoints,
 )
 from src.schemas.research_framework import ResearchFramework
+from data_provider.ifind_fundamental_adapter import IfindShareholders, ProductSegments
 from src.schemas.supply_chain import SupplyChain
 from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
@@ -88,6 +89,31 @@ Confidence = Literal["高", "中", "低"]
 # ---------------------------------------------------------------------------
 
 
+class RetainedEvidence(BaseModel):
+    """A retrieved reference retained when model research could not finish."""
+
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    tool: Annotated[str, Field(min_length=1, max_length=100)]
+    title: Annotated[str, Field(min_length=1, max_length=300)]
+    url: Annotated[str, Field(pattern=r"^https?://[^\s]+$", max_length=2000)]
+    source: Annotated[str, Field(min_length=1, max_length=160)]
+    snippet: Annotated[str, Field(max_length=1000)] = ""
+    published_date: Annotated[str, Field(max_length=40)] = ""
+
+
+class RetainedFact(BaseModel):
+    """An acquired tool fact, separate from model scores and verified conclusions."""
+
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    tool: Annotated[str, Field(min_length=1, max_length=100)]
+    label: Annotated[str, Field(min_length=1, max_length=100)]
+    value: Annotated[str, Field(min_length=1, max_length=300)]
+    source: Annotated[str, Field(min_length=1, max_length=160)]
+    period: Annotated[str, Field(max_length=80)] = ""
+    unit: Annotated[str, Field(max_length=80)] = ""
+    qualification: Annotated[str, Field(max_length=300)] = ""
+
+
 class DimEnvelope(BaseModel):
     """每个维度产出的统一信封。"""
 
@@ -97,6 +123,8 @@ class DimEnvelope(BaseModel):
     status: DimStatus = "ok"
     as_of: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     degraded_reason: Optional[str] = None
+    retained_evidence: list[RetainedEvidence] = Field(default_factory=list)
+    retained_facts: list[RetainedFact] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -289,6 +317,8 @@ class FinancialFieldQuality(BaseModel):
     rule_eligible: bool = False
     input_reasons: tuple[str, ...] = ()
     selection_reason: str = "unknown"
+    comparison_readings: tuple[AnchorReading, ...] = ()
+    source_errors: tuple[str, ...] = ()
 
 
 class FinancialDataQuality(BaseModel):
@@ -311,6 +341,7 @@ class FundamentalDim(DimEnvelope):
 
     dim: Literal["fundamental"] = "fundamental"
     data_quality: Optional[FinancialDataQuality] = None
+    financial_snapshot: dict[str, FinancialFieldQuality] = Field(default_factory=dict)
     profitability: Dict[str, Any] = Field(default_factory=dict)
     growth_quality: Dict[str, Any] = Field(default_factory=dict)
     financial_safety: Dict[str, Any] = Field(default_factory=dict)
@@ -413,6 +444,7 @@ class OwnershipDim(DimEnvelope):
     dim: Literal["ownership"] = "ownership"
     controller: str = ""
     top_holders: List[HolderInfo] = Field(default_factory=list)
+    shareholder_details: IfindShareholders | None = None
     executives: List[HolderInfo] = Field(default_factory=list)
     recent_changes: List[HolderInfo] = Field(default_factory=list)
     data_gaps: List[str] = Field(default_factory=list)
@@ -430,6 +462,7 @@ class BusinessDim(DimEnvelope):
     dim: Literal["business"] = "business"
     business_model: Dict[str, Any] = Field(default_factory=dict)
     main_products: Dict[str, Any] = Field(default_factory=dict)
+    product_segments: ProductSegments | None = None
     competitive_position: Dict[str, Any] = Field(default_factory=dict)
     vs_market_leader: Dict[str, Any] = Field(default_factory=dict)
     score: Optional[float] = Field(None, ge=0, le=100)
@@ -479,7 +512,7 @@ def parse_dim(dim: str, payload: Dict[str, Any]) -> DimEnvelope:
     model = DIM_MODELS.get(dim)
     if model is None:
         raise ValueError(f"未知维度: {dim}")
-    return model.model_validate_json(to_json(payload)) if dim == "fundamental" else model.model_validate(payload)
+    return model.model_validate_json(to_json(payload)) if dim in {"fundamental", "business", "ownership"} else model.model_validate(payload)
 
 
 # ---------------------------------------------------------------------------

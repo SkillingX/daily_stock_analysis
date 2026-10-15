@@ -23,14 +23,16 @@ import time
 from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Callable, Optional, List, Tuple, Dict, Any, cast
+from typing import Literal, Callable, Optional, List, Tuple, Dict, Any, cast
 
 import pandas as pd
 import numpy as np
 from icontract import require, ensure
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+from src.core.research_run import current_research, ResearchStopped
 from src.services.run_diagnostics import (
     record_provider_run,
     record_provider_run_started,
@@ -797,12 +799,24 @@ class DataFetcherManager:
             return lock
 
     def _call_fetcher_method(
-        self, fetcher: BaseFetcher, method_name: str, *args, **kwargs
-    ):
+        self, fetcher: BaseFetcher, method_name: str, *args: Any, **kwargs: Any
+    ) -> Any:
         """Serialize shared fetcher state access through manager-owned per-instance locks."""
+        run = current_research.get()
         method = getattr(fetcher, method_name)
-        with self._get_fetcher_call_lock(fetcher):
+        lock = self._get_fetcher_call_lock(fetcher)
+        if run is None:
+            with lock:
+                return method(*args, **kwargs)
+        while True:
+            run.check()
+            if lock.acquire(timeout=min(0.05, run.remaining())):
+                break
+        try:
+            run.check()
             return method(*args, **kwargs)
+        finally:
+            lock.release()
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -1450,6 +1464,8 @@ class DataFetcherManager:
                         )
                         if df is not None and df.empty:
                             self._record_daily_source_success(fetcher, market)
+                    except ResearchStopped:
+                        raise
                     except Exception as e:
                         error_type, error_reason = summarize_exception(e)
                         error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
@@ -1537,6 +1553,8 @@ class DataFetcherManager:
                 if df is not None and df.empty:
                     self._record_daily_source_success(fetcher, market)
 
+            except ResearchStopped:
+                raise
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
@@ -2038,6 +2056,10 @@ class DataFetcherManager:
                     if primary_quote is None:
                         failed_sources.append(source)
 
+            except ResearchStopped:
+                if primary_quote is not None:
+                    break
+                raise
             except Exception as e:
                 error_msg = f"[{source}] 失败: {str(e)}"
                 error_type, error_reason = summarize_exception(e)
@@ -2182,6 +2204,8 @@ class DataFetcherManager:
                 error_message="empty or incomplete quote",
                 record_count=0,
             )
+        except ResearchStopped:
+            raise
         except Exception as e:
             error_type, error_reason = summarize_exception(e)
             record_provider_run(
@@ -2329,6 +2353,8 @@ class DataFetcherManager:
                         )
                     # 空结果或占位结果：释放 HALF_OPEN 探测名额，避免卡死
                     circuit_breaker.record_inconclusive(source_key)
+            except ResearchStopped:
+                raise
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 record_provider_run(
@@ -2429,6 +2455,8 @@ class DataFetcherManager:
                         f"[股票名称] 从 {fetcher.name} 获取: {stock_code} -> {name}"
                     )
                     return name
+            except ResearchStopped:
+                raise
             except Exception as e:
                 logger.debug(f"[股票名称] {fetcher.name} 获取失败: {e}")
                 continue
@@ -2716,6 +2744,10 @@ class DataFetcherManager:
             (result, error, duration_ms)
         """
         start = time.time()
+        from src.core.research_run import current_research, ResearchStopped
+        run = current_research.get()
+        if run is not None:
+            run.check()
         timeout_value = max(0.0, timeout_seconds)
         if timeout_value <= 0:
             return None, f"{task_name} timeout", 0
@@ -2724,6 +2756,8 @@ class DataFetcherManager:
         deadline = time.monotonic() + timeout_value
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
+        from concurrent.futures import Future
+        completion: Future[None] | None = Future() if run is not None else None
 
         if not self._fundamental_timeout_slots.acquire(blocking=False):
             return (
@@ -2731,10 +2765,14 @@ class DataFetcherManager:
                 f"{task_name} timeout worker pool exhausted",
                 int(timeout_value * 1000),
             )
+        if run is not None and completion is not None:
+            run.track(completion)
 
         def runner() -> None:
             token = request_deadline.set(deadline)
             try:
+                if run is not None:
+                    run.check()
                 result_holder["value"] = task()
             except Exception as exc:
                 error_holder["value"] = exc
@@ -2744,6 +2782,8 @@ class DataFetcherManager:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
                     pass
+                if completion is not None:
+                    completion.set_result(None)
 
         worker = Thread(target=copy_context().run, args=(runner,), daemon=True, name=f"fundamental-{task_name}")
         try:
@@ -2753,12 +2793,17 @@ class DataFetcherManager:
                 self._fundamental_timeout_slots.release()
             except ValueError:
                 pass
+            if completion is not None:
+                completion.set_result(None)
             return None, str(exc), int((time.time() - start) * 1000)
         worker.join(timeout=timeout_value)
         if worker.is_alive():
             return None, f"{task_name} timeout", int(timeout_value * 1000)
         if "value" in error_holder:
-            return None, str(error_holder["value"]), int((time.time() - start) * 1000)
+            error = error_holder["value"]
+            if isinstance(error, ResearchStopped):
+                raise error
+            return None, str(error), int((time.time() - start) * 1000)
         return result_holder.get("value"), None, int((time.time() - start) * 1000)
 
     def _run_with_retry(
@@ -4178,10 +4223,12 @@ class DataFetcherManager:
         from src.config import get_config
         from data_provider.choice_adapter import ChoiceAdapter
         from data_provider.mx_data_adapter import financial_refresh
+        from src.core.research_run import current_research, ResearchStopped
+        run = current_research.get()
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
-        key = f"{ChoiceAdapter.contract_version}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         if not (refresh and refresh[0] == code):
@@ -4191,56 +4238,194 @@ class DataFetcherManager:
                     return cast(Dict[str, Any], cached["context"])
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
-        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline)
+        from data_provider.cross_source_validator import AnchorReading, SourceReadError
+        prefer_ifind = config.financial_primary_source == "ifind"
+        readings: dict[str, AnchorReading] = {}
+        source_error = None
+        if prefer_ifind:
+            try:
+                readings = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).financial_snapshot(
+                    code, None, deadline=deadline - budget / 2,
+                )
+            except SourceReadError as exc:
+                source_error = exc.reason_code
+            except ResearchStopped:
+                # Keep any completed sources; stopping research is not a vendor failure.
+                pass
+        verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
+        if source_error:
+            errors.append(f"ifind:{source_error}")
         # Only attempt licensed public supplements for holes, within the same deadline.
         missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
-        if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline:
-            bundle, error, _ = self._run_with_timeout(
-                lambda: self._tushare_ifind_adapter.get_fundamental_bundle(code, snapshot["report_date"], fields=missing, include_institution=False, deadline=deadline),
-                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_supplement",
-            )
-            if error:
-                errors.append(error)
-            elif isinstance(bundle, dict):
-                from data_provider.cross_source_validator import reading_from_field_record, reading_input_reasons
-                growth = bundle.get("growth") or {}
-                for field in missing:
-                    record = (growth.get("field_meta") or {}).get(field) or {}
-                    reading = reading_from_field_record(growth.get(field), record)
-                    if reading is not None and not reading_input_reasons(reading, field) and reading.period == snapshot["report_date"] and reading.statement_scope == "consolidated" and reading.adjustment == "restated" and reading.raw_currency == "CNY":
-                        snapshot["growth"][field] = reading.value
-                        snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
-        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": ChoiceAdapter.contract_version,
+        if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+            try:
+                bundle, error, _ = self._run_with_timeout(
+                    lambda: self._tushare_ifind_adapter.get_fundamental_bundle(code, snapshot["report_date"], fields=missing, include_institution=False, deadline=deadline),
+                    min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_supplement",
+                )
+                if error:
+                    errors.append(error)
+                elif isinstance(bundle, dict):
+                    from data_provider.cross_source_validator import reading_from_field_record, reading_input_reasons
+                    growth = bundle.get("growth") or {}
+                    for field in missing:
+                        record = (growth.get("field_meta") or {}).get(field) or {}
+                        reading = reading_from_field_record(growth.get(field), record)
+                        if reading is not None and not reading_input_reasons(reading, field) and reading.period == snapshot["report_date"] and reading.statement_scope == "consolidated" and reading.adjustment == "restated" and reading.raw_currency == "CNY":
+                            snapshot["growth"][field] = reading.value
+                            snapshot["field_meta"][field] = {**record, "selection_reason": "public_supplement"}
+            except ResearchStopped:
+                pass
+        cross_validation = None
+        if config.enable_ifind_mcp:
+            from data_provider.cross_source_validator import CrossSourceValidator, SnapshotSource, adopted_field_record, reading_from_field_record, reading_input_reasons, select_current_financials
+            from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
+            fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+            if not prefer_ifind and not (run and (run.stop_reason or run.finalized)):
+                try:
+                    readings = fetcher.financial_snapshot(code, snapshot.get("report_date"), deadline=deadline)
+                except SourceReadError as exc:
+                    source_error = exc.reason_code
+                    errors.append(str(exc))
+                except ResearchStopped:
+                    pass
+            primary = {}
+            choice_readings = {}
+            candidate_periods = {reading.period for reading in readings.values() if reading.period}
+            supplement_period = snapshot.get("report_date") or (next(iter(candidate_periods)) if len(candidate_periods) == 1 else None)
+            for field in fetcher.financial_fields:
+                reading = reading_from_field_record(snapshot["growth"].get(field), snapshot["field_meta"].get(field))
+                if reading is not None:
+                    primary[field] = choice_readings[field] = reading
+                candidate = readings.get(field)
+                if candidate is not None:
+                    reason = "statement_scope_unknown" if candidate.statement_scope is None else "adjustment_unknown" if candidate.adjustment is None else None
+                    if reason:
+                        readings[field] = replace(candidate, normalization_error=candidate.normalization_error or reason)
+                    if not prefer_ifind and snapshot["growth"].get(field) is None and not reading_input_reasons(readings[field], field) and readings[field].period == supplement_period and supplement_period and readings[field].period_basis != "unknown" and readings[field].statement_scope == "consolidated" and readings[field].adjustment == "restated":
+                        snapshot["growth"][field] = readings[field].value
+                        snapshot["field_meta"][field] = adopted_field_record(field, readings[field], selection_reason="ifind_supplement")
+            if prefer_ifind:
+                supplement_period, primary = select_current_financials(readings, choice_readings)
+                snapshot["report_date"] = snapshot["growth"]["report_date"] = supplement_period
+                snapshot["growth"]["disclosure_date"] = next((r.disclosed_at for r in primary.values() if r.disclosed_at), None)
+                if (snapshot["growth"].get("balance_sheet") or {}).get("period") != supplement_period:
+                    snapshot["growth"].pop("balance_sheet", None)
+                for field in fetcher.financial_fields:
+                    selected = primary.get(field)
+                    snapshot["growth"][field] = selected.value if selected is not None else None
+                    snapshot["field_meta"][field] = adopted_field_record(field, selected, selection_reason="primary" if selected.source == "ifind" else "choice_supplement") if selected is not None else {"quality": {"status": "missing", "reason_codes": ["no_eligible_current_value"]}}
+                # Keep rejected periods as evidence; they cannot become automatic main values.
+                for dataset in (readings, choice_readings):
+                    for field, reading in dataset.items():
+                        if reading.period != supplement_period or supplement_period is None:
+                            dataset[field] = replace(reading, normalization_error=reading.normalization_error or "period_mismatch")
+            groups: dict[str, list[str]] = {}
+            for field in fetcher.financial_fields:
+                source = primary[field].source if field in primary else "missing"
+                groups.setdefault(source, []).append(field)
+            anchors = {}
+            for source, fields in groups.items():
+                sources = []
+                if source != "ifind":
+                    sources.append(SnapshotSource("ifind", readings, source_error))
+                if prefer_ifind and source in {"ifind", "missing"}:
+                    choice_error = next((e.rsplit(":", 1)[-1] for e in snapshot["errors"] if e.startswith("choice:")), None) if not choice_readings else None
+                    sources.append(SnapshotSource("choice", choice_readings, choice_error))
+                validator = CrossSourceValidator(sources)
+                try:
+                    block = build_cross_validation_block(code, fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
+                    if block:
+                        anchors.update(block["anchors"])
+                finally:
+                    validator.close()
+            if anchors:
+                agreed = sum(anchor["quality"]["status"] == "verified" for anchor in anchors.values())
+                cross_validation = {"enabled": True, "anchors": anchors, "summary": f"{agreed}/{len(fetcher.financial_fields)} 锚点取得独立来源佐证"}
+                for field, anchor in anchors.items():
+                    record = field_record_from_validation(field, anchor)
+                    selected = snapshot["field_meta"].get(field) or {}
+                    if record is not None and record["value"] == snapshot["growth"].get(field) and record["source"] == selected.get("source"):
+                        snapshot["field_meta"][field] = record
+        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.data_source_contract,
                                   "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
-        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
+        if cross_validation:
+            result["cross_validation"] = cross_validation
+        for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
             payload = dict(snapshot[block])
             payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
-            chain = [{"provider": "choice", "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)}]
+            providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if block == "growth" and prefer_ifind else "choice"]
+            chain = [{"provider": provider, "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)} for provider in providers]
             result[block] = self._build_fundamental_block(status, payload, chain, errors)
             result["source_chain"].extend(chain)
-        seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
-        auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
-            lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),
-            min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_details",
-        )
-        auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
-        auxiliary_errors = auxiliary.get("errors", []) + ([auxiliary_error] if auxiliary_error else [])
-        errors.extend(auxiliary_errors)
-        for block in ("earnings", "institution"):
-            payload = auxiliary.get(block) or {}
-            status = "partial" if self._has_meaningful_payload(payload) else "failed" if auxiliary_errors else "not_supported"
-            chain = self._normalize_source_chain(auxiliary.get("source_chain", []), "public_details", status, cost_ms)
-            result[block] = self._build_fundamental_block(status, payload, chain, auxiliary_errors)
-        for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
-            result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
-            errors.extend(result[block].get("errors") or [])
-        result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()))
-        errors.extend(result["capital_flow"].get("errors") or [])
+        adopted_sources = {item["provider"] for item in result["source_chain"]}
+        result["source"] = next(iter(adopted_sources)) if len(adopted_sources) == 1 else "mixed"
+        try:
+            if run is not None:
+                run.check()
+            seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
+            auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
+                lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),
+                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_details",
+            )
+            auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
+            auxiliary_errors = auxiliary.get("errors", []) + ([auxiliary_error] if auxiliary_error else [])
+            errors.extend(auxiliary_errors)
+            for block in ("earnings", "institution"):
+                payload = auxiliary.get(block) or {}
+                status = "partial" if self._has_meaningful_payload(payload) else "failed" if auxiliary_errors else "not_supported"
+                chain = self._normalize_source_chain(auxiliary.get("source_chain", []), "public_details", status, cost_ms)
+                result[block] = self._build_fundamental_block(status, payload, chain, auxiliary_errors)
+            for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
+                if run is not None:
+                    run.check()
+                result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
+                errors.extend(result[block].get("errors") or [])
+            if run is not None:
+                run.check()
+            result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()))
+            errors.extend(result["capital_flow"].get("errors") or [])
+        except ResearchStopped:
+            pass
+        for block_name in ("earnings", "institution", "capital_flow", "dragon_tiger", "boards"):
+            result.setdefault(block_name, self._build_fundamental_block("partial", {}, [], []))
         result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
         result["status"] = "partial"
-        if not errors and self._should_cache_fundamental_context(result):
+        if not (run and (run.stop_reason or run.finalized or run.remaining() <= 0)) and not errors and self._should_cache_fundamental_context(result):
+            with self._fundamental_cache_lock:
+                self._fundamental_cache[key] = {"ts": time.time(), "context": result}
+        return result
+
+    def get_ifind_research_context(self, stock_code: str, section: Literal["products", "holders"], *, period: Optional[str] = None, deadline: Optional[float] = None) -> Dict[str, Any]:
+        """Optional research facts reuse the existing cache, refresh marker and budget."""
+        from src.config import get_config
+        from data_provider.ifind_fundamental_adapter import IfindFetcher
+        from data_provider.cross_source_validator import SourceReadError
+        from data_provider.mx_data_adapter import financial_refresh
+        from src.core.research_run import current_research
+        config = get_config()
+        if config.data_source_profile != "choice" or not config.enable_ifind_mcp:
+            return {}
+        stock_code = normalize_stock_code(stock_code)
+        key = f"{config.data_source_contract}|ifind_{section}|{stock_code}|{period or 'latest_annual'}"
+        refresh = financial_refresh.get()
+        self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
+        with self._fundamental_cache_lock:
+            cached = self._fundamental_cache.get(key)
+            if cached is not None and not (refresh and refresh[0] == stock_code):
+                return cast(Dict[str, Any], cached["context"])
+        deadline = min(deadline, time.monotonic() + config.ifind_mcp_timeout_seconds) if deadline is not None else time.monotonic() + config.ifind_mcp_timeout_seconds
+        try:
+            fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+            dataset = fetcher.product_segments(stock_code, period, deadline=deadline) if section == "products" else fetcher.shareholders(stock_code, period, deadline=deadline)
+            result = dataset.model_dump(mode="json")
+        except SourceReadError as exc:
+            return {"source": "ifind", "coverage": "partial", "items": [], "errors": [str(exc)]}
+        run = current_research.get()
+        if not (run and (run.stop_reason or run.finalized or run.remaining() <= 0)) and result["items"] and not result["errors"]:
             with self._fundamental_cache_lock:
                 self._fundamental_cache[key] = {"ts": time.time(), "context": result}
         return result

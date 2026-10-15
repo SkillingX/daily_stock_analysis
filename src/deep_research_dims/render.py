@@ -142,6 +142,10 @@ def normalize_saved_markdown(markdown: str) -> str:
                         line = "- " + _format_holder(values) + "\n"
             except (ValueError, SyntaxError, TypeError, RecursionError):
                 pass  # Unknown historical forms remain readable as original text.
+        line = line.replace("省钱模式", "分析范围")
+        old_note = re.fullmatch(r"⚠️ 本维度生成不充分（(.*?)），以下内容为降级占位。", line.strip())
+        if old_note:
+            line = f"本节研究尚未完整完成。原记录原因：{old_note[1]}。结论请结合本节资料及限制阅读。\n"
         lines.append(line)
     return "".join(lines)
 
@@ -283,9 +287,9 @@ def _event_plans_view(intel: Any) -> List[Dict[str, Any]]:
 def _degraded_note(dim: Any) -> str:
     status = getattr(dim, "status", "ok")
     if status == "degraded":
-        return f"⚠️ 本维度生成不充分（{_sanitize_reason(getattr(dim, 'degraded_reason', None))}），以下内容为降级占位。"
+        return f"本节研究尚未完整完成：{_sanitize_reason(getattr(dim, 'degraded_reason', None))}。结论请结合本节资料及限制阅读。"
     if status == "skipped":
-        return "— 本维度未选择生成（省钱模式），以下内容为默认占位，不代表分析结论。"
+        return "本节未选择生成，未参与本次研究；默认字段不代表分析结论。"
     return ""
 
 
@@ -541,6 +545,9 @@ def build_view(
     ]
 
     return {
+        "research_summary": " ｜ ".join(f"{label}{sum(getattr(dim, 'status', None) == state for dim in dims.values())}项" for state, label in [("ok", "正常"), ("degraded", "未完整完成"), ("skipped", "主动未选")]),
+        "retained_facts": {key: [entry.model_dump() for entry in value.retained_facts] for key, value in dims.items() if value.status == "degraded" and value.retained_facts},
+        "retained_evidence": {key: [entry.model_dump() for entry in value.retained_evidence] for key, value in dims.items() if getattr(value, "retained_evidence", None)},
         "stock_name": stock_name,
         "stock_code": stock_code,
         "as_of": as_of,
@@ -644,18 +651,10 @@ ZH_TOKEN_MAP: Dict[str, str] = {
     "us_china": "中美", "business": "业务",
 }
 
-_ZH_PATTERN = None
-
-
-def _zh_polish(markdown: str) -> str:
+def _zh_polish(markdown: str, extra_labels: Optional[Dict[str, str]] = None) -> str:
     """已知英文 token 整词替换为中（链接/URL 行跳过，防断路径）。"""
-    global _ZH_PATTERN
-    import re
-
-    if _ZH_PATTERN is None:
-        _ZH_PATTERN = re.compile(
-            r"\b(" + "|".join(re.escape(k) for k in ZH_TOKEN_MAP) + r")\b"
-        )
+    labels = {**(extra_labels or {}), **ZH_TOKEN_MAP}
+    pattern = re.compile(r"\b(" + "|".join(re.escape(key) for key in labels) + r")\b")
     out = []
     for line in markdown.split("\n"):
         stripped = line.strip()
@@ -667,7 +666,7 @@ def _zh_polish(markdown: str) -> str:
         ):
             out.append(line)
             continue
-        out.append(_ZH_PATTERN.sub(lambda m: ZH_TOKEN_MAP[m.group(1)], line))
+        out.append(pattern.sub(lambda m: labels[m.group(1)], line))
     return "\n".join(out)
 
 
@@ -684,7 +683,31 @@ def render_markdown(
     env.filters["cn"] = _format_cn
     env.filters["holder"] = _format_holder
     template = env.get_template(template_name or _TEMPLATE_NAME)
-    return _zh_polish(template.render(**view))
+    financial_labels = getattr(env.get_template("financial_display.j2").module, "LABELS")
+    markdown = _zh_polish(template.render(**view), financial_labels)
+    # Each cited source stays in its own dimension, so split reports keep it.
+    retained = view.get("retained_evidence") or {}
+    sections = split_dim_sections(markdown)
+    extra_ids = (set(retained) | set(view.get("retained_facts") or {})) - set(sections)
+    if extra_ids:
+        markdown += "\n\n## 附录：已取得的其他资料\n"
+        for dim_id in sorted(extra_ids):
+            markdown += f"\n<!-- dim:{dim_id} -->\n### {DIM_LABELS.get(dim_id, dim_id)}\n\n"
+        sections = split_dim_sections(markdown)
+    for dim_id, section in sections.items():
+        items = retained.get(dim_id, [])
+        facts = (view.get("retained_facts") or {}).get(dim_id, [])
+        if not items and not facts:
+            continue
+        lines = ["\n\n" + env.get_template("retained_facts.j2").render(facts=facts)] if facts else []
+        if items:
+            lines.append("\n\n**已取得的参考资料**（检索资料不等于研究结论或独立核验）：\n")
+        for item in items:
+            title = str(item["title"]).replace("[", "（").replace("]", "）")
+            url = str(item["url"]).replace(")", "%29").replace("(", "%28")
+            lines.append(f"- [{title}]({url})（{item['source']}，{item.get('published_date') or '日期未提供'}）：{item['snippet']}")
+        markdown = markdown.replace(section.rstrip(), section.rstrip() + "\n".join(lines) + "\n", 1)
+    return markdown
 
 
 def validate_structure(markdown: str) -> List[str]:

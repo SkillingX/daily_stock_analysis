@@ -146,7 +146,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | `STOCK_LIST` | Watchlist codes, e.g., `600519,300750,002594` | ✅ |
 | `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) optimized for Chinese content; the same key can also be used for Anspire LLM fallback scenarios (example model: `Doubao-Seed-2.0-lite`) | Recommended |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) search-engine results for realtime financial news | Recommended |
-| `TAVILY_API_KEYS` | [Tavily](https://tavily.com/) Search API (for news search) | Optional |
+| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. Tavily retired. [Setup](coding-plan-search.md). | Optional |
 | `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
 | `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API (privacy-first, US-stock news enrichment, comma-separated for multiple keys) | Optional |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimax.io/) Coding Plan Web Search (structured search results) | Optional |
@@ -290,7 +290,7 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 |--------|------|:----:|
 | `ANSPIRE_API_KEYS` | Anspire Open API Key (shared with search and LLM fallback examples; availability depends on account/model entitlement, and can effectively enhance A-share analysis) | Recommended |
 | `SERPAPI_API_KEYS` | SerpAPI search-engine results for realtime financial news | Recommended |
-| `TAVILY_API_KEYS` | Tavily Search API Key | Optional |
+| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. Tavily retired. [Setup](coding-plan-search.md). | Optional |
 | `BOCHA_API_KEYS` | Bocha Search API Key (Chinese optimized) | Optional |
 | `BRAVE_API_KEYS` | Brave Search API Key (US stocks optimized) | Optional |
 | `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search (structured results) | Optional |
@@ -1469,3 +1469,15 @@ Technical indicator rules use daily-close edge triggers only. Partial-bar handli
 ---
 
 For more questions, please [submit an Issue](https://github.com/ZhuLinsen/daily_stock_analysis/issues)
+
+### Process-wide model concurrency
+
+`DEEP_RESEARCH_LLM_CONCURRENCY` applies to actual model requests across all modules and model instances in one process. It accepts a positive integer (unset/empty: `3`; invalid values fail configuration loading). Use `1` for a local account requiring serial requests. Streams retain capacity until consumption ends or the transport closes; data tools and searches do not occupy model capacity. Environment variables take precedence over the local `.env`. Restart the corresponding process after changes; separate CLI, scheduler, Desktop and backend processes have independent limits. This is not an account-wide or cross-process quota.
+
+`DEEP_RESEARCH_TIMEOUT_SECONDS` is the finite total research budget (default `2400` seconds, including source acquisition, queueing and finalization). Research reserves up to 180 seconds for finalization; expiration stops new work and preserves valid partial results without an extra model call. The initial budget allows roughly three times the previous 788-second parallel baseline and must be checked against serial live execution. Pending transports retain their capacity until cleanup; a caller timeout is not proof that remote inference stopped. Completed source facts (including capital flow, financials and quotes) and retrieved references retain their source, unit, period and qualification, without dumping arbitrary tool JSON or creating scores; partial reports never become full-success cache entries. Rule-written prose is reused instead of unnecessary polishing requests.
+
+Within deep research, each admitted model call is additionally capped by the existing `LLM_STREAM_RESPONSE_TIMEOUT` (the same request cap used by Analyzer); queueing still consumes the report/stage budget. Other Agent entrypoints retain their timeout semantics.
+
+Deep research accepts an optional 32-character lowercase hex `run_id`, returned in `X-Research-Run-Id` and the first SSE `accepted` event. `GET /api/v1/deep-research/runs/{run_id}` exposes the process-local lifecycle; `POST /api/v1/deep-research/runs/{run_id}/cancel` idempotently stops subsequent work. A pending request retains its model capacity and canonical stock deduplication until actual cleanup. `partial_ready` can expose a saved partial artifact before final `done`; cancellation without useful evidence creates no empty report. Closing the page or SSE only detaches the listener: the original accepted job continues into history. Event buffers (128) and terminal receipts (256) are bounded; global authentication applies. There is no restart recovery, cross-process coordination or event replay.
+
+Report chapter counts describe actual completed, incomplete and unselected research, never data accuracy or stock quality. Historical reports without reliable dimension states do not infer completion from `quality_score`; legacy scores retain their structural-validator meaning. “Analysis scope” replaces “economy mode”. Useful facts and citations precede limitations. Missing scoring inputs do not imply an unconnected source; neutral scores and signal eligibility remain unchanged. Missing periods or adjustment conventions mean evidence is not directly comparable, not that an acquired number is wrong. Shared financial templates translate known status/period/unit codes for readers, while original values, reason codes and eligibility remain in dimension JSON. Valuation and independent technical-reference restrictions are unchanged. Page, history, subreports, Markdown and PDF share presentation; known historical formatting is adapted without rewriting files or inventing failure causes. Use `scripts/check_choice_reports.py` with an explicit local `--base-url`, `--code 300260`, `--kind deep-research`, `--timeout 2700` and ignored `--output-dir`; omit `--dims` for full forced-refresh acceptance. It records progress timing and verifies generated/read/downloaded content agrees.

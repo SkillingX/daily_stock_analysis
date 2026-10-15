@@ -13,7 +13,7 @@ from data_provider.choice_adapter import ChoiceAdapter
 def annual_transport(choice_transport, monkeypatch):
     snapshot_transport = ChoiceAdapter._native_request
     def native_request(method, args, options, deadline):
-        if method != "css" or "OPERATEREVENEW" not in args[1]:
+        if method != "css" or "OPERATEEXPNEW" not in args[1]:
             return snapshot_transport(method, args, options, deadline)
         assert "Type=1" in options and "CurType=2" in options and "DataAdjustType=1" in options
         year = int(options.split("ReportDate=")[1][:4])

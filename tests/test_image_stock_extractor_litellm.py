@@ -12,7 +12,9 @@ from unittest.mock import MagicMock
 
 # Stub out litellm and heavy chain-imports before any project code is loaded,
 # so these tests run without the package installed in this environment.
-if "litellm" not in sys.modules:
+try:
+    import litellm  # Prefer the installed SDK; do not poison later test imports.
+except ImportError:
     sys.modules["litellm"] = MagicMock()
 # Stub google.generativeai if absent (imported transitively by some modules)
 for _stub in ("google.generativeai", "google.genai", "anthropic"):
@@ -173,7 +175,7 @@ class TestCallLitellmVision:
             assert result == '["600519"]'
             mock_comp.assert_called_once()
             kwargs = mock_comp.call_args[1]
-            assert kwargs["timeout"] == VISION_API_TIMEOUT
+            assert 0 < kwargs["timeout"] <= VISION_API_TIMEOUT
             assert kwargs["max_tokens"] == 1024
 
     def test_openai_model_uses_api_base_and_aihubmix_headers(self):

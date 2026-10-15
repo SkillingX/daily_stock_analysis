@@ -135,6 +135,7 @@ def _compact_fundamental_context(fundamental_context: dict[str, Any]) -> dict[st
         "status": fundamental_context.get("status"),
         "coverage": fundamental_context.get("coverage", {}),
         "research": fundamental_context.get("research", {}),
+        "cross_validation": fundamental_context.get("cross_validation"),
         "errors": list(fundamental_context.get("errors") or []),
     }
     for block in blocks:
@@ -777,12 +778,13 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
             reading = reading_from_field_record(data.get(scalar_key), records.get(field))
             if reading is not None and field not in primary_readings:
                 primary_readings[field] = reading
-                records[field] = adopted_field_record(field, reading, previous_record=records.get(field))
+                if get_config().data_source_profile != "choice":
+                    records[field] = adopted_field_record(field, reading, previous_record=records.get(field))
         block["field_meta"] = records
 
     # opt-in 交叉验证：估值/财务/增长锚点。period 驱动 iFinD 财务类查询返回数据；
     # 快照类锚点（行情/估值）不受 period 影响。开关关 → None（零回归）。
-    _cv = build_cross_validation_block(
+    _cv = compact_context.get("cross_validation") if get_config().data_source_profile == "choice" else build_cross_validation_block(
         stock_code,
         [
             "pe_ratio",
@@ -801,7 +803,7 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
         deadline=deadline,
     )
     # akshare growth 失败时用 CV 回填毛利率/营收增速/ROE，避免报告「数据缺失」
-    if _cv:
+    if _cv and get_config().data_source_profile != "choice":
         for block_name in ("valuation", "growth", "earnings"):
             records = (compact_context.get(block_name) or {}).get("field_meta") or {}
             for field in list(records):

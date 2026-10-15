@@ -35,7 +35,8 @@ from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, normalize_report_period, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period
-from .ifind_fundamental_adapter import _apply_mcp_request_deadline, _safe_float
+from .ifind_fundamental_adapter import _safe_float
+from src.services.mcp_client import apply_mcp_request_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -376,7 +377,7 @@ class MxMcpFetcher:
                         client = create_mcp_http_client(headers=headers)
                         client.timeout = timeout
                         if deadline is not None:
-                            client.event_hooks["request"].append(partial(_apply_mcp_request_deadline, deadline=deadline))
+                            client.event_hooks["request"].append(partial(apply_mcp_request_deadline, deadline=deadline))
                         await stack.enter_async_context(client)
                         streams = await stack.enter_async_context(transport(self._endpoint, http_client=client, **close_options))
                     else:
