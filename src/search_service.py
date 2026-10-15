@@ -36,6 +36,7 @@ from tenacity import (
 )
 
 from data_provider.us_index_mapping import is_us_index_code
+from src.core.research_run import current_research, ResearchStopped
 from src.config import (
     NEWS_STRATEGY_WINDOWS,
     normalize_news_strategy_profile,
@@ -251,6 +252,9 @@ class BaseSearchProvider(ABC):
         **search_kwargs: Any,
     ) -> SearchResponse:
         """Run the shared search flow with an optional preselected API key."""
+        run = current_research.get()
+        if run is not None:
+            run.check()
         from src.patches.eastmoney_patch import request_deadline
         deadline = request_deadline.get()
         if deadline is not None and time.monotonic() >= deadline:
@@ -272,6 +276,8 @@ class BaseSearchProvider(ABC):
                 query, api_key, max_results, days=days, **search_kwargs
             )
             response.search_time = time.time() - start_time
+            if not response.success and run is not None:
+                run.check()
 
             if response.success:
                 self._record_success(api_key)
@@ -283,7 +289,11 @@ class BaseSearchProvider(ABC):
 
             return response
 
+        except ResearchStopped:
+            raise
         except Exception as e:
+            if run is not None:
+                run.check()
             self._record_error(api_key)
             elapsed = time.time() - start_time
             logger.error(f"[{self._name}] 搜索 '{query}' 失败: {e}")
@@ -1524,6 +1534,8 @@ class ZhipuSearchProvider(BaseSearchProvider):
             results = [SearchResult(title=item.title, snippet=item.content[:1500], url=item.link, source=urlparse(item.link).netloc, published_date=item.published_date) for item in items[:max_results]]
             return SearchResponse(query=query, results=results, provider=self.name, success=bool(results), error_message=None if results else "empty_result")
         except Exception as exc:
+            if run := current_research.get():
+                run.check()
             reason = "invalid_response" if isinstance(exc, ValueError) else source_failure_reason(exc)
             # MCP errors can contain supplier text/headers; never expose them.
             return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=f"zhipu:{reason}")
@@ -2326,6 +2338,9 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
     def search(self, query: str, max_results: int = 5, days: int = 7) -> SearchResponse:
         """Execute SearXNG search with instance rotation and per-request failover."""
+        run = current_research.get()
+        if run is not None:
+            run.check()
         start_time = time.time()
         if self._base_urls:
             candidates = self._rotate_candidates(
@@ -2364,6 +2379,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
 
         errors: List[str] = []
         for base_url in candidates:
+            if run is not None:
+                run.check()
             response = self._do_search(
                 query,
                 base_url,
@@ -2384,6 +2401,8 @@ class SearXNGSearchProvider(BaseSearchProvider):
                 )
                 return response
 
+            if run is not None:
+                run.check()
             errors.append(f"{base_url}: {response.error_message or '未知错误'}")
             logger.warning(
                 "[%s] 实例 %s 搜索失败: %s", self.name, base_url, response.error_message
@@ -3100,11 +3119,19 @@ class SearchService:
     def _wait_for_cached(
         self, key: str, event: threading.Event
     ) -> Optional["SearchResponse"]:
-        event.wait(timeout=max(1.0, min(float(self._cache_ttl), 30.0)))
+        run = current_research.get()
+        limit = time.monotonic() + max(1.0, min(float(self._cache_ttl), 30.0))
+        while not event.is_set() and time.monotonic() < limit:
+            if run is not None:
+                run.check()
+            event.wait(timeout=min(0.05, max(0.0, limit - time.monotonic())))
         return self._get_cached(key)
 
     def _put_cache(self, key: str, response: "SearchResponse") -> None:
         """Store a successful SearchResponse in cache."""
+        run = current_research.get()
+        if run is not None and (run.stop_reason or run.finalized or run.remaining() <= 0):
+            return
         with self._cache_lock:
             # Hard cap: evict oldest entries when cache exceeds limit
             _MAX_CACHE_SIZE = 500
@@ -4306,6 +4333,8 @@ class SearchService:
             best_ranked_response: Optional[SearchResponse] = None
             best_ranked_stats: Optional[Dict[str, int]] = None
             for provider in self._providers:
+                if run := current_research.get():
+                    run.check()
                 if not provider.is_available:
                     continue
 
@@ -4333,6 +4362,8 @@ class SearchService:
                     response = provider.search(
                         query, provider_max_results, days=search_days, **search_kwargs
                     )
+                except ResearchStopped:
+                    raise
                 except Exception as exc:
                     self._record_news_search_run(
                         provider=provider.name,
@@ -4375,6 +4406,8 @@ class SearchService:
                         max_results=max_results,
                     )
                     admitted_count = len(limited_response.results or [])
+                    if admitted_count and (run := current_research.get()):
+                        run.retain("search_stock_news", {"results": [vars(item) for item in limited_response.results]})
                     self._record_news_search_run(
                         provider=provider.name,
                         operation="search_stock_news",
@@ -4537,6 +4570,8 @@ class SearchService:
 
         # 依次尝试各个搜索引擎
         for provider in self._providers:
+            if run := current_research.get():
+                run.check()
             if not provider.is_available:
                 continue
 
@@ -4714,6 +4749,8 @@ class SearchService:
         from src.patches.eastmoney_patch import request_deadline
         deadline = request_deadline.get()
         for dim_raw in search_dimensions:
+            if run := current_research.get():
+                run.check()
             dim = cast(Dict[str, Any], dim_raw)
             if search_count >= max_searches or deadline is not None and time.monotonic() >= deadline:
                 break
@@ -4731,6 +4768,8 @@ class SearchService:
 
             response = filtered_response = SearchResponse(query=dim["query"], results=[], provider="none", success=False, error_message="搜索时限耗尽")
             for provider in available_providers:
+                if run := current_research.get():
+                    run.check()
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 logger.info(
@@ -4790,6 +4829,8 @@ class SearchService:
                     max_results=target_per_dimension,
                 )
                 results[dim["name"]] = filtered_response
+                if filtered_response.success and filtered_response.results and (run := current_research.get()):
+                    run.retain("search_comprehensive_intel", {"results": [vars(item) for item in filtered_response.results]})
                 if filtered_response.success and filtered_response.results:
                     break
             search_count += 1
@@ -4968,6 +5009,8 @@ class SearchService:
 
             # 依次尝试各个搜索引擎
             for provider in self._providers:
+                if run := current_research.get():
+                    run.check()
                 if not provider.is_available:
                     continue
 
@@ -4981,6 +5024,8 @@ class SearchService:
                                 seen_urls.add(result.url)
                                 all_results.append(result)
 
+                        if run := current_research.get():
+                            run.retain("search_stock_price_fallback", {"results": [vars(item) for item in response.results]})
                         if provider.name not in successful_providers:
                             successful_providers.append(provider.name)
 
@@ -4991,7 +5036,11 @@ class SearchService:
                     else:
                         logger.debug(f"[增强搜索] {provider.name} 无结果或失败")
 
+                except ResearchStopped:
+                    raise
                 except Exception as e:
+                    if run := current_research.get():
+                        run.check()
                     logger.warning(f"[增强搜索] {provider.name} 搜索异常: {e}")
                     continue
 

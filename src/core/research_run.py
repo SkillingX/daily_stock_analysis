@@ -164,8 +164,9 @@ class ResearchRun:
         dim = research_dimension.get() or "legacy"
         with self._lock:
             if dim and not self.finalized and self.stop_reason is None and self.remaining() > 0:
-                self.evidence.setdefault(dim, []).extend(records)
-                self.evidence[dim] = self.evidence[dim][:20]
+                retained = self.evidence.setdefault(dim, [])
+                retained.extend(record for record in records if record not in retained)
+                self.evidence[dim] = retained[:20]
 
     def retain_facts(self, tool: str, result: Any) -> None:
         records = retained_tool_facts(tool, result)

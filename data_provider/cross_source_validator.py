@@ -862,14 +862,20 @@ class CrossSourceValidator:
         """并行收集各源读数。任一源异常/返回 None 都被隔离（fail-open）。"""
         if not self._sources:
             return (), ()
+        from src.core.research_run import current_research, ResearchStopped
+        run = current_research.get()
 
         def _safe_read(source: SourceAdapter) -> tuple[Optional[AnchorReading], Optional[str]]:
             try:
+                if run is not None and not isinstance(source, SnapshotSource):
+                    run.check()
                 if deadline is not None and deadline <= monotonic():
                     return None, "timeout"
                 kwargs = {"deadline": deadline} if deadline is not None and "deadline" in signature(source.read).parameters else {}
                 reading = source.read(code, field, period, **kwargs)
                 return reading, None if reading is not None else "timeout" if deadline is not None and deadline <= monotonic() else "missing"
+            except ResearchStopped:
+                raise
             except Exception as exc:  # noqa: BLE001 — fail-open：源异常不影响其他源
                 logger.debug(
                     "[CrossValidate] source %s read %s failed: %s",
@@ -884,11 +890,19 @@ class CrossSourceValidator:
         futures = []
         busy_errors = []
         for source in self._sources:
+            if run is not None and not isinstance(source, SnapshotSource):
+                run.check()
             if not self._slots.acquire(blocking=False):
                 busy_errors.append((source.name, "source_busy"))
                 continue
-            future = self._pool.submit(copy_context().run, _safe_read, source)
+            try:
+                future = self._pool.submit(copy_context().run, _safe_read, source)
+            except BaseException:
+                self._slots.release()
+                raise
             future.add_done_callback(lambda _: self._slots.release())
+            if run is not None:
+                run.track(future)
             futures.append((source, future))
         wait([future for _, future in futures], timeout=None if deadline is None else max(0.0, deadline - monotonic()))
         readings: list[AnchorReading] = []

@@ -305,3 +305,116 @@ def test_cancellation_during_public_details_retains_completed_financials(choice_
     assert result["institution"]["data"]["institution_holding_change"] == 12.5
     assert result["boards"]["status"] == "partial"
     assert not manager._fundamental_cache
+
+
+def test_source_timeout_stays_pending_until_real_worker_completion(choice_transport):
+    manager = DataFetcherManager()
+    run = ResearchRun(5)
+    entered, release, completed, clean = Event(), Event(), Event(), Event()
+
+    def source():
+        entered.set()
+        try:
+            release.wait(2)
+        finally:
+            completed.set()
+
+    try:
+        with run.bind():
+            _, error, _ = manager._run_with_timeout(source, 0.05, "fixture")
+        assert entered.is_set() and error
+        run.finish()
+        run.when_clean(clean.set)
+        assert not run.clean
+        assert not clean.is_set()
+        assert not completed.is_set()
+    finally:
+        release.set()
+    assert completed.wait(1)
+    assert clean.wait(1)
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "report_budget"])
+@pytest.mark.parametrize("operation", ["get_realtime_quote", "get_daily_data", "get_chip_distribution"])
+def test_manager_stops_quote_history_chip_fallback_after_first_response(monkeypatch, operation, reason):
+    from src.config import Config
+    from types import SimpleNamespace
+    import pandas as pd
+    run = ResearchRun(5)
+    calls = []
+
+    class Fetcher:
+        priority = 1
+        def __init__(self, name):
+            self.name = name
+        def request(self, *args, **kwargs):
+            calls.append(self.name)
+            if len(calls) == 1:
+                run.stop(reason)
+            return pd.DataFrame() if operation == "get_daily_data" else None
+        get_realtime_quote = get_daily_data = get_chip_distribution = request
+
+    monkeypatch.setattr(Config, "_instance", Config(enable_realtime_quote=True, enable_chip_distribution=True, realtime_source_priority="efinance,akshare_sina,akshare_qq"))
+    first, fallback = Fetcher("EfinanceFetcher"), Fetcher("AkshareFetcher")
+    manager = DataFetcherManager(fetchers=[first, fallback])
+    with run.bind(), pytest.raises(ResearchStopped):
+        getattr(manager, operation)("300260")
+    assert calls == ["EfinanceFetcher"]
+
+
+@pytest.mark.parametrize("kind", ["validator", "legacy_growth"])
+def test_inner_validation_workers_stay_pending_after_caller_timeout(kind):
+    from types import SimpleNamespace
+    from data_provider.cross_source_validator import CrossSourceValidator
+    from data_provider.tushare_ifind_fundamental_adapter import TushareIfindFundamentalAdapter
+    run = ResearchRun(5)
+    entered, release, exited, clean = Event(), Event(), Event(), Event()
+
+    class Source:
+        name = "ifind"
+        available = True
+        def read(self, *args, **kwargs):
+            entered.set()
+            try:
+                release.wait(2)
+            finally:
+                exited.set()
+            return None
+
+    owner = CrossSourceValidator([Source()]) if kind == "validator" else TushareIfindFundamentalAdapter.__new__(TushareIfindFundamentalAdapter)
+    if kind == "legacy_growth":
+        from threading import BoundedSemaphore
+        owner._ifind = Source()
+        owner._pool = ThreadPoolExecutor(max_workers=1)
+        owner._slots = BoundedSemaphore(1)
+    try:
+        with run.bind():
+            if kind == "validator":
+                owner._collect("300260", "revenue", None, deadline=monotonic() + 0.05)
+            else:
+                owner._gather_growth_reads([("roe", "roe")], "300260.SZ", "20260630", deadline=monotonic() + 0.05)
+        assert entered.is_set()
+        run.finish()
+        run.when_clean(clean.set)
+        assert not run.clean
+        assert not clean.is_set()
+        assert not exited.is_set()
+    finally:
+        release.set()
+        owner._pool.shutdown(wait=True)
+    assert clean.wait(1)
+
+
+def test_worker_start_failure_does_not_leak_cleanup_registration(choice_transport, monkeypatch):
+    from data_provider import base
+    run = ResearchRun(5)
+    manager = DataFetcherManager()
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("fixture thread creation failure")
+
+    monkeypatch.setattr(base.Thread, "start", failed)
+    with run.bind():
+        _, error, _ = manager._run_with_timeout(lambda: None, 1, "fixture")
+    assert error == "fixture thread creation failure"
+    assert run.clean

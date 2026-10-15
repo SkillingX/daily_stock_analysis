@@ -32,6 +32,7 @@ import numpy as np
 from icontract import require, ensure
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
+from src.core.research_run import current_research, ResearchStopped
 from src.services.run_diagnostics import (
     record_provider_run,
     record_provider_run_started,
@@ -798,12 +799,24 @@ class DataFetcherManager:
             return lock
 
     def _call_fetcher_method(
-        self, fetcher: BaseFetcher, method_name: str, *args, **kwargs
-    ):
+        self, fetcher: BaseFetcher, method_name: str, *args: Any, **kwargs: Any
+    ) -> Any:
         """Serialize shared fetcher state access through manager-owned per-instance locks."""
+        run = current_research.get()
         method = getattr(fetcher, method_name)
-        with self._get_fetcher_call_lock(fetcher):
+        lock = self._get_fetcher_call_lock(fetcher)
+        if run is None:
+            with lock:
+                return method(*args, **kwargs)
+        while True:
+            run.check()
+            if lock.acquire(timeout=min(0.05, run.remaining())):
+                break
+        try:
+            run.check()
             return method(*args, **kwargs)
+        finally:
+            lock.release()
 
     @classmethod
     def _filter_daily_fetchers_for_market(
@@ -1451,6 +1464,8 @@ class DataFetcherManager:
                         )
                         if df is not None and df.empty:
                             self._record_daily_source_success(fetcher, market)
+                    except ResearchStopped:
+                        raise
                     except Exception as e:
                         error_type, error_reason = summarize_exception(e)
                         error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
@@ -1538,6 +1553,8 @@ class DataFetcherManager:
                 if df is not None and df.empty:
                     self._record_daily_source_success(fetcher, market)
 
+            except ResearchStopped:
+                raise
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 error_msg = f"[{fetcher.name}] ({error_type}) {error_reason}"
@@ -2039,6 +2056,10 @@ class DataFetcherManager:
                     if primary_quote is None:
                         failed_sources.append(source)
 
+            except ResearchStopped:
+                if primary_quote is not None:
+                    break
+                raise
             except Exception as e:
                 error_msg = f"[{source}] 失败: {str(e)}"
                 error_type, error_reason = summarize_exception(e)
@@ -2183,6 +2204,8 @@ class DataFetcherManager:
                 error_message="empty or incomplete quote",
                 record_count=0,
             )
+        except ResearchStopped:
+            raise
         except Exception as e:
             error_type, error_reason = summarize_exception(e)
             record_provider_run(
@@ -2330,6 +2353,8 @@ class DataFetcherManager:
                         )
                     # 空结果或占位结果：释放 HALF_OPEN 探测名额，避免卡死
                     circuit_breaker.record_inconclusive(source_key)
+            except ResearchStopped:
+                raise
             except Exception as e:
                 error_type, error_reason = summarize_exception(e)
                 record_provider_run(
@@ -2430,6 +2455,8 @@ class DataFetcherManager:
                         f"[股票名称] 从 {fetcher.name} 获取: {stock_code} -> {name}"
                     )
                     return name
+            except ResearchStopped:
+                raise
             except Exception as e:
                 logger.debug(f"[股票名称] {fetcher.name} 获取失败: {e}")
                 continue
@@ -2729,6 +2756,8 @@ class DataFetcherManager:
         deadline = time.monotonic() + timeout_value
         result_holder: Dict[str, Any] = {}
         error_holder: Dict[str, Exception] = {}
+        from concurrent.futures import Future
+        completion: Future[None] | None = Future() if run is not None else None
 
         if not self._fundamental_timeout_slots.acquire(blocking=False):
             return (
@@ -2736,6 +2765,8 @@ class DataFetcherManager:
                 f"{task_name} timeout worker pool exhausted",
                 int(timeout_value * 1000),
             )
+        if run is not None and completion is not None:
+            run.track(completion)
 
         def runner() -> None:
             token = request_deadline.set(deadline)
@@ -2751,6 +2782,8 @@ class DataFetcherManager:
                     self._fundamental_timeout_slots.release()
                 except ValueError:
                     pass
+                if completion is not None:
+                    completion.set_result(None)
 
         worker = Thread(target=copy_context().run, args=(runner,), daemon=True, name=f"fundamental-{task_name}")
         try:
@@ -2760,6 +2793,8 @@ class DataFetcherManager:
                 self._fundamental_timeout_slots.release()
             except ValueError:
                 pass
+            if completion is not None:
+                completion.set_result(None)
             return None, str(exc), int((time.time() - start) * 1000)
         worker.join(timeout=timeout_value)
         if worker.is_alive():
@@ -4355,8 +4390,8 @@ class DataFetcherManager:
             errors.extend(result["capital_flow"].get("errors") or [])
         except ResearchStopped:
             pass
-        for block in ("earnings", "institution", "capital_flow", "dragon_tiger", "boards"):
-            result.setdefault(block, self._build_fundamental_block("partial", {}, [], []))
+        for block_name in ("earnings", "institution", "capital_flow", "dragon_tiger", "boards"):
+            result.setdefault(block_name, self._build_fundamental_block("partial", {}, [], []))
         result["coverage"] = {block: result[block]["status"] for block in ("valuation", "growth", "earnings", "institution", "capital_flow", "dragon_tiger", "boards")}
         result["status"] = "partial"
         if not (run and (run.stop_reason or run.finalized or run.remaining() <= 0)) and not errors and self._should_cache_fundamental_context(result):
