@@ -1,3 +1,4 @@
+{% import 'financial_display.j2' as display %}
 ### 当前财务快照与六项独立核验
 
 > 以下是当前财期事实与核验状态，独立于年度评分和 PE/PB；不代表整份报告已核验。按本部署约定，iFinD A股标为“元”的金额按人民币处理；原始返回未给币种时仍保留缺项，不把部署约定称为供应商证明。
@@ -6,7 +7,7 @@
 | --- | ---: | --- | --- | --- | --- | --- |
 {% for name, field in snapshot.items() %}
 {% set r = field.reading %}
-| {{ {'revenue':'营业收入','net_profit':'归母净利润','roe':'加权ROE','gross_margin':'销售毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name, name) }} | {{ r.value if r else '缺失' }} | {{ r.source if r else '未知' }} | {{ (r.period or '未知') if r else '未知' }} / {{ r.period_basis if r else '未知' }} | {{ (r.unit or '未知') if r else '未知' }} / {{ (r.currency or '不适用或未知') if r else '未知' }} | {{ {'verified':'独立核验通过','single_source':'单源，未独立核验','not_comparable':'不可比','conflict':'数据冲突','unverified':'未完成核验','missing':'缺失'}.get(field.quality.status, field.quality.status) }}{% if field.quality.reason_codes %}：{{ field.quality.reason_codes|join(', ') }}{% endif %} | {{ '是' if field.rule_eligible else '否' }}{% if field.input_reasons %}：{{ field.input_reasons|join(', ') }}{% endif %} |
+| {{ {'revenue':'营业收入','net_profit':'归母净利润','roe':'加权ROE','gross_margin':'销售毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name, name) }} | {{ display.value(r) }} | {{ r.source if r else '未知' }} | {{ (r.period or '未知') if r else '未知' }} / {{ display.label(r.period_basis) if r else '未知' }} | {{ display.label(r.unit or '未知') if r else '未知' }} / {{ display.label(r.currency or '不适用或未知') if r else '未知' }} | {{ display.label(field.quality.status) }}{% if field.quality.reason_codes %}：{{ display.reasons(field.quality.reason_codes) }}{% endif %} | {{ '是' if field.rule_eligible else '否' }}{% if field.input_reasons %}：{{ display.reasons(field.input_reasons) }}{% endif %} |
 {% endfor %}
 
 {% for name, field in snapshot.items() %}
@@ -15,7 +16,7 @@
 {% endif %}
 {% for peer in field.comparison_readings %}
 {% if peer.source != (field.reading.source if field.reading else '') %}
-> 对照来源 {{ peer.source }}：原值 {{ peer.raw_value or peer.value }}，{{ peer.raw_label or '指标未知' }}；财期 {{ peer.period or '未知' }} / {{ peer.period_basis }}；单位 {{ peer.unit or '未知' }} / 币种 {{ peer.currency or '未知' }}；报表 {{ peer.statement_scope or '未知' }} / 调整 {{ peer.adjustment or '未知' }}{% if peer.normalization_error %}；不可采用：{{ peer.normalization_error }}{% endif %}。
+> 对照来源 {{ peer.source }}：原值 {{ peer.raw_value or peer.value }}，{{ peer.raw_label or '指标未知' }}；财期 {{ peer.period or '未知' }} / {{ display.label(peer.period_basis) }}；单位 {{ display.label(peer.unit or '未知') }} / 币种 {{ display.label(peer.currency or '未知') }}；报表 {{ display.label(peer.statement_scope or '未知') }} / 调整 {{ display.label(peer.adjustment or '未知') }}{% if peer.normalization_error %}；不可采用：{{ peer.normalization_error }}{% endif %}。
 {% endif %}
 {% endfor %}
 {% if field.source_errors %}

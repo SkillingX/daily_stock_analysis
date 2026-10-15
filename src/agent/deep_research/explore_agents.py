@@ -20,6 +20,7 @@ from src.deep_research_dims.narrate import load_constitution, load_dim_prompt
 logger = logging.getLogger(__name__)
 
 from src.config import get_config
+from src.core.research_run import current_research
 
 _INTEL_TOOLS = {
     "search_stock_news",
@@ -67,7 +68,6 @@ def _run_explore(
     deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """在共同截止时间内研究；仅成功响应的 JSON 格式错误允许修复。"""
-    from src.core.research_run import current_research
     run = current_research.get()
     if run is not None:
         reserve = min(180.0, run.timeout_seconds * 0.15)
@@ -255,6 +255,8 @@ _US_CHINA_TOOLS = {"search_comprehensive_intel", "verify_supply_chain_evidence"}
 
 def _chanlun_engine_facts(stock_code: str) -> str:
     """P0-1：缠论引擎真实结构（优先数据源）。引擎不可用时返回空串，LLM 退回工具取数。"""
+    if run := current_research.get():
+        run.check()
     try:
         import pandas as pd
 
@@ -312,8 +314,16 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
         import json
         from src.agent.tools.data_tools import _handle_get_capital_flow, _handle_get_stock_info
         deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+        if run := current_research.get():
+            run.check()
         flow = _handle_get_capital_flow(stock_code)
+        if run := current_research.get():
+            run.retain("get_capital_flow", flow)
+        if run := current_research.get():
+            run.check()
         info = _handle_get_stock_info(stock_code, deadline=deadline)
+        if run := current_research.get():
+            run.retain("get_stock_info", info)
         institution = (info.get("fundamental_context") or {}).get("institution") or {}
         institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
         tools = tools - {"get_capital_flow", "get_stock_info"}
@@ -368,16 +378,21 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
         if research is None:
+            if run := current_research.get():
+                run.check()
             info = _handle_get_stock_info(stock_code, deadline=deadline)
             research = (info.get("fundamental_context") or {}).get("research") or {}
         research = research or {}
+        if run := current_research.get():
+            run.retain_vendor("ownership", research)
         if get_config().enable_ifind_mcp and not research.get("shareholder_details"):
             from src.agent.tools.data_tools import _get_fetcher_manager
+            if run := current_research.get():
+                run.check()
             research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=None if get_config().financial_primary_source == "ifind" else (research.get("holders") or {}).get("period"), deadline=deadline)}
         task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
     research = research or {}
     details = research.get("shareholder_details")
-    from src.core.research_run import current_research
     if run := current_research.get():
         run.retain_vendor("ownership", research)
     out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
@@ -437,16 +452,21 @@ def run_business_agent(
         import json
         from src.agent.tools.data_tools import _handle_get_stock_info
         if research is None:
+            if run := current_research.get():
+                run.check()
             info = _handle_get_stock_info(stock_code, deadline=deadline)
             research = (info.get("fundamental_context") or {}).get("research") or {}
         research = research or {}
+        if run := current_research.get():
+            run.retain_vendor("business", research)
         if get_config().enable_ifind_mcp and not research.get("product_segments"):
             from src.agent.tools.data_tools import _get_fetcher_manager
+            if run := current_research.get():
+                run.check()
             research = {**research, "product_segments": _get_fetcher_manager().get_ifind_research_context(stock_code, "products", deadline=deadline)}
         task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验；不得将公司简介当定期报告原文）：" + json.dumps(research, ensure_ascii=False)
     else:
         research = {}
-    from src.core.research_run import current_research
     if run := current_research.get():
         run.retain_vendor("business", research)
     out = _run_explore("business", _BUSINESS_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)

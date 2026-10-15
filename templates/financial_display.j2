@@ -1,0 +1,23 @@
+{# Shared presentation only: original evidence, precision and eligibility stay in JSON. #}
+{% set LABELS = {'complete':'当前字段已取得', 'partial':'部分字段可用', 'missing':'尚未取得',
+'verified':'独立核验通过', 'single_source':'单源，尚未独立核验', 'not_comparable':'尚不能直接对比', 'conflict':'来源数据存在冲突', 'unverified':'尚未完成核验',
+'period_unknown':'财期未知', 'period_basis_unknown':'累计或单季口径未知', 'period_mismatch':'财期不同', 'period_basis_mismatch':'累计或单季口径不同',
+'caliber_unknown':'指标口径未知', 'caliber_mismatch':'指标口径不同', 'statement_scope_mismatch':'报表范围不同或未明确', 'adjustment_mismatch':'调整口径不同或未明确',
+'statement_scope_unknown':'报表范围未知', 'adjustment_unknown':'调整口径未知', 'restated':'已重述', 'invalid_response':'返回数据未通过校验',
+'single_family':'仅有同一来源家族', 'family_unknown':'来源独立性未明确', 'validation_disabled':'本次未启用独立核验', 'numeric_conflict':'数值差异超出核验范围',
+'unit_unknown':'单位未知', 'unit_incompatible':'单位与指标不匹配', 'unit_mismatch':'单位不同', 'unit_conflict':'原始单位含义冲突', 'currency_unknown':'币种未知', 'currency_mismatch':'币种不同',
+'roe_method_unknown':'ROE计算口径未知', 'pb_method_unknown':'PB计算口径未知', 'pe_not_ttm':'PE不是TTM口径', 'revenue_definition_unknown':'营收同比定义未知', 'profit_definition_unknown':'净利同比定义未知',
+'stale':'资料已超出时效', 'time_unknown':'取数时点未知', 'time_in_future':'取数时点异常', 'time_zone_unknown':'时区未知', 'disclosure_in_future':'披露日期晚于当前日期', 'invalid_value':'数值无效', 'metadata_invalid':'字段元信息不完整',
+'YTD':'年初至今累计', 'single_quarter':'单季', 'annual':'年度', 'unknown':'未知',
+'weighted_roe':'加权ROE', 'gross_margin':'销售毛利率', 'operating_revenue_yoy':'营业收入同比', 'total_operating_revenue_yoy':'营业总收入同比', 'parent_net_profit_yoy':'归母净利同比',
+'percentage_point':'百分点', 'multiple':'倍', 'currency_base':'基本货币单位', 'CNY':'人民币', 'consolidated':'合并报表', 'unadjusted':'未调整', 'adjusted':'已调整'
+} %}
+{% macro label(code) -%}
+{{ LABELS.get(code, code) }}
+{%- endmacro %}
+{% macro reasons(codes) -%}
+{% for code in codes %}{{ label(code) }}{{ '；' if not loop.last else '' }}{% endfor %}
+{%- endmacro %}
+{% macro value(reading) -%}
+{% if not reading %}尚未取得{% elif reading.unit == 'currency_base' %}{{ '%.2f'|format(reading.value / 100000000) }} 亿{{ '元' if reading.currency == 'CNY' else '（' ~ label(reading.currency or 'unknown') ~ '）' }}{% elif reading.unit == 'percentage_point' %}{{ '%.2f'|format(reading.value) }}%{% elif reading.unit == 'multiple' %}{{ '%.2f'|format(reading.value) }} 倍{% else %}{{ reading.value }}{% endif %}
+{%- endmacro %}

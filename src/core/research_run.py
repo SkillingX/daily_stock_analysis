@@ -31,6 +31,7 @@ class ResearchRun:
     context: Any = None
     progress: Callable[[dict[str, Any]], None] | None = None
     evidence: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    facts: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     vendor_research: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _pending: set[Future[Any]] = field(default_factory=set, repr=False)
@@ -134,6 +135,7 @@ class ResearchRun:
         """Retain bounded search evidence, never arbitrary raw tool responses."""
         if not isinstance(result, dict) or result.get("error") or result.get("success") is False:
             return
+        self.retain_facts(tool, result)
         from src.schemas.deep_research_dims import RetainedEvidence
         from pydantic import ValidationError
 
@@ -165,6 +167,14 @@ class ResearchRun:
                 self.evidence.setdefault(dim, []).extend(records)
                 self.evidence[dim] = self.evidence[dim][:20]
 
+    def retain_facts(self, tool: str, result: Any) -> None:
+        records = retained_tool_facts(tool, result)
+        with self._lock:
+            if records and not self.finalized and self.stop_reason is None and self.remaining() > 0:
+                dim = research_dimension.get() or "legacy"
+                self.facts.setdefault(dim, []).extend(records)
+                self.facts[dim] = self.facts[dim][-30:]
+
     @contextmanager
     def bind(self) -> Iterator[None]:
         from src.patches.eastmoney_patch import request_deadline
@@ -176,3 +186,58 @@ class ResearchRun:
         finally:
             request_deadline.reset(budget)
             current_research.reset(token)
+
+
+def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
+    """Keep only known scalar source fields; never dump arbitrary tool JSON."""
+    if not isinstance(result, dict) or result.get("error") or result.get("success") is False:
+        return []
+    from src.schemas.deep_research_dims import RetainedFact
+    from pydantic import ValidationError
+    import math
+
+    fields = {
+        "get_capital_flow": {"main_net_inflow": "当日主力净流入", "inflow_5d": "5交易日主力净流入", "inflow_10d": "10交易日主力净流入"},
+        "get_chip_distribution": {"profit_ratio": "获利盘比例", "avg_cost": "平均成本", "cost_90_low": "90%成本下限", "cost_90_high": "90%成本上限", "concentration_90": "90%筹码集中度"},
+        "get_realtime_quote": {"price": "价格", "change_pct": "涨跌幅", "volume": "成交量", "amount": "成交额"},
+        "get_stock_info": {"name": "公司名称", "pe_ratio": "PE", "pb_ratio": "PB", "total_mv": "总市值", "circ_mv": "流通市值", "revenue": "营业收入", "net_profit": "归母净利润", "roe": "加权ROE", "gross_margin": "毛利率", "revenue_yoy": "营收同比", "net_profit_yoy": "归母净利同比"},
+        "get_daily_history": {"open": "最近交易日开盘", "high": "最近交易日最高", "low": "最近交易日最低", "close": "最近交易日收盘", "volume": "最近交易日成交量"},
+        "analyze_trend": {"ma5": "5日均线", "ma10": "10日均线", "ma20": "20日均线", "current_price": "价格", "macd_dif": "MACD DIF", "rsi_6": "6日RSI"},
+    }.get(tool, {})
+    values = dict(result)
+    metadata = dict(result.get("field_meta") or {})
+    if tool == "get_stock_info":
+        context = result.get("fundamental_context") or {}
+        for key in ("valuation", "growth", "earnings"):
+            block = context.get(key) or {}
+            data = block.get("data") or {}
+            if key == "earnings":
+                data = data.get("financial_report") or {}
+            values.update(data)
+            metadata.update(block.get("field_meta") or {})
+        if "net_profit_parent" in values:
+            values["net_profit"] = values["net_profit_parent"]
+    if tool == "get_daily_history":
+        rows = result.get("data") or []
+        values = rows[-1] if isinstance(rows, list) and rows and isinstance(rows[-1], dict) else {}
+    records = []
+    for key, label in fields.items():
+        value = values.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)) or value == "":
+            continue
+        if isinstance(value, (int, float)) and not math.isfinite(value):
+            continue
+        meta = metadata.get({"main_net_inflow": "main_inflow", "price": "current_price"}.get(key, key)) or {}
+        quality = meta.get("quality") or {}
+        try:
+            record = RetainedFact(
+                tool=tool, label=label, value=str(value)[:300],
+                source=str(meta.get("source") or result.get("source") or "工具未标注来源")[:160],
+                period=str(meta.get("period") or meta.get("observed_at") or values.get("date") or result.get("latest_date") or result.get("date") or "")[:80],
+                unit=" / ".join(str(part) for part in (meta.get("unit") or result.get("source_unit"), meta.get("currency") or result.get("currency")) if part)[:80],
+                qualification="；".join([str(quality.get("status") or "未独立核验"), *[str(code) for code in quality.get("reason_codes", [])], *[str(code) for code in meta.get("input_reasons", [])], *[str(meta[key]) for key in ("period_basis", "statement_scope", "adjustment") if meta.get(key)], *(["历史估算"] if result.get("estimated") else [])])[:300],
+            )
+            records.append(record.model_dump())
+        except ValidationError:
+            continue
+    return records

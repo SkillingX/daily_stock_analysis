@@ -326,7 +326,7 @@ class DeepResearchExecutor:
             return ""
         return (
             f"# {stock_name}（{stock_code}）深度投研报告（未完成）\n\n"
-            f"> ⚠️ **本报告因分析时长/步数限制未能完整生成。** "
+            f"> ⚠️ **本次研究尚未完整完成。** "
             f"以下为已收集数据的初步整理，建议稍后重新生成获取完整报告。\n\n"
             f"**分析状态**：{loop_result.error or '达到最大步数限制'}\n\n"
             f"**已调用工具（{len(tools_used)} 个）**：{', '.join(tools_used) if tools_used else '无'}\n\n"
@@ -340,6 +340,9 @@ class DeepResearchExecutor:
         chunks: List[str] = []
         from src.core.research_run import current_research
         if run := current_research.get():
+            for facts in run.facts.values():
+                for fact in facts:
+                    chunks.append(f"{fact['label']}：{fact['value']} {fact['unit']}；来源 {fact['source']}，{fact['period'] or '时点未明确'}；{fact['qualification']}（未完成模型解读，不参与评分）。")
             for items in run.evidence.values():
                 for item in items:
                     chunks.append(f"[{item['title']}]({item['url']})（{item['source']}）：{item['snippet']}")

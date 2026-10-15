@@ -1,3 +1,4 @@
+{% import 'financial_display.j2' as display %}
 #### 主营分产品明细（iFinD）
 
 > 部分覆盖，仅列已取得且身份可关联的产品；不作分项求和，不作为公司整体毛利率。A股标为“元”的金额按本部署人民币约定处理。披露日 {{ products.disclosed_at or '未提供' }}；原文链接 {{ products.original_url or '未提供' }}，供应商记录不等于公告原文核验。
@@ -7,11 +8,11 @@
 | 产品 | 实际财期 | 收入 | 成本 | 毛利金额 | 毛利率 |
 | --- | --- | ---: | ---: | ---: | ---: |
 {% for item in rows %}
-| {{ item.name }} | {{ item.report_date }} |{% for field in ('revenue','cost','gross_profit','gross_margin') %}{% set r = item[field] %} {{ r.value if r else '缺失' }}{% if r %}（{{ r.unit or '单位未知' }}{% if r.currency %} / {{ r.currency }}{% endif %}{% if r.normalization_error %}；{{ r.normalization_error }}{% endif %}）{% endif %} |{% endfor +%}
+| {{ item.name }} | {{ item.report_date }} |{% for field in ('revenue','cost','gross_profit','gross_margin') %}{% set r = item[field] %} {{ display.value(r) }}{% if r %}（{{ display.label(r.unit or '单位未知') }}{% if r.currency %} / {{ display.label(r.currency) }}{% endif %}{% if r.normalization_error %}；{{ display.label(r.normalization_error) }}{% endif %}）{% endif %} |{% endfor +%}
 {% endfor %}
 {% else %}
 分产品资料未取得或证券、财期、排名无法匹配。
 {% endif %}
 {% if products.errors %}
-- 分产品资料缺口：{{ products.errors|join('、') }}。
+- 分产品资料缺口：{{ display.reasons(products.errors) }}。
 {% endif %}

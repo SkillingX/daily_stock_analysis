@@ -26,7 +26,7 @@ def test_products_survive_model_failure_and_render_in_existing_reports(ifind_tra
     assert first.report_date == '2025-12-31'
     assert dim.status == 'degraded'
     md = _render_markdown('新莱应材','300260','2026-10-14',{'business':dim.model_dump(),'financial':{},'sector':{}},'test')
-    assert '1411150168.69' in md and '2025-12-31' in md and 'iFinD' in md
+    assert '14.11 亿元' in md and '2025-12-31' in md and 'iFinD' in md
     assert '公司既有资料' in md
     assert '部分覆盖' in md
     assert len([call for call in calls if '主营构成' in call[1]]) == 1
@@ -104,7 +104,7 @@ def test_fundamental_force_refresh_updates_supplier_products(ifind_transport, fu
     product = fresh['dims']['business']['product_segments']['items'][0]
     assert product['revenue']['value'] == 1511150168.69 != old
     assert product['report_date'] == '2025-12-31'
-    assert '1511150168.69' in fresh['markdown']
+    assert '15.11 亿元' in fresh['markdown']
     saved = database.get_fundamentals_report(fresh['report_id'])
     assert service.report_markdown(saved) == fresh['markdown']
     html = markdown(service.report_markdown(saved), extras=['tables'])

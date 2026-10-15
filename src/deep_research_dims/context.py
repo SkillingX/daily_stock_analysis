@@ -274,6 +274,8 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
     workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history", "chip")}
     from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
     eastmoney_patch(budget_only=True)
+    if outer := request_deadline.get():
+        stage_deadline = min(stage_deadline, outer)
     token = request_deadline.set(stage_deadline)
     try:
         futures = {

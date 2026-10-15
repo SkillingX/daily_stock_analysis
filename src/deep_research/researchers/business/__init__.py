@@ -45,5 +45,5 @@ def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
     if products is not None:
         dim = dim.model_copy(update={"product_segments": ProductSegments.model_validate_json(json.dumps(products))})
     if dim.data_gaps or not any((dim.business_model, dim.main_products, dim.competitive_position, dim.vs_market_leader)):
-        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": "业务资料不足，已有内容仅供部分参考"})
+        dim = dim.model_copy(update={"status": "degraded", "degraded_reason": dim.degraded_reason or "业务资料不足，已有内容仅供部分参考"})
     return dim, used

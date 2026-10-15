@@ -1,3 +1,4 @@
+{% import 'financial_display.j2' as display %}
 #### 前十大股东明细（iFinD）
 
 {% set rows = holders['items'] if holders is mapping else holders.items %}
@@ -13,5 +14,5 @@
 未取得可关联的股东明细。
 {% endif %}
 {% if holders.errors %}
-- 股东资料缺口：{{ holders.errors|join('、') }}。
+- 股东资料缺口：{{ display.reasons(holders.errors) }}。
 {% endif %}

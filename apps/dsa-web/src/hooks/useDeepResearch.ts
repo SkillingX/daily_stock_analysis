@@ -240,6 +240,7 @@ export function useDeepResearch() {
                   setDimStatuses((prev) => {
                     const next = { ...prev };
                     for (const [dimId, payload] of Object.entries(event.dimensions!)) {
+                      if (!['ok', 'degraded', 'skipped'].includes(payload?.status ?? '')) continue;
                       next[dimId] =
                         payload?.status === 'degraded'
                           ? 'degraded'
@@ -252,7 +253,7 @@ export function useDeepResearch() {
                 }
               }
               if (!terminal) {
-                setProgressSteps((prev) => [...prev.slice(-199), { type: 'thinking', message: '有效资料已保存，正在等待在途工作结束。' }]);
+                setProgressSteps((prev) => [...prev.slice(-199), { type: 'thinking', message: rid && event.markdown ? '有效资料已保存，正在等待在途工作结束。' : '正在等待在途工作结束，尚未形成可保存的报告。' }]);
                 continue;
               }
               if (event.end_reason === 'cancelled') {

@@ -431,6 +431,8 @@ def _run_dual_track(
         _emit(progress_callback, {"type": "dim_done", "dim": dim_id, "status": status})
 
     def start_dim(dim_id: str) -> None:
+        if run is not None:
+            run.check()
         _emit(progress_callback, {"type": "dim_start", "dim": dim_id})
 
     from src.deep_research_dims.dim_cache import (
@@ -627,10 +629,11 @@ def _run_dual_track(
                     dims[dim_id] = DIM_MODELS[dim_id](
                         status="degraded", degraded_reason=f"研究员异常: {exc}"
                     )
-                if run is not None and run.evidence.get(dim_id):
+                if run is not None and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
                     from src.schemas.deep_research_dims import parse_dim
                     payload = dims[dim_id].model_dump()
-                    payload["retained_evidence"] = list(run.evidence[dim_id])
+                    payload["retained_evidence"] = list(run.evidence.get(dim_id, []))
+                    payload["retained_facts"] = list(run.facts.get(dim_id, []))
                     dims[dim_id] = parse_dim(dim_id, payload)
                 emit_dim(dim_id, dims[dim_id].status)
         finally:
@@ -863,7 +866,7 @@ def _run_dual_track(
     executed = [d for d, m in dims.items() if m.status != "skipped"]
     degraded = [d for d, m in dims.items() if m.status == "degraded"]
     ok_count = len(executed) - len(degraded)
-    valid = ok_count > 0 or any(model.retained_evidence for model in dims.values()) or any(getattr(model, "product_segments", None) or getattr(model, "shareholder_details", None) or getattr(model, "controller", "") for model in dims.values())
+    valid = _has_useful_data(dims)
     status = "success" if not degraded else "partial" if valid else "failed"
 
     result.success = status != "failed" and bool(markdown.strip())
@@ -887,21 +890,54 @@ def _run_dual_track(
     return result
 
 
+def _has_useful_data(dims: dict[str, Any]) -> bool:
+    """Use the same acquired-data criterion for normal and interrupted reports."""
+    for dim in dims.values():
+        if dim.status == "skipped":
+            continue
+        if dim.status == "ok" or dim.retained_evidence or dim.retained_facts:
+            return True
+        if any(getattr(dim, field, None) for field in ("business_model", "main_products", "controller", "top_holders")):
+            return True
+        if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments", "shareholder_details")):
+            return True
+    financial = dims.get("fundamental")
+    if financial is None or financial.status == "skipped":
+        return False
+    return bool(
+        financial.data_quality and financial.data_quality.obtained_count > 0
+        or any(field.reading is not None for field in financial.financial_snapshot.values())
+        or financial.valuation_detail.get("market_cap") is not None
+        or financial.financial_safety.get("leverage") is not None
+    )
+
+
 def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, selected: set[str], report_id: str | None) -> DualTrackResult:
     """Freeze completed results and render without starting any new model/tool work."""
     from datetime import datetime
     from src.schemas.deep_research_dims import parse_dim
     dims = dict(run.dimensions)
+    ctx = run.context or SharedContext(stock_code, stock_name, datetime.now().isoformat(timespec="seconds"))
+    # Stage zero can have facts even if cancellation preceded rule dimension assembly.
+    if "fundamental" in selected and "fundamental" not in dims:
+        dims["fundamental"] = build_fundamental_dim(ctx).model_copy(update={"status": "degraded", "degraded_reason": run.reason_text})
+    if "data" in selected and "data" not in dims:
+        from src.core.research_run import retained_tool_facts
+        facts = retained_tool_facts("get_realtime_quote", ctx.quote)
+        facts += retained_tool_facts("get_daily_history", {"data": ctx.history})
+        dims["data"] = DIM_MODELS["data"](status="degraded", degraded_reason=run.reason_text, retained_facts=facts)
     for dim_id in DIM_IDS:
         if dim_id not in dims:
             dims[dim_id] = DIM_MODELS[dim_id](
                 status="degraded" if dim_id in selected else "skipped",
                 degraded_reason=run.reason_text if dim_id in selected else "本次分析范围未选择",
                 retained_evidence=run.evidence.get(dim_id, []),
+                retained_facts=run.facts.get(dim_id, []),
             )
-        elif dim_id in selected and run.evidence.get(dim_id):
+        elif dim_id in selected and (run.evidence.get(dim_id) or run.facts.get(dim_id)):
             payload = dims[dim_id].model_dump()
-            payload["retained_evidence"] = run.evidence[dim_id]
+            payload["retained_evidence"] = run.evidence.get(dim_id, [])
+            payload["retained_facts"] = [*payload.get("retained_facts", []), *run.facts.get(dim_id, [])][-30:]
             dims[dim_id] = parse_dim(dim_id, payload)
     for dim_id, research in run.vendor_research.items():
         if dim_id not in selected or dims[dim_id].status == "ok":
@@ -926,14 +962,11 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
             dims[dim_id] = parse_dim(dim_id, payload)
         except (ValidationError, ValueError, TypeError) as exc:
             logger.warning("Retained vendor evidence did not pass %s contract: %s", dim_id, type(exc).__name__)
-    ctx = run.context or SharedContext(stock_code, stock_name, datetime.now().isoformat(timespec="seconds"))
     events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})
     dims = {key: parse_dim(key, value) for key, value in adjusted.items()}
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")
     markdown = render_markdown(view)
-    valid = any(dim.status == "ok" or dim.retained_evidence for dim in dims.values()) or bool(ctx.quote or ctx.history)
-    if not valid:
-        valid = any(ctx.fundamental.get(key) is not None for key in ("roe", "gross_margin", "pe_ttm", "pb", "revenue_growth", "net_profit_yoy"))
+    valid = _has_useful_data(dims)
     return DualTrackResult(success=bool(valid), status="partial" if valid else "failed", markdown=markdown if valid else "",
                            dims=dims, dims_payload={key: value.model_dump(mode="json") for key, value in dims.items()},
                            guardrail_events=events, error=run.reason_text)

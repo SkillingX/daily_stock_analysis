@@ -57,3 +57,81 @@ def test_saved_report_detail_and_download_agree_without_rewriting_file(monkeypat
     assert '来源：announcement' in download.text
     assert 'filename*=' in download.headers['content-disposition']
     assert path.read_text() == raw
+
+
+def test_partial_report_keeps_useful_content_before_limits_and_reference_in_its_subreport():
+    from src.schemas.deep_research_dims import RetainedEvidence
+    from src.deep_research_dims.render import split_dim_sections
+    dims = _all_default_dims()
+    dims['business'] = dims['business'].model_copy(update={
+        'status': 'degraded', 'degraded_reason': '模型请求超时，未完成本维度研究',
+        'narrative': '已取得主营产品收入。',
+        'retained_evidence': [RetainedEvidence(tool='search', title='公司公告', url='https://example.com/report', source='公告', snippet='主营收入资料')],
+    })
+    dims['ownership'] = dims['ownership'].model_copy(update={'status': 'skipped'})
+    md = render_markdown(build_view('样本', '300260', 'fixture', [], dims, []))
+    assert '降级占位' not in md and '省钱模式' not in md
+    assert '正常17项' in md and '未完整完成1项' in md and '主动未选1项' in md
+    business = split_dim_sections(md)['business']
+    assert business.index('已取得主营产品收入') < business.index('模型请求超时')
+    assert '[公司公告](https://example.com/report)' in business
+    assert '尚未完整完成' in business
+    assert '独立技术点位' in md and 'EV：**N/A' in md
+
+
+def test_known_historical_scope_label_changes_without_inventing_failure_cause():
+    from src.deep_research_dims.render import normalize_saved_markdown
+    raw = '省钱模式：自选维度\n⚠️ 本维度生成不充分（未知旧错误），以下内容为降级占位。\n```\n省钱模式\n```\n'
+    md = normalize_saved_markdown(raw)
+    assert md.startswith('分析范围：自选维度')
+    assert '未知旧错误' in md and '模型请求超时' not in md
+    assert '降级占位' not in md and '```\n省钱模式\n```' in md
+
+
+def test_shared_financial_template_explains_unknown_period_without_changing_eligibility():
+    from src.services.fundamentals_service import _render_markdown
+    from tests.test_f1_financial_quality import context
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+    dim = build_fundamental_dim(context({'roe': 4.56789})).model_dump(mode='json')
+    field = dim['data_quality']['fields']['roe']
+    field['quality'] = {'status': 'not_comparable', 'reason_codes': ['period_unknown', 'adjustment_mismatch', 'adjustment_unknown']}
+    before = field.copy()
+    md = _render_markdown('样本', '600519', 'fixture', {'financial': dim})
+    assert '财期未知' in md and '调整口径不同' in md and '尚不能直接对比' in md
+    assert '4.57%' in md and '百分点' in md
+    assert 'period_unknown' not in md and 'adjustment_unknown' not in md and '调整口径未知' in md
+    assert field == before
+
+
+def test_model_timeout_with_acquired_facts_does_not_claim_source_is_unconnected():
+    from src.schemas.deep_research_dims import RetainedFact
+    from src.schemas.research_framework import DimensionScore, IndicatorScore, ResearchFramework
+    from src.scoring.indicators_v2 import aggregate_v2_dimensions, framework_total_v2
+    from src.scoring.weights_v2 import DIMENSION_WEIGHTS_V2
+    from src.deep_research_dims.render import split_dim_sections
+
+    dims = _all_default_dims()
+    scores = aggregate_v2_dimensions({})
+    dims['six_dim'] = dims['six_dim'].model_copy(update={'framework': ResearchFramework(
+        dimension_total=framework_total_v2(scores),
+        dimensions=[DimensionScore(
+            dimension=row['dimension'], weight=DIMENSION_WEIGHTS_V2[row['dimension']],
+            score=row['score'], indicators=[IndicatorScore(**item) for item in row['indicators']],
+        ) for row in scores],
+    )})
+    fact = RetainedFact(tool='get_capital_flow', label='5交易日主力净流入', value='124384302.0',
+                        source='choice', period='2026-10-15', unit='CNY / CNY', qualification='unverified')
+    dims['capital'] = dims['capital'].model_copy(update={
+        'status': 'degraded', 'degraded_reason': '模型请求超时，未完成本维度研究',
+        'retained_facts': [fact],
+    })
+    before = dims['six_dim'].model_dump()
+    md = render_markdown(build_view('样本', '300260', 'fixture', [], dims, []))
+    assert '尚未接线' not in md
+    assert '当前未形成可用于该项评分的输入' in md
+    capital = split_dim_sections(md)['capital']
+    assert '模型请求超时' in capital and '124384302.0' in capital
+    assert '人民币 / 人民币' not in capital
+    assert '人民币' in capital and 'choice' in capital and '2026-10-15' in capital
+    assert dims['capital'].retained_facts[0] == fact and fact.unit == 'CNY / CNY'
+    assert dims['six_dim'].model_dump() == before

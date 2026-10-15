@@ -32,5 +32,5 @@ def parse(parsed: dict[str, Any], steps: int) -> tuple[OwnershipDim, int]:
         dim = dim.model_copy(update={"shareholder_details": IfindShareholders.model_validate_json(json.dumps(details))})
     missing = [label for label, value in (("实际控制人信息", dim.controller), ("十大股东", dim.top_holders or (dim.shareholder_details.items if dim.shareholder_details else [])), ("核心高管", dim.executives)) if not value]
     if missing or dim.data_gaps:
-        dim = dim.model_copy(update={"status": "degraded", "score": None, "degraded_reason": "股权资料不足，已有内容仅供部分参考", "data_gaps": list(dict.fromkeys([*dim.data_gaps, *missing]))})
+        dim = dim.model_copy(update={"status": "degraded", "score": None, "degraded_reason": dim.degraded_reason or "股权资料不足，已有内容仅供部分参考", "data_gaps": list(dict.fromkeys([*dim.data_gaps, *missing]))})
     return dim, used

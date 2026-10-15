@@ -101,6 +101,19 @@ class RetainedEvidence(BaseModel):
     published_date: Annotated[str, Field(max_length=40)] = ""
 
 
+class RetainedFact(BaseModel):
+    """An acquired tool fact, separate from model scores and verified conclusions."""
+
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    tool: Annotated[str, Field(min_length=1, max_length=100)]
+    label: Annotated[str, Field(min_length=1, max_length=100)]
+    value: Annotated[str, Field(min_length=1, max_length=300)]
+    source: Annotated[str, Field(min_length=1, max_length=160)]
+    period: Annotated[str, Field(max_length=80)] = ""
+    unit: Annotated[str, Field(max_length=80)] = ""
+    qualification: Annotated[str, Field(max_length=300)] = ""
+
+
 class DimEnvelope(BaseModel):
     """每个维度产出的统一信封。"""
 
@@ -111,6 +124,7 @@ class DimEnvelope(BaseModel):
     as_of: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     degraded_reason: Optional[str] = None
     retained_evidence: list[RetainedEvidence] = Field(default_factory=list)
+    retained_facts: list[RetainedFact] = Field(default_factory=list)
 
     @property
     def ok(self) -> bool:
