@@ -177,6 +177,7 @@ def test_fundamentals_keeps_business_facts_on_failure_without_success_cache(vend
     _assert_vendor("business", json.loads(saved["dims_json"])["business"], runtime["research"])
     assert report["markdown"] == saved["markdown"] == download.text
     assert "无菌包材" in download.text and "iFinD" in download.text
+    assert "validation error" not in download.text and "errors.pydantic.dev" not in download.text
     assert retry.json()["report_id"] != rid and retry.json()["status"] == "partial"
     assert not runtime["cache_writes"]
 

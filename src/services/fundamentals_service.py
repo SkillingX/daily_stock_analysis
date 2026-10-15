@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import uuid4
 from time import monotonic
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,7 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
                 break
     except Exception as exc:  # noqa: BLE001
         logger.warning("[Fundamentals] 研究员 %s 失败: %s", dim_id, exc)
-        reason = f"研究员异常: {exc}"
+        reason = "研究内容未通过格式校验，业务画像未完成" if isinstance(exc, ValidationError) else "研究员未成功完成，业务画像未完成"
     from src.schemas.deep_research_dims import DIM_MODELS
     dim = orch.restore_vendor_facts(dim_id, DIM_MODELS[dim_id](status="degraded", degraded_reason=reason), vendor_research)
     return dim.model_dump()
