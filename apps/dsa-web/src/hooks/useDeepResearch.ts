@@ -5,7 +5,7 @@ import {
   type DeepResearchReportDetail,
 } from '../api/deepResearch';
 
-export type DeepResearchStatus = 'idle' | 'generating' | 'done' | 'error';
+export type DeepResearchStatus = 'idle' | 'generating' | 'cancelling' | 'cancelled' | 'done' | 'error';
 
 export interface DeepResearchProgressStep {
   type: string;
@@ -19,7 +19,7 @@ export interface DeepResearchProgressStep {
   status?: string;
 }
 
-/** 双轨引擎 11 维度（与后端 DIM_IDS 严格对齐，徽章展示用） */
+/** 双轨引擎19维度（与后端 DIM_IDS 严格对齐，徽章展示用） */
 export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
   { id: 'fundamental', label: '财务' },
   { id: 'sector', label: '板块' },
@@ -42,7 +42,7 @@ export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
   { id: 'business', label: '业务' },
 ];
 
-export type DimRunStatus = 'pending' | 'running' | 'ok' | 'degraded' | 'skipped';
+export type DimRunStatus = 'pending' | 'queued' | 'running' | 'ok' | 'degraded' | 'skipped';
 
 export type DimStatusMap = Record<string, DimRunStatus>;
 
@@ -65,10 +65,10 @@ const INITIAL_DIM_STATUSES: DimStatusMap = Object.fromEntries(
  *
  * 参考 agentChatStore 的 SSE 解析（fetch + ReadableStream + `data: ` 行），
  * 增强点：
- * - AbortController：用户可取消（cancel）。
+ * - 主动取消调用运行API；AbortController仅用于断开页面连接。
  * - 心跳 watchdog：90s 内无任何事件（含 heartbeat）视为断线 → error。
  * - 双轨引擎维度徽章：dim_start/dim_done 事件维护 dimStatuses。
- * - 状态机：idle → generating → done | error。
+ * - 状态机：idle → generating → cancelling → cancelled，或 done/error。
  *
  * 注意：断线不做自动重连（一次性生成，重连=重复生成浪费）。断线提示用户
  * 去"历史列表"查看（报告可能已在后端生成落盘）。
@@ -87,6 +87,9 @@ export function useDeepResearch() {
   });
 
   const abortRef = useRef<AbortController | null>(null);
+  const runRef = useRef<string | null>(null);
+  const acceptedRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
   const watchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 90s 无事件 = 断线（服务端每 30s 发心跳，90s 容忍 2 次心跳丢失）
@@ -110,12 +113,28 @@ export function useDeepResearch() {
     }, WATCHDOG_MS);
   }, [clearWatchdog]);
 
+  const requestCancellation = useCallback(async (runId: string) => {
+    try {
+      await deepResearchApi.cancelRun(runId);
+    } catch {
+      if (runRef.current === runId) {
+        cancelRequestedRef.current = false;
+        setStatus('generating');
+        setError('取消请求尚未确认，研究可能仍在继续。请重试取消，或稍后到历史记录查看。');
+      }
+    }
+  }, []);
+
   const generate = useCallback(
     async (
       stockCode: string,
       stockName?: string,
       options?: { dims?: string[]; forceRefresh?: boolean },
     ) => {
+      const runId = crypto.randomUUID().replaceAll('-', '');
+      runRef.current = runId;
+      acceptedRef.current = false;
+      cancelRequestedRef.current = false;
       // 重置状态
       setStatus('generating');
       setProgressSteps([]);
@@ -132,6 +151,7 @@ export function useDeepResearch() {
       try {
         const response = await deepResearchApi.generateStream(
           {
+            run_id: runId,
             stock_code: stockCode,
             stock_name: stockName,
             report_type: 'deep',
@@ -140,6 +160,9 @@ export function useDeepResearch() {
           },
           { signal: ac.signal },
         );
+        if (runRef.current !== runId) return;
+        acceptedRef.current = true;
+        if (cancelRequestedRef.current) void requestCancellation(runId);
         const reader = response.body?.getReader();
         if (!reader) {
           throw new Error('SSE 流不可用');
@@ -150,6 +173,7 @@ export function useDeepResearch() {
 
         while (true) {
           const { done, value } = await reader.read();
+          if (runRef.current !== runId) return;
           if (done) break;
           buf += decoder.decode(value, { stream: true });
           const lines = buf.split('\n');
@@ -162,6 +186,9 @@ export function useDeepResearch() {
 
             let event: DeepResearchProgressStep & {
               report_id?: string;
+              run_id?: string;
+              end_reason?: 'report_budget' | 'cancelled' | null;
+              cleanup_pending?: boolean;
               markdown?: string;
               status?: string;
               quality_score?: number;
@@ -182,8 +209,9 @@ export function useDeepResearch() {
               continue;
             }
 
-            if (event.type === 'done') {
-              doneReceived = true;
+            if (event.type === 'done' || event.type === 'partial_ready') {
+              const terminal = event.type === 'done';
+              doneReceived = terminal;
               const rid = event.report_id ?? null;
               setReportId(rid);
               setReport({
@@ -195,6 +223,8 @@ export function useDeepResearch() {
                 quality_score: event.quality_score,
                 missing_layers: event.missing_layers || [],
                 engine: event.engine,
+                run_id: runId,
+                end_reason: event.end_reason,
               });
               setDualTrack((prev) => ({ ...prev, cacheHit: Boolean(event.cache_hit) }));
               if (event.engine === 'dual_track') {
@@ -221,7 +251,13 @@ export function useDeepResearch() {
                   });
                 }
               }
-              if (rid) {
+              if (!terminal) {
+                setProgressSteps((prev) => [...prev.slice(-199), { type: 'thinking', message: '有效资料已保存，正在等待在途工作结束。' }]);
+                continue;
+              }
+              if (event.end_reason === 'cancelled') {
+                setStatus('cancelled');
+              } else if (rid) {
                 setStatus('done');
               } else {
                 setStatus('error');
@@ -237,12 +273,12 @@ export function useDeepResearch() {
               break;
             }
 
-            if (event.type === 'heartbeat') {
+            if (event.type === 'heartbeat' || event.type === 'accepted') {
               continue; // 心跳仅用于重置 watchdog，不入 steps
             }
 
             // 双轨维度徽章事件（dim_start/dim_done）
-            if ((event.type === 'dim_start' || event.type === 'dim_done') && event.dim) {
+            if (['dim_queued', 'model_queued', 'model_start', 'dim_start', 'dim_done'].includes(event.type) && event.dim) {
               const dimId = event.dim;
               setDimStatuses((prev) =>
                 prev[dimId] === undefined
@@ -250,7 +286,9 @@ export function useDeepResearch() {
                   : {
                       ...prev,
                       [dimId]:
-                        event.type === 'dim_start'
+                        event.type === 'dim_queued' || event.type === 'model_queued'
+                          ? 'queued'
+                          : event.type === 'dim_start' || event.type === 'model_start'
                           ? 'running'
                           : event.status === 'degraded'
                             ? 'degraded'
@@ -262,7 +300,7 @@ export function useDeepResearch() {
             }
 
             // thinking / tool_start / tool_done / generating / dim_* → 进度步骤
-            setProgressSteps((prev) => [...prev, event]);
+            setProgressSteps((prev) => [...prev.slice(-199), event]);
           }
 
           if (doneReceived) break;
@@ -274,30 +312,41 @@ export function useDeepResearch() {
           setError('连接已结束但未收到完整报告，请稍后在历史列表查看或重试。');
         }
       } catch (e: unknown) {
+        if (runRef.current !== runId) return;
         const err = e as { name?: string; message?: string };
         if (err?.name === 'AbortError') {
-          // 用户取消：静默回 idle
-          setStatus('idle');
+          // 页面卸载已由运行标识隔离；此处是当前连接中断。
+          setStatus('error');
+          setError('连接已中断，原任务继续运行。请稍后到历史记录查看。');
         } else {
           setStatus('error');
           setError(err?.message || '连接失败，请检查网络后重试');
         }
       } finally {
-        clearWatchdog();
-        abortRef.current = null;
+        if (runRef.current === runId) {
+          clearWatchdog();
+          abortRef.current = null;
+          runRef.current = null;
+          acceptedRef.current = false;
+        }
       }
     },
-    [resetWatchdog, clearWatchdog],
+    [resetWatchdog, clearWatchdog, requestCancellation],
   );
 
   const cancel = useCallback(() => {
-    if (abortRef.current) {
-      abortRef.current.abort();
-    }
-    setStatus('idle');
-  }, []);
+    const runId = runRef.current;
+    if (!runId || cancelRequestedRef.current) return;
+    cancelRequestedRef.current = true;
+    setStatus('cancelling');
+    setError(null);
+    if (acceptedRef.current) void requestCancellation(runId);
+  }, [requestCancellation]);
 
   const reset = useCallback(() => {
+    runRef.current = null;
+    acceptedRef.current = false;
+    cancelRequestedRef.current = false;
     if (abortRef.current) {
       abortRef.current.abort();
     }
@@ -314,6 +363,7 @@ export function useDeepResearch() {
   // 卸载时清理
   useEffect(() => {
     return () => {
+      runRef.current = null;
       if (abortRef.current) {
         abortRef.current.abort();
       }

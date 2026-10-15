@@ -281,6 +281,10 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
             "history": pool.submit(copy_context().run, _safe_history, stock_code, 260, workers["history"]),
             "chip": pool.submit(copy_context().run, _safe_chip, stock_code, workers["chip"]),
         }
+        from src.core.research_run import current_research
+        if run := current_research.get():
+            for future in futures.values():
+                run.track(future)
         # Financial IO already has bounded workers/validation. Assemble its timeout
         # evidence here instead of racing its summary against an identical outer timer.
         ctx.fundamental = _safe_fundamental(stock_code, ctx)

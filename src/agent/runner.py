@@ -657,6 +657,10 @@ def run_agent_loop(
         ):
             _persist_usage(response.usage, model_for_usage, call_type="agent")
 
+        if research_run is not None and research_run.stop_reason:
+            return RunLoopResult(success=False, error=research_run.reason_text, messages=messages,
+                                 total_steps=step + 1, tool_calls_log=tool_calls_log,
+                                 total_tokens=total_tokens, provider=provider_used, models_used=models_used)
         remaining_timeout = _remaining_timeout_seconds(
             start_time, max_wall_clock_seconds
         )
@@ -934,8 +938,9 @@ def _execute_tools(
                 if research_run := current_research.get():
                     research_run.track(future)
                 try:
-                    _, result_str, success, dur, cached, guard_result = future.result(
-                        timeout=tool_wait_timeout_seconds
+                    _, result_str, success, dur, cached, guard_result = (
+                        research_run.wait_for(future, tool_wait_timeout_seconds) if research_run is not None
+                        else future.result(timeout=tool_wait_timeout_seconds)
                     )
                 except FuturesTimeoutError:
                     timeout_triggered = True
@@ -1018,12 +1023,12 @@ def _execute_tools(
                 for future in futures:
                     research_run.track(future)
             pending = set(futures)
-            for future in as_completed(
-                futures,
-                timeout=tool_wait_timeout_seconds
-                if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0
-                else None,
-            ):
+            research_run = current_research.get()
+            completed_futures = (
+                research_run.completed(futures, tool_wait_timeout_seconds) if research_run is not None
+                else as_completed(futures, timeout=tool_wait_timeout_seconds if tool_wait_timeout_seconds and tool_wait_timeout_seconds > 0 else None)
+            )
+            for future in completed_futures:
                 pending.discard(future)
                 tc_item, result_str, success, dur, cached, guard_result = (
                     future.result()

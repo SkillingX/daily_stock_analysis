@@ -56,6 +56,9 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                             continue
                     return
                 time.sleep(0.2)
+                hold_deadline = time.monotonic() + 8
+                while state.get("hold_models") and time.monotonic() < hold_deadline:
+                    time.sleep(0.01)
                 if state.get("research_mode") == 1 and any(message.get("role") == "tool" for message in request.get("messages", [])):
                     body = b'{"error":{"message":"controlled provider failure","type":"server_error"}}'
                     self.send_response(500)
@@ -66,6 +69,8 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                 if state.get("research_mode") == 2:
                     time.sleep(0.6)
                 message: dict[str, Any] = {"role": "assistant", "content": '{"status":"ok"}'}
+                if state.get("legacy_text"):
+                    message["content"] = "# 样本研究\n\n本次资料不足，尚不能形成完整结论。"
                 finish = "stop"
                 if state.get("research_mode") == 1:
                     message = {"role": "assistant", "content": None, "tool_calls": [{"id": "search-1", "type": "function", "function": {"name": "search_comprehensive_intel", "arguments": '{"stock_code":"600519","stock_name":"样本"}'}}]}

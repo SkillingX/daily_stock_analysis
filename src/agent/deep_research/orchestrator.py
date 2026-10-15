@@ -608,7 +608,7 @@ def _run_dual_track(
 
             for fut, dim_id in futures.items():
                 try:
-                    out = fut.result(timeout=max(0.0, run.remaining()) if run is not None else 600)
+                    out = run.wait_for(fut) if run is not None else fut.result(timeout=600)
                     if out.get("ok"):
                         if dim_id == "intel":
                             dim, used = _parse_intel(out["data"], int(out.get("steps") or 0))

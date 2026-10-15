@@ -83,7 +83,7 @@ export function DeepResearchPage() {
   const [selectedDims, setSelectedDims] = useState<string[]>(DUAL_TRACK_DIMS.map((d) => d.id));
   const [forceRefresh, setForceRefresh] = useState(false);
 
-  const isGenerating = status === 'generating';
+  const isGenerating = status === 'generating' || status === 'cancelling';
 
   // 当前展示的维度信息：新生成报告用 done 事件字段，历史报告用 dimsInfo
   const effectiveDims: DimsInfo | null = isDualTrackDetail(report)
@@ -127,7 +127,7 @@ export function DeepResearchPage() {
 
   // 生成完成后刷新历史列表
   useEffect(() => {
-    if (status === 'done' && reportId) {
+    if ((status === 'done' || status === 'cancelled') && reportId) {
       loadHistory();
     }
   }, [status, reportId, loadHistory]);
@@ -369,9 +369,10 @@ export function DeepResearchPage() {
             {isGenerating && (
               <button
                 onClick={cancel}
+                disabled={status === 'cancelling'}
                 className="inline-flex h-11 items-center gap-1.5 rounded-xl border border-white/10 px-3 text-sm text-muted-text hover:text-secondary-text"
               >
-                <X className="h-4 w-4" /> 取消
+                <X className="h-4 w-4" /> {status === 'cancelling' ? '正在取消…' : '取消'}
               </button>
             )}
           </div>
@@ -445,7 +446,7 @@ export function DeepResearchPage() {
             <div className="space-y-4">
               <div className="flex items-center gap-3 text-secondary-text">
                 <Loader2 className="h-5 w-5 animate-spin text-cyan" />
-                <span>正在执行双轨多维深度分析（短线六件套 × 长线五段式），请勿关闭页面...</span>
+                <span>{status === 'cancelling' ? '正在停止后续研究并保留有效资料；在途工作结束后完成取消。' : '正在生成深度投研报告。关闭页面后仍会继续，可稍后到历史记录查看。'}</span>
               </div>
               {/* 双轨维度徽章进度 */}
               <div className="flex flex-wrap gap-1.5">
@@ -496,6 +497,10 @@ export function DeepResearchPage() {
             </div>
           )}
 
+          {status === 'cancelled' && !report?.markdown && (
+            <p className="py-8 text-center text-secondary-text">本次生成已取消，尚未形成可保存的有效资料。</p>
+          )}
+          {isGenerating && error && <p role="alert" className="text-sm text-amber-400">{error}</p>}
           {/* 错误 */}
           {status === 'error' && (
             <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">

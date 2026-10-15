@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
-from concurrent.futures import Future
+from collections.abc import Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError as FutureTimeout, wait
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -34,6 +34,7 @@ class ResearchRun:
     vendor_research: dict[str, dict[str, Any]] = field(default_factory=dict)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _pending: set[Future[Any]] = field(default_factory=set, repr=False)
+    _on_clean: Callable[[], None] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.deadline = monotonic() + self.timeout_seconds
@@ -68,12 +69,53 @@ class ResearchRun:
         def done(completed: Future[Any]) -> None:
             with self._lock:
                 self._pending.discard(completed)
+            self._notify_clean()
 
         future.add_done_callback(done)
 
     def finish(self) -> None:
         with self._lock:
             self.finalized = True
+        self._notify_clean()
+
+    def when_clean(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            self._on_clean = callback
+        self._notify_clean()
+
+    def _notify_clean(self) -> None:
+        callback = None
+        with self._lock:
+            if self.finalized and not self._pending:
+                callback, self._on_clean = self._on_clean, None
+        if callback is not None:
+            callback()
+
+    def wait_for(self, future: Future[Any], timeout: float | None = None) -> Any:
+        deadline = min(self.deadline, monotonic() + timeout) if timeout is not None else self.deadline
+        while True:
+            if future.done():
+                return future.result()
+            self.check()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise FutureTimeout()
+            try:
+                return future.result(timeout=min(0.05, remaining))
+            except FutureTimeout:
+                if future.done():
+                    return future.result()
+
+    def completed(self, futures: Iterable[Future[Any]], timeout: float | None) -> Iterator[Future[Any]]:
+        pending = set(futures)
+        deadline = min(self.deadline, monotonic() + timeout) if timeout is not None else self.deadline
+        while pending:
+            self.check()
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise FutureTimeout()
+            done, pending = wait(pending, timeout=min(0.05, remaining), return_when=FIRST_COMPLETED)
+            yield from done
 
     def emit(self, event: dict[str, Any]) -> None:
         if self.progress is not None and not self.finalized:

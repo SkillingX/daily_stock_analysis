@@ -38,12 +38,14 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/generate/stream` | SSE 流式生成。事件：`thinking`/`tool_start`/`tool_done`/`generating`/`done`/`error`/`heartbeat`（30s 心跳）|
+| GET | `/runs/{run_id}` | 当前运行状态：running/cancelling/finishing/finished；进程内查询 |
+| POST | `/runs/{run_id}/cancel` | 取消指定运行；等待实际在途清理，重复调用不影响后续运行 |
 | GET | `/reports?limit=50&offset=0` | 历史报告列表（分页，按时间倒序）|
 | GET | `/reports/{report_id}` | 报告详情（含 Markdown 正文）|
 | DELETE | `/reports/{report_id}` | 删除报告（元数据 + .md + .pdf）|
 | GET | `/reports/{report_id}/pdf` | PDF 下载（惰性生成，`asyncio.to_thread` + Semaphore 限流）|
 
-**report_id 格式**：`{6位A股代码}_{YYYYMMDDHHmm}`，白名单 `^\d{6}_\d{12}$`（防路径穿越）。
+**report_id 格式**：`{6位A股代码}_{YYYYMMDDHHmm}`，允许同分钟冲突后缀 `_序号`，白名单 `^\d{6}_\d{12}(_\d+)?$`（防路径穿越）。
 
 ## 4. 配置
 
@@ -79,7 +81,7 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 
 - **数据缺失**：政策评分/行业高频价/龙虎榜等无专门数据源 → LLM 基于公开信息推断，**必须标注「数据缺失/基于推断」**，禁止编造。
 - **单数据源失败**：复用 `DataFetcherManager` 多源 fallback，不拖垮报告。
-- **超时**：executor `max_steps=30` / `wall_clock=1200s`；SSE 30s 心跳；前端 90s watchdog 断线检测。
+- **超时**：有限报告总预算与各阶段预算共同生效；SSE 30s 心跳；前端90s无事件按连接中断处理，后台任务继续。
 - **认证**：单管理员模型（历史报告全局可见，无用户隔离）。
 
 ## 8. 排障
@@ -105,3 +107,9 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 ### 研究预算与部分结果
 
 完整范围仍为19维。2400秒是有限的初始总预算：既有并发3基线约788秒，为串行执行预留约三倍时间；最终应结合并发1的真实运行复核。它不是逐个Future的等待时限，也不改变其他Agent入口的超时配置。深研单次模型响应复用已有 `LLM_STREAM_RESPONSE_TIMEOUT` 上限（与Analyzer一致），获得额度后再计算；等待仍消耗报告与阶段剩余预算。排队、模型响应和数据查询分别记录；超时不据此推断限流或欠费。规则已有正文直接使用，减少纯润色请求；研究失败保留已经取得且通过现有契约的资料及来源，部分产物不写入完整成功缓存。搜索参考资料不等于研究结论或独立核验，不参与补造评分、目标价。
+
+### 取消与连接生命周期
+
+提交可传可选 `run_id`（32位小写十六进制），旧客户端不传时由服务端生成。HTTP响应头 `X-Research-Run-Id` 与首个 `accepted` 事件回显该标识。前端提交前生成标识，接收确认前点击取消会等待接收后再发送取消请求。取消停止后续模型/工具工作，已有有效资料可保存为部分报告；没有有效资料时不创建空报告。同步SDK等不能立即中止的在途调用继续占用额度和同股去重，清理完成才发最终 `done`；期间可先收到 `partial_ready`，不表示后台已停止。
+
+关闭页面、切换路由或SSE断线只断开监听，已接收任务继续执行，生成产物进入原有历史。股票代码统一后去重，取消后的清理期间也不能重复提交同股任务。运行标识区分每次任务，旧取消请求不影响新任务。事件队列最多128条、完成回执最多256条，断线后不积压事件；状态与取消接口继承全局认证，不承诺重启恢复、跨进程协调或事件重放。
