@@ -33,6 +33,9 @@ def financial_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[s
     from src.patches.eastmoney_patch import _patch_sign
     monkeypatch.setattr(_patch_sign, "patched", False)
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden_request)
+    # This fixture supplies the public primary only, without optional suppliers.
+    for key in ("FUYAO_API_KEY", "IFIND_MCP_TOKEN", "IFIND_MCP_ENDPOINT"):
+        monkeypatch.delenv(key, raising=False)
 
     values: dict[str, Any] = {"ratio": 0.0, "market_cap": 100_000_000_000.0}
     quote = UnifiedRealtimeQuote(
@@ -47,7 +50,6 @@ def financial_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[s
     monkeypatch.setattr("src.config.get_config", lambda: cfg)
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", manager)
     monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path / "cache"))
-    monkeypatch.delenv("FUYAO_API_KEY", raising=False)
     monkeypatch.setattr(
         akshare, "stock_financial_abstract",
         lambda **kwargs: values["frame"] if values.get("frame") is not None else pd.DataFrame({

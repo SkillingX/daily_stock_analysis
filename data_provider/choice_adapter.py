@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import importlib
 import json
+import logging
 import math
 import multiprocessing
 import os
@@ -25,10 +26,13 @@ from icontract import ensure
 from data_provider.base import is_bse_code, normalize_stock_code
 from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
 
+logger = logging.getLogger(__name__)
+
 
 class NativeReply(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
     error: str | None = None
+    native_code: int | None = None
     codes: list[str] = Field(default_factory=list)
     indicators: list[str] = Field(default_factory=list)
     dates: list[str] = Field(default_factory=list)
@@ -140,12 +144,12 @@ def _serve_native(connection: Connection) -> None:
                         sdk = importlib.import_module("EmQuantAPI").c
                     login = sdk.start(options_login, logcallback=lambda _: 1)
                     if login.ErrorCode:
-                        connection.send({"error": _native_error(login.ErrorCode, login.ErrorMsg)})
+                        connection.send({"error": _native_error(login.ErrorCode, login.ErrorMsg), "native_code": login.ErrorCode})
                         continue
                     logged_in = True
                 result = getattr(sdk, method)(*args, options)
                 if result.ErrorCode:
-                    connection.send({"error": _native_error(result.ErrorCode, result.ErrorMsg)})
+                    connection.send({"error": _native_error(result.ErrorCode, result.ErrorMsg), "native_code": result.ErrorCode})
                 else:
                     connection.send({"codes": result.Codes, "indicators": result.Indicators,
                                      "dates": [str(d) for d in result.Dates], "data": result.Data})
@@ -253,7 +257,9 @@ class ChoiceAdapter:
         except ValidationError as exc:
             raise SourceReadError(self.name, "invalid_response") from exc
         if reply.error:
-            raise SourceReadError(self.name, reply.error)
+            error = SourceReadError(self.name, reply.error)
+            logger.warning("Choice request failed: method=%s reason=%s native_code=%s", method, error.reason_code, reply.native_code)
+            raise error
         return reply
 
     @staticmethod
@@ -325,6 +331,7 @@ class ChoiceAdapter:
     def snapshot(self, code: str, *, deadline: float) -> dict[str, Any]:
         today = date.today()
         out: dict[str, Any] = {"growth": {}, "valuation": {}, "field_meta": {}, "errors": [], "contract": self.contract_version}
+        field_errors: dict[str, str] = {}
         from src.core.research_run import ResearchStopped
         report, disclosure, trade_day = None, None, None
         try:
@@ -337,6 +344,7 @@ class ChoiceAdapter:
                     out["errors"].append("choice:period_unknown")
             except SourceReadError as exc:
                 out["errors"].append(str(exc))
+                field_errors["growth"] = exc.reason_code
             if report is not None:
                 try:
                     fields = self.css(code, "OPERATEREVENEW,PARENTNETPROFITNEW,ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
@@ -351,6 +359,7 @@ class ChoiceAdapter:
                     out["growth"].update(report_date=report, disclosure_date=disclosure)
                 except SourceReadError as exc:
                     out["errors"].append(str(exc))
+                    field_errors["growth"] = exc.reason_code
                 try:
                     balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
                     disclosed = self.report_date(balance["ACTUALISSUINGDATE"]) if balance.get("ACTUALISSUINGDATE") else None
@@ -372,6 +381,7 @@ class ChoiceAdapter:
                 out["valuation"]["trade_date"] = trade_day
             except SourceReadError as exc:
                 out["errors"].append(str(exc))
+                field_errors["valuation"] = exc.reason_code
             out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
             for name, indicators, options in (
                 ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
@@ -393,6 +403,13 @@ class ChoiceAdapter:
         except ResearchStopped:
             # A stopped run may still render completed, validated source facts.
             pass
+        for block, fields in {"growth": ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy"), "valuation": ("pe_ratio", "pb_ratio", "total_mv")}.items():
+            if block in field_errors:
+                for field in fields:
+                    out["field_meta"].setdefault(field, {
+                        "quality": {"status": "missing", "reason_codes": ["source_error"]},
+                        "source_errors": [{"source": self.name, "reason_code": field_errors[block]}],
+                    })
         out.update(as_of=trade_day, report_date=report, disclosure_date=disclosure)
         out.setdefault("research", {"source": "choice", "as_of": today.isoformat(), "errors": []})
         return out

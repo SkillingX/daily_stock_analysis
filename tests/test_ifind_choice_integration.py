@@ -246,7 +246,9 @@ def test_report_keeps_secondary_evidence_and_safe_failure(ifind_transport, monke
     snapshot = build_fundamental_dim(ctx).financial_snapshot
     rendered = Environment(loader=FileSystemLoader('templates')).get_template('financial_snapshot.j2').render(snapshot=snapshot)
     assert snapshot['revenue'].reading.value == 2997710000
-    assert 'authentication_failed' in rendered
+    assert snapshot['revenue'].source_errors == ('ifind:authentication_failed',)
+    assert 'iFinD：登录验证未通过' in rendered
+    assert 'authentication_failed' not in rendered
     assert snapshot['revenue'].quality.status != 'verified'
 
 
