@@ -20,6 +20,6 @@
 {% endif %}
 {% endfor %}
 {% if field.source_errors %}
-> 核验未完成：{{ field.source_errors|join(', ') }}。
+> {{ {'revenue':'营收','net_profit':'归母净利','roe':'ROE','gross_margin':'毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name,name) }}数据查询未完成：{% for error in field.source_errors %}{{ display.failure(error) }}{{ '；' if not loop.last else '' }}{% endfor %}。
 {% endif %}
 {% endfor %}
