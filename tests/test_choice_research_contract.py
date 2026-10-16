@@ -9,11 +9,59 @@ from src.deep_research_dims.fundamental_dim import build_fundamental_dim
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.scenarios_dim import build_scenarios_dim
 from src.deep_research_dims.signal_dim import build_signal_dim
-from src.deep_research_dims.render import build_view, render_markdown
+from src.deep_research_dims.render import build_view, render_markdown, split_dim_sections
 from src.deep_research_dims.manager_writeup import qualified_manager_writeup
 from src.deep_research.researchers.ownership import parse
 from src.schemas.deep_research_dims import DataDim
 from tests.test_deep_research_dims import _all_default_dims
+
+
+@pytest.mark.parametrize('failed_query,reason', [
+    ('all', 'authentication_failed'),
+    ('header', 'authentication_failed'),
+    ('financials', 'timeout'),
+    ('valuation', 'permission_denied'),
+    ('targets', 'quota_exhausted'),
+    ('empty', None),
+])
+def test_financial_query_errors_reach_only_affected_fields(choice_transport, monkeypatch, failed_query, reason):
+    from data_provider.choice_adapter import ChoiceAdapter
+    from data_provider.cross_source_validator import SourceReadError
+    native = ChoiceAdapter._native_request
+
+    def request(method, args, options, deadline):
+        indicators = args[1] if method == 'css' else ''
+        query = 'header' if 'LATESTREPORTNEW' in indicators else 'financials' if 'ROEWA' in indicators else 'valuation' if 'PETTM' in indicators else 'targets' if 'RATINGTARGETPRICE' in indicators else None
+        if reason and (failed_query == 'all' or failed_query == query):
+            raise SourceReadError('choice', reason)
+        reply = native(method, args, options, deadline)
+        if failed_query == 'empty' and query == 'financials':
+            reply['data'][args[0]] = [None] * len(reply['indicators'])
+        return reply
+
+    monkeypatch.setattr(ChoiceAdapter, '_native_request', staticmethod(request))
+    ctx = SharedContext('300398', '飞凯材料', date.today().isoformat())
+    ctx.fundamental = _safe_fundamental(ctx.stock_code, ctx)
+    dim = build_fundamental_dim(ctx)
+    for field, evidence in dim.data_quality.fields.items():
+        affected = failed_query == 'all' or (failed_query == 'valuation' and field in {'pe_ratio', 'pb_ratio'}) or (failed_query in {'header', 'financials'} and field not in {'pe_ratio', 'pb_ratio'})
+        assert evidence.source_errors == ((f'choice:{reason}',) if affected else ())
+        if affected:
+            assert evidence.reading is None and not evidence.rule_eligible
+        elif failed_query != 'empty' or field in {'pe_ratio', 'pb_ratio'}:
+            assert evidence.reading is not None
+        else:
+            assert evidence.reading is None
+            assert 'source_error' not in evidence.quality.reason_codes
+    if failed_query == 'all':
+        assert dim.data_quality.obtained_count == 0 and dim.health_score is None
+        dims = _all_default_dims()
+        dims['fundamental'] = dim
+        markdown = render_markdown(build_view(ctx.stock_name, ctx.stock_code, ctx.as_of, [], dims, []))
+        assert 'Choice：登录验证未通过' in markdown
+        assert 'source_error' not in markdown and 'authentication_failed' not in markdown
+        rows = [line for line in split_dim_sections(markdown)['fundamental'].splitlines() if line.startswith(('| PE |', '| PB |', '| ROE |', '| 毛利率 |', '| 营收同比 |', '| 归母净利同比 |'))]
+        assert len(rows) == 6 and all(row.count('|') == 8 and row.endswith(' 否 |') for row in rows)
 
 
 def test_choice_inputs_reach_financial_sector_and_target_report(choice_transport):
@@ -62,6 +110,38 @@ def test_invalid_missing_or_stale_target_cannot_become_model_valuation(changes):
     assert scenario.target_price is scenario.expected_value is None
     signal = build_signal_dim(ctx, {}, scenario.model_dump())
     assert signal.status == 'degraded' and signal.target_price is None
+
+
+@pytest.mark.parametrize('failure,label', [
+    ('authentication_failed', '登录验证'),
+    ('permission_denied', '权限'),
+    ('quota_exhausted', '额度'),
+    ('timeout', '超时'),
+    ('sdk_unavailable', '连接'),
+    ('invalid_response', '查询未完成'),
+])
+@pytest.mark.parametrize('price', [None, 60.0])
+def test_target_query_failure_is_not_reported_as_an_empty_window(failure, label, price):
+    ctx = SharedContext('300398', '飞凯材料', date.today().isoformat())
+    ctx.fundamental = {'research': {'source': 'choice', 'as_of': ctx.as_of,
+                                  'target_window_days': 180, 'targets': {'RATINGTARGETPRICE': price},
+                                  'errors': [f'choice:targets:{failure}']}}
+    scenario = build_scenarios_dim(ctx, 27.73)
+    assert scenario.status == 'degraded'
+    assert scenario.target_price is scenario.expected_value is None
+    assert label in scenario.degraded_reason
+    assert '近180日窗口未提供机构目标价' not in scenario.degraded_reason
+    assert failure not in scenario.narrative
+
+
+def test_other_choice_failure_does_not_hide_successful_empty_target_window():
+    ctx = SharedContext('300398', '飞凯材料', date.today().isoformat())
+    ctx.fundamental = {'research': {'source': 'choice', 'as_of': ctx.as_of,
+                                  'target_window_days': 180, 'targets': {},
+                                  'errors': ['choice:industry:authentication_failed']}}
+    scenario = build_scenarios_dim(ctx, 27.73)
+    assert '近180日窗口未提供机构目标价' in scenario.degraded_reason
+    assert 'authentication_failed' not in scenario.narrative
 
 
 def test_missing_sector_and_ownership_are_not_called_complete():
@@ -117,7 +197,8 @@ def test_model_failure_preserves_choice_company_and_holder_evidence(choice_trans
     assert business['data']['status'] == 'degraded'
 
 
-def test_target_reference_survives_real_service_sse_and_persisted_readback(choice_transport, monkeypatch, tmp_path):
+@pytest.mark.parametrize('target_result', ['ok', 'empty', 'authentication_failed', 'timeout', 'financial_authentication_failed'])
+def test_target_reference_survives_real_service_sse_and_persisted_readback(choice_transport, monkeypatch, tmp_path, target_result):
     import json
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -125,6 +206,22 @@ def test_target_reference_survives_real_service_sse_and_persisted_readback(choic
     from src.agent.deep_research import orchestrator
     from src.services import deep_research_service as service
     from src.storage import DatabaseManager
+    from data_provider.choice_adapter import ChoiceAdapter
+    native = ChoiceAdapter._native_request
+
+    def request(method, args, options, deadline):
+        if target_result == 'financial_authentication_failed' and method == 'css' and any(indicator in args[1] for indicator in ('LATESTREPORTNEW', 'ROEWA', 'PETTM')):
+            return {'error': 'authentication_failed', 'native_code': 10001009}
+        if method == 'css' and 'RATINGTARGETPRICE' in args[1]:
+            if target_result in {'authentication_failed', 'timeout'}:
+                return {'error': target_result, 'native_code': 10001009 if target_result == 'authentication_failed' else None}
+            reply = native(method, args, options, deadline)
+            if target_result == 'empty':
+                reply['data'][args[0]] = [None, None, None]
+            return reply
+        return native(method, args, options, deadline)
+
+    monkeypatch.setattr(ChoiceAdapter, '_native_request', staticmethod(request))
     choice_transport.deep_research_engine = 'dual_track'
     monkeypatch.setattr(choice_transport, 'is_agent_available', lambda: True)
     choice_transport.database_path = str(tmp_path / 'research.db')
@@ -139,17 +236,31 @@ def test_target_reference_survives_real_service_sse_and_persisted_readback(choic
     app.include_router(endpoint.router, prefix='/api/v1/deep-research')
     try:
         with TestClient(app) as client:
-            response = client.post('/api/v1/deep-research/generate/stream', json={'stock_code': '300260', 'stock_name': 'fixture', 'force_refresh': True, 'dims': ['scenarios']})
+            response = client.post('/api/v1/deep-research/generate/stream', json={'stock_code': '300260', 'stock_name': 'fixture', 'force_refresh': True, 'dims': ['fundamental', 'scenarios']})
             events = [json.loads(line[5:]) for line in response.text.splitlines() if line.startswith('data:')]
             assert not [event for event in events if event['type'] == 'error'], events
             done = next(event for event in events if event['type'] == 'done')
-            assert done['dimensions']['scenarios']['target_price'] == 60.0
-            reference = done['dimensions']['scenarios']['analyst_target']
-            assert reference['as_of'] == date.today().isoformat() and reference['price'] == '60'
+            scenario = done['dimensions']['scenarios']
+            reference = scenario['analyst_target']
+            if target_result in {'ok', 'financial_authentication_failed'}:
+                assert scenario['target_price'] == 60.0
+                assert reference['as_of'] == date.today().isoformat() and reference['price'] == '60'
+            else:
+                assert scenario['status'] == 'degraded'
+                assert scenario['target_price'] is reference is None
+                assert ('近180日窗口未提供机构目标价' in scenario['narrative']) == (target_result == 'empty')
             report_id = done['report_id']
             reread = client.get(f'/api/v1/deep-research/reports/{report_id}').json()
             downloaded = client.get(f'/api/v1/deep-research/reports/{report_id}/markdown').text
             assert reread['data']['markdown'] == downloaded == done['markdown']
+            if target_result == 'financial_authentication_failed':
+                quality = reread['data']['dimensions']['fundamental']['data_quality']
+                assert quality == done['dimensions']['fundamental']['data_quality']
+                assert quality['obtained_count'] == 0
+                assert all(field['source_errors'] == ['choice:authentication_failed'] for field in quality['fields'].values())
+                assert 'Choice：登录验证未通过' in downloaded
+                assert 'source_error' not in downloaded
+                assert '|\n盈利质量：' not in downloaded
             dims_response = client.get(f'/api/v1/deep-research/reports/{report_id}/dims')
             assert dims_response.status_code == 200
             assert dims_response.json()['data']['dimensions']['scenarios']['analyst_target'] == reference

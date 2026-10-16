@@ -23,9 +23,9 @@ def financial_field_quality(fund: Dict[str, Any], field: str) -> FinancialFieldQ
     metadata = (fund.get("field_meta") or {}).get(field) or {}
     comparison = ((fund.get("cross_validation") or {}).get("anchors") or {}).get(field) or {}
     readings = tuple(reading for item in comparison.get("readings", []) if (reading := reading_from_field_record(item.get("value"), item)) is not None)
-    failures = tuple(f"{item['source']}:{item['reason_code']}" for item in comparison.get("source_errors", []))
     if metadata.get("value", fund.get(_FUNDAMENTAL_FIELDS.get(field, field))) != fund.get(_FUNDAMENTAL_FIELDS.get(field, field)):
         metadata = {}
+    failures = tuple(dict.fromkeys(f"{item['source']}:{item['reason_code']}" for item in [*metadata.get("source_errors", []), *comparison.get("source_errors", [])]))
     reading = reading_from_field_record(fund.get(_FUNDAMENTAL_FIELDS.get(field, field)), metadata)
     if reading is None:
         return FinancialFieldQuality(quality=AnchorQuality(status="missing", reason_codes=tuple((metadata.get("quality") or {}).get("reason_codes") or ())), comparison_readings=readings, source_errors=failures)

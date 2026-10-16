@@ -9,6 +9,29 @@ from tests.test_deep_research_dims import _all_default_dims
 
 
 @pytest.mark.parametrize('template', ['deep_research_report_v2.j2', 'deep_research_dual_track.j2'])
+@pytest.mark.parametrize('values', [{}, {'roe': 0.0, 'net_profit_yoy': -7.5}])
+def test_financial_table_does_not_consume_following_prose(template, values):
+    from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+    from tests.test_f1_financial_quality import context
+    dims = _all_default_dims()
+    dims['fundamental'] = build_fundamental_dim(context(values))
+    markdown = render_markdown(build_view('样本', '300260', 'fixture', [], dims, []), template_name=template)
+    assert '|\n盈利质量：' not in markdown
+    last_row = next(line for line in markdown.splitlines() if line.startswith('| 归母净利同比 |'))
+    assert last_row + '\n\n' in markdown
+
+
+def test_saved_financial_table_boundary_is_repaired_without_changing_code_examples():
+    from src.deep_research_dims.render import normalize_saved_markdown
+    raw = '| 指标 | 值 |\n| --- | --- |\n| ROE | 尚未取得 |\n盈利质量：\n- 数据缺失\n'
+    code = '\n```markdown\n' + raw + '```\n'
+    normalized = normalize_saved_markdown(raw + code)
+    assert '| ROE | 尚未取得 |\n\n盈利质量：' in normalized
+    assert code in normalized
+    assert normalize_saved_markdown(normalized) == normalized
+
+
+@pytest.mark.parametrize('template', ['deep_research_report_v2.j2', 'deep_research_dual_track.j2'])
 def test_ownership_objects_and_disclosure_sections_render_as_markdown(template):
     dims = _all_default_dims()
     dims['ownership'], _ = parse({'top_holders': [{'rank_or_note': '股东名单缺失', 'detail': '未取得原始公告', 'source': '未验证'}], 'executives': [{'name': '示例高管', 'source': 'announcement', 'detail': '公开职务'}]}, 0)
@@ -31,7 +54,8 @@ def test_legacy_markdown_is_normalized_without_changing_code():
     assert normalize_saved_markdown(rendered) == rendered
 
 
-def test_saved_report_detail_and_download_agree_without_rewriting_file(monkeypatch, tmp_path):
+@pytest.mark.parametrize('financial_table', [False, True])
+def test_saved_report_detail_and_download_agree_without_rewriting_file(monkeypatch, tmp_path, financial_table):
     from types import SimpleNamespace
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -40,6 +64,8 @@ def test_saved_report_detail_and_download_agree_without_rewriting_file(monkeypat
     report_id = '300260_202610130930'
     path = tmp_path / (report_id + '.md')
     raw = '<!-- dim:ownership -->\n<details>\n<summary>历史报告</summary>\n\n- name=\'示例高管\' source=\'announcement\'\n\n</details>\n'
+    if financial_table:
+        raw = '| 指标 | 值 |\n| --- | --- |\n| ROE | 尚未取得 |\n盈利质量：\n- 数据缺失\n'
     path.write_text(raw)
     metadata = {'id': report_id, 'md_path': str(path), 'stock_code': '300260', 'stock_name': '样本'}
     record = SimpleNamespace(md_path=str(path), to_dict=lambda: metadata.copy())
@@ -54,7 +80,10 @@ def test_saved_report_detail_and_download_agree_without_rewriting_file(monkeypat
     assert detail.json()['data']['markdown'] == download.text
     assert '<details>' not in download.text and 'name=' not in download.text
     assert '<!-- dim:' not in download.text
-    assert '来源：announcement' in download.text
+    if financial_table:
+        assert '| ROE | 尚未取得 |\n\n盈利质量：' in download.text
+    else:
+        assert '来源：announcement' in download.text
     assert 'filename*=' in download.headers['content-disposition']
     assert path.read_text() == raw
 
