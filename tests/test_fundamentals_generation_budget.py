@@ -3,7 +3,7 @@ Run: python -m pytest tests/test_fundamentals_generation_budget.py
 Uses synthetic providers and a loopback HTTP server; no external credentials.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Event, Semaphore, Thread
+from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any
 
@@ -25,7 +25,6 @@ def exploration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(explore_agents, '_registry_source', ToolRegistry)
     monkeypatch.setattr(explore_agents, 'load_constitution', lambda: '')
     monkeypatch.setattr(explore_agents, 'load_dim_prompt', lambda _: 'fixture business rules')
-    monkeypatch.setattr(explore_agents, '_llm_semaphore', lambda: Semaphore(1))
 
 
 def test_failed_model_is_not_retried_as_invalid_json(exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -38,7 +37,7 @@ def test_failed_model_is_not_retried_as_invalid_json(exploration: None, monkeypa
     assert not out['ok'] and len(calls) == 1
 
 
-def test_json_repair_and_semaphore_use_original_deadline(exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_json_repair_uses_original_deadline(exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
     budgets: list[float] = []
     def loop(**kwargs: Any) -> RunLoopResult:
         budgets.append(kwargs['max_wall_clock_seconds'])
@@ -47,9 +46,8 @@ def test_json_repair_and_semaphore_use_original_deadline(exploration: None, monk
     monkeypatch.setattr(explore_agents, 'run_agent_loop', loop)
     out = explore_agents._run_explore('business', set(), 'fixture', object(), deadline=monotonic() + 1)
     assert out['ok'] and len(budgets) == 2 and budgets[1] < budgets[0] - 0.01
-    monkeypatch.setattr(explore_agents, '_llm_semaphore', lambda: Semaphore(0))
     started = monotonic()
-    out = explore_agents._run_explore('business', set(), 'fixture', object(), deadline=started + 0.03)
+    out = explore_agents._run_explore('business', set(), 'fixture', object(), deadline=started - 0.03)
     assert not out['ok'] and len(budgets) == 2 and monotonic() - started < 0.3
 
 

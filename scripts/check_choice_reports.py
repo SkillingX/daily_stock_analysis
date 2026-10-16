@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, ProxyHandler, build_opener
@@ -29,6 +30,8 @@ def main() -> None:
         parser.error("--dims is only supported for deep-research")
     http = build_opener(ProxyHandler({}))
     base = f"{args.base_url.rstrip('/')}/api/v1/{args.kind}"
+    started = time.monotonic()
+    events = []
     if args.kind == "deep-research":
         request = Request(f"{base}/generate/stream", data=json.dumps({"stock_code": args.code, "force_refresh": True,
                           "dims": args.dims}).encode(), headers={"Content-Type": "application/json"}, method="POST")
@@ -38,6 +41,11 @@ def main() -> None:
                 if not line.startswith(b"data:"):
                     continue
                 event = json.loads(line[5:])
+                observation = {key: event[key] for key in ("type", "run_id", "dim", "tool", "success", "status", "queue_seconds", "model_seconds") if key in event}
+                observation["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                events.append(observation)
+                if event.get("type") in {"accepted", "dim_done", "partial_ready", "done"}:
+                    print(json.dumps(observation, ensure_ascii=False), flush=True)
                 if event.get("type") == "error":
                     raise RuntimeError(event.get("message") or "Deep research failed")
                 if event.get("type") == "done":
@@ -58,9 +66,10 @@ def main() -> None:
         raise RuntimeError("Generation, reread and download disagree")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.output_dir / f"{args.kind}-{args.code}"
+    prefix.with_suffix(".events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2))
     prefix.with_suffix(".json").write_text(json.dumps({"generated": generated, "reread": reread}, ensure_ascii=False, indent=2))
     prefix.with_suffix(".md").write_text(markdown)
-    print(json.dumps({"kind": args.kind, "report_id": report_id, "status": generated.get("status"), "reread_download_match": True}, ensure_ascii=False))
+    print(json.dumps({"kind": args.kind, "report_id": report_id, "status": generated.get("status"), "reread_download_match": True, "elapsed_seconds": round(time.monotonic() - started, 3)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

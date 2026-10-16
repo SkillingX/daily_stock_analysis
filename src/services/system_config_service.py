@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 
+from src.llm.concurrency import limited_completion
 from src.config import (
     ANSPIRE_LLM_BASE_URL_DEFAULT,
     ANSPIRE_LLM_MODEL_DEFAULT,
@@ -122,6 +123,8 @@ class SystemConfigService:
     _SERVER_MASKED_CONFIG_KEYS: Set[str] = {
         "CHOICE_USERNAME",
         "CHOICE_PASSWORD",
+        "IFIND_MCP_TOKEN",
+        "TAVILY_API_KEYS",
         "ALPHASIFT_INSTALL_SPEC",
         "LLM_USAGE_HMAC_SECRET",
     }
@@ -924,7 +927,7 @@ class SystemConfigService:
 
             started_at = time.perf_counter()
             response = call_litellm_with_param_recovery(
-                lambda kwargs: litellm.completion(**kwargs),
+                lambda kwargs: limited_completion(litellm.completion, **kwargs),
                 model=resolved_model,
                 call_kwargs=call_kwargs,
                 logger=logger,
@@ -1095,7 +1098,7 @@ class SystemConfigService:
     ) -> Dict[str, Any]:
         try:
             started_at = time.perf_counter()
-            response = litellm_module.completion(
+            response = limited_completion(litellm_module.completion,
                 **cls._build_llm_capability_completion_kwargs(
                     resolved_model=resolved_model,
                     selected_api_key=selected_api_key,
@@ -1186,7 +1189,7 @@ class SystemConfigService:
         ]
         try:
             started_at = time.perf_counter()
-            response = litellm_module.completion(
+            response = limited_completion(litellm_module.completion,
                 **cls._build_llm_capability_completion_kwargs(
                     resolved_model=resolved_model,
                     selected_api_key=selected_api_key,
@@ -1246,7 +1249,7 @@ class SystemConfigService:
         stream = None
         started_at = time.perf_counter()
         try:
-            stream = litellm_module.completion(
+            stream = limited_completion(litellm_module.completion,
                 **cls._build_llm_capability_completion_kwargs(
                     resolved_model=resolved_model,
                     selected_api_key=selected_api_key,
@@ -1305,7 +1308,7 @@ class SystemConfigService:
     ) -> Dict[str, Any]:
         try:
             started_at = time.perf_counter()
-            response = litellm_module.completion(
+            response = limited_completion(litellm_module.completion,
                 **cls._build_llm_capability_completion_kwargs(
                     resolved_model=resolved_model,
                     selected_api_key=selected_api_key,

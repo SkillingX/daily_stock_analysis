@@ -54,7 +54,7 @@ def narrate(
     LLM 被明确要求只写叙述、复述数字时不得改动；任何异常/空响应返回 default_sentence。
     """
     # Prices, comparisons and the valuation method already have rule-written prose.
-    if dim_id in {"data", "scenarios", "signal"}:
+    if default_sentence.strip() or dim_id in {"data", "scenarios", "signal"}:
         return default_sentence
     prompt = load_dim_prompt(dim_id)
     if not prompt or llm_adapter is None:
@@ -79,6 +79,8 @@ def narrate(
             temperature=0.3,
             timeout=timeout,
         )
+        if getattr(response, "provider", "") == "error" or getattr(response, "finish_reason", None) in {"length", "content_filter"}:
+            return default_sentence
         text = (response.content or "").strip()
         # 推理模型可能泄漏 <think>/<thinking> 思考块（实测 8.9KB 污染），先剥除再用
         text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()

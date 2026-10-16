@@ -22,6 +22,7 @@ import litellm
 from json_repair import repair_json
 from litellm.router import Router
 
+from src.llm.concurrency import limited_completion
 from src.agent.llm_adapter import (
     get_thinking_extra_body,
     resolve_fallback_litellm_wire_models,
@@ -2883,15 +2884,15 @@ class GeminiAnalyzer:
         register_fallback_model_pricing(wire_models)
         effective_kwargs = dict(call_kwargs)
         if use_channel_router and self._router and model in router_model_names:
-            return self._router.completion(**effective_kwargs)
+            return limited_completion(self._router.completion, **effective_kwargs)
         if self._router and model == config.litellm_model and not use_channel_router:
-            return self._router.completion(**effective_kwargs)
+            return limited_completion(self._router.completion, **effective_kwargs)
 
         keys = get_api_keys_for_model(model, config)
         if keys:
             effective_kwargs["api_key"] = keys[0]
         effective_kwargs.update(extra_litellm_params(model, config))
-        return litellm.completion(**effective_kwargs)
+        return limited_completion(litellm.completion, **effective_kwargs)
 
     def _normalize_usage(
         self,
@@ -3056,21 +3057,35 @@ class GeminiAnalyzer:
         # so we can apply first-chunk / idle-chunk timeouts via queue.get(timeout=).
         # Without this, ``for chunk in stream_response`` would block forever
         # on a slow provider (we saw MiniMax-M3 do this for >100s).
-        from queue import Empty, Queue
-        from threading import Thread
+        from queue import Empty, Full, Queue
+        from threading import Event, Thread
 
         chunk_queue: "Queue[Any]" = Queue(maxsize=64)
         stream_error: "List[Exception]" = []
         stream_done = object()  # sentinel
+        stop_pump = Event()
+
+        def put_chunk(chunk: Any) -> None:
+            while not stop_pump.is_set():
+                try:
+                    chunk_queue.put(chunk, timeout=0.05)
+                    return
+                except Full:
+                    continue
 
         def _pump() -> None:
             try:
                 for chunk in stream_response:
-                    chunk_queue.put(chunk)
+                    if stop_pump.is_set():
+                        break
+                    put_chunk(chunk)
             except Exception as exc:  # noqa: BLE001
                 stream_error.append(exc)
             finally:
-                chunk_queue.put(stream_done)
+                close = getattr(stream_response, "close", None)
+                if close is not None:
+                    close()
+                put_chunk(stream_done)
 
         pump_thread = Thread(
             target=_pump,
@@ -3134,8 +3149,16 @@ class GeminiAnalyzer:
                 partial_received=chars_received > 0,
             ) from exc
         finally:
-            # Best-effort wait; pump_thread is daemon so it won't block shutdown.
-            pump_thread.join(timeout=0.1)
+            stop_pump.set()
+            close = getattr(stream_response, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except (RuntimeError, ValueError):
+                    # A generator currently being read closes in the pump's
+                    # finally; its permit remains held until that happens.
+                    logger.debug("Stream is still being consumed; awaiting transport cleanup")
+            pump_thread.join(timeout=1.0)
 
         if stream_error and chars_received == 0:
             # Propagate the underlying iterator error so the caller can decide

@@ -13,6 +13,7 @@ import os
 from typing import cast, Dict, Any, Optional, List
 
 from data_provider.supply_chain import latest_fiscal_year
+from src.llm.concurrency import limited_completion
 from src.scoring import (
     aggregate_framework,
     calculate_bayesian,
@@ -781,7 +782,7 @@ class ResearchScoringService:
         try:
             from litellm import completion
 
-            response = completion(
+            response = limited_completion(completion,
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
@@ -865,7 +866,7 @@ class ResearchScoringService:
 
             model = os.environ.get("LITELLM_MODEL", "openai/MiniMax-M3")
 
-            response = completion(
+            response = limited_completion(completion,
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,

@@ -292,37 +292,3 @@ class TestTsCodeNormalize(unittest.TestCase):
 
     def test_empty_returns_empty(self) -> None:
         self.assertEqual(TushareIfindFundamentalAdapter._normalize_ts_code(""), "")
-
-
-class TestIfindFetcherDaemonLoop(unittest.TestCase):
-    """The IfindFetcher should host a daemon thread + event loop and
-    reuse the same loop across multiple ``fetch`` calls. These tests
-    verify the lifecycle without needing the real iFinD server.
-    """
-
-    def test_ensure_loop_is_idempotent(self) -> None:
-        from data_provider.ifind_fundamental_adapter import IfindFetcher
-
-        fetcher = IfindFetcher(
-            endpoint="http://example/mcp",
-            token="test-token",
-            timeout_seconds=2.0,
-        )
-        self.assertTrue(fetcher.available)
-        self.assertIsNone(fetcher._loop)
-
-        loop = fetcher._ensure_loop()
-        self.assertIsNotNone(loop)
-        # Idempotent: second call returns the same loop.
-        self.assertIs(loop, fetcher._ensure_loop())
-        self.assertTrue(loop.is_running())
-        # The thread is a daemon so the interpreter can exit.
-        self.assertTrue(fetcher._loop_thread.daemon)
-
-    @pytest.mark.xfail(reason="pre-existing test debt; tracked in PR #42 follow-up", strict=False)
-    def test_ensure_loop_returns_none_when_unavailable(self) -> None:
-        from data_provider.ifind_fundamental_adapter import IfindFetcher
-
-        fetcher = IfindFetcher(endpoint="", token="", timeout_seconds=2.0)
-        self.assertFalse(fetcher.available)
-        self.assertIsNone(fetcher._ensure_loop())

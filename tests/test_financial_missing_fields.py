@@ -195,7 +195,7 @@ def test_actual_mcp_session_uses_remaining_timeout_and_cancels_slow_tool(monkeyp
     timeouts: list[float] = []
     closed: list[bool] = []
     @asynccontextmanager
-    async def stream(url, headers=None, timeout=30):
+    async def stream(url, headers=None, timeout=30, terminate_on_close=True):
         timeouts.append(timeout)
         try:
             yield (None, None, None)
@@ -218,7 +218,7 @@ def test_actual_mcp_session_uses_remaining_timeout_and_cancels_slow_tool(monkeyp
         # Real MCP request/cancellation coverage below uses the same isolated HTTP transport.
         install_real_mcp_mock_http(monkeypatch)
         @asynccontextmanager
-        async def modern_stream(url, *, http_client=None):
+        async def modern_stream(url, *, http_client=None, terminate_on_close=True):
             timeouts.append(http_client.timeout.read)
             try:
                 yield (None, None)
@@ -300,7 +300,7 @@ def install_real_mcp_mock_http(monkeypatch, *, slow_tool=False, slow_delete=Fals
                 except asyncio.CancelledError:
                     calls.append(("tools/cancelled", time.monotonic(), request.extensions.get("timeout")))
                     raise
-            raw = json.dumps({"data":{"answer":"|报告期|净资产收益率ROE(加权,公布值)（单位：%）|\n|---|---|\n|2025年报|18%|"}})
+            raw = json.dumps({"code":1,"data":{"answer":"|证券代码|报告期|净资产收益率ROE(加权,公布值)（单位：%）|\n|---|---|---|\n|600519.SH|2025年报|18%|"}})
             result = {"content":[{"type":"text","text":raw}]}
         return httpx2.Response(200, headers={"content-type":"application/json", "mcp-session-id":"fixture-session"}, json={"jsonrpc":"2.0","id":body["id"],"result":result})
     def create(headers=None, **kwargs):

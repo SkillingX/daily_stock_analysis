@@ -13,6 +13,8 @@ import logging
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
+from src.llm.concurrency import limited_acompletion
+
 logger = logging.getLogger(__name__)
 
 
@@ -164,7 +166,7 @@ class LLMSubjectiveScoringService:
             raise RuntimeError("LLM client not available")
 
         try:
-            response = await client(
+            response = await limited_acompletion(client,
                 model=self.model or "gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,

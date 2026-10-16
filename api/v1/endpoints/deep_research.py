@@ -4,8 +4,10 @@
 形态：表单输入股票 → SSE 流式生成 → 报告展示 + PDF 下载 + 历史列表。
 与问股/郑希/供应链的对话框模式不同（无多轮会话），但复用同一套 SSE 线程池包装。
 
-接口（7 个，挂 ``/api/v1/deep-research``，继承全局 AuthMiddleware）：
+接口（9 个，挂 ``/api/v1/deep-research``，继承全局 AuthMiddleware）：
 - ``POST /generate/stream``  SSE 流式生成（thinking/tool_start/tool_done/generating/done/error/heartbeat）
+- ``GET  /runs/{run_id}``  查询本次运行及清理状态
+- ``POST /runs/{run_id}/cancel`` 主动取消（幂等）
 - ``GET  /reports``          历史报告列表（分页）
 - ``GET  /reports/{id}``     报告详情（含 Markdown 正文）
 - ``DELETE /reports/{id}``   删除报告（元数据 + .md + .pdf + 维度产物）
@@ -24,13 +26,20 @@ import asyncio
 import json
 import logging
 import re
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from queue import Empty, Full, Queue
+from uuid import uuid4
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Path as PathParam, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
+from src.core.research_run import ResearchRun
 from src.config import get_config
 from src.services.deep_research_service import (
     DeepResearchInputError,
@@ -45,8 +54,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# SSE event 间隔 timeout（五层穿透 + 报告生成 2–5 分钟，对齐 executor 1200s）
-STREAM_QUEUE_TIMEOUT_S = 1200.0
 # 心跳间隔（保活连接，防 nginx/uvicorn 静默切断）
 HEARTBEAT_INTERVAL_S = 30.0
 
@@ -57,9 +64,20 @@ _REPORT_ID_RE = re.compile(r"^\d{6}_\d{12}(_\d+)?$")
 # PDF 渲染并发限流（xhtml2pdf 内存密集，模块级 Semaphore(1) 串行化惰性生成）
 _PDF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
 
-# 深度投研 in-flight 请求去重（防止用户快速点击导致重复生成）
-# key: stock_code, value: asyncio.Event（生成完成时置位）
-_IN_FLIGHT_REQUESTS: Dict[str, asyncio.Event] = {}
+# Runs live only in this process. Keep bounded terminal receipts for idempotent cancellation.
+@dataclass
+class _StreamRun:
+    control: ResearchRun
+    code: str
+    events: Queue[Dict[str, Any]] = field(default_factory=lambda: Queue(maxsize=128))
+    terminal: Optional[Dict[str, Any]] = None
+    connected: bool = True
+    cleaned: threading.Event = field(default_factory=threading.Event)
+
+
+_RUNS: OrderedDict[str, _StreamRun] = OrderedDict()
+_IN_FLIGHT_REQUESTS: Dict[str, str] = {}
+_RUNS_LOCK = threading.RLock()
 
 
 # ============================================================
@@ -68,10 +86,12 @@ _IN_FLIGHT_REQUESTS: Dict[str, asyncio.Event] = {}
 
 
 class DeepResearchRequest(BaseModel):
-    stock_code: str
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    run_id: Optional[Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]] = None
+    stock_code: Annotated[str, Field(min_length=1, max_length=32)]
     stock_name: Optional[str] = None
     report_type: str = "deep"
-    # 维度子集（省钱模式）：None/空 = 全部 11 维度；传入时自动补依赖闭包
+    # 分析范围：None/空 = 全部19维；传入时自动补依赖闭包
     dims: Optional[List[str]] = None
     # 跳过维度缓存强制重算（默认复用未过期缓存）
     force_refresh: bool = False
@@ -138,139 +158,157 @@ def _require_agent(config) -> None:
 # ============================================================
 
 
-@router.post("/generate/stream")
-async def generate_stream(request: DeepResearchRequest):
-    """SSE 流式生成深度投研报告。
+class ResearchRunStatus(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    run_id: Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
+    status: Literal["running", "cancelling", "finishing", "finished"]
+    end_reason: Literal["report_budget", "cancelled"] | None = None
+    report_id: Annotated[str, Field(pattern=_REPORT_ID_RE.pattern)] | None = None
 
-    入口先同步校验 A 股代码（非 A 股直接 400，不浪费 SSE 连接），
-    通过后在线程池跑 ``deep_research_service.generate_report``，
-    progress_callback 把事件塞入 asyncio.Queue，event_generator 消费并加 30s 心跳。
-    """
+
+def _run_status(run_id: str, record: _StreamRun) -> ResearchRunStatus:
+    control = record.control
+    status = "finished" if record.cleaned.is_set() else "cancelling" if control.stop_reason == "cancelled" else "finishing" if control.finalized else "running"
+    return ResearchRunStatus(run_id=run_id, status=status, end_reason=control.stop_reason,
+                             report_id=(record.terminal or {}).get("report_id"))
+
+
+@router.get("/runs/{run_id}", response_model=ResearchRunStatus)
+async def get_run(run_id: Annotated[str, PathParam(pattern=r"^[a-f0-9]{32}$")]) -> ResearchRunStatus:
+    with _RUNS_LOCK:
+        record = _RUNS.get(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="本次运行不存在或已超出进程内保留范围")
+        return _run_status(run_id, record)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=ResearchRunStatus)
+async def cancel_run(run_id: Annotated[str, PathParam(pattern=r"^[a-f0-9]{32}$")]) -> ResearchRunStatus:
+    with _RUNS_LOCK:
+        record = _RUNS.get(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="本次运行尚未被接收或已超出保留范围")
+        record.control.stop("cancelled")
+        return _run_status(run_id, record)
+
+
+@router.post("/generate/stream")
+async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
     from src.core.market_policy import require_stock_market
     require_stock_market(request.stock_code)
-
     config = get_config()
     _require_agent(config)
-
-    # 入口预校验（非 A 股 / 非法维度直接 400，不浪费 SSE 连接）
     try:
-        normalize_a_share(request.stock_code)
+        code = normalize_a_share(request.stock_code)
     except DeepResearchInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if request.dims:
         from src.schemas.deep_research_dims import DIM_IDS
+        if unknown := [dim for dim in request.dims if dim not in DIM_IDS]:
+            raise HTTPException(status_code=422, detail=f"未知分析维度：{', '.join(unknown)}")
+    run_id = request.run_id or uuid4().hex
+    record = _StreamRun(ResearchRun(config.deep_research_timeout_seconds, run_id=run_id), code)
+    with _RUNS_LOCK:
+        if code in _IN_FLIGHT_REQUESTS:
+            raise HTTPException(status_code=409, detail=f"{code}的报告正在生成或收尾，请稍后到历史记录查看。")
+        if run_id in _RUNS:
+            raise HTTPException(status_code=409, detail="本次运行已提交，请勿重复生成。")
+        _RUNS[run_id] = record
+        _IN_FLIGHT_REQUESTS[code] = run_id
 
-        unknown = [d for d in request.dims if d not in DIM_IDS]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"未知维度: {', '.join(unknown)}（可选: {', '.join(DIM_IDS)}）",
-            )
-
-    # ── In-flight 请求去重 ──
-    # 同一股票如果已有进行中的生成请求，直接返回冲突错误，避免重复生成
-    dedupe_key = request.stock_code.strip()
-    if dedupe_key in _IN_FLIGHT_REQUESTS:
-        logger.warning(
-            "[DeepResearch] 股票 %s 已有进行中的生成请求，拒绝重复提交",
-            dedupe_key,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=f"股票 {dedupe_key} 已有生成任务正在进行中，请等待完成后重试",
-        )
-
-    # 标记为进行中（函数返回时清除）
-    in_flight_event = asyncio.Event()
-    _IN_FLIGHT_REQUESTS[dedupe_key] = in_flight_event
-
-    loop = asyncio.get_running_loop()
-    queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
-
-    def progress_callback(event: Dict[str, Any]) -> None:
-        # executor/service 在工作线程调用，需跨线程把事件塞回 event loop
-        try:
-            asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-        except RuntimeError:
-            pass  # loop 已关闭，忽略
+    def progress(event: Dict[str, Any]) -> None:
+        event = {**event, "run_id": run_id}
+        with _RUNS_LOCK:
+            if event.get("type") in {"done", "error"}:
+                record.terminal = event
+            elif record.connected:
+                try:
+                    record.events.put_nowait(event)
+                except Full:
+                    try:
+                        record.events.get_nowait()
+                    except Empty:
+                        pass
+                    record.events.put_nowait(event)
 
     def run_sync() -> None:
         try:
-            deep_research_service.generate_report(
-                raw_code=request.stock_code,
-                raw_name=request.stock_name,
-                report_type=request.report_type,
-                progress_callback=progress_callback,
-                dims=request.dims,
-                force_refresh=request.force_refresh,
+            result = deep_research_service.generate_report(
+                raw_code=code, raw_name=request.stock_name, report_type=request.report_type,
+                progress_callback=progress, dims=request.dims, force_refresh=request.force_refresh,
+                run=record.control,
             )
-            # done 事件由 service.generate_report 内部推
-        except DeepResearchInputError as exc:
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"type": "error", "message": str(exc)}), loop
-            )
-        except Exception as exc:
-            logger.error("[DeepResearch] stream error: %s", exc, exc_info=True)
-            asyncio.run_coroutine_threadsafe(
-                queue.put({"type": "error", "message": f"生成失败：{exc}"}), loop
-            )
+            if record.terminal is None:
+                progress({"type": "done", **result})
+        except Exception:
+            logger.exception("[DeepResearch] Run %s failed", run_id)
+            progress({"type": "error", "message": "报告生成失败，请查看服务日志。"})
+        finally:
+            record.control.finish()
+
+    future = try_submit_long_task(run_sync)
+    if future is None:
+        with _RUNS_LOCK:
+            _RUNS.pop(run_id, None)
+            if _IN_FLIGHT_REQUESTS.get(code) == run_id:
+                _IN_FLIGHT_REQUESTS.pop(code)
+        raise HTTPException(status_code=503, detail="分析任务较多，请稍后重试。")
+    record.control.track(future)
+
+    def clean() -> None:
+        with _RUNS_LOCK:
+            record.cleaned.set()
+            if _IN_FLIGHT_REQUESTS.get(code) == run_id:
+                _IN_FLIGHT_REQUESTS.pop(code)
+            for old_id, old_record in list(_RUNS.items()):
+                if len(_RUNS) <= 256:
+                    break
+                if old_record.cleaned.is_set():
+                    _RUNS.pop(old_id)
+
+    record.control.when_clean(clean)
 
     async def event_generator():
-        import time
-
-        fut_sync = try_submit_long_task(run_sync)
-        if fut_sync is None:
-            # 线程池满：清理 in-flight 标记后返回错误
-            _IN_FLIGHT_REQUESTS.pop(dedupe_key, None)
-            yield (
-                "data: "
-                + json.dumps(
-                    {"type": "error", "message": "长任务线程池已满，请稍后重试"},
-                    ensure_ascii=False,
-                )
-                + "\n\n"
-            )
-            return
-        fut = asyncio.wrap_future(fut_sync)
-        last_event_time = time.time()
+        def encode(event: Dict[str, Any]) -> str:
+            return "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+        last_event = time.monotonic()
+        partial_sent = False
         try:
+            yield encode({"type": "accepted", "run_id": run_id})
             while True:
                 try:
-                    event = await asyncio.wait_for(
-                        queue.get(), timeout=HEARTBEAT_INTERVAL_S
-                    )
-                except asyncio.TimeoutError:
-                    # 心跳：保活连接（防 nginx 静默切断）
-                    if time.time() - last_event_time >= HEARTBEAT_INTERVAL_S:
-                        yield (
-                            "data: "
-                            + json.dumps({"type": "heartbeat"}, ensure_ascii=False)
-                            + "\n\n"
-                        )
-                    continue
-                last_event_time = time.time()
-                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
-                if event.get("type") in ("done", "error"):
-                    break
+                    event = record.events.get_nowait()
+                except Empty:
+                    event = None
+                if event is not None:
+                    last_event = time.monotonic()
+                    yield encode(event)
+                elif record.terminal is not None and record.cleaned.is_set():
+                    yield encode(record.terminal)
+                    return
+                elif record.terminal is not None and not partial_sent:
+                    partial_sent = True
+                    yield encode({**record.terminal, "type": "partial_ready", "cleanup_pending": True})
+                elif time.monotonic() - last_event >= HEARTBEAT_INTERVAL_S:
+                    last_event = time.monotonic()
+                    yield encode({"type": "heartbeat", "run_id": run_id,
+                                  "cleanup_pending": record.control.finalized and not record.cleaned.is_set()})
+                else:
+                    await asyncio.sleep(0.05)
         finally:
-            # 清理 in-flight 标记（无论正常/异常结束都必须清理）
-            _IN_FLIGHT_REQUESTS.pop(dedupe_key, None)
-            try:
-                await asyncio.wait_for(fut, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            except Exception as exc:
-                logger.debug("[DeepResearch] executor cleanup error (ignored): %s", exc)
+            # Transport ownership is separate from the accepted job's lifetime.
+            with _RUNS_LOCK:
+                record.connected = False
+            while True:
+                try:
+                    record.events.get_nowait()
+                except Empty:
+                    break
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # nginx 关缓冲，配合 proxy_read_timeout >= 1200s
-            "Connection": "keep-alive",
-        },
-    )
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive",
+        "X-Research-Run-Id": run_id,
+    })
 
 
 # ============================================================

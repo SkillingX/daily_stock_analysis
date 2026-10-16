@@ -194,6 +194,10 @@ def eastmoney_patch(*, budget_only: bool = False) -> None:
         request_before_patch = original_request
 
         def patched_request(self: requests.Session, method: str, url: str, **kwargs: Any) -> requests.Response:
+            from src.core.research_run import current_research
+            run = current_research.get()
+            if run is not None:
+                run.check()
             deadline = request_deadline.get()
             if deadline is not None and deadline <= time.monotonic():
                 raise requests.Timeout("fundamental request deadline exhausted")
@@ -219,6 +223,8 @@ def eastmoney_patch(*, budget_only: bool = False) -> None:
                     kwargs["timeout"] = tuple(min(float(value), remaining) if value is not None else remaining for value in configured)
                 else:
                     kwargs["timeout"] = min(float(configured), remaining) if isinstance(configured, (int, float)) else remaining
+            if run is not None:
+                run.check()
             return request_before_patch(self, method, url, **kwargs)
 
         requests.Session.request = patched_request  # type: ignore[assignment]

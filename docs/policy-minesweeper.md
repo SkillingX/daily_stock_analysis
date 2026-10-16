@@ -82,7 +82,7 @@ src/services/policy_minesweeper_service.py (编排: 校验→生成→存盘→�
 | 环境变量 | 默认 | 说明 |
 |---------|------|------|
 | `POLICY_MINESWEEPER_MAX_REPORTS` | `200` | 保留报告数量上限（超出删最旧，含 .md/.pdf 文件；`0` = 不清理）|
-| `TAVILY_API_KEYS` | _(空)_ | 公告/新闻搜索引擎 key（逗号分隔多个）。配置后 `search_company_announcements`/`search_stock_news` 可用，否则 α 公告证据只能标注「待核验」 |
+| `SERPAPI_API_KEYS` | _(空)_ | 公告/新闻搜索引擎 key（逗号分隔多个）。配置后 `search_company_announcements`/`search_stock_news` 可用，否则 α 公告证据只能标注「待核验」 |
 
 **系统依赖**：PDF 生成复用 `src/md2pdf.py`（WeasyPrint / Pango+Cairo 渲染，正确处理 CJK、emoji、表格、列表项目符号）。macOS 自动探测 Homebrew lib 路径；Docker/CI 需装 `pango`/`cairo`/`fonts-noto-cjk`（已在后端镜像与 CI 中配置）。渲染失败时优雅降级（返回 404，不影响报告生成主流程）。
 
@@ -97,7 +97,7 @@ src/services/policy_minesweeper_service.py (编排: 校验→生成→存盘→�
 ## 7. 边界与降级
 
 - **三 Agent 降级**：α/β 任一失败 → Ω 基于可用腿 + 已知信息裁决（status=`partial`，显式标注不可用腿）；Ω 失败但 α/β 可用 → 降级输出公司/政策原始分析（无综合评分/仓位指令）；三者全失败 → status=`failed`，返回空正文 + 错误信息。
-- **公司公告检索**：α 优先调用 `search_company_announcements`（复用共享 SearchService 的 Tavily provider，走原生 `.search()` 保留一手公告源），命中巨潮资讯网/新浪证券 `vCB_AllBulletin`/东方财富公告页/公司官网等，每条带**公告原文地址 `url`** + `is_official`（一手/二手标注）。`TAVILY_API_KEYS` 未配或检索失败 → 返回 error，α 据此标注「待核验」而非编造。
+- **公司公告检索**：α 优先调用 `search_company_announcements`（复用共享 SearchService 的 SerpAPI provider，走原生 `.search()` 保留一手公告源），命中巨潮资讯网/新浪证券 `vCB_AllBulletin`/东方财富公告页/公司官网等，每条带**公告原文地址 `url`** + `is_official`（一手/二手标注）。`SERPAPI_API_KEYS` 未配或检索失败 → 返回 error，α 据此标注「待核验」而非编造。
 - **数据缺失**：无专门政策数据源 → LLM 基于公开信息推断，**必须标注「待核验」**；预期冲击区间标注「历史经验区间，非精确预测」。证据必须含来源+日期；**公司公告类证据必须附公告原文地址 `url`**（取自检索工具结果，报告内以 `[原文](url)` 渲染，取不到则标注「待核验」）。
 - **超时**：executor α/β `max_steps=10`/`wall=300s`、Ω `max_steps=6`/`wall=240s`（并行 α/β + 串行 Ω，总时长约 9 分钟，低于 SSE 960s 超时）；前端 90s watchdog 断线检测。
 - **认证**：单管理员模型（历史报告全局可见，无用户隔离）。

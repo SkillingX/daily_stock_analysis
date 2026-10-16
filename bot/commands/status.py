@@ -105,10 +105,10 @@ class StatusCommand(BotCommand):
         
         # 搜索服务状态
         status["search_bocha"] = len(config.bocha_api_keys) > 0
-        status["search_tavily"] = len(config.tavily_api_keys) > 0
         status["search_brave"] = len(config.brave_api_keys) > 0
         status["search_serpapi"] = len(config.serpapi_keys) > 0
-        status["search_minimax"] = len(config.minimax_api_keys) > 0
+        status["search_minimax"] = config.coding_plan_search_provider == "minimax" and bool(config.minimax_api_keys)
+        status["search_zhipu"] = config.coding_plan_search_provider == "zhipu" and bool(config.zhipu_api_key)
         status["search_searxng"] = config.has_searxng_enabled()
         
         # 通知渠道状态
@@ -182,10 +182,11 @@ class StatusCommand(BotCommand):
             "",
             "**🔍 搜索服务**",
             f"• Bocha: {icon(status['search_bocha'])}",
-            f"• Tavily: {icon(status['search_tavily'])}",
+            "• Tavily: 已停用",
             f"• Brave: {icon(status['search_brave'])}",
             f"• SerpAPI: {icon(status['search_serpapi'])}",
             f"• MiniMax: {icon(status['search_minimax'])}",
+            f"• 智谱 Coding Plan: {icon(status['search_zhipu'])}",
             f"• SearXNG: {icon(status['search_searxng'])}",
             "",
             "**📢 通知渠道**",

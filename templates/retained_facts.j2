@@ -1,0 +1,8 @@
+{% import 'financial_display.j2' as display %}
+**已取得的工具资料**（模型解读尚未完成，不计入评分或目标价；单位未明确的值仅作原始线索）：
+
+| 资料 | 原值 | 单位 / 币种 | 来源 | 期间 / 时点 | 核验与使用限制 |
+|---|---:|---|---|---|---|
+{% for fact in facts %}
+| {{ fact.label }} | {{ fact.value|replace('|',' / ')|replace('\n',' ') }} | {% for part in fact.unit.split(' / ')|unique %}{{ display.label(part) }}{{ ' / ' if not loop.last else '' }}{% endfor %}{{ '未明确' if not fact.unit else '' }} | {{ fact.source|replace('|',' / ')|replace('\n',' ') }} | {{ fact.period or '未明确' }} | {{ display.reasons(fact.qualification.split('；')) }} |
+{% endfor %}

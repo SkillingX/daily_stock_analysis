@@ -41,6 +41,14 @@ class ChoiceSDK:
 
 @pytest.fixture
 def choice_transport(monkeypatch, tmp_path):
+    import socket
+    from src.patches import eastmoney_patch
+    # Runtime calls may install wrappers around the forbidden HTTP transport.
+    # Restore their marker and socket wrapper together with Session.request.
+    monkeypatch.setattr(eastmoney_patch, "_patch_sign", eastmoney_patch.PatchSign())
+    monkeypatch.setattr(eastmoney_patch, "original_request", eastmoney_patch.original_request)
+    monkeypatch.setattr(eastmoney_patch, "_read_budget_installed", eastmoney_patch._read_budget_installed)
+    monkeypatch.setattr(socket.SocketIO, "readinto", socket.SocketIO.readinto)
     from src.agent.tools import data_tools
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", None)
     from src.deep_research_dims import dim_cache

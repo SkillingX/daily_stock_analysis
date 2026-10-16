@@ -59,7 +59,7 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                     analysis = json.loads(full.get("analysis_json") or "{}")
                     if analysis.get("data_contract", "legacy") != contract:
                         continue
-                    if analysis.get("analysis_version") != _ANALYSIS_VERSION or analysis.get("gaps"):
+                    if analysis.get("analysis_version") != _ANALYSIS_VERSION or analysis.get("gaps") or analysis.get("verification_errors"):
                         return None
                     if not analysis.get("years") or any(
                         (analysis.get("dims", {}).get(key) or {}).get("score") is None for key in _DIM_WEIGHTS
@@ -265,7 +265,7 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
 
     # ---- 估值 ----
     from src.scoring.indicators_v2 import score_valuation
-    from src.deep_research_dims.fundamental_dim import eligible_financial_value
+    from src.deep_research_dims.fundamental_dim import eligible_financial_value, financial_field_quality
     snap = fund or {}
     pe_ttm = eligible_financial_value(snap, "pe_ratio")
     pb = eligible_financial_value(snap, "pb_ratio")
@@ -311,10 +311,15 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
     np_yoy_fmt = f"{np_yoy:+.2f}" if np_yoy is not None else None
     scissors_fmt = f"{scissors:+.2f}" if scissors is not None else None
 
+    snapshot = {field: financial_field_quality(snap, field).model_dump(mode="json") for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")} if snap.get("cross_validation") else {}
+    verification_errors = list(dict.fromkeys(error for field in snapshot.values() for error in field["source_errors"]))
+
     return {
         "dims": dims,
         "health_score": health,
         "gaps": list(dict.fromkeys(gaps))[:20],
+        "financial_snapshot": snapshot,
+        "verification_errors": verification_errors,
         "analysis_version": _ANALYSIS_VERSION,
         "data_contract": get_config().data_source_contract,
         "years": years_data,
@@ -461,7 +466,7 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None, force_refresh
         return {
             "report_id": rid if ok else None,
             "stock_code": code, "stock_name": name,
-            "status": ("partial" if analysis["gaps"] else "success") if ok else "failed",
+            "status": ("partial" if analysis["gaps"] or analysis.get("verification_errors") else "success") if ok else "failed",
             "markdown": md, "analysis": analysis,
         }
     finally:

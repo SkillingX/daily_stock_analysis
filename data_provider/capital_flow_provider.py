@@ -6,10 +6,13 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from decimal import Decimal
+import logging
 from time import monotonic
 from typing import Any, Literal, Sequence
 
 from icontract import ensure, require
+
+logger = logging.getLogger(__name__)
 
 _WINDOW_5D = 5
 _WINDOW_10D = 10
@@ -93,7 +96,12 @@ def get_main_inflow_cumulative(
     fetcher = IfindFetcher.get_instance()
     if not fetcher.available or (deadline is not None and deadline <= monotonic()):
         return {}
-    series = fetcher.fetch_main_inflow_series(code, days, **({"deadline": deadline} if deadline is not None else {}))
+    from data_provider.cross_source_validator import SourceReadError
+    try:
+        series = fetcher.fetch_main_inflow_series(code, days, **({"deadline": deadline} if deadline is not None else {}))
+    except SourceReadError as exc:
+        logger.warning("iFinD capital flow unavailable: %s", exc)
+        return {}
     if not series:
         return {}
     reading = AnchorReading("ifind", series[0][1], observed_at=series[0][0])
