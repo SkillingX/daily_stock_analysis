@@ -4355,7 +4355,7 @@ class DataFetcherManager:
             result["cross_validation"] = cross_validation
         for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
             payload = dict(snapshot[block])
-            payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["source_error"]}}) for field in fields}
+            payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["missing"]}}) for field in fields}
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
             providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if block == "growth" and prefer_ifind else "choice"]
             chain = [{"provider": provider, "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)} for provider in providers]

@@ -38,6 +38,24 @@ def test_revenue_only_has_original_65_score_and_partial_counts() -> None:
     assert quality["state"] == "partial"
 
 
+def test_primary_and_verification_failures_merge_without_changing_acquired_zero() -> None:
+    ctx = context({"roe": 0.0})
+    ctx.fundamental["field_meta"]["roe"]["source_errors"] = [{"source": "choice", "reason_code": "authentication_failed"}]
+    ctx.fundamental["cross_validation"] = {"anchors": {"roe": {"source_errors": [
+        {"source": "choice", "reason_code": "authentication_failed"},
+        {"source": "ifind", "reason_code": "timeout"},
+    ]}}}
+    dim = build_fundamental_dim(ctx)
+    evidence = dim.data_quality.fields["roe"]
+    assert evidence.reading.value == 0.0 and evidence.rule_eligible
+    assert evidence.source_errors == ("choice:authentication_failed", "ifind:timeout")
+    assert dim.financial_snapshot["roe"] == evidence
+    from src.services.fundamentals_service import _render_markdown
+    markdown = _render_markdown("样本", "600519", "fixture", {"financial": dim.model_dump(mode="json")})
+    assert "Choice：登录验证未通过" in markdown and "iFinD：数据查询超时" in markdown
+    assert "authentication_failed" not in markdown and "ifind:timeout" not in markdown
+
+
 def test_conflicting_pe_cannot_feed_f1_six_dim_or_scenarios() -> None:
     ctx = context({"pe_ratio": 999}, conflicts=("pe_ratio",))
     f1 = build_fundamental_dim(ctx).model_dump(mode="json")

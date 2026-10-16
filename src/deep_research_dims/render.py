@@ -128,6 +128,8 @@ def normalize_saved_markdown(markdown: str) -> str:
         if fence or line.startswith(("    ", "\t")):
             lines.append(line)
             continue
+        if line.strip() == "盈利质量：" and lines and lines[-1].lstrip().startswith("|"):
+            lines.append("\n")
         if re.fullmatch(r"\s*(?:</?details>|<!-- dim:[a-z_]+ -->)\s*", line):
             continue
         summary = re.fullmatch(r"\s*<summary>(.*?)</summary>\s*", line)

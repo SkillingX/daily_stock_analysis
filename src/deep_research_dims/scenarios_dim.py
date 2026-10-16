@@ -92,9 +92,17 @@ def build_scenarios_dim(
     reason = "缺少可追溯的目标价与估值计算依据，仅保留定性情景"
     if research.get("source") == "choice":
         reason = "Choice 在截至日期的近180日窗口未提供机构目标价；不以现价倍数或模型猜测补齐"
-        if research.get("errors"):
-            reason += "；" + "; ".join(research["errors"])
-        if targets.get("RATINGTARGETPRICE") is not None:
+        target_errors = [error for error in research.get("errors") or [] if error.startswith("choice:targets:")]
+        if target_errors:
+            cause = {
+                "authentication_failed": "Choice登录验证暂未通过",
+                "permission_denied": "当前Choice权限未覆盖此项数据",
+                "quota_exhausted": "Choice调用额度受限",
+                "timeout": "Choice查询超时",
+                "sdk_unavailable": "Choice数据连接尚未就绪",
+            }.get(target_errors[0].rsplit(":", 1)[-1], "Choice查询未完成")
+            reason = f"机构目标价尚未取得：{cause}，暂时无法提供估值参考。恢复数据连接后可重新生成。"
+        elif targets.get("RATINGTARGETPRICE") is not None:
             try:
                 reference = AnalystTarget.model_validate_json(json.dumps({"source": research["source"], "as_of": research.get("as_of"), "window_days": research.get("target_window_days"), "price": targets["RATINGTARGETPRICE"], "low": targets.get("RATINGTARGETPRICEMIN"), "high": targets.get("RATINGTARGETPRICEMAX")}))
                 if (date.fromisoformat(ctx.as_of[:10]) - reference.as_of).days not in (0, 1):
