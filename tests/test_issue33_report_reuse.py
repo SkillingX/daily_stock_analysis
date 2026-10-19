@@ -173,6 +173,31 @@ def test_published_history_is_adopted_only_inside_the_same_open_run():
         assert not adopt_published_history(isolated)
 
 
+def test_adoption_clears_only_history_notes():
+    from src.agent.deep_research.orchestrator import _reconcile_shared_history
+
+    records = [{"date": FRIDAY.isoformat(), "close": 10.0} for _ in range(30)]
+    run = ResearchRun(30)
+    ctx = SharedContext("300209", "行云科技", "2026-10-17T22:52:34")
+    ctx.limitations[:] = [
+        "quote 装配超时，本次未采用",
+        "history 装配超时，本次未采用",
+        "chip 装配超时，本次未采用",
+        "日线历史数据缺失",
+        "日线历史数据装配失败: fixture",
+    ]
+    with run.bind():
+        run.publish_daily_history(FRIDAY.isoformat(), records, "tencent")
+        dims = {"data": build_data_dim(SharedContext("300209", "行云科技", "2026-10-17T22:52:34"))}
+        dims["data"] = dims["data"].model_copy(update={"status": "degraded", "degraded_reason": "日线历史不足 20 条，无法计算均线与点位"})
+        _reconcile_shared_history(ctx, dims)
+        assert ctx.history and dims["data"].status == "ok"
+        assert ctx.limitations == [
+            "quote 装配超时，本次未采用",
+            "chip 装配超时，本次未采用",
+        ]
+
+
 def test_daily_attempt_budget_does_not_extend_the_outer_deadline():
     import time
     outer = time.monotonic() + 2

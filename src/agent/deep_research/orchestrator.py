@@ -910,9 +910,10 @@ def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
 
     if not adopt_published_history(ctx):
         return
-    # The stage-zero timeout note no longer applies to the adopted session.
+    # Adoption only resolves the history notes; quote/chip timeout notes stay.
     ctx.limitations[:] = [
-        note for note in ctx.limitations if "装配超时，本次未采用" not in note
+        note for note in ctx.limitations
+        if not (note.startswith("history 装配超时") or note.startswith("日线历史数据"))
     ]
     data = dims.get("data")
     if data is not None and data.status == "degraded":
