@@ -12,7 +12,7 @@ import contextvars
 import logging
 from datetime import date, datetime, time, timedelta
 from threading import Lock
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -150,7 +150,7 @@ def cache_session_date(
 
 
 def _history_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    records = df.to_dict(orient="records")
+    records = cast(List[Dict[str, Any]], df.to_dict(orient="records"))
     for row in records:
         if "date" in row:
             row["date"] = str(row["date"])[:10]

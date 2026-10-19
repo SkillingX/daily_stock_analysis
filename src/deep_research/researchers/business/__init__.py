@@ -37,17 +37,25 @@ def _strip_noise_keys(value: Any) -> Any:
     return value
 
 
+_PLACEHOLDER_TEXTS = {"未知", "暂无", "待补充", "N/A", "无", "缺失", "未披露", "—", "-"}
+
+
 def _substantive(value: Any) -> bool:
     if isinstance(value, dict):
-        text = str(value.get("value") or value.get("summary") or "").strip()
+        texts = [str(item).strip() for item in value.values() if isinstance(item, (str, int, float))]
     else:
-        text = str(value or "").strip()
-    return bool(text) and text not in {"未知", "暂无", "待补充", "N/A", "无", "缺失", "未披露", "—", "-"}
+        texts = [str(value or "").strip()]
+    return any(text and text not in _PLACEHOLDER_TEXTS for text in texts)
 
 
 def _core_complete(dim: BusinessDim) -> bool:
+    """Core needs the business model plus product/revenue structure unless the
+    research itself reports that structure as an undelivered core gap."""
     products = _substantive(dim.main_products) or bool(dim.product_segments and dim.product_segments.items)
-    return _substantive(dim.business_model) and products
+    core_gap_declared = any(
+        keyword in gap for gap in dim.data_gaps for keyword in ("主营产品", "产品结构", "收入结构")
+    )
+    return _substantive(dim.business_model) and (products or not core_gap_declared)
 
 
 def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:

@@ -362,8 +362,10 @@ def test_local_business_gap_does_not_fail_the_chapter():
 
 
 def test_missing_or_placeholder_core_business_stays_limited():
-    incomplete, _ = parse_business({"business_model": {"value": "制造设备"}, "data_gaps": []}, 1)
-    assert incomplete.status == "degraded"
+    core_only, _ = parse_business({"business_model": {"value": "制造设备"}, "data_gaps": []}, 1)
+    assert core_only.status == "ok"
+    no_core, _ = parse_business({"competitive_position": {"value": "国内领先"}, "data_gaps": []}, 1)
+    assert no_core.status == "degraded"
     placeholder, _ = parse_business(
         {"business_model": {"value": "未知"}, "main_products": {"value": "待补充"}}, 1
     )
