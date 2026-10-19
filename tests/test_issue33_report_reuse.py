@@ -346,6 +346,78 @@ def test_total_ratio_column_is_never_a_holder_value(ifind_transport):
     assert len(result.items) == 1
 
 
+def test_wrong_actual_period_is_disclosed_not_adopted(ifind_transport):
+    response = ifind_transport[1]
+    response.clear()
+    response.update(json.loads((Path("tests/fixtures/ifind_shareholders.json")).read_text()))
+    result = IfindFetcher("https://fixture.invalid", "test-only").shareholders("300260", "2025-09-30")
+    assert result.coverage == "partial"
+    assert "period_mismatch" in result.errors
+    assert all(item.report_date == "2025-12-31" for item in result.items)
+
+
+def test_network_history_trims_future_bars_before_use(monkeypatch, caplog):
+    from src.services.history_loader import load_history_df
+    from src.core.research_run import ResearchRun
+
+    rows = [
+        {"date": "2026-10-15", "close": 10.0},
+        {"date": "2026-10-16", "close": 11.0},
+        {"date": "2026-10-19", "close": 12.0},  # Monday bar beyond the Saturday query point
+    ]
+    frame = pd.DataFrame(rows)
+    manager = MagicMock()
+    manager.get_daily_data.return_value = (frame, "tencent")
+    db = MagicMock()
+    db.get_data_range.return_value = []
+    monkeypatch.setattr("src.storage.get_db", lambda: db)
+    monkeypatch.setattr("src.services.history_loader._get_fetcher_manager", lambda: manager)
+
+    run = ResearchRun(30)
+    with run.bind():
+        trimmed, source = load_history_df("300209", days=30, target_date=SATURDAY)
+    assert source == "tencent"
+    assert list(trimmed["date"]) == ["2026-10-15", "2026-10-16"]
+    assert run.daily_history is not None and run.daily_history["as_of"] == FRIDAY.isoformat()
+
+    manager.get_daily_data.return_value = (pd.DataFrame([{"date": "2026-10-19", "close": 12.0}]), "tencent")
+    with caplog.at_level("WARNING", logger="src.services.history_loader"):
+        dropped, source = load_history_df("300209", days=30, target_date=SATURDAY)
+    assert dropped is None and source == "none"
+    assert any("均晚于已完成交易日" in record.message for record in caplog.records)
+
+
+def test_declared_core_gap_degrades_but_incidental_mention_does_not():
+    declared, _ = parse_business(
+        {"business_model": {"value": "制造设备"}, "data_gaps": ["收入结构未公开披露"]}, 1
+    )
+    assert declared.status == "degraded"
+    incidental, _ = parse_business(
+        {
+            "business_model": {"value": "制造设备"},
+            "main_products": {"value": "真空系统，收入占比 62%"},
+            "data_gaps": ["收入结构披露口径存在差异，详见正文"],
+        },
+        1,
+    )
+    assert incidental.status == "ok"
+
+
+def test_adoption_refuses_populated_context_and_foreign_session():
+    from src.services.history_loader import adopt_published_history
+
+    records = [{"date": FRIDAY.isoformat(), "close": 10.0} for _ in range(30)]
+    run = ResearchRun(30)
+    with run.bind():
+        run.publish_daily_history(FRIDAY.isoformat(), records, "tencent")
+        populated = SharedContext("300209", "行云科技", "2026-10-17T22:52:34", history=[{"date": FRIDAY.isoformat()}])
+        assert not adopt_published_history(populated)
+        assert len(populated.history) == 1
+        foreign = SharedContext("300209", "行云科技", "2026-10-15T18:00:00")
+        assert not adopt_published_history(foreign)
+        assert foreign.history == []
+
+
 def test_local_business_gap_does_not_fail_the_chapter():
     payload = {
         "business_model": {"value": "半导体设备制造"},

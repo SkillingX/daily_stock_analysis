@@ -648,6 +648,10 @@ def daily_attempt_budget(reserve_fallback: bool) -> Iterator[None]:
         request_deadline.reset(token)
 
 
+def _daily_budget_exhausted(deadline: Optional[float]) -> bool:
+    return deadline is not None and deadline <= time.monotonic()
+
+
 class DataFetcherManager:
     """
     数据源策略管理器
@@ -1429,8 +1433,11 @@ class DataFetcherManager:
             market_label = "美股指数" if is_us_index else "美股"
 
             for order_index, src_name in enumerate(source_order):
-                if outer_daily_deadline is not None and outer_daily_deadline <= time.monotonic():
-                    logger.info("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
+                if _daily_budget_exhausted(outer_daily_deadline):
+                    errors.append(
+                        f"[budget] 外层预算已耗尽，剩余 {len(source_order) - order_index} 个数据源未尝试"
+                    )
+                    logger.warning("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
                     break
                 fallback_to = (
                     source_order[order_index + 1]
@@ -1529,8 +1536,11 @@ class DataFetcherManager:
             raise DataFetchError(error_summary)
 
         for attempt, fetcher in enumerate(fetchers, start=1):
-            if outer_daily_deadline is not None and outer_daily_deadline <= time.monotonic():
-                logger.info("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
+            if _daily_budget_exhausted(outer_daily_deadline):
+                errors.append(
+                    f"[budget] 外层预算已耗尽，剩余 {total_fetchers - attempt + 1} 个数据源未尝试"
+                )
+                logger.warning("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
                 break
             if not self._is_daily_source_available(fetcher, market):
                 errors.append(self._daily_source_unavailable_error(fetcher))

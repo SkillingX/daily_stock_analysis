@@ -12,6 +12,12 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
+# Stage-zero limitation notes; adopters of a same-run history clear the
+# history ones (see orchestrator._reconcile_shared_history).
+STAGE_TIMEOUT_NOTE_SUFFIX = "装配超时，本次未采用"
+HISTORY_MISSING_NOTE = "日线历史数据缺失"
+HISTORY_FAILED_NOTE_PREFIX = "日线历史数据装配失败"
+
 
 @dataclass
 class SharedContext:
@@ -38,7 +44,7 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
 
         df, source = load_history_df(code, days=days)
         if df is None or df.empty:
-            ctx.limitation("日线历史数据缺失")
+            ctx.limitation(HISTORY_MISSING_NOTE)
             return []
         records: List[Dict[str, Any]] = df.tail(days).to_dict(orient="records")  # type: ignore[assignment]
         for r in records:
@@ -47,7 +53,7 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
         return records
     except Exception as exc:  # noqa: BLE001 - 阶段0装配失败只降级
         logger.warning("[DualTrack] 历史数据装配失败 %s: %s", code, exc)
-        ctx.limitation(f"日线历史数据装配失败: {exc}")
+        ctx.limitation(f"{HISTORY_FAILED_NOTE_PREFIX}: {exc}")
         return []
 
 
@@ -321,7 +327,7 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
                     ctx.limitation(limitation)
             else:
                 future.cancel()
-                ctx.limitation(f"{key} 装配超时，本次未采用")
+                ctx.limitation(f"{key} {STAGE_TIMEOUT_NOTE_SUFFIX}")
         request_deadline.reset(token)
         pool.shutdown(wait=False, cancel_futures=True)
     if run is None or not run.stop_reason:

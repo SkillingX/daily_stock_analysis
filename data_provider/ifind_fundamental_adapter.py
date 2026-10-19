@@ -351,7 +351,10 @@ def confirmed_disclosed_period(*sources: object, as_of: str | None = None) -> st
             if disclosed and anchor and disclosed > anchor:
                 continue
             found.append(period)
-    return max(found) if found else None
+    if not found:
+        logger.info("confirmed_disclosed_period: 截至 %s 未找到已披露财期，股东查询退回最新一期并要求实际财期", anchor)
+        return None
+    return max(found)
 
 
 def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[dict[tuple[str, int], dict[str, _RankedCell]], list[str]]:

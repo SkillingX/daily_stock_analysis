@@ -20,8 +20,6 @@ VALUATION_CASCADE = "主缺口及受影响章节：缺少可追溯目标价，�
 
 
 def with_valuation_cascade(reason: str) -> str:
-    if VALUATION_CASCADE in reason:
-        return reason
     return f"{reason}。{VALUATION_CASCADE}"
 
 

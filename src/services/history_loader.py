@@ -167,15 +167,13 @@ def _trim_to_session(df: pd.DataFrame, required: date) -> pd.DataFrame:
 
 
 def _publish_history(df: pd.DataFrame, source: str, required: date) -> None:
+    """Publish an already session-trimmed frame; keeps only the freshness guard."""
     from src.core.research_run import current_research
 
     run = current_research.get()
-    if run is None:
+    if run is None or df is None or df.empty:
         return
-    trimmed = _trim_to_session(df, required)
-    if trimmed is None or trimmed.empty:
-        return
-    records = _history_records(trimmed)
+    records = _history_records(df)
     latest = max((str(row.get("date") or "")[:10] for row in records), default="")
     if latest != required.isoformat():
         return
@@ -231,7 +229,7 @@ def load_history_df(
         usable = [bar for bar in bars if date.min < _bar_date(bar) <= required]
         latest_date = max((_bar_date(bar) for bar in usable), default=date.min)
         if usable and latest_date == required and len(usable) >= required_records:
-            df = _trim_to_session(pd.DataFrame([bar.to_dict() for bar in usable]), required)
+            df = pd.DataFrame([bar.to_dict() for bar in usable])
             logger.debug(
                 "load_history_df(%s): %d bars from DB through %s (requested %d)",
                 stock_code, len(df), required.isoformat(), days,
@@ -249,6 +247,10 @@ def load_history_df(
             if trimmed is not None and not trimmed.empty:
                 _publish_history(trimmed, source, required)
                 return trimmed, source
+            logger.warning(
+                "load_history_df(%s): %s 返回 %d 行但均晚于已完成交易日 %s，本次不采用",
+                stock_code, source, len(df), required.isoformat(),
+            )
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
 

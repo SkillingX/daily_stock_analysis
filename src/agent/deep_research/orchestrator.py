@@ -906,14 +906,20 @@ def _run_dual_track(
 
 def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
     """Adopt a same-session history published during this run before dependent dims."""
+    from src.deep_research_dims.context import (
+        HISTORY_FAILED_NOTE_PREFIX,
+        HISTORY_MISSING_NOTE,
+        STAGE_TIMEOUT_NOTE_SUFFIX,
+    )
     from src.services.history_loader import adopt_published_history
 
     if not adopt_published_history(ctx):
         return
     # Adoption only resolves the history notes; quote/chip timeout notes stay.
+    history_note = f"history {STAGE_TIMEOUT_NOTE_SUFFIX}"
     ctx.limitations[:] = [
         note for note in ctx.limitations
-        if not (note.startswith("history 装配超时") or note.startswith("日线历史数据"))
+        if not (note.startswith(history_note) or note.startswith(HISTORY_MISSING_NOTE) or note.startswith(HISTORY_FAILED_NOTE_PREFIX))
     ]
     data = dims.get("data")
     if data is not None and data.status == "degraded":
