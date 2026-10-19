@@ -418,6 +418,51 @@ def test_adoption_refuses_populated_context_and_foreign_session():
         assert foreign.history == []
 
 
+def test_wan_unit_quantity_is_converted_but_flagged_not_clean(ifind_transport):
+    reply = _holder_reply("股东甲", "1.2亿", "25.06")
+    reply["data"]["indicators_params"]["股东持股数量__十大股东排名:第1名__"]["单位"] = "万股"
+    response = ifind_transport[1]
+    response.clear()
+    response.update(reply)
+    result = IfindFetcher("https://fixture.invalid", "test-only").shareholders("300260", "2025-12-31")
+    assert result.coverage == "partial"
+    assert result.items[0].shares is not None
+    assert result.items[0].shares.value == 120000000.0
+    assert result.items[0].shares.normalization_error == "unit_conflict"
+
+
+def test_unranked_columns_never_become_holder_values(ifind_transport):
+    reply = _holder_reply("股东甲", "1亿", "25.06")
+    unranked = (
+        "|证券代码|证券简称|日期|股东持股数量（单位：股）|股东持股比例（单位：%）|\n|---|---|---|---|---|\n"
+        "|300260.SZ|样本|20251231|9亿|99.99|\n"
+    )
+    reply["data"]["answer"] += unranked
+    response = ifind_transport[1]
+    response.clear()
+    response.update(reply)
+    result = IfindFetcher("https://fixture.invalid", "test-only").shareholders("300260", "2025-12-31")
+    assert len(result.items) == 1
+    assert result.items[0].shares is not None and result.items[0].shares.value == 100000000.0
+    assert all(item.ratio is None or item.ratio.value != 99.99 for item in result.items)
+
+
+def test_abnormal_probabilities_are_normalized_without_false_guardrail():
+    ctx = SharedContext("300209", "行云科技", "2026-10-17T22:55:20", fundamental={})
+    dim = build_scenarios_dim(
+        ctx,
+        18.5,
+        {"scenarios": [
+            {"type": "optimistic", "probability": 0.7, "description": "需求上行"},
+            {"type": "pessimistic", "probability": 0.1, "description": "需求下行"},
+        ]},
+    )
+    assert dim.probability_sum == 1.0
+    assert abs(sum(s.probability for s in dim.scenarios.scenarios) - 1.0) < 1e-9
+    events, adjusted = apply_guardrails({"scenarios": dim.model_dump(), "signal": {}, "conclusion": {}, "intel": {}, "six_dim": {}})
+    assert not [e for e in events if e.rule_id == "GR4_probability_sum"]
+
+
 def test_local_business_gap_does_not_fail_the_chapter():
     payload = {
         "business_model": {"value": "半导体设备制造"},
