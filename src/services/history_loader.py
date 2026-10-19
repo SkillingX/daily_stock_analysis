@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import contextvars
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from threading import Lock
-from typing import Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from src.deep_research_dims.context import SharedContext
 
 import pandas as pd
 
@@ -123,6 +127,82 @@ def _select_best_bars(db, stock_code: str, start: date, end: date) -> Tuple[Opti
     return best_code, best_bars
 
 
+def cache_session_date(
+    stock_code: str,
+    target_date: Optional[date] = None,
+    now: Optional[datetime] = None,
+) -> date:
+    """Latest completed daily bar for this analysis point, not the calendar date."""
+    from src.core.trading_calendar import (
+        MARKET_TIMEZONE,
+        get_effective_trading_date,
+        get_market_for_stock,
+    )
+
+    market = get_market_for_stock(stock_code) or "cn"
+    if now is not None:
+        return get_effective_trading_date(market, current_time=now)
+    if target_date is not None:
+        tz = ZoneInfo(MARKET_TIMEZONE.get(market, "Asia/Shanghai"))
+        end_of_day = datetime.combine(target_date, time(23, 59), tzinfo=tz)
+        return get_effective_trading_date(market, current_time=end_of_day)
+    return get_effective_trading_date(market)
+
+
+def _history_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    records = df.to_dict(orient="records")
+    for row in records:
+        if "date" in row:
+            row["date"] = str(row["date"])[:10]
+    return records
+
+
+def _trim_to_session(df: pd.DataFrame, required: date) -> pd.DataFrame:
+    if df is None or df.empty or "date" not in getattr(df, "columns", []):
+        return df
+    dates = df["date"].map(_coerce_bar_date)
+    if (dates <= required).all():
+        return df
+    return df.loc[dates <= required].copy()
+
+
+def _publish_history(df: pd.DataFrame, source: str, required: date) -> None:
+    from src.core.research_run import current_research
+
+    run = current_research.get()
+    if run is None:
+        return
+    trimmed = _trim_to_session(df, required)
+    if trimmed is None or trimmed.empty:
+        return
+    records = _history_records(trimmed)
+    latest = max((str(row.get("date") or "")[:10] for row in records), default="")
+    if latest != required.isoformat():
+        return
+    run.publish_daily_history(required.isoformat(), records, source)
+
+
+def adopt_published_history(ctx: "SharedContext") -> bool:
+    """Copy this run's completed session into an empty context. Never fetches."""
+    from src.core.research_run import current_research
+
+    run = current_research.get()
+    if run is None or getattr(ctx, "history", None):
+        return False
+    slot = run.published_daily_history()
+    if not slot:
+        return False
+    try:
+        analyzed_at = datetime.fromisoformat(str(ctx.as_of))
+    except ValueError:
+        return False
+    required = cache_session_date(ctx.stock_code, now=analyzed_at)
+    if slot.get("as_of") != required.isoformat():
+        return False
+    ctx.history = [dict(row) for row in slot["records"]]
+    return True
+
+
 def load_history_df(
     stock_code: str,
     days: int = 60,
@@ -136,38 +216,39 @@ def load_history_df(
     """
     from src.storage import get_db
 
-    # Resolve effective end date
     if target_date is not None:
-        end = target_date
+        required = cache_session_date(stock_code, target_date)
+    elif (frozen := get_frozen_target_date()) is not None:
+        required = cache_session_date(stock_code, frozen)
     else:
-        frozen = get_frozen_target_date()
-        end = frozen if frozen else date.today()
+        required = cache_session_date(stock_code)
+    start = required - timedelta(days=int(days * 1.8) + 10)
+    required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
 
-    # Calendar-day buffer: ~1.8x trading days + margin for long holidays
-    start = end - timedelta(days=int(days * 1.8) + 10)
-
-    # --- 1. DB lookup (canonical code, then prefix-stripped fallback) ------
     try:
         db = get_db()
-        _code, bars = _select_best_bars(db, stock_code, start, end)
-        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
-        latest_date = max((_bar_date(bar) for bar in bars), default=date.min)
-        if bars and latest_date >= end and len(bars) >= required_records:
-            df = pd.DataFrame([b.to_dict() for b in bars])
+        _code, bars = _select_best_bars(db, stock_code, start, required)
+        usable = [bar for bar in bars if date.min < _bar_date(bar) <= required]
+        latest_date = max((_bar_date(bar) for bar in usable), default=date.min)
+        if usable and latest_date == required and len(usable) >= required_records:
+            df = _trim_to_session(pd.DataFrame([bar.to_dict() for bar in usable]), required)
             logger.debug(
-                "load_history_df(%s): %d bars from DB (requested %d)",
-                stock_code, len(df), days,
+                "load_history_df(%s): %d bars from DB through %s (requested %d)",
+                stock_code, len(df), required.isoformat(), days,
             )
+            _publish_history(df, "db_cache", required)
             return df, "db_cache"
     except Exception as e:
         logger.debug("load_history_df(%s): DB read failed: %s", stock_code, e)
 
-    # --- 2. Network fallback via singleton DataFetcherManager -------------
     try:
         manager = _get_fetcher_manager()
         df, source = manager.get_daily_data(stock_code, days=days)
         if df is not None and not df.empty:
-            return df, source
+            trimmed = _trim_to_session(df, required)
+            if trimmed is not None and not trimmed.empty:
+                _publish_history(trimmed, source, required)
+                return trimmed, source
     except Exception as e:
         logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
 

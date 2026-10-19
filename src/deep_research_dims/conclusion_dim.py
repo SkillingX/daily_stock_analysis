@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from src.deep_research_dims.context import SharedContext
+from src.deep_research_dims.scenarios_dim import with_valuation_cascade
 from src.schemas.deep_research_dims import ConclusionDim
 from src.schemas.investment_conclusion import InvestmentConclusion
 
@@ -58,7 +59,7 @@ def build_conclusion_dim(
     )
     return ConclusionDim(
         status="ok" if valuation_available else "degraded",
-        degraded_reason=None if valuation_available else "估值依据不足，无法形成估值驱动的行动结论",
+        degraded_reason=None if valuation_available else with_valuation_cascade("估值依据不足，无法形成估值驱动的行动结论"),
         conclusion=conclusion,
         rationale="",
         narrative=(

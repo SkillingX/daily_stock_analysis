@@ -37,6 +37,19 @@ def _strip_noise_keys(value: Any) -> Any:
     return value
 
 
+def _substantive(value: Any) -> bool:
+    if isinstance(value, dict):
+        text = str(value.get("value") or value.get("summary") or "").strip()
+    else:
+        text = str(value or "").strip()
+    return bool(text) and text not in {"未知", "暂无", "待补充", "N/A", "无", "缺失", "未披露", "—", "-"}
+
+
+def _core_complete(dim: BusinessDim) -> bool:
+    products = _substantive(dim.main_products) or bool(dim.product_segments and dim.product_segments.items)
+    return _substantive(dim.business_model) and products
+
+
 def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
     payload = _strip_noise_keys(parsed or {})
     products = payload.pop("product_segments", None)
@@ -44,6 +57,8 @@ def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
     assert isinstance(dim, BusinessDim)
     if products is not None:
         dim = dim.model_copy(update={"product_segments": ProductSegments.model_validate_json(json.dumps(products))})
-    if dim.data_gaps or not any((dim.business_model, dim.main_products, dim.competitive_position, dim.vs_market_leader)):
+    if dim.status == "degraded" and dim.degraded_reason:
+        return dim, used
+    if not _core_complete(dim):
         dim = dim.model_copy(update={"status": "degraded", "degraded_reason": dim.degraded_reason or "业务资料不足，已有内容仅供部分参考"})
     return dim, used

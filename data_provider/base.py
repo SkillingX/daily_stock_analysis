@@ -20,6 +20,8 @@ import os
 import random
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
@@ -620,6 +622,30 @@ class BaseFetcher(ABC):
         sleep_time = random.uniform(min_seconds, max_seconds)
         logger.debug(f"随机休眠 {sleep_time:.2f} 秒...")
         time.sleep(sleep_time)
+
+
+# Slow primaries may consume the whole daily stage budget, leaving nothing for
+# fallback sources (issue #33). Keep a bounded slice for the next source.
+_DAILY_FALLBACK_RESERVE_SECONDS = 8.0
+_DAILY_FALLBACK_RESERVE_RATIO = 0.3
+
+
+@contextmanager
+def daily_attempt_budget(reserve_fallback: bool) -> Iterator[None]:
+    """Shrink the request deadline for this source so a later one still gets time."""
+    from src.patches.eastmoney_patch import request_deadline
+
+    deadline = request_deadline.get()
+    if deadline is None or not reserve_fallback:
+        yield
+        return
+    remaining = deadline - time.monotonic()
+    reserve = min(_DAILY_FALLBACK_RESERVE_SECONDS, remaining * _DAILY_FALLBACK_RESERVE_RATIO) if remaining > 1 else 0.0
+    token = request_deadline.set(min(deadline, time.monotonic() + max(0.0, remaining - reserve)))
+    try:
+        yield
+    finally:
+        request_deadline.reset(token)
 
 
 class DataFetcherManager:
@@ -1338,9 +1364,10 @@ class DataFetcherManager:
             DataFetchError: 所有数据源都失败时抛出
         """
         from .us_index_mapping import is_us_index_code, is_us_stock_code
+        from src.patches.eastmoney_patch import request_deadline
 
-        # Normalize code (strip SH/SZ prefix etc.)
         stock_code = normalize_stock_code(stock_code)
+        outer_daily_deadline = request_deadline.get()
 
         fetchers = self._get_fetchers_snapshot()
         errors = []
@@ -1402,6 +1429,9 @@ class DataFetcherManager:
             market_label = "美股指数" if is_us_index else "美股"
 
             for order_index, src_name in enumerate(source_order):
+                if outer_daily_deadline is not None and outer_daily_deadline <= time.monotonic():
+                    logger.info("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
+                    break
                 fallback_to = (
                     source_order[order_index + 1]
                     if order_index + 1 < len(source_order)
@@ -1425,14 +1455,15 @@ class DataFetcherManager:
                             provider=fetcher.name,
                             operation="get_daily_data",
                         )
-                        df = self._call_fetcher_method(
-                            fetcher,
-                            "get_daily_data",
-                            stock_code=stock_code,
-                            start_date=start_date,
-                            end_date=end_date,
-                            days=days,
-                        )
+                        with daily_attempt_budget(order_index + 1 < len(source_order)):
+                            df = self._call_fetcher_method(
+                                fetcher,
+                                "get_daily_data",
+                                stock_code=stock_code,
+                                start_date=start_date,
+                                end_date=end_date,
+                                days=days,
+                            )
                         if df is not None and not df.empty:
                             duration_ms = int((time.time() - attempt_start) * 1000)
                             record_provider_run(
@@ -1498,6 +1529,9 @@ class DataFetcherManager:
             raise DataFetchError(error_summary)
 
         for attempt, fetcher in enumerate(fetchers, start=1):
+            if outer_daily_deadline is not None and outer_daily_deadline <= time.monotonic():
+                logger.info("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
+                break
             if not self._is_daily_source_available(fetcher, market):
                 errors.append(self._daily_source_unavailable_error(fetcher))
                 continue
@@ -1512,14 +1546,15 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_daily_data",
                 )
-                df = self._call_fetcher_method(
-                    fetcher,
-                    "get_daily_data",
-                    stock_code=stock_code,
-                    start_date=start_date,
-                    end_date=end_date,
-                    days=days,
-                )
+                with daily_attempt_budget(attempt < total_fetchers):
+                    df = self._call_fetcher_method(
+                        fetcher,
+                        "get_daily_data",
+                        stock_code=stock_code,
+                        start_date=start_date,
+                        end_date=end_date,
+                        days=days,
+                    )
 
                 if df is not None and not df.empty:
                     duration_ms = int((time.time() - attempt_start) * 1000)
