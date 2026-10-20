@@ -64,11 +64,13 @@ def _support_resistance(history: List[Dict[str, Any]], window: int = 60) -> tupl
 def _chip_structure(chip: Dict[str, Any]) -> ChipStructure:
     if not chip:
         return ChipStructure(chip_health="数据缺失")
+    estimated = chip.get("source") == "estimated_from_history"
     return ChipStructure(
         profit_ratio=chip.get("profit_ratio") or chip.get("winner_percent"),
         avg_cost=chip.get("avg_cost") or chip.get("average_cost"),
         concentration=chip.get("concentration") or chip.get("concentration_70"),
-        chip_health="见数据" if chip else "数据缺失",
+        chip_health="见数据（历史行情估算，精度有限）" if estimated else "见数据",
+        estimated=True if estimated else None,
     )
 
 

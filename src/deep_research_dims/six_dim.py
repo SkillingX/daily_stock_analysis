@@ -379,6 +379,8 @@ def _chip_from_context(ctx: SharedContext) -> Optional[Dict[str, Any]]:
         else:
             chip_score = 50.0
             summary = "筹码数据部分可用（平均成本缺失），使用中性分"
+        if chip.get("source") == "estimated_from_history":
+            summary = f"（历史行情估算，精度有限）{summary}"
         return {
             "id": "chip_score",
             "score": chip_score,

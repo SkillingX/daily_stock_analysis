@@ -123,8 +123,16 @@ def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runt
         invalid = {"data_gaps": ["证据不足"], "business_model": {}, "main_products": {}}
     if mode not in {"runner_error", "data_gaps"}:
         from src.deep_research.researchers import REGISTRY
-        with pytest.raises(ValidationError):
-            REGISTRY[dim_id].parser(invalid, 1)
+        if dim_id == "ownership":
+            # 契约收敛（#35）：包装列表形状在股权适配边界解包/记缺项，不再抛
+            # ValidationError；本用例继续验证坏形状下供应商资料保留与不写成功缓存。
+            dim, _steps = REGISTRY[dim_id].parser(invalid, 1)
+            assert dim.status == "degraded"
+            assert dim.executives == [] and dim.recent_changes == []
+            assert any("核心高管" in gap for gap in dim.data_gaps)
+        else:
+            with pytest.raises(ValidationError):
+                REGISTRY[dim_id].parser(invalid, 1)
 
     def model(*args, **kwargs):
         if mode == "runner_error":

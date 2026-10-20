@@ -595,6 +595,30 @@ def _estimate_chip_from_history(
     }
 
 
+def _estimate_chip_fallback(stock_code: str) -> Optional[Dict[str, Any]]:
+    """em 筹码源不可用时的历史K线估算降级入口（工具与共享上下文共用）。
+
+    数据不足或装配失败返回 None；成功时返回带 ``source=estimated_from_history``
+    与 ``estimated=True`` 标记的估算载荷。
+    """
+    manager = _get_fetcher_manager()
+    try:
+        from src.services.history_loader import load_history_df
+
+        df, _ = load_history_df(stock_code, days=60)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("chip estimation fallback(%s) failed: %s", stock_code, exc)
+        return None
+    # 实时价取不到时用最后一根收盘价估算，不让报价异常带走整次估算。
+    try:
+        quote = manager.get_realtime_quote(stock_code)
+        current_price = getattr(quote, "price", None) if quote else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("chip estimation fallback(%s) quote failed: %s", stock_code, exc)
+        current_price = None
+    return _estimate_chip_from_history(stock_code, df, current_price)
+
+
 def _handle_get_chip_distribution(stock_code: str) -> dict[str, Any]:
     """Get chip distribution data."""
     from src.core.market_policy import require_stock_market
@@ -605,16 +629,7 @@ def _handle_get_chip_distribution(stock_code: str) -> dict[str, Any]:
 
     if chip is None:
         # fail-open：em 筹码源不可用时，用历史K线估算降级（标注 estimated）
-        try:
-            from src.services.history_loader import load_history_df
-
-            df, _ = load_history_df(stock_code, days=60)
-            quote = manager.get_realtime_quote(stock_code)
-            current_price = getattr(quote, "price", None) if quote else None
-            estimated = _estimate_chip_from_history(stock_code, df, current_price)
-        except Exception as exc:
-            logger.debug("get_chip_distribution(%s) 估算降级失败: %s", stock_code, exc)
-            estimated = None
+        estimated = _estimate_chip_fallback(stock_code)
         if estimated:
             logger.info(
                 "get_chip_distribution(%s): em 源不可用，历史K线估算降级", stock_code

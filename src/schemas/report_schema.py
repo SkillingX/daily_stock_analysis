@@ -80,6 +80,7 @@ class ChipStructure(BaseModel):
     avg_cost: Optional[Union[int, float, str]] = None
     concentration: Optional[Union[int, float, str]] = None
     chip_health: Optional[str] = None
+    estimated: Optional[bool] = None
 
 
 class DataPerspective(BaseModel):

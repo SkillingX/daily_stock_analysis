@@ -56,7 +56,7 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                             continue
                     return
                 time.sleep(0.2)
-                hold_deadline = time.monotonic() + 8
+                hold_deadline = time.monotonic() + state.get("hold_seconds", 8)
                 while state.get("hold_models") and time.monotonic() < hold_deadline:
                     time.sleep(0.01)
                 if state.get("research_mode") == 1 and any(message.get("role") == "tool" for message in request.get("messages", [])):
@@ -106,7 +106,7 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
         thread.join(timeout=1)
 
 
-def run_application(tmp_path: Path, base: str, script: str, limit: str = "1") -> subprocess.CompletedProcess[str]:
+def run_application(tmp_path: Path, base: str, script: str, limit: str = "1", extra_env: dict[str, str] | None = None, timeout: int = 45) -> subprocess.CompletedProcess[str]:
     config = tmp_path / "models.yaml"
     config.write_text(f"model_list:\n  - model_name: openai/fixture\n    litellm_params:\n      model: openai/fixture\n      api_base: {base}\n      api_key: fixture-key\n")
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR")}
@@ -114,6 +114,7 @@ def run_application(tmp_path: Path, base: str, script: str, limit: str = "1") ->
                LITELLM_MODEL="openai/fixture", DEEP_RESEARCH_LLM_CONCURRENCY=limit,
                OPENAI_API_KEY="fixture-key", OPENAI_API_BASE=base, DATABASE_PATH=str(tmp_path / "db.sqlite"),
                LITELLM_LOCAL_MODEL_COST_MAP="True", NO_PROXY="127.0.0.1,localhost")
+    env.update(extra_env or {})
     prelude = '''
 import json, sys, time, urllib.request
 from src.agent.llm_adapter import LLMToolAdapter
@@ -129,7 +130,7 @@ def wait_active():
         assert time.monotonic() < end
         time.sleep(0.005)
 '''
-    return subprocess.run([sys.executable, "-c", prelude + script, base], env=env, capture_output=True, text=True, timeout=45)
+    return subprocess.run([sys.executable, "-c", prelude + script, base], env=env, capture_output=True, text=True, timeout=timeout)
 
 
 @pytest.mark.parametrize("limit", [1, 2])
@@ -233,3 +234,53 @@ def test_startup_validates_model_limit(tmp_path: Path, limit: str, expected: int
         assert "must be a positive integer" in result.stderr
     else:
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_stream_response_timeout_caps_actual_transport_read(tmp_path: Path, provider: tuple[str, dict[str, int]]) -> None:
+    """单次响应上限与调用者预算都作用于真实传输读取，排队等待只消耗剩余预算。
+
+    单次上限被 config 钳制到最小 10 秒，因此 hold 13 秒：cap 生效时读取约 10 秒
+    超时，未生效时会等完 hold 后成功返回。排队段：holder 出站约 10 秒后失败，
+    waiter 名额等待后只剩剩余预算，出站读取被削减而非重置为原始 timeout。
+    """
+    base, observed = provider
+    observed["hold_models"] = True
+    observed["hold_seconds"] = 13
+    try:
+        result = run_application(tmp_path, base, """
+import concurrent.futures, time
+from src.core.research_run import ResearchRun
+run = ResearchRun(60)
+with run.bind():
+    start = time.monotonic()
+    capped = agent(timeout=30)
+    capped_elapsed = time.monotonic() - start
+    assert capped.provider == "error", capped.content
+    assert 8 < capped_elapsed < 13, capped_elapsed
+    start = time.monotonic()
+    short = agent(timeout=0.5)
+    short_elapsed = time.monotonic() - start
+    assert short.provider == "error", short.content
+    assert short_elapsed < 2, short_elapsed
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        holder = pool.submit(agent, 11)
+        # 此前超时请求的服务端 handler 仍挂起，active 不会归零；用请求计数确认
+        # holder（第 3 个请求）真正出站后，主线程请求才必然在名额上排队。
+        deadline = time.monotonic() + 10
+        while state()["count"] < 3:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        start = time.monotonic()
+        queued_result = agent(timeout=12)   # 主线程在名额上排队，出站只剩剩余预算
+        queued_elapsed = time.monotonic() - start
+    assert holder.result().provider == "error"
+    assert queued_result.provider == "error"
+    assert queued_elapsed < 17, queued_elapsed
+""", extra_env={"LLM_STREAM_RESPONSE_TIMEOUT": "10"}, timeout=90)
+    finally:
+        observed["hold_models"] = False
+        observed.pop("hold_seconds", None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # 四个请求都真实到达传输层；服务端 handler 在客户端读超时后仍挂起至 hold
+    # 结束，peak 反映的是残留连接而非名额并发，此处不作断言。
+    assert observed["count"] == 4
