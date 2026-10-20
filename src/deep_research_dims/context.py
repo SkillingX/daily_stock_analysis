@@ -217,7 +217,16 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         if not stopped and not result.get("errors") and all(result.get(key) is not None for key in financial_keys):
             save_snapshot(cache_key, result)
         elif not stopped:
-            ctx.limitation("基本面数据不完整（快照不缓存，下次重试）")
+            # 已取得指标与未完成查询分开说；部分来源失败不写成全部财务无数据，
+            # 逐条来源错误已由上方“基本面取数: …”记录，缓存行为不进用户可见文案。
+            labels = {"pe_ttm": "市盈率TTM", "pb": "市净率", "roe": "ROE", "gross_margin": "毛利率", "revenue_growth": "营收同比", "net_profit_yoy": "归母净利同比", "market_cap": "总市值"}
+            missing = [key for key in financial_keys if result.get(key) is None]
+            notice = f"基本面核心指标已取得 {len(financial_keys) - len(missing)}/{len(financial_keys)} 项"
+            if missing:
+                notice += f"（未取得：{'、'.join(labels.get(key, key) for key in missing)}）"
+            if result.get("errors"):
+                notice += "；部分补充查询未完成，已取得指标不受影响"
+            ctx.limitation(notice)
         return result
     except ResearchStopped:
         raise
@@ -233,6 +242,12 @@ def _safe_chip(code: str, ctx: SharedContext) -> Dict[str, Any]:
 
         dist = _get_fetcher_manager().get_chip_distribution(code)
         if dist is None:
+            from src.agent.tools.data_tools import _estimate_chip_fallback
+
+            estimated = _estimate_chip_fallback(code)
+            if estimated is not None:
+                ctx.limitation("原始筹码分布数据未取得，资金面采用历史行情估算（精度有限）")
+                return estimated
             ctx.limitation("筹码分布数据缺失")
             return {}
         data = getattr(dist, "to_dict", None)

@@ -41,7 +41,7 @@ IFIND_MCP_TIMEOUT_SECONDS=30
 | `TAVILY_API_KEYS` | 本版本停用 Tavily，遗留值不再触发调用 | 无需补配；可从部署凭据中移除，其余搜索工具不变 |
 | `DEEP_RESEARCH_LLM_CONCURRENCY` | 默认 `3`；行为改为限制同一进程所有模块的实际模型请求 | 当前共享 Coding Plan 建议显式设 `1`；独立后端、CLI、调度进程分别计数 |
 | `DEEP_RESEARCH_TIMEOUT_SECONDS` | 有限报告总预算默认 `2400` 秒，包含取数、排队、研究与收尾 | 可保持默认；结束预算后保存有效资料，在途资源清理不被伪装成已完成 |
-| `LLM_STREAM_RESPONSE_TIMEOUT` | 既有单次模型响应上限，未统一改默认值 | 本机 GLM 验收用 `180` 秒，依据实测返回耗时；线上按实际模型设置，不机械照搬 |
+| `LLM_STREAM_RESPONSE_TIMEOUT` | 既有单次模型响应上限，未统一改默认值（最小钳制 10 秒） | 本机 GLM 验收用 `180` 秒，依据实测返回耗时；三个超时维度的生产对照建议在 120–180 秒范围做一次有界验证（首选 180 候选），需单独授权后执行；线上按实际模型设置，不机械照搬 |
 | `CHOICE_FORCE_LOGIN` | 新增，默认 `false` | 共享试用账号错峰且明确允许挤掉另一端时才设 `true`；不增加同时登录容量 |
 | `CHOICE_USERNAME` / `CHOICE_PASSWORD`、`ENABLED_MARKETS` | 沿用既有配置 | Choice 保留原登录方式和 SDK；本部署保持 `ENABLED_MARKETS=cn` |
 

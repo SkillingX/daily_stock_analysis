@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import ClassVar, Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_core import to_json
@@ -412,6 +412,8 @@ class SentimentDim(DimEnvelope):
 class HolderInfo(BaseModel):
     """Named ownership evidence with its original detail and source."""
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    # 空对象/缺名字条目被填入的占位名；适配层用它识别“无实质内容的记录”。
+    PLACEHOLDER_NAME: ClassVar[str] = "资料缺失"
     name: str = Field(min_length=1)
     source: Optional[str] = None
     detail: Optional[str] = None
@@ -433,7 +435,7 @@ class HolderInfo(BaseModel):
                 recovered = None
             if isinstance(recovered, dict):
                 data = {**recovered, **{key: item for key, item in data.items() if key != "name" and item is not None}}
-        title = data.get("name") or data.get("holder_name") or data.get("title") or data.get("rank_or_note") or data.get("role") or "资料缺失"
+        title = data.get("name") or data.get("holder_name") or data.get("title") or data.get("rank_or_note") or data.get("role") or cls.PLACEHOLDER_NAME
         parts = [str(data[key]) for key in ("date", "type", "detail", "description", "change", "position", "holding_ratio", "shares") if data.get(key) is not None]
         return {"name": title, "source": data.get("source"), "detail": "；".join(parts) or None}
 
