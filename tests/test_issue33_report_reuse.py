@@ -102,13 +102,14 @@ def test_cache_session_follows_completed_trading_day(moment, expected):
 
 
 def test_slow_primary_leaves_budget_for_fallback():
+    seen = {}
+
     class Slow:
         name = "SlowFetcher"
         priority = 0
 
         def get_daily_data(self, **kwargs):
-            deadline = request_deadline.get()
-            assert deadline is not None and deadline < outer
+            seen["deadline"] = request_deadline.get()
             raise TimeoutError("capped")
 
     class Fast:
@@ -119,7 +120,7 @@ def test_slow_primary_leaves_budget_for_fallback():
             return pd.DataFrame({"date": [FRIDAY.isoformat()], "close": [10.0]})
 
     manager = DataFetcherManager(fetchers=[Slow(), Fast()])
-    outer = time.monotonic() + 0.6
+    outer = time.monotonic() + 2.0
     token = request_deadline.set(outer)
     try:
         frame, source = manager.get_daily_data("300209", days=30)
@@ -127,7 +128,10 @@ def test_slow_primary_leaves_budget_for_fallback():
         request_deadline.reset(token)
     assert source == "FastFetcher"
     assert len(frame) == 1
-    assert time.monotonic() < outer + 0.2
+    # The reserve must actually bite: the slow primary saw a shortened
+    # deadline, and the outer deadline itself was never extended.
+    assert seen["deadline"] is not None and outer - seen["deadline"] >= 0.3
+    assert time.monotonic() < outer
 
 
 def test_cancelled_daily_fetch_stays_bounded():
