@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
-from src.schemas.deep_research_dims import DIM_MODELS, DimEnvelope, HolderInfo
+from src.schemas.deep_research_dims import DIM_MODELS, DimEnvelope
 
 
 @dataclass(frozen=True)
@@ -69,9 +69,5 @@ def generic_parse(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[DimE
 
 
 def _coerce_list(dim_id: str, key: str, value: list) -> list:
-    """List[dict] → List[str]，对 ownership 三字段取 dict["name"] 拼字符串；其余原样返回。"""
-    ownership_list_keys = {"top_holders", "executives", "recent_changes"}
-    if dim_id == "ownership" and key in ownership_list_keys:
-        return [item if isinstance(item, HolderInfo) else HolderInfo.model_validate(item) for item in value]
-    # 普通 list（如 List[str]）原样返回
+    """ownership 三个列表由该研究员的适配边界完成条目校验后原样传入；其余 list 原样返回。"""
     return value
