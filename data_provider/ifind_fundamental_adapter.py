@@ -318,6 +318,45 @@ class _RankedCell:
     params: dict[str, str | int | float | None]
 
 
+def confirmed_disclosed_period(*sources: object, as_of: str | None = None) -> str | None:
+    """Latest period already disclosed by the analysis time. Never invents a date."""
+    anchor = (as_of or date.today().isoformat())[:10]
+    found: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        pairs: list[tuple[object, object]] = [
+            (source.get("period"), source.get("disclosed_at")),
+            (source.get("report_date"), source.get("disclosure_date")),
+        ]
+        holders = source.get("holders") if isinstance(source.get("holders"), dict) else {}
+        growth = source.get("growth") if isinstance(source.get("growth"), dict) else {}
+        growth_data = growth.get("data") if isinstance(growth.get("data"), dict) else growth
+        pairs.extend([
+            (holders.get("period"), holders.get("disclosed_at")),
+            (growth_data.get("report_date"), growth_data.get("disclosure_date")),
+        ])
+        meta = source.get("field_meta") if isinstance(source.get("field_meta"), dict) else {}
+        financial_meta = source.get("financial_field_meta") if isinstance(source.get("financial_field_meta"), dict) else {}
+        for record in (*meta.values(), *financial_meta.values()):
+            if isinstance(record, dict):
+                pairs.append((record.get("period"), record.get("disclosed_at")))
+        for period_raw, disclosed_raw in pairs:
+            period = normalize_report_period(period_raw)[0]
+            disclosed = normalize_report_period(disclosed_raw)[0]
+            if not period or not period.endswith(("-03-31", "-06-30", "-09-30", "-12-31")):
+                continue
+            if anchor and period > anchor:
+                continue
+            if disclosed and anchor and disclosed > anchor:
+                continue
+            found.append(period)
+    if not found:
+        logger.info("confirmed_disclosed_period: 截至 %s 未找到已披露财期，股东查询退回最新一期并要求实际财期", anchor)
+        return None
+    return max(found)
+
+
 def _ranked_cells(data: IfindData, code: str, fields: dict[str, str]) -> tuple[dict[tuple[str, int], dict[str, _RankedCell]], list[str]]:
     """Join ranked supplier cells only by returned security, explicit period and rank."""
     joined: dict[tuple[str, int], dict[str, _RankedCell]] = {}
@@ -583,8 +622,12 @@ class IfindFetcher:
         return ProductSegments(items=items, errors=list(dict.fromkeys(errors)))
 
     def shareholders(self, code: str, period: str | None = None, *, deadline: float | None = None) -> IfindShareholders:
-        target = period or "最新已披露财期"
-        data = self.query("get_stock_shareholders", f"{code} 截止{target} 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际财期、披露日和原文链接，合计比例另列，空值不要推算。", deadline=deadline)
+        requested = normalize_report_period(period)[0] if period else None
+        if requested:
+            question = f"{code} 报告期{requested} 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际截止日期、披露日和原文链接，合计比例另列，空值不要推算。"
+        else:
+            question = f"{code} 截止最新已披露财期 前十大股东：各排名的股东名称、持股数量(单位股)、持股比例(单位%)；明确实际财期、披露日和原文链接，合计比例另列，空值不要推算。"
+        data = self.query("get_stock_shareholders", question, deadline=deadline)
         cells, errors = _ranked_cells(data, code, {"name": "股东名称", "shares": "股东持股数量", "ratio": "股东持股比例"})
         if not cells and not errors:
             raise SourceReadError("ifind", "invalid_response")
@@ -606,6 +649,8 @@ class IfindFetcher:
             if ratio is not None and (ratio.unit != "percentage_point" or not 0 <= ratio.value <= 100):
                 ratio = replace(ratio, normalization_error=ratio.normalization_error or "invalid_holder_ratio")
             items.append(IfindHolder(name=name.raw, rank=rank, report_date=row_period, shares=shares, ratio=ratio))
+        if requested and actual and actual != requested:
+            errors.append("period_mismatch")
         complete = {item.rank for item in items} == set(range(1, 11)) and all(item.shares is not None and item.ratio is not None and not item.shares.normalization_error and not item.ratio.normalization_error for item in items) and not errors
         return IfindShareholders(items=items, coverage="complete" if complete else "partial", errors=list(dict.fromkeys(errors)))
 

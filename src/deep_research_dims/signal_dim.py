@@ -13,6 +13,7 @@ from math import isfinite
 from icontract import ensure
 
 from src.deep_research_dims.context import SharedContext
+from src.deep_research_dims.scenarios_dim import with_valuation_cascade
 from src.schemas.deep_research_dims import Confidence, Rating, SignalDim
 
 
@@ -53,7 +54,7 @@ def build_signal_dim(
 
 
     if scenarios_payload.get("status") != "ok" or target is None:
-        return SignalDim(status="degraded", degraded_reason="估值依据不足", rating="中性", confidence="低",
+        return SignalDim(status="degraded", degraded_reason=with_valuation_cascade("估值依据不足"), rating="中性", confidence="低",
                          one_sentence="估值不可用，暂观察；技术点位见独立行动计划。", narrative="缺少估值依据，不生成目标价或期望收益。")
 
     if not isinstance(current, (int, float)) or isinstance(current, bool) or not isfinite(current) or current <= 0:

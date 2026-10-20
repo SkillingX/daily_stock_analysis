@@ -33,6 +33,7 @@ class ResearchRun:
     evidence: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     facts: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     vendor_research: dict[str, dict[str, Any]] = field(default_factory=dict)
+    daily_history: dict[str, Any] | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _pending: set[Future[Any]] = field(default_factory=set, repr=False)
     _on_clean: Callable[[], None] | None = field(default=None, repr=False)
@@ -125,6 +126,24 @@ class ResearchRun:
             except Exception:
                 # A detached progress listener cannot stop accepted research.
                 pass
+
+    def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
+        """Share one completed session inside this run. Does not touch a returned context."""
+        with self._lock:
+            if self.finalized or self.stop_reason or self.remaining() <= 0 or not records:
+                return
+            current = self.daily_history
+            if current and current.get("as_of") != as_of:
+                return
+            if current and len(current.get("records") or []) >= len(records):
+                return
+            self.daily_history = {"as_of": as_of, "records": [dict(row) for row in records], "source": source}
+
+    def published_daily_history(self) -> dict[str, Any] | None:
+        with self._lock:
+            if self.finalized or self.stop_reason or self.remaining() <= 0:
+                return None
+            return self.daily_history
 
     def retain_vendor(self, dim: str, research: dict[str, Any]) -> None:
         with self._lock:

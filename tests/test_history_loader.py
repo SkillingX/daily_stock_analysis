@@ -38,7 +38,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
 
         fake_bar = MagicMock()
         fake_bar.to_dict.return_value = {
-            "date": "2026-04-18",
+            "date": "2026-04-17",
             "open": 10,
             "high": 11,
             "low": 9,
@@ -49,7 +49,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
         mock_db.get_data_range.return_value = [fake_bar] * 40
         mock_get_db.return_value = mock_db
 
-        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 18))
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 17))
 
         self.assertIsNotNone(df)
         self.assertEqual(source, "db_cache")
@@ -73,7 +73,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
         mock_fm.get_daily_data.return_value = (fake_df, "eastmoney")
         mock_get_fm.return_value = mock_fm
 
-        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 18))
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 17))
 
         self.assertIsNotNone(df)
         self.assertEqual(source, "eastmoney")
@@ -116,7 +116,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
         from src.services.history_loader import load_history_df
 
         fake_bar = MagicMock()
-        fake_bar.to_dict.return_value = {"date": "2026-04-18", "close": 10}
+        fake_bar.to_dict.return_value = {"date": "2026-04-17", "close": 10}
 
         mock_db = MagicMock()
 
@@ -128,7 +128,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
         mock_db.get_data_range.side_effect = side_effect
         mock_get_db.return_value = mock_db
 
-        df, source = load_history_df("SH600519", days=30, target_date=date(2026, 4, 18))
+        df, source = load_history_df("SH600519", days=30, target_date=date(2026, 4, 17))
 
         self.assertEqual(source, "db_cache")
         self.assertEqual(mock_db.get_data_range.call_count, 2)
@@ -149,7 +149,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
         mock_fm.get_daily_data.side_effect = Exception("API down")
         mock_get_fm.return_value = mock_fm
 
-        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 18))
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 17))
 
         self.assertIsNone(df)
         self.assertEqual(source, "none")

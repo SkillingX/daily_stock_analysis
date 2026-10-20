@@ -340,6 +340,10 @@ def test_manager_stops_quote_history_chip_fallback_after_first_response(monkeypa
     from src.config import Config
     from types import SimpleNamespace
     import pandas as pd
+    # Earlier tests in the same process may have opened the class-level daily
+    # circuit breaker; this test asserts first-response stop semantics, not
+    # breaker state, so start from a clean health board.
+    DataFetcherManager.reset_daily_source_health()
     run = ResearchRun(5)
     calls = []
 
