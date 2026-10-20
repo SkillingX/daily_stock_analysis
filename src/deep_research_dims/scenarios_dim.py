@@ -16,6 +16,12 @@ from src.schemas.deep_research_dims import ScenariosDim
 
 from src.schemas.value_scenarios import AnalystTarget, Scenario, ValueHorizons, ValueScenarios
 
+VALUATION_CASCADE = "主缺口及受影响章节：缺少可追溯目标价，情景、结论与信号因此受限"
+
+
+def with_valuation_cascade(reason: str) -> str:
+    return f"{reason}。{VALUATION_CASCADE}"
+
 
 @require(lambda scenarios: len(scenarios) > 0, "至少一个情景")
 def normalize_probabilities(scenarios: List[Scenario]) -> List[Scenario]:
@@ -113,7 +119,7 @@ def build_scenarios_dim(
                 reason = "机构目标价数据契约异常，不能参与估值"
     return ScenariosDim(
         status="ok" if reference is not None else "degraded",
-        degraded_reason=None if reference is not None else reason,
+        degraded_reason=None if reference is not None else with_valuation_cascade(reason),
         scenarios=scenarios,
         probability_sum=prob_sum,
         expected_value=None,

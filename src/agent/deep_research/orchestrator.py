@@ -658,6 +658,7 @@ def _run_dual_track(
     if run is not None:
         run.check()
     _perf_mark("wave1_done")
+    _reconcile_shared_history(ctx, dims)
 
     # ---- 波次 2：F2 板块（带产业链定位文本）→ L1 六维 v2 → L2 贝叶斯 ----
     if "sector" in selected:
@@ -901,6 +902,28 @@ def _run_dual_track(
         "[DualTrack][perf] total=%.1fs stages: %s", time.time() - _perf_t0, _perf_summary
     )
     return result
+
+
+def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
+    """Adopt a same-session history published during this run before dependent dims."""
+    from src.deep_research_dims.context import (
+        HISTORY_FAILED_NOTE_PREFIX,
+        HISTORY_MISSING_NOTE,
+        STAGE_TIMEOUT_NOTE_SUFFIX,
+    )
+    from src.services.history_loader import adopt_published_history
+
+    if not adopt_published_history(ctx):
+        return
+    # Adoption only resolves the history notes; quote/chip timeout notes stay.
+    history_note = f"history {STAGE_TIMEOUT_NOTE_SUFFIX}"
+    ctx.limitations[:] = [
+        note for note in ctx.limitations
+        if not (note.startswith(history_note) or note.startswith(HISTORY_MISSING_NOTE) or note.startswith(HISTORY_FAILED_NOTE_PREFIX))
+    ]
+    data = dims.get("data")
+    if data is not None and data.status == "degraded":
+        dims["data"] = build_data_dim(ctx)
 
 
 def _has_useful_data(dims: dict[str, Any]) -> bool:

@@ -387,9 +387,14 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
             run.retain_vendor("ownership", research)
         if get_config().enable_ifind_mcp and not research.get("shareholder_details"):
             from src.agent.tools.data_tools import _get_fetcher_manager
+            from data_provider.ifind_fundamental_adapter import confirmed_disclosed_period
             if run := current_research.get():
                 run.check()
-            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=None if get_config().financial_primary_source == "ifind" else (research.get("holders") or {}).get("period"), deadline=deadline)}
+            run_ctx = getattr(run, "context", None) if run else None
+            fundamental = getattr(run_ctx, "fundamental", {}) or {}
+            as_of = str(research.get("as_of") or getattr(run_ctx, "as_of", "") or "")
+            period = confirmed_disclosed_period(research, fundamental, as_of=as_of)
+            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=period, deadline=deadline)}
         task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
     research = research or {}
     details = research.get("shareholder_details")
