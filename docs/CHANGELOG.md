@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [改进] 默认 MiniMax 模型切换为 M3.1-Flash，全局请求按 MINIMAX_REASONING_EFFORT（默认 low）设置推理强度并保持 thinking 开启；基本面专项研究预算默认值和上限放宽到 300 秒，页面等待 330 秒，超时保留部分报告并刷新历史，历史刷新失败不再误报生成失败。
+- [修复] 基本面验收脚本等待时间与报告预算对齐；MiniMax 设置页新建渠道默认选 M3.1-Flash，并按官方公开价格估算该模型用量，不将其记为零成本。
 - [改进] 独立 Scheduler 可通过 SCHEDULER_LITELLM_CONFIG 加载单模型 YAML，启动与任务重载均沿用该模型，普通分析和 Agent 保持一致；无效配置明确失败，不跨模型回退，API 保留原模型配置。
 - [修复] 股权研究员把 JSON 数组字符串或带 items 的包装对象在适配边界解包后再过严格条目契约；股东、高管、变动三个列表统一防御，空对象、无法识别形状记为该列表具体缺项，不再拖垮实控人等已取得核心资料，可选变动缺项不降低章节状态，提示词同步明确三个列表的条目结构与空列表约定。
 - [修复] 数据局限按采用结果区分：原始筹码未取得而采用历史行情估算时明确披露估算来源，财务指标写明已取得与缺失项，不把部分来源失败写成全部无数据，“快照不缓存”等实现细节移出用户可见文案。

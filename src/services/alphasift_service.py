@@ -27,6 +27,7 @@ from fastapi import HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.llm.concurrency import limited_completion
+from src.llm.generation_params import apply_minimax_reasoning_params
 from src.auth import COOKIE_NAME, is_auth_enabled, refresh_auth_state, verify_session
 from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, get_configured_llm_models
 
@@ -566,20 +567,25 @@ def _summarize_hotspot_news_event_with_llm(
             "不要输出完整报道、股票价格流水、免责声明或投资建议。\n\n"
             f"题材：{topic}\n新闻：{text}"
         )
-        with _alphasift_litellm_headers(config):
-            response = litellm.completion(
-                model=model,
-                messages=[
+        call_kwargs = apply_minimax_reasoning_params(
+            {
+                "model": model,
+                "messages": [
                     {
                         "role": "system",
                         "content": "你是A股题材事件摘要助手，只输出一句短摘要。",
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.2,
-                max_tokens=120,
-                timeout=8,
-            )
+                "temperature": 0.2,
+                "max_tokens": 120,
+                "timeout": 8,
+            },
+            [model],
+            config.minimax_reasoning_effort,
+        )
+        with _alphasift_litellm_headers(config):
+            response = litellm.completion(**call_kwargs)
         return _clean_hotspot_llm_summary(_extract_litellm_message_content(response))
     except Exception as exc:
         logger.info(

@@ -834,6 +834,8 @@ class Config:
     # ±13 score deltas across runs with identical input). 0.2 still allows
     # a small amount of variation while making repeated analyses converge.
     llm_temperature: float = 0.2
+    # MiniMax-M3.1-Flash only; other models keep their own reasoning behavior.
+    minimax_reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
 
     # --- Multi-channel LLM config (new) ---
     # LITELLM_CONFIG: path to a standard litellm_config.yaml file (most powerful)
@@ -874,7 +876,7 @@ class Config:
     # OpenAI 兼容 API（备选，当 Gemini/Anthropic 不可用时使用）
     openai_api_key: Optional[str] = None
     openai_base_url: Optional[str] = None  # 如: https://api.openai.com/v1
-    openai_model: str = "MiniMax-M3"  # OpenAI 兼容模型名称
+    openai_model: str = "MiniMax-M3.1-Flash"  # OpenAI 兼容模型名称
     openai_vision_model: Optional[str] = None  # Deprecated: use VISION_MODEL instead
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
 
@@ -1194,7 +1196,7 @@ class Config:
     # 全局总开关；关闭时返回 not_supported 并保持主流程无变化
     enable_fundamental_pipeline: bool = True
     # 基本面阶段总预算（秒）
-    fundamentals_report_timeout_seconds: float = 150.0
+    fundamentals_report_timeout_seconds: float = 300.0
     fundamental_stage_timeout_seconds: float = FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = FUNDAMENTAL_FETCH_TIMEOUT_SECONDS_DEFAULT
@@ -1549,7 +1551,7 @@ class Config:
                 _anspire_llm_model_env or _openai_model_env or ANSPIRE_LLM_MODEL_DEFAULT
             )
         else:
-            _openai_model_name = _openai_model_env or "MiniMax-M3"
+            _openai_model_name = _openai_model_env or "MiniMax-M3.1-Flash"
         if not litellm_model:
             _gemini_model_name = os.getenv(
                 "GEMINI_MODEL", "gemini-3.1-pro-preview"
@@ -1809,6 +1811,15 @@ class Config:
             and not report_show_llm_model_raw.strip()
         ):
             report_show_llm_model = False
+        minimax_reasoning_effort = (
+            os.getenv("MINIMAX_REASONING_EFFORT", "low").strip().lower()
+        )
+        if minimax_reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}:
+            logger.warning(
+                "MINIMAX_REASONING_EFFORT=%r is unsupported; falling back to low",
+                minimax_reasoning_effort,
+            )
+            minimax_reasoning_effort = "low"
 
         return cls(
             stock_list=stock_list,
@@ -2139,6 +2150,10 @@ class Config:
             report_summary_only=os.getenv("REPORT_SUMMARY_ONLY", "false").lower()
             == "true",
             report_show_llm_model=report_show_llm_model,
+            minimax_reasoning_effort=cast(
+                Literal["low", "medium", "high", "xhigh", "max"],
+                minimax_reasoning_effort,
+            ),
             report_templates_dir=os.getenv("REPORT_TEMPLATES_DIR", "templates"),
             report_renderer_enabled=os.getenv(
                 "REPORT_RENDERER_ENABLED", "false"
@@ -2418,10 +2433,10 @@ class Config:
             == "true",
             fundamentals_report_timeout_seconds=parse_env_float(
                 os.getenv("FUNDAMENTALS_REPORT_TIMEOUT_SECONDS"),
-                150.0,
+                300.0,
                 field_name="FUNDAMENTALS_REPORT_TIMEOUT_SECONDS",
                 minimum=1.0,
-                maximum=150.0,
+                maximum=300.0,
             ),
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv("FUNDAMENTAL_STAGE_TIMEOUT_SECONDS"),
