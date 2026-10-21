@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import FundamentalsPage from '../FundamentalsPage';
+import { AxiosError } from 'axios';
 
 const { get, post } = vi.hoisted(() => ({ get: vi.fn(), post: vi.fn() }));
 vi.mock('../../api/index', () => ({ default: { get, post } }));
@@ -26,6 +27,7 @@ describe('Fundamentals refresh intent', () => {
     const refresh = screen.getByRole('button', { name: '刷新数据并生成新报告' });
     act(() => { fireEvent.click(refresh); fireEvent.click(refresh); });
     expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][2]).toEqual({ timeout: 330000 });
     expect(post.mock.calls[0][0]).toContain('force_refresh=true');
     expect(screen.getByText('刷新财务数据中...')).toBeInTheDocument();
     await act(async () => { resolve({ data: { report_id: 'fd_202610091200_1', markdown: 'partial 财务品质' } }); });
@@ -55,6 +57,48 @@ describe('Fundamentals refresh intent', () => {
     fireEvent.click(screen.getByRole('button', { name: '生成报告' }));
     await screen.findByText(/已保存部分报告/);
     expect(screen.getByText('业务画像未完成；财务数据已保留')).toBeInTheDocument();
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes history once after client timeout without retrying or adopting an unrelated report', async () => {
+    get.mockResolvedValueOnce({ data: { data: [] } });
+    post.mockRejectedValueOnce(new AxiosError('timeout of 330000ms exceeded', 'ECONNABORTED'));
+    render(<FundamentalsPage />);
+    fireEvent.click(screen.getByText('选择样本'));
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+    get.mockResolvedValueOnce({ data: { data: [{ id: 'fd_202610211200', stock_code: '600519', stock_name: '另一次请求的报告' }] } });
+    fireEvent.click(screen.getByRole('button', { name: '生成报告' }));
+    await screen.findByText(/本次等待已结束/);
+    expect(screen.getByText('另一次请求的报告')).toBeInTheDocument();
+    expect(screen.getByText('输入股票，生成经营模式/主营产品/行业地位/龙头对比的详细基本面报告')).toBeInTheDocument();
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not report generation failure when only history refresh fails', async () => {
+    render(<FundamentalsPage />);
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+    get.mockRejectedValueOnce(new Error('历史列表暂不可用'));
+    post.mockResolvedValueOnce({ data: { report_id: 'fd_202610211200', status: 'partial', markdown: '已经保存的部分报告' } });
+    fireEvent.click(screen.getByText('选择样本'));
+    fireEvent.click(screen.getByRole('button', { name: '生成报告' }));
+    await screen.findByText('已经保存的部分报告');
+    expect(screen.getByText(/已保存部分报告/)).toBeInTheDocument();
+    expect(screen.getByText(/历史列表刷新失败/)).toBeInTheDocument();
+    expect(screen.queryByText(/操作不会自动重试/)).not.toBeInTheDocument();
+  });
+
+  it('keeps a server timeout distinct when the recovery history request also fails', async () => {
+    render(<FundamentalsPage />);
+    await waitFor(() => expect(get).toHaveBeenCalledTimes(1));
+    get.mockRejectedValueOnce(new Error('history unavailable'));
+    post.mockRejectedValueOnce(Object.assign(new AxiosError('服务端模型请求超时', 'ECONNABORTED'), { response: { status: 504 } }));
+    fireEvent.click(screen.getByText('选择样本'));
+    fireEvent.click(screen.getByRole('button', { name: '生成报告' }));
+    await screen.findByText(/服务端模型请求超时/);
+    await screen.findByText(/历史列表刷新失败/);
+    expect(screen.queryByText(/本次等待已结束/)).not.toBeInTheDocument();
+    expect(get).toHaveBeenCalledTimes(2);
     expect(post).toHaveBeenCalledTimes(1);
   });
 

@@ -9,3 +9,5 @@ model_list:
       api_base: https://api.kimi.com/coding/v1
       api_key: os.environ/LLM_KIMI_API_KEY
       reasoning_effort: high
+      # openai provider 默认丢弃未声明参数；Kimi Code 需要显式放行 reasoning_effort
+      allowed_openai_params: ["reasoning_effort"]

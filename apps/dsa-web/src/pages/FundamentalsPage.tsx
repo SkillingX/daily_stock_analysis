@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { isAxiosError } from 'axios';
 import { Download, FileText, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
@@ -23,10 +24,16 @@ export default function FundamentalsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const loadHistory = useCallback(async () => {
-    const res = await apiClient.get<{ data: FundamentalsItem[] }>('/api/v1/fundamentals/reports');
-    setHistory(res.data.data || []);
+    try {
+      const res = await apiClient.get<{ data: FundamentalsItem[] }>('/api/v1/fundamentals/reports');
+      setHistory(res.data.data || []);
+      setHistoryError(null);
+    } catch {
+      setHistoryError('历史列表刷新失败，请稍后手动刷新；当前显示的报告仍可阅读。');
+    }
   }, []);
 
   useEffect(() => { void loadHistory(); }, [loadHistory]);
@@ -39,19 +46,23 @@ export default function FundamentalsPage() {
     try {
       const res = await apiClient.post<{ report_id: string | null; markdown: string; status: string }>(
         `/api/v1/fundamentals/generate?stock_code=${encodeURIComponent(selected.code)}&stock_name=${encodeURIComponent(selected.name || '')}&force_refresh=${forceRefresh}`,
-        undefined, { timeout: 180000 },
+        undefined, { timeout: 330000 },
       );
       if (res.data.report_id) {
         setDetail({ id: res.data.report_id, markdown: res.data.markdown });
         if (res.data.status === 'partial') setNotice('已保存部分报告，未完成章节及数据缺口请查看正文；本次不会自动重试。');
         else if (forceRefresh) setNotice('新报告已保存，历史报告保留；数据完整度以财务品质说明为准。');
-        await loadHistory();
       } else {
         setError('报告保存失败，已有报告保留。');
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? `${e.message}；可查看历史列表确认是否已保存新版本，操作不会自动重试。` : '生成失败，已有报告保留。');
+      const clientTimeout = isAxiosError(e) && !e.response
+        && (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT');
+      setError(clientTimeout
+        ? '本次等待已结束，后台可能仍在生成或已保存报告，请查看或稍后刷新历史；操作不会自动重试。'
+        : e instanceof Error ? `${e.message}；可查看历史列表确认是否已保存新版本，操作不会自动重试。` : '生成失败，已有报告保留。');
     } finally {
+      await loadHistory();
       setGenerating(false);
       setRefreshing(false);
       inFlight.current = false;
@@ -128,6 +139,7 @@ export default function FundamentalsPage() {
           <p className="text-xs text-muted-text">普通生成复用当天最新报告。显式刷新重取所选股票的财务数据，并保留历史版本。</p>
           {error && <p className="text-sm text-red-400">{error}</p>}
           {notice && <p className="text-sm text-cyan" role="status">{notice}</p>}
+          {historyError && <p className="text-sm text-amber-400" role="status">{historyError}</p>}
         </header>
 
         <div className="rounded-[1.25rem] border border-white/8 bg-card/82 p-5">
