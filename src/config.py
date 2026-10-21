@@ -16,10 +16,11 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, cast
 from urllib.parse import unquote, urlparse
 from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from src.report_language import (
     is_supported_report_language_value,
@@ -39,6 +40,26 @@ from src.notification_contracts import (
 from src.llm import generation_params as llm_generation_params
 
 logger = logging.getLogger(__name__)
+
+
+class _SchedulerModelParams(BaseModel):
+    model_config = ConfigDict(
+        strict=True, frozen=True, validate_assignment=True,
+        extra="allow", hide_input_in_errors=True,
+    )
+    model: Annotated[str, Field(pattern=r"^\S+$")]
+    api_base: Annotated[str, Field(pattern=r"^https?://\S+$")]
+    api_key: Annotated[SecretStr, Field(min_length=8)]
+
+
+class _SchedulerModelDeployment(BaseModel):
+    model_config = ConfigDict(
+        strict=True, frozen=True, validate_assignment=True,
+        extra="allow", hide_input_in_errors=True,
+    )
+    model_name: Annotated[str, Field(pattern=r"^\S+$")]
+    litellm_params: _SchedulerModelParams
+
 
 DEFAULT_ALPHASIFT_INSTALL_SPEC = "git+https://github.com/ZhuLinsen/alphasift.git@14e74fc0819267f7c04c3117a0dd0fe3f9b19404"
 
@@ -1361,7 +1382,14 @@ class Config:
         return cls._instance
 
     @classmethod
-    def _load_from_env(cls) -> "Config":
+    def reload_for_scheduler(cls) -> "Config":
+        """Install scheduled-process config for all consumers of this singleton."""
+        config = cls._load_from_env(scheduler=True)
+        cls._instance = config
+        return config
+
+    @classmethod
+    def _load_from_env(cls, *, scheduler: bool = False) -> "Config":
         """
         从 .env 文件加载配置
 
@@ -1565,7 +1593,12 @@ class Config:
                 litellm_fallback_models = []
 
         # === LLM Channels + YAML config ===
-        litellm_config_path = os.getenv("LITELLM_CONFIG", "").strip() or None
+        scheduler_config_path = (
+            os.getenv("SCHEDULER_LITELLM_CONFIG", "").strip() if scheduler else ""
+        )
+        litellm_config_path = (
+            scheduler_config_path or os.getenv("LITELLM_CONFIG", "").strip() or None
+        )
         llm_models_source = "legacy_env"
         llm_channels: List[Dict[str, Any]] = []
         llm_channel_names: List[str] = []
@@ -1576,6 +1609,22 @@ class Config:
             llm_model_list = cls._parse_litellm_yaml(litellm_config_path)
             if llm_model_list:
                 llm_models_source = "litellm_config"
+
+        if scheduler_config_path:
+            if len(llm_model_list) != 1:
+                raise ValueError(
+                    "SCHEDULER_LITELLM_CONFIG must contain exactly one model deployment; "
+                    "refusing to fall back to the API process model"
+                )
+            try:
+                deployment = _SchedulerModelDeployment.model_validate(llm_model_list[0])
+            except ValueError:
+                raise ValueError(
+                    "Invalid SCHEDULER_LITELLM_CONFIG: model_name, model, api_base "
+                    "and a resolved api_key are required"
+                ) from None
+            litellm_model = deployment.model_name
+            litellm_fallback_models = []
 
         # Priority 2: LLM_CHANNELS (env var based channel config)
         if not llm_model_list:
@@ -1631,10 +1680,13 @@ class Config:
                 if m not in _seen and not _seen.add(m)  # type: ignore[func-returns-value]
             ]
 
-        agent_litellm_model = normalize_agent_litellm_model(
-            os.getenv("AGENT_LITELLM_MODEL", ""),
-            configured_models=set(get_configured_llm_models(llm_model_list)),
-        )
+        if scheduler_config_path:
+            agent_litellm_model = litellm_model
+        else:
+            agent_litellm_model = normalize_agent_litellm_model(
+                os.getenv("AGENT_LITELLM_MODEL", ""),
+                configured_models=set(get_configured_llm_models(llm_model_list)),
+            )
         agent_context_compression_profile = normalize_agent_context_compression_profile(
             os.getenv("AGENT_CONTEXT_COMPRESSION_PROFILE")
         )

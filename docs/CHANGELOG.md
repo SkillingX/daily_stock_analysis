@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [改进] 独立 Scheduler 可通过 SCHEDULER_LITELLM_CONFIG 加载单模型 YAML，启动与任务重载均沿用该模型，普通分析和 Agent 保持一致；无效配置明确失败，不跨模型回退，API 保留原模型配置。
 - [修复] 股权研究员把 JSON 数组字符串或带 items 的包装对象在适配边界解包后再过严格条目契约；股东、高管、变动三个列表统一防御，空对象、无法识别形状记为该列表具体缺项，不再拖垮实控人等已取得核心资料，可选变动缺项不降低章节状态，提示词同步明确三个列表的条目结构与空列表约定。
 - [修复] 数据局限按采用结果区分：原始筹码未取得而采用历史行情估算时明确披露估算来源，财务指标写明已取得与缺失项，不把部分来源失败写成全部无数据，“快照不缓存”等实现细节移出用户可见文案。
 - [测试] 本地可控 HTTP 服务验证单次模型响应上限（最小 10 秒钳制）确实作用于真实传输读取，调用者更短预算与排队后剩余预算仍然优先。

@@ -473,7 +473,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "_RUNTIME_ENV_FILE_KEYS",
             {"SCHEDULE_TIME"},
         ), patch(
-            "main.get_config",
+            "main.Config.reload_for_scheduler",
             return_value=runtime_config,
         ) as get_config_mock:
             reloaded_config = main._reload_runtime_config()
@@ -513,15 +513,12 @@ class MainScheduleModeTestCase(unittest.TestCase):
                 {"OPENAI_API_KEY", "SCHEDULE_TIME"},
             )
 
-    def test_reload_runtime_config_refreshes_env_before_resetting_singleton(self) -> None:
+    def test_reload_runtime_config_refreshes_env_before_reloading_singleton(self) -> None:
         runtime_config = self._make_config(schedule_enabled=True, schedule_time="09:30")
         call_order = []
 
         def fake_reload_env() -> None:
             call_order.append("reload_env")
-
-        def fake_reset_instance() -> None:
-            call_order.append("reset_instance")
 
         def fake_get_config():
             call_order.append("get_config")
@@ -531,16 +528,13 @@ class MainScheduleModeTestCase(unittest.TestCase):
             "main._reload_env_file_values_preserving_overrides",
             side_effect=fake_reload_env,
         ), patch(
-            "main.Config.reset_instance",
-            side_effect=fake_reset_instance,
-        ), patch(
-            "main.get_config",
+            "main.Config.reload_for_scheduler",
             side_effect=fake_get_config,
         ):
             reloaded_config = main._reload_runtime_config()
 
         self.assertIs(reloaded_config, runtime_config)
-        self.assertEqual(call_order, ["reload_env", "reset_instance", "get_config"])
+        self.assertEqual(call_order, ["reload_env", "get_config"])
 
     def test_schedule_time_provider_propagates_config_read_failures(self) -> None:
         with patch.object(

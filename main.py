@@ -1064,8 +1064,7 @@ def _resolve_scheduled_stock_codes(
 def _reload_runtime_config() -> Config:
     """Reload config from the latest persisted `.env` values for scheduled runs."""
     _reload_env_file_values_preserving_overrides()
-    Config.reset_instance()
-    return get_config()
+    return Config.reload_for_scheduler()
 
 
 def _build_schedule_time_provider(default_schedule_time: str):
@@ -1180,6 +1179,17 @@ def main() -> int:
         "GITHUB_ACTIONS"
     ) != "true"
 
+    if (
+        start_serve and not args.serve_only
+        and (args.schedule or config.schedule_enabled)
+        and os.getenv("SCHEDULER_LITELLM_CONFIG", "").strip()
+    ):
+        logger.error(
+            "SCHEDULER_LITELLM_CONFIG requires separate API and Scheduler processes; "
+            "use --serve-only and --schedule in separate processes"
+        )
+        return 1
+
     # 兼容旧版 WEBUI_HOST/WEBUI_PORT：如果用户未通过 --host/--port 指定，则使用旧变量
     if start_serve:
         if args.host == "0.0.0.0" and os.getenv("WEBUI_HOST"):
@@ -1283,7 +1293,9 @@ def main() -> int:
 
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
+            config = _reload_runtime_config()
             logger.info("模式: 定时任务")
+            logger.info("Scheduler LLM: model=%s, source=%s", config.litellm_model, config.llm_models_source)
             logger.info(f"每日执行时间: {config.schedule_time}")
 
             # Determine whether to run immediately:
