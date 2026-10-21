@@ -1,5 +1,6 @@
 """Replay a messages/tools JSON file through the configured Agent model, without executing tools.
 Run: python scripts/probe_agent_model.py request.json --timeout 120
+Add --scheduler to use the dedicated Scheduler model configuration.
 Loads the normal ENV_FILE/.env and model configuration; makes a paid request, prints metadata only.
 """
 from __future__ import annotations
@@ -30,6 +31,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('request', type=Path)
     parser.add_argument('--timeout', type=float, default=120.0)
+    parser.add_argument('--scheduler', action='store_true', help='Use the Scheduler model configuration')
     args = parser.parse_args()
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('timeout must be positive')
@@ -40,7 +42,7 @@ def main() -> int:
         # Libraries can include credentials or response text in errors; emit only safe metadata.
         with open(os.devnull, 'w') as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             from src.agent.llm_adapter import LLMToolAdapter
-            from src.config import get_config
+            from src.config import Config, get_config
             request = ProbeRequest.model_validate_json(args.request.read_text())
             messages = request.messages
             for message in messages:
@@ -50,7 +52,7 @@ def main() -> int:
                          'arguments': json.loads(tool['function']['arguments'])}
                         for tool in message['tool_calls']
                     ]
-            config = get_config()
+            config = Config.reload_for_scheduler() if args.scheduler else get_config()
             response = LLMToolAdapter(config).call_with_tools(messages, request.tools, timeout=args.timeout)
             summary['configured_reasoning_efforts'] = [
                 entry['litellm_params'].get('reasoning_effort')
