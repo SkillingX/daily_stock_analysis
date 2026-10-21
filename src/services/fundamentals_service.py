@@ -98,7 +98,10 @@ def _research_dim(dim_id: str, code: str, name: str, *, deadline: Optional[float
             return payload
         error = str(out.get("error") or "")
         reason = "模型未成功完成研究，业务画像未完成"
-        for marker, explanation in (("时限", "研究时限耗尽"), ("length", "模型输出被截断"),
+        for marker, explanation in (("研究预算不足", "研究预算不足，保留已取得资料"),
+                                    ("等待模型额度", "等待模型额度超时，尚未发送模型请求"),
+                                    ("模型请求超时", "模型请求超时"),
+                                    ("时限", "研究时限耗尽"), ("length", "模型输出被截断"),
                                     ("content_filter", "模型输出被服务商过滤"), ("JSON", "模型输出格式无效")):
             if marker in error:
                 reason = explanation + "，业务画像未完成"

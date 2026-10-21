@@ -1194,7 +1194,7 @@ class Config:
     # 全局总开关；关闭时返回 not_supported 并保持主流程无变化
     enable_fundamental_pipeline: bool = True
     # 基本面阶段总预算（秒）
-    fundamentals_report_timeout_seconds: float = 150.0
+    fundamentals_report_timeout_seconds: float = 300.0
     fundamental_stage_timeout_seconds: float = FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = FUNDAMENTAL_FETCH_TIMEOUT_SECONDS_DEFAULT
@@ -2418,10 +2418,10 @@ class Config:
             == "true",
             fundamentals_report_timeout_seconds=parse_env_float(
                 os.getenv("FUNDAMENTALS_REPORT_TIMEOUT_SECONDS"),
-                150.0,
+                300.0,
                 field_name="FUNDAMENTALS_REPORT_TIMEOUT_SECONDS",
                 minimum=1.0,
-                maximum=150.0,
+                maximum=300.0,
             ),
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv("FUNDAMENTAL_STAGE_TIMEOUT_SECONDS"),

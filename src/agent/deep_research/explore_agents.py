@@ -110,6 +110,7 @@ def _run_explore(
             tool_registry=registry,
             llm_adapter=llm_adapter,
             max_steps=min(max_steps, 2) if dim_id == "business" else max_steps,
+            final_response_without_thinking=dim_id == "business",
             **({"research_deadline": research_deadline} if research_deadline is not None else {}),
             progress_callback=progress_callback,
             max_wall_clock_seconds=remaining,
