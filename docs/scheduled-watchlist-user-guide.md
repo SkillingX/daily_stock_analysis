@@ -110,6 +110,8 @@ python main.py --schedule
 
 ### 4.2 使用 systemd 管理（推荐用于生产环境）
 
+API 与 Scheduler 独立进程需要分别使用模型时，配置 `SCHEDULER_LITELLM_CONFIG`，见 [按进程配置模型](./scheduler-model-routing.md)。CLI 启动参数保持原样；页面/API 手动触发任务仍使用 API 进程的模型。
+
 创建 `/etc/systemd/system/dsa-scheduler.service`：
 
 ```ini

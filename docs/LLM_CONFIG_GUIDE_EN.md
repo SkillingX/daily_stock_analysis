@@ -1,5 +1,7 @@
 # LLM Configuration Guide
 
+For separate API and Scheduler processes, `SCHEDULER_LITELLM_CONFIG` selects a dedicated single-deployment YAML for scheduled model calls, while the API retains its regular model configuration. The Scheduler has no cross-model fallback and fails on invalid dedicated configuration. See [process model routing](./scheduler-model-routing.md) (Chinese) for configuration, restart, manual-trigger behavior, verification, and rollback.
+
 Welcome! Whether you are a beginner newly exposed to AI or a veteran skilled with various APIs, this guide will help you set up Large Language Models (LLMs) quickly.
 
 This project exposes a unified AI model access flow that supports official APIs, OpenAI-compatible platforms, and local models. Under the hood it is powered by [LiteLLM](https://docs.litellm.ai/), but most users only need to think in terms of picking a provider, adding an API key, and optionally choosing a primary model or channels. To cater to different experience levels, we provide a three-tier configuration hierarchy. Choose the method that fits you best.

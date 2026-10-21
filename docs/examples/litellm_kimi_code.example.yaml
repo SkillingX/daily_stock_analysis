@@ -1,0 +1,11 @@
+# Kimi Code 套餐模型，供独立 Scheduler 使用。
+# .env: SCHEDULER_LITELLM_CONFIG=docs/examples/litellm_kimi_code.example.yaml
+# .env: LLM_KIMI_API_KEY=<Kimi Code 控制台创建的套餐 Key>
+# 按账号地域/权益修改 api_base 和 model；不要改成 Moonshot 按量计费入口。
+model_list:
+  - model_name: openai/kimi-for-coding
+    litellm_params:
+      model: openai/kimi-for-coding
+      api_base: https://api.kimi.com/coding/v1
+      api_key: os.environ/LLM_KIMI_API_KEY
+      reasoning_effort: high
