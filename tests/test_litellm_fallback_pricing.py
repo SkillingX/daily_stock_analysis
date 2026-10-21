@@ -41,6 +41,7 @@ def _fake_agent_config(**overrides) -> SimpleNamespace:
         "openai_api_keys": [],
         "deepseek_api_keys": [],
         "openai_base_url": None,
+        "minimax_reasoning_effort": "low",
     }
     config.update(overrides)
     return SimpleNamespace(**config)
@@ -89,6 +90,20 @@ class LiteLLMFallbackPricingTestCase(unittest.TestCase):
             registered,
             [{"MiniMax-M2.7": llm_adapter._CUSTOM_MODEL_PRICING["MiniMax-M2.7"]}],
         )
+
+    def test_registers_m3_1_flash_with_published_pricing_and_context(self) -> None:
+        registered = []
+        with patch.object(llm_adapter.litellm, "register_model", side_effect=registered.append, create=True):
+            with patch.object(llm_adapter.litellm, "model_cost", {}, create=True):
+                llm_adapter.register_fallback_model_pricing(["openai/MiniMax-M3.1-Flash"])
+
+        self.assertEqual(len(registered), 1)
+        model = registered[0]["MiniMax-M3.1-Flash"]
+        self.assertEqual(model["input_cost_per_token"], 0.15 / 1_000_000)
+        self.assertEqual(model["output_cost_per_token"], 0.60 / 1_000_000)
+        self.assertEqual(model["cache_read_input_token_cost"], 0.015 / 1_000_000)
+        self.assertEqual(model["max_input_tokens"], 1_000_000)
+        self.assertNotIn("max_tokens", model)
 
     def test_register_fallback_pricing_falls_back_to_zero_cost_when_custom_pricing_registration_fails(self) -> None:
         registered: list[dict] = []

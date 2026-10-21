@@ -118,7 +118,21 @@ _OPT_IN_THINKING_MODELS: Dict[str, dict[str, Any]] = {
 # - MiniMax-M2.5: kept as legacy so existing user configs continue to report
 #   accurate cost. Still listed as a Legacy Model on the official pricing
 #   page; remove only after we have user-facing migration guidance.
+# - MiniMax-M3.1-Flash: $0.15/M input, $0.60/M output, $0.015/M cache reads;
+#   1M context. These pay-as-you-go list prices are usage estimates, not
+#   subscription charges. The published docs do not state a max output limit.
 _CUSTOM_MODEL_PRICING: Dict[str, dict[str, Any]] = {
+    "MiniMax-M3.1-Flash": {
+        "supports_function_calling": True,
+        "supports_vision": True,
+        "supports_audio_input": False,
+        "supports_audio_output": False,
+        "context_window": 1000000,
+        "max_input_tokens": 1000000,
+        "input_cost_per_token": 0.00000015,
+        "output_cost_per_token": 0.0000006,
+        "cache_read_input_token_cost": 0.000000015,
+    },
     "MiniMax-M3": {
         "supports_function_calling": True,
         "supports_vision": True,

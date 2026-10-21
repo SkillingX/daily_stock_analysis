@@ -27,7 +27,7 @@ def main() -> int:
     params = {'stock_code': args.stock_code, 'force_refresh': 'true'}
     if args.stock_name:
         params['stock_name'] = args.stock_name
-    with httpx.Client(base_url=args.base_url.rstrip('/'), timeout=180, trust_env=False) as client:
+    with httpx.Client(base_url=args.base_url.rstrip('/'), timeout=330, trust_env=False) as client:
         response = client.post('/api/v1/fundamentals/generate', params=params)
         response.raise_for_status()
         report = FundamentalsGenerateResponse.model_validate_json(response.content)
