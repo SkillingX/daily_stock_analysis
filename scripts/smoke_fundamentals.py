@@ -22,12 +22,15 @@ def main() -> int:
     parser.add_argument('--stock-code', required=True)
     parser.add_argument('--stock-name')
     parser.add_argument('--output', type=Path, help='Optional private JSON evidence file')
+    parser.add_argument('--timeout', type=float, default=330, help='HTTP wait in seconds (default: 330)')
     args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error('--timeout must be positive')
     started = monotonic()
     params = {'stock_code': args.stock_code, 'force_refresh': 'true'}
     if args.stock_name:
         params['stock_name'] = args.stock_name
-    with httpx.Client(base_url=args.base_url.rstrip('/'), timeout=330, trust_env=False) as client:
+    with httpx.Client(base_url=args.base_url.rstrip('/'), timeout=args.timeout, trust_env=False) as client:
         response = client.post('/api/v1/fundamentals/generate', params=params)
         response.raise_for_status()
         report = FundamentalsGenerateResponse.model_validate_json(response.content)
@@ -43,7 +46,7 @@ def main() -> int:
         args.output.chmod(0o600)
     summary = {'report_id': report.report_id, 'status': report.status,
                'elapsed_seconds': round(monotonic() - started, 3), 'reopened': True,
-               'dimensions': {key: value.get('status') for key, value in report.dims.items()}}
+               'dimensions': {key: value.get('status') for key, value in report.dims.items() if isinstance(value, dict)}}
     print(json.dumps(summary, ensure_ascii=False))
     # A readable partial report is useful evidence, but is not full acceptance.
     return 0 if report.status == 'success' else 2

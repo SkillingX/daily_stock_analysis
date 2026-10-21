@@ -135,7 +135,7 @@ Agent 在明确传入 timeout 时关闭 Router/SDK 内部重试及 Router 隐式
 
 模型的 length/content_filter 结束原因不作为完整报告成功；`force_refresh=true` 同时绕过业务维度缓存和当天报告复用，旧记录仍保留。资料缺失或不适用规则的财务字段继续显示 partial/degraded，不因 GLM 正常结束而改成全绿。
 
-可复跑本机 API 验收：`python scripts/smoke_fundamentals.py --base-url http://localhost:8000 --stock-code 300260 --stock-name 新莱应材 --output <私有证据文件>`。该操作消耗数据源/模型额度并保存一个新报告，随后核对重新读取的 Markdown；退出 0 为完整 success，退出 2 表示已保存可重读的 partial，其他错误非零退出。页面打开历史列表可查看新版本。只对本机测试服务使用；不要把 partial 当成所有财务数据都已核验。
+可复跑本机 API 验收：`python scripts/smoke_fundamentals.py --base-url http://localhost:8000 --stock-code 300260 --stock-name 新莱应材 --output <私有证据文件>`。脚本默认等待 330 秒，可用 `--timeout` 调整；该操作消耗数据源/模型额度并保存一个新报告，随后核对重新读取的 Markdown；退出 0 为完整 success，退出 2 表示已保存可重读的 partial，其他错误非零退出。页面打开历史列表可查看新版本。只对本机测试服务使用；不要把 partial 当成所有财务数据都已核验。
 
 ### 报告排版与历史兼容
 
