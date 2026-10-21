@@ -189,8 +189,9 @@ LITELLM_MODEL=ollama/qwen3:8b
 
 ### MiniMax 渠道模型填写说明
 
-- 如果你通过 OpenAI Compatible 渠道接 MiniMax，请在渠道模型里直接填写 `minimax/<模型名>`，例如 `minimax/MiniMax-M1`。
+- 如果你通过 OpenAI Compatible 渠道接 MiniMax，请在渠道模型里直接填写 `minimax/<模型名>`，例如 `minimax/MiniMax-M3.1-Flash`。
 - Web 设置页里的主模型、Agent 主模型、Fallback、Vision 下拉会保留这个值原样展示，不会再错误改写成 `openai/minimax/<模型名>`。
+- `MINIMAX_REASONING_EFFORT` 默认是 `low`，可选 `low`、`medium`、`high`、`xhigh`、`max`。当本次路由解析到的所有部署均为 MiniMax M3.1-Flash 时，系统发送 `thinking: {type: adaptive}` 和该档位；若包含其他模型的 fallback，则不会向混合路由发送 MiniMax 专属参数。若要使用该档位，当前生效模型也须切换为 `MiniMax-M3.1-Flash`。M3.1-Flash 不支持关闭 thinking。
 
 ### 问股 Agent / LiteLLM 配置兼容说明
 

@@ -14,6 +14,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from src.llm.concurrency import limited_acompletion
+from src.config import get_config
+from src.llm.generation_params import apply_minimax_reasoning_params
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +168,17 @@ class LLMSubjectiveScoringService:
             raise RuntimeError("LLM client not available")
 
         try:
-            response = await limited_acompletion(client,
-                model=self.model or "gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
+            model = self.model or "gpt-3.5-turbo"
+            call_kwargs = apply_minimax_reasoning_params(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                },
+                [model],
+                get_config().minimax_reasoning_effort,
             )
+            response = await limited_acompletion(client, **call_kwargs)
             response_obj: Any = response
             content_raw: Any = response_obj.choices[0].message.content
             return content_raw if content_raw is not None else ""

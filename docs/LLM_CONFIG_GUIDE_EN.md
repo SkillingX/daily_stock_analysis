@@ -182,8 +182,9 @@ LITELLM_MODEL=ollama/qwen3:8b
 
 ### MiniMax Model Naming in Channel Mode
 
-- If you access MiniMax through an OpenAI-compatible channel, enter the model as `minimax/<model-name>` in the channel model list, for example `minimax/MiniMax-M1`.
+- If you access MiniMax through an OpenAI-compatible channel, enter the model as `minimax/<model-name>` in the channel model list, for example `minimax/MiniMax-M3.1-Flash`.
 - The Web settings page now keeps that value unchanged in Primary, Agent Primary, Fallback, and Vision selectors instead of rewriting it to `openai/minimax/<model-name>`.
+- `MINIMAX_REASONING_EFFORT` defaults to `low` and accepts `low`, `medium`, `high`, `xhigh`, or `max`. The setting is sent with `thinking: {type: adaptive}` only when every deployment resolved for the request is MiniMax M3.1-Flash; mixed routes with other fallbacks do not receive MiniMax-specific parameters. Select `MiniMax-M3.1-Flash` in the active model configuration to use the effort setting. M3.1-Flash does not support disabling thinking.
 
 ### Ask-Stock Agent / LiteLLM compatibility notes
 

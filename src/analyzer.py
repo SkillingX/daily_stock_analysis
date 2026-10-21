@@ -40,7 +40,10 @@ from src.config import (
     resolve_litellm_wire_model,
     resolve_news_window_days,
 )
-from src.llm.generation_params import apply_litellm_generation_params
+from src.llm.generation_params import (
+    apply_litellm_generation_params,
+    apply_minimax_reasoning_params,
+)
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.usage import (
     attach_message_hmacs,
@@ -2882,7 +2885,11 @@ class GeminiAnalyzer:
         """Dispatch a LiteLLM completion through router or direct fallback."""
         wire_models = resolve_fallback_litellm_wire_models(model, config.llm_model_list)
         register_fallback_model_pricing(wire_models)
-        effective_kwargs = dict(call_kwargs)
+        effective_kwargs = apply_minimax_reasoning_params(
+            call_kwargs,
+            wire_models,
+            config.minimax_reasoning_effort,
+        )
         if use_channel_router and self._router and model in router_model_names:
             return limited_completion(self._router.completion, **effective_kwargs)
         if self._router and model == config.litellm_model and not use_channel_router:

@@ -6,9 +6,39 @@ from src.llm.errors import (
     classify_litellm_generation_param_error,
 )
 from src.llm.generation_params import (
+    apply_minimax_reasoning_params,
     apply_litellm_generation_params,
     clear_litellm_generation_param_recovery_cache,
 )
+
+
+def test_minimax_reasoning_controls_apply_only_to_m31_flash_routes() -> None:
+    kwargs = {"model": "minimax-primary", "messages": []}
+
+    minimax = apply_minimax_reasoning_params(
+        kwargs, ["openai/MiniMax-M3.1-Flash"], "low"
+    )
+    minimax_channel = apply_minimax_reasoning_params(
+        kwargs, ["minimax/MiniMax-M3.1-Flash"], "low"
+    )
+    legacy = apply_minimax_reasoning_params(
+        kwargs, ["openai/MiniMax-M3"], "low"
+    )
+    glm = apply_minimax_reasoning_params(kwargs, ["openai/glm-5.3"], "low")
+    mixed = apply_minimax_reasoning_params(
+        kwargs,
+        ["openai/MiniMax-M3.1-Flash", "openai/glm-5.3"],
+        "low",
+    )
+
+    assert minimax["extra_body"] == {
+        "thinking": {"type": "adaptive"},
+        "reasoning_effort": "low",
+    }
+    assert minimax_channel["extra_body"] == minimax["extra_body"]
+    assert legacy == kwargs
+    assert glm == kwargs
+    assert mixed == kwargs
 
 
 def test_temperature_default_only_error_sets_temperature_to_one() -> None:

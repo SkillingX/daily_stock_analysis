@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from typing import cast, Any, Dict, List, Optional, Tuple
 
 from src.llm.concurrency import limited_completion
+from src.config import get_config
+from src.llm.generation_params import apply_minimax_reasoning_params
 
 logger = logging.getLogger(__name__)
 
@@ -380,7 +382,9 @@ class SupplyChainDataService:
     """
 
     def __init__(self):
-        self._llm_model = os.environ.get("LITELLM_MODEL", "openai/MiniMax-M3")
+        self._llm_model = os.environ.get(
+            "LITELLM_MODEL", "openai/MiniMax-M3.1-Flash"
+        )
 
     def fetch_all(
         self,
@@ -545,12 +549,17 @@ class SupplyChainDataService:
         try:
             from litellm import completion
 
-            response = limited_completion(completion,
-                model=self._llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=800,
+            call_kwargs = apply_minimax_reasoning_params(
+                {
+                    "model": self._llm_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 800,
+                },
+                [self._llm_model],
+                get_config().minimax_reasoning_effort,
             )
+            response = limited_completion(completion, **call_kwargs)
 
             response_obj: Any = response
             content_raw: Any = response_obj.choices[0].message.content

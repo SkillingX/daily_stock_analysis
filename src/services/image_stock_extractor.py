@@ -21,6 +21,7 @@ from typing import Any, List, Optional, Tuple, cast
 
 from src.llm.concurrency import limited_completion
 from src.config import Config, get_config
+from src.llm.generation_params import apply_minimax_reasoning_params
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ def _resolve_vision_model() -> str:
         elif cfg.anthropic_api_keys:
             model = f"anthropic/{cfg.anthropic_model or 'claude-sonnet-4-6'}"
         elif cfg.openai_api_keys:
-            model = f"openai/{cfg.openai_model or 'MiniMax-M3'}"
+            model = f"openai/{cfg.openai_model or 'MiniMax-M3.1-Flash'}"
         else:
             return ""
     return model
@@ -281,6 +282,12 @@ def _call_litellm_vision(
             call_kwargs["api_base"] = cfg.openai_base_url
         if cfg.openai_base_url and "aihubmix.com" in cfg.openai_base_url:
             call_kwargs["extra_headers"] = {"APP-Code": "GPIJ3886"}
+
+    call_kwargs = apply_minimax_reasoning_params(
+        call_kwargs,
+        [model],
+        cfg.minimax_reasoning_effort,
+    )
 
     if getattr(litellm, "completion", None) is None:
         import litellm as litellm_module

@@ -44,7 +44,10 @@ from src.core.config_registry import (
     get_registered_field_keys,
 )
 from src.llm.errors import call_litellm_with_param_recovery
-from src.llm.generation_params import apply_litellm_generation_params
+from src.llm.generation_params import (
+    apply_litellm_generation_params,
+    apply_minimax_reasoning_params,
+)
 from src.notification_contracts import (
     FEISHU_APP_BOT_ENV_GROUP,
     FEISHU_WEBHOOK_ENV_GROUP,
@@ -891,7 +894,7 @@ class SystemConfigService:
         call_kwargs: Dict[str, Any] = {
             "model": resolved_model,
             "messages": [{"role": "user", "content": "Reply with OK"}],
-            "max_tokens": 256,  # Increased to allow MiniMax-M3 thinking process + response
+            "max_tokens": 256,  # Allow MiniMax-M3.1-Flash thinking plus response
             "timeout": max(5.0, float(timeout_seconds)),
         }
         if selected_api_key:
@@ -902,6 +905,11 @@ class SystemConfigService:
             call_kwargs,
             resolved_model,
             self._get_runtime_llm_temperature(),
+        )
+        call_kwargs = apply_minimax_reasoning_params(
+            call_kwargs,
+            [resolved_model],
+            Config.get_instance().minimax_reasoning_effort,
         )
 
         try:
@@ -1396,6 +1404,11 @@ class SystemConfigService:
             call_kwargs,
             resolved_model,
             0.0,
+        )
+        call_kwargs = apply_minimax_reasoning_params(
+            call_kwargs,
+            [resolved_model],
+            Config.get_instance().minimax_reasoning_effort,
         )
         return call_kwargs
 
@@ -2901,7 +2914,9 @@ class SystemConfigService:
         if cls._has_any_config_value(
             effective_map, ("OPENAI_API_KEYS", "OPENAI_API_KEY", "AIHUBMIX_KEY")
         ):
-            model = (effective_map.get("OPENAI_MODEL") or "MiniMax-M3").strip()
+            model = (
+                effective_map.get("OPENAI_MODEL") or "MiniMax-M3.1-Flash"
+            ).strip()
             return model if "/" in model else f"openai/{model}"
         if cls._anspire_legacy_llm_enabled(effective_map) and cls._has_any_config_value(
             effective_map, ("ANSPIRE_API_KEYS",)
