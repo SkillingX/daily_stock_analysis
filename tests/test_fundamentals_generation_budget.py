@@ -36,6 +36,22 @@ def test_report_budget_configuration_preserves_explicit_shorter_values(configure
     assert Config().fundamentals_report_timeout_seconds == 300.0
 
 
+@pytest.mark.parametrize('configured, expected', [
+    (None, 'low'), ('low', 'low'), ('medium', 'medium'), ('high', 'high'),
+    ('xhigh', 'xhigh'), ('max', 'max'), ('invalid', 'low'),
+])
+def test_minimax_reasoning_effort_configuration_defaults_to_low(configured: str | None, expected: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    env_file = tmp_path / '.env'
+    env_file.write_text('')
+    environment = {'ENV_FILE': str(env_file)}
+    if configured is not None:
+        environment['MINIMAX_REASONING_EFFORT'] = configured
+    monkeypatch.setattr(Config, '_instance', None)
+    with patch.dict(os.environ, environment, clear=True):
+        assert Config.get_instance().minimax_reasoning_effort == expected
+    assert Config().minimax_reasoning_effort == 'low'
+
+
 @pytest.fixture
 def exploration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(explore_agents, '_registry_source', ToolRegistry)
@@ -127,14 +143,15 @@ def test_real_router_and_sdk_do_not_retry_slow_http(channel: bool) -> None:
         thread.join(timeout=1)
 
 
-@pytest.mark.parametrize('channel, dim_id, wire_model, fallback', [
-    (True, 'business', 'openai/MiniMax-M3', False),
-    (False, 'business', 'openai/MiniMax-M3', False),
-    (True, 'business', 'openai/glm-5.3', False),
-    (True, 'intel', 'openai/MiniMax-M3', False),
-    (True, 'business', 'openai/MiniMax-M3', True),
+@pytest.mark.parametrize('channel, dim_id, wire_model, fallback, effort', [
+    (True, 'business', 'openai/MiniMax-M3.1-Flash', False, 'low'),
+    (False, 'business', 'openai/MiniMax-M3.1-Flash', False, 'medium'),
+    (True, 'business', 'openai/MiniMax-M3', False, 'low'),
+    (True, 'business', 'openai/glm-5.3', False, 'low'),
+    (True, 'intel', 'openai/MiniMax-M3.1-Flash', False, 'low'),
+    (True, 'business', 'openai/MiniMax-M3.1-Flash', True, 'low'),
 ])
-def test_business_final_response_disables_thinking_at_http_boundary(channel: bool, dim_id: str, wire_model: str, fallback: bool, exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_minimax_reasoning_effort_reaches_supported_models_at_http_boundary(channel: bool, dim_id: str, wire_model: str, fallback: bool, effort: str, exploration: None, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.agent.tools.registry import ToolDefinition
     bodies: list[dict[str, Any]] = []
 
@@ -170,6 +187,7 @@ def test_business_final_response_disables_thinking_at_http_boundary(channel: boo
     base = f'http://127.0.0.1:{server.server_port}/v1'
     model = 'business-alias' if channel else wire_model
     cfg = Config(litellm_model=model, openai_api_keys=['fixture-only'], openai_base_url=base)
+    cfg.minimax_reasoning_effort = effort
     if channel:
         cfg.llm_model_list = [{'model_name': model, 'litellm_params': {'model': wire_model, 'api_base': base, 'api_key': 'fixture-only'}}]
     if fallback:
@@ -184,8 +202,14 @@ def test_business_final_response_disables_thinking_at_http_boundary(channel: boo
     try:
         out = explore_agents._run_explore(dim_id, {'search_comprehensive_intel'}, 'fixture', adapter, deadline=monotonic() + 30)
         assert out['ok'], out
-        expected = {'type': 'disabled'} if dim_id == 'business' and wire_model == 'openai/MiniMax-M3' else None
-        assert [body.get('thinking') for body in bodies] == [None, expected] + ([None] if fallback else [])
+        expected_efforts = [
+            effort if 'minimax-m3.1-flash' in body['model'].lower() else None
+            for body in bodies
+        ]
+        assert [body.get('reasoning_effort') for body in bodies] == expected_efforts
+        assert [body.get('thinking') for body in bodies] == [
+            {'type': 'adaptive'} if expected else None for expected in expected_efforts
+        ]
         assert [body['model'] for body in bodies] == [wire_model.removeprefix('openai/')] * 2 + (['glm-5.3'] if fallback else [])
     finally:
         server.shutdown()

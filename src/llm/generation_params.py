@@ -437,3 +437,36 @@ def apply_litellm_generation_params(
     if cached_recovery:
         updated = apply_litellm_param_recovery(updated, cached_recovery)
     return updated
+
+
+def apply_minimax_reasoning_params(
+    call_kwargs: Dict[str, Any],
+    wire_models: List[str],
+    reasoning_effort: str,
+) -> Dict[str, Any]:
+    """Apply MiniMax M3.1-Flash thinking controls to its resolved deployments."""
+    if not wire_models:
+        return call_kwargs
+
+    for wire_model in wire_models:
+        parts = _model_parts(wire_model)
+        if (
+            len(parts) < 2
+            or parts[0] not in {"openai", "minimax"}
+            or parts[1] != "minimax-m3.1-flash"
+        ):
+            return call_kwargs
+
+    updated = dict(call_kwargs)
+    existing_extra_body = updated.get("extra_body")
+    if existing_extra_body is not None and not isinstance(existing_extra_body, dict):
+        return updated
+    extra_body = dict(existing_extra_body or {})
+    extra_body.update(
+        {
+            "thinking": {"type": "adaptive"},
+            "reasoning_effort": reasoning_effort,
+        }
+    )
+    updated["extra_body"] = extra_body
+    return updated

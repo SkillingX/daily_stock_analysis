@@ -35,6 +35,7 @@ from src.agent.provider_trace import (
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.generation_params import (
     apply_litellm_generation_params,
+    apply_minimax_reasoning_params,
     resolve_litellm_wire_model,
 )
 from src.llm.usage import (
@@ -463,8 +464,6 @@ class LLMToolAdapter:
         tools: List[dict[str, Any]],
         provider: Optional[str] = None,
         timeout: Optional[float] = None,
-        *,
-        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Send messages + tool declarations to LLM, return normalized response.
 
@@ -479,7 +478,6 @@ class LLMToolAdapter:
         """
         return self.call_completion(
             messages, tools=tools, provider=provider, timeout=timeout,
-            disable_thinking=disable_thinking,
         )
 
     def call_text(
@@ -510,7 +508,6 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
-        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Shared completion path for both tool and text-only calls."""
         config = self._config
@@ -546,7 +543,6 @@ class LLMToolAdapter:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=remaining_timeout,
-                    disable_thinking=disable_thinking,
                 )
             except Exception as e:
                 if isinstance(e, _resolve_litellm_exception("RateLimitError")):
@@ -604,7 +600,6 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
-        disable_thinking: bool = False,
     ) -> LLMResponse:
         """Call a specific litellm model with OpenAI-format messages and tools."""
         openai_messages = self._convert_messages(messages, target_model=model)
@@ -653,15 +648,12 @@ class LLMToolAdapter:
             if keys:
                 call_kwargs["api_key"] = keys[0]
             call_kwargs.update(extra_litellm_params(model, self._config))
-        # Resolve aliases (including multi-key deployments) before applying this
-        # MiniMax-M3 protocol capability. Other models retain their own parameters.
         wire_models = resolve_fallback_litellm_wire_models(model, recovery_model_list)
-        if disable_thinking and wire_models and all(
-            _split_provider_model(wire)[0] == "openai"
-            and _split_provider_model(wire)[1].lower() == "minimax-m3"
-            for wire in wire_models
-        ):
-            call_kwargs["extra_body"] = {**(call_kwargs.get("extra_body") or {}), "thinking": {"type": "disabled"}}
+        call_kwargs = apply_minimax_reasoning_params(
+            call_kwargs,
+            wire_models,
+            self._config.minimax_reasoning_effort,
+        )
         call_kwargs = apply_litellm_generation_params(
             call_kwargs,
             model,

@@ -517,7 +517,6 @@ def run_agent_loop(
     tool_call_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
     research_deadline: Optional[float] = None,
-    final_response_without_thinking: bool = False,
 ) -> RunLoopResult:
     """Execute the ReAct LLM ↔ tool loop.
 
@@ -537,8 +536,6 @@ def run_agent_loop(
         tool_call_timeout_seconds: Optional timeout for one parallel tool batch.
         research_deadline: Absolute monotonic deadline for planning/tools; the last
             round uses remaining report time without tools. None preserves existing behavior.
-        final_response_without_thinking: Prefer direct synthesis for the final
-            business response; the adapter applies it only to supported models.
 
     Returns:
         A :class:`RunLoopResult` with the final content, stats, and the
@@ -645,7 +642,6 @@ def run_agent_loop(
             messages,
             [] if finalizing else tool_decls,
             timeout=call_timeout,
-            **({"disable_thinking": True} if finalizing and final_response_without_thinking else {}),
         )
         logger.info("Agent LLM step %d finished in %.2fs, provider=%s", step + 1, time.monotonic() - llm_started, response.provider)
         provider_used = response.provider

@@ -14,6 +14,8 @@ from typing import cast, Dict, Any, Optional, List
 
 from data_provider.supply_chain import latest_fiscal_year
 from src.llm.concurrency import limited_completion
+from src.config import get_config
+from src.llm.generation_params import apply_minimax_reasoning_params
 from src.scoring import (
     aggregate_framework,
     calculate_bayesian,
@@ -864,14 +866,19 @@ class ResearchScoringService:
         try:
             from litellm import completion
 
-            model = os.environ.get("LITELLM_MODEL", "openai/MiniMax-M3")
+            model = os.environ.get("LITELLM_MODEL", "openai/MiniMax-M3.1-Flash")
 
-            response = limited_completion(completion,
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=500,
+            call_kwargs = apply_minimax_reasoning_params(
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 500,
+                },
+                [model],
+                get_config().minimax_reasoning_effort,
             )
+            response = limited_completion(completion, **call_kwargs)
 
             response_obj: Any = response
             content_raw: Any = response_obj.choices[0].message.content
