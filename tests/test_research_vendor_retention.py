@@ -115,13 +115,15 @@ def _assert_vendor(dim_id, payload, research, *, details=True):
     return dim
 
 
-@pytest.mark.parametrize("dim_id,mode", [("ownership", "bad_list"), ("business", "bad_score"), ("business", "runner_error"), ("business", "data_gaps")])
+@pytest.mark.parametrize("dim_id,mode", [("ownership", "bad_list"), ("ownership", "object_gaps"), ("business", "bad_score"), ("business", "runner_error"), ("business", "data_gaps")])
 def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runtime, monkeypatch, dim_id, mode):
     runtime = vendor_runtime
     invalid = {"executives": {"source_note": "模型错误列表"}, "recent_changes": {"window": "本期未取得"}} if dim_id == "ownership" else {"score": 999, "narrative": "模型未通过契约"}
     if mode == "data_gaps":
         invalid = {"data_gaps": ["证据不足"], "business_model": {}, "main_products": {}}
-    if mode not in {"runner_error", "data_gaps"}:
+    if mode == "object_gaps":
+        invalid = {"executives": [{"name": "高管甲", "source": "公告"}], "data_gaps": [{"item": "近一年减持公告未取得"}], "narrative": "模型已取得的股权研究"}
+    if mode not in {"runner_error", "data_gaps", "object_gaps"}:
         from src.deep_research.researchers import REGISTRY
         if dim_id == "ownership":
             # 契约收敛（#35）：包装列表形状在股权适配边界解包/记缺项，不再抛
@@ -154,6 +156,13 @@ def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runt
     saved = detail.json()["data"]
     _assert_vendor(dim_id, saved["dimensions"][dim_id], runtime["research"])
     assert report["markdown"] == saved["markdown"] == download.text
+    if mode == "object_gaps":
+        ownership = saved["dimensions"]["ownership"]
+        assert ownership["executives"][0]["name"] == "高管甲"
+        assert ownership["data_gaps"] == ["近一年减持公告未取得"]
+        assert ownership["narrative"] == "模型已取得的股权研究"
+        assert "近一年减持公告未取得" in download.text
+        assert "validation error" not in download.text and "{'item':" not in download.text
     assert ("李水波" if dim_id == "ownership" else "无菌包材") in download.text
     assert "iFinD" in download.text and "2025-12-31" in download.text
 
