@@ -104,6 +104,43 @@ def test_holder_details_recovered_do_not_mark_research_complete() -> None:
     assert "实际控制人信息" in dim.data_gaps and "核心高管" in dim.data_gaps
 
 
+@pytest.mark.parametrize("coverage", ["complete", "partial"])
+def test_object_gaps_survive_runner_and_parser(
+    monkeypatch: pytest.MonkeyPatch, coverage: str
+) -> None:
+    from src.agent.deep_research import explore_agents
+
+    gaps = [{"item": f"缺少公开资料 {i}"} for i in range(8)]
+    payload = {**_CORE_PAYLOAD, "data_gaps": gaps, "score": 85, "narrative": "已有股权研究结论"}
+    monkeypatch.setattr(explore_agents, "get_config", lambda: SimpleNamespace(data_source_profile="legacy"))
+    monkeypatch.setattr(explore_agents, "_run_explore", lambda *a, **kw: {"ok": True, "data": payload})
+    details = {"coverage": coverage, "items": [{"name": "股东甲", "rank": 1, "report_date": "2026-06-30"}]}
+    out = explore_agents.run_ownership_agent("300260", "新莱应材", None, research={"shareholder_details": details})
+    dim, _ = parse_ownership(out["data"], steps=1)
+
+    assert dim.controller == _CORE_PAYLOAD["controller"]
+    assert dim.top_holders[0].name == "李水波" and dim.executives[0].name == "高管甲"
+    assert dim.shareholder_details is not None and dim.shareholder_details.items[0].name == "股东甲"
+    assert dim.narrative == "已有股权研究结论"
+    assert dim.data_gaps[:8] == [f"缺少公开资料 {i}" for i in range(8)]
+    assert ("iFinD股东资料覆盖不完整" in dim.data_gaps) == (coverage == "partial")
+    assert dim.status == "degraded" and dim.score is None
+
+
+@pytest.mark.parametrize("gaps,expected", [
+    ([], []),
+    ([" 缺少公告 ", "缺少公告"], ["缺少公告"]),
+    ([{"item": "减持明细", "reason": "未取得公告", "detail": "近一年"}], ["减持明细；未取得公告；近一年"]),
+    (["有效缺项", {}, {"item": 123}, 42, " "], ["有效缺项", "资料缺口有 4 条记录无法识别，需重新核实"]),
+    ({"unexpected": "缺项"}, ["资料缺口未解析：模型输出应为数组，需重新核实"]),
+])
+def test_gap_shapes_keep_strict_string_contract(gaps: Any, expected: list[str]) -> None:
+    dim, _ = parse_ownership({**_CORE_PAYLOAD, "data_gaps": gaps, "score": 85}, steps=1)
+    assert dim.data_gaps == expected
+    assert dim.status == ("degraded" if expected else "ok")
+    assert dim.score == (None if expected else 85)
+
+
 # ---------------------------------------------------------------------------
 # B：数据局限提示区分原始来源、已采用资料与缺口范围
 # ---------------------------------------------------------------------------
