@@ -371,8 +371,9 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
         "查实控人/股东/高管的公开信息（结构化资料优先，搜索为补）；\n"
         "2) 输出 JSON：controller(实际控制人/控股股东，一句话)、top_holders(前十大股东要点数组)、"
         "executives(核心高管：姓名/职务/背景一句，数组)、recent_changes(近一年增减持/任免/股权变动数组)、"
-        "data_gaps(取不到的数据项数组，禁止编造)、score(治理结构健康度参考分 0-100，可 null)、"
-        "narrative(调查结论一段)。三个数组每条必须是对象（name 必填，附 source 来源标签，"
+        'data_gaps(未取得资料的字符串数组，如 ["近一年减持公告未取得"]，不得输出对象，禁止编造)、'
+        "score(治理结构健康度参考分 0-100，可 null)、narrative(调查结论一段)。"
+        "top_holders、executives、recent_changes 三个数组每条必须是对象（name 必填，附 source 来源标签，"
         "detail 补充说明，变动条目尽量附 date），不要输出 JSON 字符串或 {items:[…]} 包装；"
         "某列表无资料时输出空数组（空数组不代表没有发生变动），不得编造条目、日期或来源。所有事实带来源等级标签。"
     )
@@ -417,8 +418,6 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
         out["data"].pop("shareholder_details", None)
         if details:
             out["data"]["shareholder_details"] = details
-            if details.get("errors") or details.get("coverage") != "complete":
-                out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), "iFinD股东资料覆盖不完整", *(details.get("errors") or [])]))
     out["vendor_research"] = research
     return out
 
