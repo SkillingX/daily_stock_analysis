@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -169,21 +170,63 @@ def _score_compass_weekly(ctx: SharedContext) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _scoring_timeout() -> float:
+    """单次补充评分超时：继承全局单次上限，并受研究剩余预算限制。"""
+    from src.config import get_config
+    from src.core.research_run import current_research
+
+    cap = float(get_config().llm_stream_response_timeout)
+    run = current_research.get()
+    if run is not None:
+        return min(cap, run.remaining())
+    return cap
+
+
+def _bounded_facts_json(facts: Dict[str, Any], limit: int = 2500) -> tuple[str, List[str]]:
+    """整键累加序列化：超预算丢弃整键而非截断字符串，输出恒为完整合法 JSON。
+
+    返回 (JSON 块, 被省略字段名)；键序即保留优先级（stock/quote 靠前）。
+    """
+    kept: Dict[str, Any] = {}
+    omitted: List[str] = []
+    for key, value in facts.items():
+        if kept:
+            candidate = {**kept, key: value}
+            encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+            if len(encoded) > limit:
+                omitted.append(key)
+                continue
+        kept[key] = value
+    return json.dumps(kept, ensure_ascii=False, default=str), omitted
+
+
 def _score_llm_indicators(
     ctx: SharedContext,
     stock_name: str,
     llm_adapter: Any,
     intel_payload: Optional[Dict[str, Any]] = None,
+    existing: Optional[Dict[str, Optional[Dict[str, Any]]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """LLM 结构化打分（股权高管/情绪/宏观五项，强制依据句）。
+    """LLM 补充打分（股权高管/情绪/宏观，强制依据句）。
 
-    LLM 不可用/未给依据句 → 按纪律记缺口；绝不编分。
+    只补真正缺项：已有研究员评分不被本调用覆盖；全部覆盖时不发请求。
+    LLM 不可用/失败/无依据 → 该项按纪律记缺口；绝不编分、不冒称中性判断。
     """
-    results: Dict[str, Dict[str, Any]] = {
-        ind_id: gap_indicator(ind_id, "LLM 打分不可用") for ind_id in _LLM_INDICATOR_IDS
-    }
+    covered = existing or {}
+    missing = [ind_id for ind_id in _LLM_INDICATOR_IDS if covered.get(ind_id) is None]
+    if not missing:
+        return {}
     if llm_adapter is None:
-        return results
+        return {
+            ind_id: gap_indicator(ind_id, "补充评分模型不可用") for ind_id in missing
+        }
+    timeout = _scoring_timeout()
+    if timeout <= 0:
+        logger.warning("[SixDimV2] 研究剩余预算不足，跳过补充评分（缺 %d 项）", len(missing))
+        return {
+            ind_id: gap_indicator(ind_id, "研究剩余预算不足，本次未发起补充评分")
+            for ind_id in missing
+        }
     intel = intel_payload or {}
     intel_summary: Dict[str, Any] = {}
     if intel:
@@ -199,28 +242,39 @@ def _score_llm_indicators(
         "intel_brief": intel_summary or None,
         "limitations": ctx.limitations,
     }
-    import json
-
+    facts_json, omitted = _bounded_facts_json(facts)
+    user_content = f"## 事实\n```json\n{facts_json}\n```"
+    if omitted:
+        user_content += f"\n（因长度上限省略字段：{', '.join(omitted)}；剩余事实不足以评分的指标不要评分）"
     system = (
         "你是投研评分员。对输入事实中可推断的指标打 0-100 分，每个分必须附带"
         "一句中文依据（basis_sentence，含具体数字或事实）；事实不足的指标不要打分。"
         "只输出 JSON：{\"indicators\": [{\"id\", \"score\", \"basis_sentence\"}]}，"
-        f"可选 id 限定为 {list(_LLM_INDICATOR_IDS)}。"
+        f"可选 id 限定为 {missing}。"
     )
+    results: Dict[str, Dict[str, Any]] = {}
     try:
         response = llm_adapter.call_text(
             [
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": f"## 事实\n```json\n{json.dumps(facts, ensure_ascii=False, default=str)[:2500]}\n```",
-                },
+                {"role": "user", "content": user_content},
             ],
             temperature=0.2,
-            timeout=90.0,
+            timeout=timeout,
         )
-        if getattr(response, "provider", "") == "error" or getattr(response, "finish_reason", None) in {"length", "content_filter"}:
-            return results
+        if getattr(response, "provider", "") == "error":
+            return {
+                ind_id: gap_indicator(ind_id, "补充评分模型返回错误") for ind_id in missing
+            }
+        finish = getattr(response, "finish_reason", None)
+        if finish == "length":
+            return {
+                ind_id: gap_indicator(ind_id, "模型输出被截断，本次评分未完成") for ind_id in missing
+            }
+        if finish == "content_filter":
+            return {
+                ind_id: gap_indicator(ind_id, "模型输出被内容过滤拦截") for ind_id in missing
+            }
         import re
 
         text = (response.content or "").strip()
@@ -233,11 +287,19 @@ def _score_llm_indicators(
             match = re.search(r"\{.*\}", text, flags=re.DOTALL)
             text = match.group(0) if match else ""
         if not text:
-            return results
-        parsed = json.loads(text)
+            return {
+                ind_id: gap_indicator(ind_id, "补充评分响应结构无效") for ind_id in missing
+            }
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return {
+                ind_id: gap_indicator(ind_id, "补充评分响应结构无效") for ind_id in missing
+            }
+        valid_ids = set(missing)
         for item in parsed.get("indicators") or []:
             ind_id = str(item.get("id") or "")
-            if ind_id not in results:
+            if ind_id not in valid_ids:
                 continue
             sentence = str(item.get("basis_sentence") or "").strip()
             try:
@@ -245,7 +307,9 @@ def _score_llm_indicators(
             except (TypeError, ValueError):
                 continue
             if len(sentence) < 8:
-                continue  # 无依据句的分按纪律不采纳
+                # 无依据句的分不采纳，但与“未返回”区分开
+                results[ind_id] = gap_indicator(ind_id, "模型评分缺依据句，未采纳")
+                continue
             results[ind_id] = {
                 "id": ind_id,
                 "score": max(0.0, min(100.0, score)),
@@ -255,7 +319,11 @@ def _score_llm_indicators(
                 "summary": f"{sentence}",
             }
     except Exception as exc:  # noqa: BLE001 - LLM 失败按纪律记缺口
-        logger.warning("[SixDimV2] LLM 指标打分失败: %s", exc)
+        logger.warning("[SixDimV2] LLM 补充评分调用失败: %s", exc)
+    for ind_id in missing:
+        results.setdefault(
+            ind_id, gap_indicator(ind_id, "补充评分调用失败（超时或异常）")
+        )
     return results
 
 
@@ -452,12 +520,21 @@ def build_six_dim(
     )
     indicator_results["基本面"]["valuation"] = valuation
 
+    # 补充评分只填真正缺项：已有研究员评分（equity_mgmt / 两个 view）优先保留
+    llm_existing = {
+        "equity_mgmt": indicator_results["基本面"].get("equity_mgmt"),
+        "institute_view": indicator_results["情绪面"].get("institute_view"),
+        "community_view": indicator_results["情绪面"].get("community_view"),
+        "liquidity": indicator_results["宏观"].get("liquidity"),
+        "risk_appetite": indicator_results["宏观"].get("risk_appetite"),
+    }
     llm_results = _score_llm_indicators(
-        ctx, ctx.stock_name, llm_adapter, intel_payload
+        ctx, ctx.stock_name, llm_adapter, intel_payload, existing=llm_existing
     )
     for ind_id, result in llm_results.items():
         dim = "基本面" if ind_id == "equity_mgmt" else ("情绪面" if "view" in ind_id else "宏观")
-        indicator_results[dim][ind_id] = result
+        if indicator_results[dim].get(ind_id) is None:
+            indicator_results[dim][ind_id] = result
 
     dimensions = aggregate_v2_dimensions(indicator_results)
     total = framework_total_v2(dimensions)
