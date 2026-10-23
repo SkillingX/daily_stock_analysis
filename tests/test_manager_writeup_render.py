@@ -897,3 +897,64 @@ def test_manager_investment_narrative_contradictory_directive_dropped():
     assert "跌破 48" not in rendered  # 矛盾叙事被丢弃
     assert "规则信号叙述" in rendered  # 回退规则叙述
     assert "等待回落至 30 再买入" in rendered  # 合规内容概括保留
+
+
+def test_unified_boundary_covers_all_prose_outlets():
+    """第四轮审查 P1：同一矛盾指令不得从赚钱路径/核心论点/技术章节等出口进入最终报告。"""
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(
+        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
+    )
+    manager = {
+        "thesis_points": [
+            {"header": "合规论点", "body": "回落至 30 买入并在 24 止损，纪律执行。这是方案复用。"},
+            {"header": "矛盾论点", "body": "回调至30买入，跌破48止损。这是经理自拟点位。"},
+        ],
+        "money_paths": [
+            {"name": "路径甲", "win_rate": "约50%", "playbook": "三季报后回调至 30 买入（方案点位）。"},
+            {"name": "路径乙", "win_rate": "约60%", "playbook": "回调至30买入，跌破48止损，持有至 35。"},
+        ],
+        "section_narratives": {
+            "technical": "技术形态上回调至30买入，跌破48止损；MACD 金叉。",  # 矛盾指令进技术正文
+            "capital": "资金面正常描述：主力净流入，量比 1.5，现价 31.92。",  # 无指令叙事
+        },
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    assert "跌破48" not in rendered and "跌破 48" not in rendered  # 矛盾指令全出口拦截
+    assert "经理自拟点位" not in rendered  # 矛盾论点整条丢弃
+    assert "路径乙" not in rendered  # 矛盾路径整条丢弃
+    assert "这是方案复用" in rendered  # 合法多动作句不误删（30买入+24止损均属方案）
+    assert "路径甲" in rendered
+    assert "MACD 金叉" not in rendered  # 技术节含矛盾指令 → 整节清空回退研究员叙述
+    assert "量比 1.5" in rendered  # 无指令叙事（量比/现价）不受影响
+
+
+def test_price_recognition_edges():
+    """第四轮 Standards 观察：个位数单价、负价格、均线误提取。"""
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(
+        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
+    )
+    manager = {
+        "executive_summary": "现价 31.92 观察，100日均线拐头，量比 1.5 正常。",  # 无指令、无价格误提取
+        "thesis_points": [
+            {"header": "负价格", "body": "挂单 -133.16 买入，异常价位。"},  # 负价格不得当作合法锚
+        ],
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    assert "100日均线拐头" in rendered  # 均线数字不再被误提取成价格
+    assert "量比 1.5" in rendered
+    assert "异常价位" not in rendered  # 负价格指令条目丢弃
+
+    watch_dims = _dims()  # 观察方案：无任何锚
+    watch_manager = {
+        "executive_summary": "无方案锚点时现价 8.5元买入 是经理自拟指令。",
+    }
+    view2 = build_view("fixture", "300260", "2026-10-13", [], watch_dims, [], manager=watch_manager)
+    assert "经理自拟指令" not in render_markdown(view2)  # 观察方案下个位数单价指令拦下
