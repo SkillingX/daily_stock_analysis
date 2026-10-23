@@ -145,18 +145,21 @@ def _weekly_close_series(ctx: SharedContext) -> Optional[Any]:
 
     records = list(ctx.history)
     if len(records) < _WEEKLY_MIN_DAILY_BARS + 50:
+        from src.core.research_run import current_research
+
+        if run := current_research.get():
+            run.check()  # 研究取消/预算耗尽时不再发起补取（与 _chanlun_engine_facts 一致）
         from src.services.history_loader import load_history_df
 
         try:
             df, _src = load_history_df(
                 ctx.stock_code, days=1200, min_records=_WEEKLY_MIN_DAILY_BARS
             )
-        except Exception as exc:  # noqa: BLE001 - 补取失败按样本不足处理
+        except Exception as exc:  # noqa: BLE001 - 补取失败回退共享快照样本
             logger.warning("[SixDimV2] 周线历史补取失败 %s: %s", ctx.stock_code, exc)
-            return None
-        if df is None or df.empty or "close" not in getattr(df, "columns", []):
-            return None
-        records = df.to_dict(orient="records")
+            df = None
+        if df is not None and not df.empty and "close" in getattr(df, "columns", []):
+            records = df.to_dict(orient="records")
     closes: Dict[Any, float] = {}
     for row in records:
         raw_close = row.get("close")
@@ -363,9 +366,15 @@ def _score_llm_indicators(
             }
     except Exception as exc:  # noqa: BLE001 - LLM 失败按纪律记缺口
         logger.warning("[SixDimV2] LLM 补充评分调用失败: %s", exc)
+        for ind_id in missing:
+            results.setdefault(
+                ind_id, gap_indicator(ind_id, "补充评分调用失败（超时或异常）")
+            )
+        return results
+    # 调用成功且响应已合法解析：剩余缺项是模型按纪律未评分，不是调用失败
     for ind_id in missing:
         results.setdefault(
-            ind_id, gap_indicator(ind_id, "补充评分调用失败（超时或异常）")
+            ind_id, gap_indicator(ind_id, "模型未对该指标形成评分（事实不足或未返回）")
         )
     return results
 

@@ -97,12 +97,19 @@ class TestWeeklyCloseBasis:
 
 class TestCompassWeeklyScoring:
     def test_short_history_and_fetch_failure_keeps_gap(self):
-        """共享 260 根 + 补取失败：保持缺口并说明原因，不编数；日线研究不受影响。"""
+        """共享 260 根 + 补取失败：回退共享样本按真实周数记缺口，不编数；日线研究不受影响。"""
         ctx = _ctx(_daily_history(260))
         with patch("src.services.history_loader.load_history_df", return_value=(None, "none")):
             result = six_dim._score_compass_weekly(ctx)
         assert result is not None and result["data_gap"] is True
-        assert "周线历史未取得" in result["summary"]
+        assert "周线样本不足" in result["summary"]
+
+    def test_fetch_exception_falls_back_to_shared_snapshot(self):
+        """补取抛异常时回退共享快照样本（已达门槛时仍可参与），不丢弃已有数据。"""
+        ctx = _ctx(_daily_history(1010))  # 1010 < 1050 触发补取；回退后 202 周仍可参与
+        with patch("src.services.history_loader.load_history_df", side_effect=RuntimeError("db down")):
+            weekly = six_dim._weekly_close_series(ctx)
+        assert weekly is not None and len(weekly) >= 200
 
     def test_short_cache_miss_triggers_bounded_fetch(self):
         """DB 只有 260 条时，min_records 门槛应使短缓存不命中（详见 test_history_loader）。"""

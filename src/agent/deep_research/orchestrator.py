@@ -143,7 +143,7 @@ def _emit(cb: ProgressCb, event: Dict[str, Any]) -> None:
 _ROOT_CAUSE_LIMIT = 2000
 _EVIDENCE_LIMIT = 2000
 _EVENT_TEXT_LIMIT = 400
-_EVENT_DATE_LIMIT = 40
+_EVENT_DATE_LIMIT = 24  # 与展示层 _clean_event_date 的收口上限一致，避免双层截断吞掉披露
 _EVENT_ITEM_LIMIT = 500
 _OUTCOMES_MAX = 8
 _PLANS_MAX = 8
@@ -189,29 +189,45 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             "persistence": _bounded(rc_raw.get("persistence"), _ROOT_CAUSE_LIMIT),
         }
     calendar = []
+    dropped_events = 0
     for item in parsed.get("event_calendar") or []:
         if not isinstance(item, dict):
             continue
+        if len(calendar) >= _CALENDAR_MAX:
+            dropped_events += 1
+            continue
+        raw_outcomes = item.get("outcomes") or []
+        raw_plans = item.get("plans") or []
+        if len(raw_outcomes) > _OUTCOMES_MAX or len(raw_plans) > _PLANS_MAX:
+            logger.warning(
+                "[DualTrack] 事件「%s」结果/预案超条数上限（%d/%d 条，各保留 %d），超出部分丢弃",
+                str(item.get("event") or "")[:30],
+                len(raw_outcomes), len(raw_plans), _OUTCOMES_MAX,
+            )
         calendar.append(
             {
                 "event": _bounded(item.get("event"), _EVENT_TEXT_LIMIT),
                 "date": _bounded(item.get("date"), _EVENT_DATE_LIMIT),
                 "outcomes": [
                     _bounded(x, _EVENT_ITEM_LIMIT)
-                    for x in (item.get("outcomes") or [])[:_OUTCOMES_MAX]
+                    for x in raw_outcomes[:_OUTCOMES_MAX]
                 ],
                 "plans": [
                     _bounded(x, _EVENT_ITEM_LIMIT)
-                    for x in (item.get("plans") or [])[:_PLANS_MAX]
+                    for x in raw_plans[:_PLANS_MAX]
                 ],
             }
+        )
+    if dropped_events:
+        logger.warning(
+            "[DualTrack] 事件日历超上限，丢弃 %d 项（上限 %d）", dropped_events, _CALENDAR_MAX
         )
     dim = IntelDim(
         intelligence=intelligence,
         evidence_items=evidence,
         unverified_count=int(parsed.get("unverified_count") or 0),
         root_cause=root_cause,
-        event_calendar=calendar[:_CALENDAR_MAX],
+        event_calendar=calendar,
     )
     return dim, steps
 

@@ -18,6 +18,16 @@ from src.deep_research_dims import six_dim
 from src.deep_research_dims.context import SharedContext
 
 
+@pytest.fixture(autouse=True)
+def _no_history_fetch(monkeypatch: pytest.MonkeyPatch):
+    """离线套件不得打真实网络：共享快照不足 1050 根时周线会触发补取（issue #42），
+    fixture 股票代码的真实 DB/供应商请求是无关副作用，统一按取数失败降级。"""
+    monkeypatch.setattr(
+        "src.services.history_loader.load_history_df",
+        lambda *args, **kwargs: (None, "none"),
+    )
+
+
 def _ctx() -> SharedContext:
     ctx = SharedContext("fixture", "fixture", "2026-10-23")
     ctx.quote = {"price": 100.0}
@@ -96,6 +106,24 @@ class TestExistingScoresPreserved:
         macro = _scores(dim.framework.dimensions, "宏观")
         assert macro["宏观流动性"] == (63.0, False)
         assert macro["风险偏好"] == (50.0, True)
+
+    def test_call_success_unreturned_indicator_not_blamed_as_failure(self):
+        """调用成功但模型按纪律未返回某指标 → 归因为未形成评分，不是调用失败。"""
+
+        class PartialAdapter:
+            def call_text(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                return SimpleNamespace(
+                    content='{"indicators": [{"id": "liquidity", "score": 63, "basis_sentence": "成交活跃度支持该评分判断"}]}',
+                    provider="fixture", finish_reason="stop",
+                )
+
+        results = six_dim._score_llm_indicators(_ctx(), "fixture", PartialAdapter())
+        assert "调用失败" not in results["risk_appetite"]["summary"]
+        assert "未对该指标形成评分" in results["risk_appetite"]["summary"]
+
+    def test_call_exception_blamed_as_failure(self):
+        results = six_dim._score_llm_indicators(_ctx(), "fixture", ErrorAdapter())
+        assert "调用失败" in results["risk_appetite"]["summary"]
 
     def test_no_extra_call_when_all_indicators_covered(self):
         calls: list[Any] = []
