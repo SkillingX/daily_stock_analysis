@@ -189,7 +189,7 @@ class _WaveLLM:
                     {
                         "persona": f"状态{i}",
                         "action": f"指令{i}",
-                        "price_range": f"{20 + i}-{21 + i}",
+                        "price_range": "",
                         "rationale": f"理由{i}含数字",
                     }
                     for i in range(3)
@@ -527,9 +527,14 @@ class TestSellSideView:
         from src.schemas.report_schema import DataPerspective, PricePosition
         from src.schemas.value_scenarios import Scenario, ValueScenarios
 
+        from src.schemas.report_schema import SniperPoints
+
         dims = _dims()
         dims["data"] = dims["data"].model_copy(
             update={"perspective": DataPerspective(price_position=PricePosition(current_price=31.92))}
+        )
+        dims["plan"] = dims["plan"].model_copy(
+            update={"sniper_points": SniperPoints(ideal_buy=27.5, secondary_buy=26.5, stop_loss=24.0, take_profit=33.0)}
         )
         dims["scenarios"] = dims["scenarios"].model_copy(
             update={
@@ -757,6 +762,22 @@ class TestSellSideView:
         assert "| 未知 | 2026年三季报 |" in md
         assert "未知(按A股规则需在2026年4月30日" not in md
 
+    def test_truncation_notes_rendered_in_intel_section(self):
+        """条数上限丢弃披露随报告保存并渲染（issue #40：不静默丢失）。"""
+        from src.schemas.deep_research_dims import EventPlan
+
+        dims = self._dims_full()
+        dims["intel"] = dims["intel"].model_copy(
+            update={
+                "event_calendar": [EventPlan(event="三季报", date="2026-10-30", outcomes=["超预期"], plans=["回调加仓"])],
+                "truncation_notes": ["未来事件超出 10 项上限，丢弃 1 项"],
+            }
+        )
+        view = build_view("至纯科技", "603690", "2026-10-04T08:42:06", [], dims, [], report_id="r5", manager=_MANAGER)
+        md = render_markdown(view)
+        assert "内容限制披露" in md
+        assert "未来事件超出 10 项上限，丢弃 1 项" in md
+
 
 def test_manager_cannot_rewrite_degraded_or_skipped_dimension_as_valid_conclusion():
     dims = _dims()
@@ -772,3 +793,41 @@ def test_manager_cannot_rewrite_degraded_or_skipped_dimension_as_valid_conclusio
     rendered = render_markdown(view)
     assert "已验证业务事实" in rendered
     assert "主力净买入1亿元" not in rendered and "资金单位未确认" in rendered
+
+
+def test_manager_decision_matrix_cannot_restore_contradictory_levels():
+    """审查 P1-1：经理改写不得在操作表恢复与规则方案矛盾的买卖点位。"""
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(
+        update={"sniper_points": SniperPoints(ideal_buy=133.16, secondary_buy=128.66, stop_loss=119.66, take_profit=189.15)}
+    )
+    manager = {
+        "decision_matrix": [
+            {"persona": "空仓者", "action": "买入", "price_range": "133.16", "rationale": "回调到位分批买入"},
+            {"persona": "持仓者", "action": "止损", "price_range": "跌破148.66", "rationale": "经理自拟止损线"},
+            {"persona": "观望者", "action": "等待企稳", "price_range": "", "rationale": "无价格指令"},
+        ]
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    # 方案内点位（133.16）与无价格行保留；方案外止损线（148.66）不得回到操作表
+    assert "133.16" in rendered
+    assert "等待企稳" in rendered
+    assert "148.66" not in rendered
+
+
+def test_manager_decision_matrix_no_prices_when_plan_is_watch_only():
+    """观察方案（无点位）下，决策行不得携带任何价格指令。"""
+    dims = _dims()  # plan 默认 sniper_points=None（观察）
+    manager = {
+        "decision_matrix": [
+            {"persona": "空仓者", "action": "买入", "price_range": "100.5", "rationale": "自拟买点"},
+            {"persona": "观望者", "action": "观察", "price_range": "", "rationale": "保留观察"},
+        ]
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    assert "自拟买点" not in rendered
+    assert "保留观察" in rendered

@@ -57,6 +57,24 @@ class TestParseIntelKeepsFullText:
         dim, _ = _parse_intel({"event_calendar": calendar}, 1)
         assert len(dim.event_calendar) == 7
 
+    def test_overflow_disclosed_in_truncation_notes(self):
+        """审查反例：11 个事件、每项 9 个结果 → 丢弃数量随报告保存（truncation_notes）。"""
+        calendar = [
+            _calendar_entry(
+                event=f"事件{i}",
+                date="2026-05-01",
+                outcomes=[f"结果{i}-{j}" for j in range(1, 10)],
+                plans=[f"预案{i}-{j}" for j in range(1, 3)],
+            )
+            for i in range(1, 12)
+        ]
+        dim, _ = _parse_intel({"event_calendar": calendar}, 1)
+        assert len(dim.event_calendar) == 10
+        assert all(len(ev.outcomes) == 8 for ev in dim.event_calendar)
+        notes = "；".join(dim.truncation_notes)
+        assert "丢弃 1 项" in notes
+        assert "可能结果超出 8 条上限，丢弃 1 条" in notes
+
     def test_extreme_length_truncation_disclosed(self):
         huge = "超" * 5000
         dim, _ = _parse_intel({"root_cause": {"event": huge}}, 1)

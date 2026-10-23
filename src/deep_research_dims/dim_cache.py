@@ -48,7 +48,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 11  # Structured iFinD product and shareholder evidence
+SCHEMA_VERSION = 12  # IntelDim truncation_notes（条数上限丢弃披露）
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 FUNDAMENTAL_MAPPING_VERSION = 18  # Choice latest-period balance sheet and research evidence
