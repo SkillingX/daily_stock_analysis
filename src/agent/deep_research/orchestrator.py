@@ -138,13 +138,32 @@ def _emit(cb: ProgressCb, event: Dict[str, Any]) -> None:
             pass
 
 
+# 情报正文大界防御（issue #40）：合理长度原文保留，只有极端超长才截断并披露，
+# 不再按 200/100/120/80 字符静默硬截半句话。
+_ROOT_CAUSE_LIMIT = 2000
+_EVIDENCE_LIMIT = 2000
+_EVENT_TEXT_LIMIT = 400
+_EVENT_DATE_LIMIT = 40
+_EVENT_ITEM_LIMIT = 500
+_OUTCOMES_MAX = 8
+_PLANS_MAX = 8
+_CALENDAR_MAX = 10
+
+
+def _bounded(text: Any, limit: int) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "（内容超长，已截断）"
+
+
 def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
     evidence: List[EvidenceItem] = []
     for raw in parsed.get("evidence_items") or []:
         try:
             evidence.append(
                 EvidenceItem(
-                    evidence=str(raw.get("evidence") or "")[:500],
+                    evidence=_bounded(raw.get("evidence"), _EVIDENCE_LIMIT),
                     strength=raw.get("strength") or "neutral",
                     lr=float(raw.get("lr") or 1.0),
                     posterior_p=0.5,
@@ -164,10 +183,10 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
     root_cause = None
     if any(rc_raw.get(k) for k in ("event", "mechanism", "magnitude")):
         root_cause = {
-            "event": str(rc_raw.get("event") or "")[:200],
-            "mechanism": str(rc_raw.get("mechanism") or "")[:200],
-            "magnitude": str(rc_raw.get("magnitude") or "")[:100],
-            "persistence": str(rc_raw.get("persistence") or "")[:100],
+            "event": _bounded(rc_raw.get("event"), _ROOT_CAUSE_LIMIT),
+            "mechanism": _bounded(rc_raw.get("mechanism"), _ROOT_CAUSE_LIMIT),
+            "magnitude": _bounded(rc_raw.get("magnitude"), _ROOT_CAUSE_LIMIT),
+            "persistence": _bounded(rc_raw.get("persistence"), _ROOT_CAUSE_LIMIT),
         }
     calendar = []
     for item in parsed.get("event_calendar") or []:
@@ -175,10 +194,16 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             continue
         calendar.append(
             {
-                "event": str(item.get("event") or "")[:120],
-                "date": str(item.get("date") or "")[:20],
-                "outcomes": [str(x)[:80] for x in (item.get("outcomes") or [])][:4],
-                "plans": [str(x)[:120] for x in (item.get("plans") or [])][:4],
+                "event": _bounded(item.get("event"), _EVENT_TEXT_LIMIT),
+                "date": _bounded(item.get("date"), _EVENT_DATE_LIMIT),
+                "outcomes": [
+                    _bounded(x, _EVENT_ITEM_LIMIT)
+                    for x in (item.get("outcomes") or [])[:_OUTCOMES_MAX]
+                ],
+                "plans": [
+                    _bounded(x, _EVENT_ITEM_LIMIT)
+                    for x in (item.get("plans") or [])[:_PLANS_MAX]
+                ],
             }
         )
     dim = IntelDim(
@@ -186,7 +211,7 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
         evidence_items=evidence,
         unverified_count=int(parsed.get("unverified_count") or 0),
         root_cause=root_cause,
-        event_calendar=calendar[:6],
+        event_calendar=calendar[:_CALENDAR_MAX],
     )
     return dim, steps
 
