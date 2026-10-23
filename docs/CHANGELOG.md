@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 作战计划统一条件买入方案的计算语境：止损改为相对首批入场锚（MA20/1.5×ATR 孰近下沿）计算，不再与现价锚混用；入场、补仓、止损、止盈不满足同一多头方案价格关系时明确保留观察、不输出可执行点位，入场计划与风控文案区分未持仓条件买入与已有持仓参考边界。
 - [修复] 股权资料缺口兼容模型返回的 item 对象并保留可识别文字；供应商缺口在校验后统一合并，避免整维校验失败丢失有效研究，真实缺口仍披露并停用评分。
 - [改进] 默认 MiniMax 模型切换为 M3.1-Flash，全局请求按 MINIMAX_REASONING_EFFORT（默认 low）设置推理强度并保持 thinking 开启；基本面专项研究预算默认值和上限放宽到 300 秒，页面等待 330 秒，超时保留部分报告并刷新历史，历史刷新失败不再误报生成失败。
 - [修复] 基本面验收脚本等待时间与报告预算对齐；MiniMax 设置页新建渠道默认选 M3.1-Flash，并按官方公开价格估算该模型用量，不将其记为零成本。
