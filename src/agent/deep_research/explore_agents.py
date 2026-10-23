@@ -253,19 +253,24 @@ _OWNERSHIP_TOOLS = {
 _US_CHINA_TOOLS = {"search_comprehensive_intel", "verify_supply_chain_evidence"}
 
 
-def _chanlun_engine_facts(stock_code: str) -> str:
-    """P0-1：缠论引擎真实结构（优先数据源）。引擎不可用时返回空串，LLM 退回工具取数。"""
+def _chanlun_engine_facts(stock_code: str, history: Optional[list[dict[str, Any]]] = None) -> str:
+    """P0-1：缠论引擎真实结构。优先复用共享快照日线，缺时才按需取数（issue #42）。"""
     if run := current_research.get():
         run.check()
     try:
         import pandas as pd
 
         from chanlun.chanlun_engine import ChanLunEngine
-        from src.services.history_loader import load_history_df
 
-        df, _src = load_history_df(stock_code, days=250)
-        if df is None or df.empty or len(df) < 60:
-            return ""
+        df = None
+        if history is not None and len(history) >= 60:
+            df = pd.DataFrame(history)
+        else:
+            from src.services.history_loader import load_history_df
+
+            df, _src = load_history_df(stock_code, days=250)
+            if df is None or df.empty or len(df) < 60:
+                return ""
         df = df.copy()
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -279,19 +284,72 @@ def _chanlun_engine_facts(stock_code: str) -> str:
         return ""
 
 
-def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
-    """技术研究员：缠论引擎结构注入（LLM 只解读），+ 支撑压力 + MACD/RSI/波浪。"""
-    engine_facts = _chanlun_engine_facts(stock_code)
-    task = (
+def _shared_market_facts(ctx: Any) -> str:
+    """共享快照中已取得的技术事实摘要（同次研究、同分析时点，issue #42）。
+
+    现价、最新收盘（含真实数据日期）、MA20、支撑阻力与数据来源均来自
+    阶段 0 共享快照；指标复用既有计算入口（data_dim._support_resistance）。
+    """
+    if ctx is None:
+        return ""
+    parts: list[str] = []
+    if ctx.quote and ctx.quote.get("price") is not None:
+        parts.append(f"现价 {ctx.quote['price']}")
+    history = getattr(ctx, "history", None) or []
+    if history:
+        closes = [r.get("close") for r in history if r.get("close") is not None]
+        latest = history[-1]
+        if closes and latest.get("date"):
+            parts.append(
+                f"最新收盘 {latest['close']}（数据截至 {str(latest['date'])[:10]}，共 {len(closes)} 根日线）"
+            )
+        elif closes:
+            parts.append(f"日线 {len(closes)} 根（收盘区间 {min(closes)}–{max(closes)}）")
+        if len(closes) >= 20:
+            ma20 = round(sum(float(c) for c in closes[-20:]) / 20, 2)
+            parts.append(f"MA20 {ma20}")
+        try:
+            from src.deep_research_dims.data_dim import _support_resistance
+
+            support, resistance = _support_resistance(list(history))
+            if support is not None:
+                parts.append(f"支撑 {support}")
+            if resistance is not None:
+                parts.append(f"阻力 {resistance}")
+        except Exception:  # noqa: BLE001 - 指标失败不阻断事实注入
+            pass
+    source = str(getattr(ctx, "history_source", "") or "")
+    parts.append(f"来源：本次研究共享快照（日线实际来源 {source or '未记录'}）")
+    return "；".join(parts)
+
+
+def _technical_task(
+    stock_code: str, stock_name: str, market_facts: str, engine_facts: str
+) -> str:
+    """技术研究员任务文本：共享事实优先注入，工具仅作补充（issue #42）。"""
+    return (
         f"请对 A 股 {stock_name}（{stock_code}）做技术面深度分析并直接输出 JSON：\n"
-        f"0) 缠论结构事实（引擎已算好，你的解读必须与之一致，禁止矛盾）：{engine_facts or '引擎不可用，用工具取数后自行判定'}\n"
-        "1) 用 get_daily_history 取 250 天日线，analyze_trend 取综合指标；\n"
+        f"0) 共享快照事实（本次研究已取得，权威，禁止声称这些行情缺失）：{market_facts or '共享快照无行情，用工具取数'}\n"
+        f"0.1) 缠论结构事实（引擎已算好，你的解读必须与之一致，禁止矛盾）：{engine_facts or '引擎不可用，用工具取数后自行判定'}\n"
+        "1) 第 0) 项事实够用时直接使用，确需补充才调 get_daily_history / analyze_trend；"
+        "工具调用失败时基于第 0) 项已有事实作答，只说明真实缺项（如仅 MACD 未取得），"
+        "禁止把局部缺项说成整套行情缺失；\n"
         "2) 输出 JSON：chanlun_summary(字符串：基于引擎结构的解读——为什么是这个趋势/位置/背驰)、"
         "support(数值)、resistance(数值)、indicator_summary(字符串：MACD/RSI/均线状态)、"
         "wave_note(字符串：波浪理论视角的一句判断，不适用则写不适用)、"
         "score(0-100 综合技术分，须与引擎结构方向一致)、basis(打分依据一句话，含具体数字)、"
         "narrative(50-100 字结论：必须含至少 2 个硬数字——价位/百分比/指标值，禁止只给分无论据)。"
     )
+
+
+def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
+    """技术研究员：共享快照 + 缠论引擎结构注入（LLM 只解读），+ 支撑压力 + MACD/RSI/波浪。"""
+    run = current_research.get()
+    shared_ctx = getattr(run, "context", None)
+    shared_history = list(shared_ctx.history) if getattr(shared_ctx, "history", None) else None
+    engine_facts = _chanlun_engine_facts(stock_code, history=shared_history)
+    market_facts = _shared_market_facts(shared_ctx)
+    task = _technical_task(stock_code, stock_name, market_facts, engine_facts)
     return _run_explore("technical", _TECHNICAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
 

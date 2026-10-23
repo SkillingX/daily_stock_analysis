@@ -86,4 +86,4 @@ jobs:
         env:
           ICONTRACT_SLOW: "true"
         run: |
-          python -m pytest tests/test_realtime_types_contract.py tests/test_risk_check_contract.py tests/test_data_fetcher_caching.py tests/test_sector_analysis_contracts.py tests/test_sector_analysis_schemas.py tests/test_choice_data_contract.py tests/test_choice_research_contract.py -v --tb=short
+          python -m pytest tests/test_realtime_types_contract.py tests/test_risk_check_contract.py tests/test_data_fetcher_caching.py tests/test_sector_analysis_contracts.py tests/test_sector_analysis_schemas.py tests/test_choice_data_contract.py tests/test_choice_research_contract.py tests/test_plan_dim_contract.py -v --tb=short

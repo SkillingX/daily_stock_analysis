@@ -78,16 +78,7 @@
 {% endif %}
 期望价值 EV：{{ scenarios.expected_value or 'N/A' }}（{{ scenarios.valuation_basis }} 口径）
 
-{% if intel.event_calendar %}
-**未来事件与预案**：
-{% for ev in intel.event_calendar %}
-- **{{ ev.event }}**（{{ ev.date or '日期待定' }}）
-{% for o in ev.outcomes %}  - 可能结果：{{ o }}
-{% endfor %}
-{% for pl in ev.plans %}  - 预案：{{ pl }}
-{% endfor %}
-{% endfor %}
-{% endif %}
+{% include 'event_plans.j2' %}
 {% endif %}
 {% if scenarios.narrative %}{{ scenarios.narrative }}{% endif %}
 
@@ -228,6 +219,9 @@
 {% endif %}
 {% endif %}
 - unverified 情报条数：{{ intel.unverified_count }}
+{% if intel.truncation_notes %}
+- 内容限制披露：{{ intel.truncation_notes|join('；') }}
+{% endif %}
 {% if intel.narrative %}{{ intel.narrative }}{% endif %}
 
 ### 5.3 资金面（权重 15%）

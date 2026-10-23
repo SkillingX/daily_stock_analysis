@@ -271,16 +271,33 @@ def _clean_event_date(value: Any) -> str:
     return text or "日期待定"
 
 
+def _md_cell(text: str) -> str:
+    """表格单元格转义：竖线转义 + 换行折叠，防表格断裂。"""
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
 def _event_plans_view(intel: Any) -> List[Dict[str, Any]]:
-    """事件日历视图：date 经清洗，事件/结果/预案原样透传。"""
+    """事件日历视图（issue #40）：日期/事件/可能结果/应对预案四列表格素材。
+
+    date 经清洗；结果与预案是独立清单，数量不等时不逐项配对，
+    各自按原顺序编号（模板见 event_plans.j2）。
+    """
     out = []
     for ev in getattr(intel, "event_calendar", []) or []:
+        outcomes = [str(o) for o in (getattr(ev, "outcomes", None) or [])]
+        plans = [str(p) for p in (getattr(ev, "plans", None) or [])]
         out.append(
             {
-                "event": str(getattr(ev, "event", "") or "").strip(),
-                "date": _clean_event_date(getattr(ev, "date", None)),
-                "outcomes": [str(o) for o in (getattr(ev, "outcomes", None) or [])],
-                "plans": [str(p) for p in (getattr(ev, "plans", None) or [])],
+                "event": _md_cell(str(getattr(ev, "event", "") or "").strip()),
+                "date": _md_cell(_clean_event_date(getattr(ev, "date", None))),
+                "outcomes_md": "<br>".join(
+                    f"{i}. {_md_cell(o)}" for i, o in enumerate(outcomes, 1)
+                )
+                or "—",
+                "plans_md": "<br>".join(
+                    f"{i}. {_md_cell(p)}" for i, p in enumerate(plans, 1)
+                )
+                or "—",
             }
         )
     return out
