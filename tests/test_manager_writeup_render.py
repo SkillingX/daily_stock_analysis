@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
+
+import pytest
 
 from src.deep_research_dims.manager_writeup import (
     DIM_SECTION_KEYS,
@@ -32,6 +35,50 @@ from src.schemas.deep_research_dims import DIM_IDS, DIM_MODELS, HistoryDim, Hist
 
 def _dims() -> dict:
     return {d: DIM_MODELS[d]() for d in DIM_IDS}
+
+
+@pytest.mark.parametrize("instruction", [
+    "买入条件：股价回落至30元并放量站稳。止损条件：股价回落至35元并放量破位。",
+    "买入条件：等待公司完成本轮信息披露、股价回落并站稳之后再按8.5执行。",
+    "等股价回落至30以后再买，低于35就卖。",
+])
+def test_manager_execution_blocks_never_reenter_any_rendered_outlet(instruction: str) -> None:
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(update={"sniper_points": SniperPoints(
+        ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0,
+    )})
+    dims["technical"] = dims["technical"].model_copy(update={"narrative": "规则技术事实：现价31.92，量比1.5。"})
+    block = instruction + "这些条件为本段结论，不得用其他方案替换。"
+    prompts = []
+
+    def wave(adapter, system, facts, **kwargs):
+        prompts.append(system)
+        return {
+            "title_angle": block, "executive_summary": block,
+            "section_titles": {"technical": block},
+            "section_narratives": {"investment": block, "technical": block},
+            "thesis_points": [{"header": "论点", "body": block}],
+            "money_paths": [{"name": "路径", "playbook": block}],
+            "risk_matrix": [{"risk": "风险", "impact": block, "trigger": block}],
+            "scenario_triggers": {"optimistic": block}, "dim_verdicts": {"技术面": block},
+        }
+
+    with patch("src.deep_research_dims.manager_writeup._call_wave", side_effect=wave):
+        manager = generate_manager_writeup(object(), "fixture", "300260", dims, [])
+    view = build_view("fixture", "300260", "2026-10-24", [], dims, [], manager=manager)
+    for template in ("deep_research_report_v2.j2", "deep_research_dual_track.j2"):
+        rendered = render_markdown(view, template)
+        assert instruction not in rendered
+        assert "规则技术事实" in rendered
+    assert not manager["title_angle"] and not manager["scenario_triggers"] and not manager["dim_verdicts"]
+    assert "technical" not in manager["section_titles"]
+    assert view["decision_matrix"][0]["price_range"] == "30 / 28"
+    for prompt in prompts:
+        assert "跌破31.3" not in prompt
+        assert "触发条件+目标位" not in prompt
+        assert "等什么价格" not in prompt
 
 
 def test_degraded_evidence_cannot_reenter_global_manager_or_final_conclusion():
