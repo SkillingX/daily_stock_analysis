@@ -7,6 +7,7 @@
 
 from src.deep_research_dims.context import SharedContext
 from src.deep_research_dims.plan_dim import build_plan_dim, sniper_relation_violation
+from src.schemas.report_schema import SniperPoints
 
 
 def _ctx(price: float, history_len: int = 15) -> SharedContext:
@@ -109,6 +110,22 @@ class TestPlanDegradation:
         ctx = _ctx(100.0)
         plan = build_plan_dim(ctx, _payload(-1.0, support=95.0), "观察")
         assert plan.status == "degraded"
+
+    def test_negative_support_keeps_watch_only(self):
+        """审查反例：现价 100、ATR 2、支撑 -1 → 不得输出首批 0/补仓 -1/止损 -3 的可执行计划。"""
+        ctx = _ctx(100.0)
+        plan = build_plan_dim(ctx, _payload(100.0, support=-1.0), "观察")
+        assert plan.sniper_points is None
+        entry_plan = plan.position_strategy.entry_plan or ""
+        assert "支撑位数据无效" in entry_plan
+        assert plan.position_strategy.suggested_position == "观察"
+
+    def test_sniper_rejects_non_positive_points(self):
+        """不变式入口：非正/NaN 点位直接判违规，不靠顺序校验兜底。"""
+        bad = SniperPoints(ideal_buy=0.0, secondary_buy=-1.0, stop_loss=-3.0, take_profit=6.0)
+        assert sniper_relation_violation(bad) is not None
+        nan_sniper = SniperPoints(ideal_buy=float("nan"), secondary_buy=1.0, stop_loss=0.5, take_profit=2.0)
+        assert sniper_relation_violation(nan_sniper) is not None
 
 
 class TestPlanWording:

@@ -338,6 +338,9 @@
 {% endif %}
 {% endif %}
 - 未经证实情报条数：{{ s.env.unverified_count }}
+{% if s.env.truncation_notes %}
+- 内容限制披露：{{ s.env.truncation_notes|join('；') }}
+{% endif %}
 {% elif s.id == 'capital' %}
 {% if s.env.flow_summary %}
 {{ s.env.flow_summary | cn }}

@@ -189,6 +189,7 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             "persistence": _bounded(rc_raw.get("persistence"), _ROOT_CAUSE_LIMIT),
         }
     calendar = []
+    truncation_notes: List[str] = []
     dropped_events = 0
     for item in parsed.get("event_calendar") or []:
         if not isinstance(item, dict):
@@ -198,11 +199,14 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             continue
         raw_outcomes = item.get("outcomes") or []
         raw_plans = item.get("plans") or []
-        if len(raw_outcomes) > _OUTCOMES_MAX or len(raw_plans) > _PLANS_MAX:
-            logger.warning(
-                "[DualTrack] 事件「%s」结果/预案超条数上限（%d/%d 条，各保留 %d），超出部分丢弃",
-                str(item.get("event") or "")[:30],
-                len(raw_outcomes), len(raw_plans), _OUTCOMES_MAX,
+        event_label = str(item.get("event") or "未知")[:30]
+        if len(raw_outcomes) > _OUTCOMES_MAX:
+            truncation_notes.append(
+                f"事件「{event_label}」可能结果超出 {_OUTCOMES_MAX} 条上限，丢弃 {len(raw_outcomes) - _OUTCOMES_MAX} 条"
+            )
+        if len(raw_plans) > _PLANS_MAX:
+            truncation_notes.append(
+                f"事件「{event_label}」应对预案超出 {_PLANS_MAX} 条上限，丢弃 {len(raw_plans) - _PLANS_MAX} 条"
             )
         calendar.append(
             {
@@ -219,15 +223,21 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             }
         )
     if dropped_events:
+        truncation_notes.append(
+            f"未来事件超出 {_CALENDAR_MAX} 项上限，丢弃 {dropped_events} 项"
+        )
         logger.warning(
             "[DualTrack] 事件日历超上限，丢弃 %d 项（上限 %d）", dropped_events, _CALENDAR_MAX
         )
+    for note in truncation_notes:
+        logger.warning("[DualTrack] %s", note)
     dim = IntelDim(
         intelligence=intelligence,
         evidence_items=evidence,
         unverified_count=int(parsed.get("unverified_count") or 0),
         root_cause=root_cause,
         event_calendar=calendar,
+        truncation_notes=truncation_notes,
     )
     return dim, steps
 

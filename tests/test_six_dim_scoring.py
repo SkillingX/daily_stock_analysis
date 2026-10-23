@@ -163,6 +163,23 @@ class TestScoringFactsJson:
         parsed = json.loads(raw)  # 截断序列化会在这里抛 ValueError
         assert isinstance(parsed, dict)
 
+    def test_large_dict_keeps_subfields_instead_of_whole_key(self):
+        """fundamental 过大时按子键保留核心字段与宏观证据，不再整块删除。"""
+        ctx = _ctx()
+        ctx.fundamental = {
+            "pe_ttm": 12.5,
+            "macro_note": "央行公告：维持流动性合理充裕",
+            "large_evidence": "证据" * 2000,
+        }
+        adapter_cls, captured = self._captured_user_content()
+        six_dim._score_llm_indicators(ctx, "fixture", adapter_cls())
+        raw = captured[-1][-1]["content"].split("```json\n", 1)[1].split("\n```", 1)[0]
+        parsed = json.loads(raw)
+        assert parsed["fundamental"]["macro_note"] == "央行公告：维持流动性合理充裕"
+        assert "large_evidence" not in parsed["fundamental"]
+        user = captured[-1][-1]["content"]
+        assert "fundamental.large_evidence" in user.split("```", 2)[2]
+
     def test_omitted_fields_disclosed(self):
         ctx = _ctx()
         ctx.fundamental = {"large_evidence": "证据" * 2000}

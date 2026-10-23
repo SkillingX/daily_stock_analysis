@@ -31,6 +31,40 @@ def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
                for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"))
 
 
+_PLAN_PRICE_TOLERANCE = 0.005
+_PLAN_PRICE_RE = re.compile(r"\d{2,6}(?:\.\d+)?")
+
+
+def _plan_price_anchors(plan: Any) -> List[float]:
+    """规则作战计划的有效点位锚（观察方案返回空列表）。"""
+    sniper = getattr(plan, "sniper_points", None)
+    if sniper is None:
+        return []
+    anchors: List[float] = []
+    for key in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
+        value = getattr(sniper, key, None)
+        if isinstance(value, (int, float)) and float(value) > 0:
+            anchors.append(float(value))
+    return anchors
+
+
+def _decision_row_uses_plan_prices(row: Mapping[str, str], anchors: List[float]) -> bool:
+    """决策行的价格指令必须与规则方案同源（±0.5% 容差）；观察方案不得携带价格。
+
+    经理终稿可以解释方案，不能引入与规则点位不一致的买卖价格（issue #39：
+    最终正文与操作表使用同一方案，经理改写不得恢复矛盾指令）。
+    """
+    prices = [float(x) for x in _PLAN_PRICE_RE.findall(str(row.get("price_range") or ""))]
+    if not prices:
+        return True
+    if not anchors:
+        return False
+    return all(
+        any(abs(price - anchor) <= max(0.01, anchor * _PLAN_PRICE_TOLERANCE) for anchor in anchors)
+        for price in prices
+    )
+
+
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
     """Keep evidenced sections; unstructured global claims cannot be separated safely."""
     result = dict(manager)
@@ -42,6 +76,12 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
             result[key] = []
         for key in ("scenario_triggers", "dim_verdicts"):
             result[key] = {}
+    # 操作决策表与规则方案同源：无论证据是否完整，经理改写不得引入方案外价格
+    anchors = _plan_price_anchors(dims.get("plan"))
+    result["decision_matrix"] = [
+        row for row in (result.get("decision_matrix") or [])
+        if _decision_row_uses_plan_prices(row, anchors)
+    ]
     for key in ("section_titles", "section_narratives"):
         result[key] = {
             section: value for section, value in (manager.get(key) or {}).items()
@@ -431,7 +471,7 @@ def generate_manager_writeup(
             "{\"name\": \"…(≤16字路径名，如 财报验证驱动)\", \"win_rate\": \"…(胜率估计，如 约50%)\", \"playbook\": \"…(触发条件+目标位，≤80字)\"}"
             " × ≤3 条，按确定性降序], \"decision_matrix\": ["
             "{\"persona\": \"…(持仓状态，如 空仓者/持仓高位)\", \"action\": \"…(指令)\", \"price_range\": \"…\", \"rationale\": \"…(≤60字)\"}"
-            " × ≤5 行], \"scenario_triggers\": {"
+            " × ≤5 行]（price_range 只能使用 dims.plan 作战计划已给出的点位价格；计划无点位时只写状态与动作，不写价格）, \"scenario_triggers\": {"
             "\"optimistic\": \"…(可验证触发条件)\", \"neutral\": \"…\", \"pessimistic\": \"…\"}}",
             _wave_b_facts(stock_name, stock_code, dims),
         )

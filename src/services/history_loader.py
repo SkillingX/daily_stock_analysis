@@ -198,6 +198,7 @@ def adopt_published_history(ctx: "SharedContext") -> bool:
     if slot.get("as_of") != required.isoformat():
         return False
     ctx.history = [dict(row) for row in slot["records"]]
+    ctx.history_source = str(slot.get("source") or "")
     return True
 
 

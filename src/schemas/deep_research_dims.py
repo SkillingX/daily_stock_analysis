@@ -208,6 +208,8 @@ class IntelDim(DimEnvelope):
     unverified_count: int = Field(0, ge=0)
     root_cause: Optional[RootCause] = None
     event_calendar: List[EventPlan] = Field(default_factory=list)
+    # 解析层丢弃披露（条数上限超出部分）：随报告保存并在渲染展示，重读/下载可见
+    truncation_notes: List[str] = Field(default_factory=list)
     narrative: str = ""
 
 

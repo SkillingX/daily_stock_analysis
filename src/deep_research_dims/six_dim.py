@@ -229,21 +229,32 @@ def _scoring_timeout() -> float:
 
 
 def _bounded_facts_json(facts: Dict[str, Any], limit: int = 2500) -> tuple[str, List[str]]:
-    """整键累加序列化：超预算丢弃整键而非截断字符串，输出恒为完整合法 JSON。
+    """有界序列化：超预算丢弃整键，dict 键降级为子键裁剪，输出恒为完整合法 JSON。
 
-    返回 (JSON 块, 被省略字段名)；键序即保留优先级（stock/quote 靠前）。
+    返回 (JSON 块, 被省略字段名，形如 "fundamental.research")；键/子键序即保留优先级。
+    大对象按子键保留前缀字段（估值/财务核心字段靠前），避免相关证据整块丢失。
     """
+    def _encode(obj: Dict[str, Any]) -> str:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+
     kept: Dict[str, Any] = {}
     omitted: List[str] = []
     for key, value in facts.items():
-        if kept:
-            candidate = {**kept, key: value}
-            encoded = json.dumps(candidate, ensure_ascii=False, default=str)
-            if len(encoded) > limit:
-                omitted.append(key)
+        if kept and len(_encode({**kept, key: value})) > limit:
+            if isinstance(value, dict) and value:
+                sub_kept: Dict[str, Any] = {}
+                for sub_key, sub_value in value.items():
+                    if len(_encode({**kept, key: {**sub_kept, sub_key: sub_value}})) <= limit:
+                        sub_kept[sub_key] = sub_value
+                    else:
+                        omitted.append(f"{key}.{sub_key}")
+                if sub_kept:
+                    kept[key] = sub_kept
                 continue
+            omitted.append(key)
+            continue
         kept[key] = value
-    return json.dumps(kept, ensure_ascii=False, default=str), omitted
+    return _encode(kept), omitted
 
 
 def _score_llm_indicators(

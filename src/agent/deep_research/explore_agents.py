@@ -285,19 +285,41 @@ def _chanlun_engine_facts(stock_code: str, history: Optional[list[dict[str, Any]
 
 
 def _shared_market_facts(ctx: Any) -> str:
-    """共享快照中已取得的技术事实摘要（同次研究、同分析时点，issue #42）。"""
+    """共享快照中已取得的技术事实摘要（同次研究、同分析时点，issue #42）。
+
+    现价、最新收盘（含真实数据日期）、MA20、支撑阻力与数据来源均来自
+    阶段 0 共享快照；指标复用既有计算入口（data_dim._support_resistance）。
+    """
     if ctx is None:
         return ""
     parts: list[str] = []
     if ctx.quote and ctx.quote.get("price") is not None:
-        parts.append(f"现价 {ctx.quote['price']}（截至 {ctx.as_of}）")
-    if getattr(ctx, "history", None):
-        closes = [r.get("close") for r in ctx.history if r.get("close") is not None]
-        if closes:
+        parts.append(f"现价 {ctx.quote['price']}")
+    history = getattr(ctx, "history", None) or []
+    if history:
+        closes = [r.get("close") for r in history if r.get("close") is not None]
+        latest = history[-1]
+        if closes and latest.get("date"):
             parts.append(
-                f"日线已取得 {len(closes)} 根（收盘区间 {min(closes)}–{max(closes)}，"
-                f"来源：本次研究共享快照，时点 {ctx.as_of}）"
+                f"最新收盘 {latest['close']}（数据截至 {str(latest['date'])[:10]}，共 {len(closes)} 根日线）"
             )
+        elif closes:
+            parts.append(f"日线 {len(closes)} 根（收盘区间 {min(closes)}–{max(closes)}）")
+        if len(closes) >= 20:
+            ma20 = round(sum(float(c) for c in closes[-20:]) / 20, 2)
+            parts.append(f"MA20 {ma20}")
+        try:
+            from src.deep_research_dims.data_dim import _support_resistance
+
+            support, resistance = _support_resistance(list(history))
+            if support is not None:
+                parts.append(f"支撑 {support}")
+            if resistance is not None:
+                parts.append(f"阻力 {resistance}")
+        except Exception:  # noqa: BLE001 - 指标失败不阻断事实注入
+            pass
+    source = str(getattr(ctx, "history_source", "") or "")
+    parts.append(f"来源：本次研究共享快照（日线实际来源 {source or '未记录'}）")
     return "；".join(parts)
 
 

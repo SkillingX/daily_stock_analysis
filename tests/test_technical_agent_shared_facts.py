@@ -54,18 +54,28 @@ class TestSharedMarketFacts:
         ctx = SharedContext("600519", "贵州茅台", "2026-10-23T15:00:00")
         ctx.quote = {"price": 162.16}
         ctx.history = _history(260)
+        ctx.history_source = "db_cache"
         return ctx
 
     def test_facts_contain_price_and_history(self):
         facts = explore_agents._shared_market_facts(self._ctx())
         assert "162.16" in facts
         assert "260" in facts
-        assert "2026-10-23" in facts
+        assert "2026-" in facts  # 最新收盘的真实数据日期（非装配时间）
+
+    def test_facts_include_computed_indicators_and_real_source(self):
+        """审查 P1-2：MA20、支撑阻力与实际来源必须传入，不得概括为装配时点。"""
+        facts = explore_agents._shared_market_facts(self._ctx())
+        assert "MA20" in facts
+        assert "支撑" in facts and "阻力" in facts
+        assert "db_cache" in facts
+        assert "15:00:00" not in facts  # 装配时间不再冒充数据日期
 
     def test_empty_context_gives_nothing(self):
         assert explore_agents._shared_market_facts(None) == ""
         empty = SharedContext("600519", "x", "2026-10-23")
-        assert explore_agents._shared_market_facts(empty) == ""
+        facts = explore_agents._shared_market_facts(empty)
+        assert "MA20" not in facts
 
     def test_task_forbids_claiming_shared_data_missing(self):
         ctx = self._ctx()
@@ -74,3 +84,5 @@ class TestSharedMarketFacts:
         assert "禁止声称这些行情缺失" in task
         assert "禁止把局部缺项说成整套行情缺失" in task
         assert "162.16" in task
+        assert "MA20" in task
+        assert "支撑" in task
