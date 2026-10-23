@@ -202,17 +202,7 @@
 {% endfor %}
 {% endif %}
 
-{% if event_plans %}
-### 未来事件与预案（{{ event_plans|length }} 个）
-
-{% for ev in event_plans %}
-- **{{ ev.event }}**（{{ ev.date }}）
-{% for o in ev.outcomes %}  - 可能结果：{{ o }}
-{% endfor %}
-{% for pl in ev.plans %}  - 预案：{{ pl }}
-{% endfor %}
-{% endfor %}
-{% endif %}
+{% include 'event_plans.j2' %}
 
 ---
 

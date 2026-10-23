@@ -78,16 +78,7 @@
 {% endif %}
 期望价值 EV：{{ scenarios.expected_value or 'N/A' }}（{{ scenarios.valuation_basis }} 口径）
 
-{% if intel.event_calendar %}
-**未来事件与预案**：
-{% for ev in intel.event_calendar %}
-- **{{ ev.event }}**（{{ ev.date or '日期待定' }}）
-{% for o in ev.outcomes %}  - 可能结果：{{ o }}
-{% endfor %}
-{% for pl in ev.plans %}  - 预案：{{ pl }}
-{% endfor %}
-{% endfor %}
-{% endif %}
+{% include 'event_plans.j2' %}
 {% endif %}
 {% if scenarios.narrative %}{{ scenarios.narrative }}{% endif %}
 
