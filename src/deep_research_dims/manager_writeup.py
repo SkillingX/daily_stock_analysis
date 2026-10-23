@@ -31,95 +31,80 @@ def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
                for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"))
 
 
-_PLAN_PRICE_TOLERANCE = 0.005
-# 价格形态：≥2 位整数（可带小数）或「N.N元」单价；捕获可选负号（负价格即违规）。
-# 断言排除数字后缀（防"100日均线"回溯出 10）与均线/周期/百分比/金额倍数等非价格词。
 _PLAN_PRICE_RE = re.compile(
-    r"(?<![\d.-])(-?(?:\d{2,6}(?:\.\d+)?|\d\.\d+\s*元))(?!\s*(?:\d|日线|周线|均线|日|周|线|分|%|点|倍|亿|万))"
+    r"(?<![\d.-])(-?(?:\d{2,6}(?:\.\d+)?|\d\.\d+))(?!\s*(?:\d|日线|周线|均线|日|周|线|分|%|点|倍|亿|万))"
 )
-# 执行词 → 角色锚键。卖出动作可挂在止盈位或止损位（跌破止损后的离场）。
-_ROLE_ANCHOR_KEYS: Dict[str, tuple] = {
-    "buy": ("ideal_buy", "secondary_buy"),
-    "stop": ("stop_loss",),
-    "sell": ("take_profit", "stop_loss"),
-}
-_BUY_ROLE_WORDS = ("买入", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单买", "吸纳")
-_STOP_ROLE_WORDS = ("止损", "跌破")
-_SELL_ROLE_WORDS = ("止盈", "卖出", "减仓", "兑现", "清仓")
-_ROLE_WORD_SETS = (
-    ("buy", _BUY_ROLE_WORDS),
-    ("stop", _STOP_ROLE_WORDS),
-    ("sell", _SELL_ROLE_WORDS),
+_DIRECTIVE_WORDS = (
+    "买入", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单买", "吸纳",
+    "止损", "跌破", "止盈", "卖出", "减仓", "兑现", "清仓",
 )
-# 价格与执行词的就近配对窗口（字符）：超出窗口的执行词不构成该价格的角色
-_ROLE_PROXIMITY = 6
+# 执行词与价格的关联窗口（字符）：窗口内即视为该价格构成经理自拟指令
+_DIRECTIVE_PROXIMITY = 6
 
 
-def _plan_price_anchors(plan: Any) -> Dict[str, float]:
-    """规则作战计划的有效点位锚（按角色），观察方案返回空 dict。"""
-    sniper = getattr(plan, "sniper_points", None)
-    if sniper is None:
-        return {}
-    anchors: Dict[str, float] = {}
-    for key in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
-        value = getattr(sniper, key, None)
-        if isinstance(value, (int, float)) and float(value) > 0:
-            anchors[key] = float(value)
-    return anchors
+def _rule_decision_matrix(plan: Any) -> List[Dict[str, str]]:
+    """操作决策表由规则作战计划统一生成（issue #39 终局语义）。
 
-
-def _price_in(price: float, candidates: List[float]) -> bool:
-    return any(abs(price - anchor) <= max(0.01, anchor * _PLAN_PRICE_TOLERANCE) for anchor in candidates)
-
-
-def _nearest_role(before: str, after: str) -> Optional[str]:
-    """价格前后窗口内距离最近的执行词角色（平局取后侧，中文「价+动词」更常见）。"""
-    best: Optional[str] = None
-    best_dist = _ROLE_PROXIMITY + 1
-    for role, words in _ROLE_WORD_SETS:
-        pos = min((after.find(w) for w in words if w in after), default=-1)
-        if pos != -1 and pos < best_dist:
-            best, best_dist = role, pos
-        rpos = max((before.rfind(w) for w in words if w in before), default=-1)
-        if rpos != -1:
-            dist = len(before) - rpos
-            if dist < best_dist:
-                best, best_dist = role, dist
-    return best
-
-
-def _directive_prices_match_plan(text: str, anchors: Dict[str, float], strict: bool = False) -> bool:
-    """执行指令价格与规则方案的统一采用边界（issue #39，全部正文出口共用）。
-
-    逐价格就近配对角色：每个价格只绑定其前后窗口内**最近**的执行词——
-    「30买入并在24止损」中 30 绑定买入锚、24 绑定止损锚，合法多动作句不误删；
-    无执行词伴随的价格不校验（叙事可自由引用现价、估值等非方案数字）。
-    strict（操作决策表）：所有价格必须属于方案锚集，且角色价格匹配对应锚。
-    观察方案（无锚）下，任何执行词伴随的价格都不可采信（经理只解释，不造指令）。
+    可执行动作及触发条件只有一个来源——规则 plan；经理矩阵不采信，
+    价格与动作不再经自然语言解析转述（平行解析器既漏检又误删，已移除）。
     """
-    role_candidates = {
-        role: [anchors[k] for k in keys if k in anchors] for role, keys in _ROLE_ANCHOR_KEYS.items()
+    sniper = getattr(plan, "sniper_points", None)
+    points = {
+        key: getattr(sniper, key, None)
+        for key in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit")
     }
-    all_anchors = list(anchors.values())
-    for match in _PLAN_PRICE_RE.finditer(str(text or "")):
-        raw = match.group(1).rstrip("元").strip()
+    if sniper is None or not all(
+        isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) > 0
+        for v in points.values()
+    ):
+        strategy = getattr(plan, "position_strategy", None)
+        entry = str(getattr(strategy, "entry_plan", None) or "").strip()
+        rationale = entry[:100] or "未形成可执行方案，保留观察；触发条件见作战计划"
+        return [
+            {"persona": "所有持仓状态", "action": "观察", "price_range": "—", "rationale": rationale}
+        ]
+
+    def _fmt(value: Any) -> str:
+        return f"{float(value):g}"
+
+    return [
+        {
+            "persona": "空仓/未入场",
+            "action": "条件买入",
+            "price_range": f"{_fmt(points['ideal_buy'])} / {_fmt(points['secondary_buy'])}",
+            "rationale": "回落至首批价且量比≥1.5 触发首批，补仓价更低半档；未取得用户持仓成本，非按现价追高",
+        },
+        {
+            "persona": "已持仓（参考）",
+            "action": "止损/止盈纪律",
+            "price_range": f"{_fmt(points['stop_loss'])} / {_fmt(points['take_profit'])}",
+            "rationale": "跌破止损无条件离场，到达止盈分批兑现；止损锚定方案首批成本，已有持仓按自身成本另行评估",
+        },
+    ]
+
+
+def _prose_carries_directive_price(text: str) -> bool:
+    """经理叙事是否承载执行价位：执行词邻近出现价格即不可采信（issue #39）。
+
+    可执行指令由规则方案承载（决策表/操作表/行动清单）；经理正文只解释或
+    引用其结果——定性解释（"按作战计划执行""等待触发条件"）不受影响，
+    出现具体买卖/止损/止盈价位的叙事块整体丢弃，回退规则叙述。
+    负价格出现在任何位置都视为异常。
+    """
+    text = str(text or "")
+    for match in _PLAN_PRICE_RE.finditer(text):
+        raw = match.group(1)
         try:
             price = float(raw)
         except ValueError:
             continue
         if price < 0:
-            return False  # 负价格出现在执行语境即异常，不得当作合法锚
-        if strict and all_anchors and not _price_in(price, all_anchors):
-            return False
-        role = _nearest_role(
-            str(text or "")[: match.start()][-_ROLE_PROXIMITY:],
-            str(text or "")[match.end() : match.end() + _ROLE_PROXIMITY],
-        )
-        if role is not None:
-            candidates = role_candidates[role]
-            if not candidates or not _price_in(price, candidates):
-                return False
-    return True
+            return True
+        before = text[max(0, match.start() - _DIRECTIVE_PROXIMITY) : match.start()]
+        after = text[match.end() : match.end() + _DIRECTIVE_PROXIMITY]
+        if any(word in before or word in after for word in _DIRECTIVE_WORDS):
+            return True
+    return False
 
 
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
@@ -133,26 +118,18 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
             result[key] = []
         for key in ("scenario_triggers", "dim_verdicts"):
             result[key] = {}
-    # 统一采用边界（issue #39）：经理改写不得在任何正文出口引入方案外或角色
-    # 错位的执行价格——可执行操作由规则方案生成，经理文本只解释并复用其点位。
-    anchors = _plan_price_anchors(dims.get("plan"))
-    result["decision_matrix"] = [
-        row for row in (result.get("decision_matrix") or [])
-        if _directive_prices_match_plan(
-            " ".join(str(row.get(key) or "") for key in ("action", "price_range", "rationale")),
-            anchors, strict=True,
-        )
-    ]
+    # 可执行动作及触发条件由规则作战计划统一生成（issue #39 终局语义）：
+    # 经理矩阵不采信，决策表直接采用规则行（含价格与动作）。
+    if complete:
+        result["decision_matrix"] = _rule_decision_matrix(dims.get("plan"))
+    # 经理叙事不承载执行价位：执行词邻近出现价格的条目/章节丢弃，回退规则叙述
     for key in ("thesis_points", "money_paths", "risk_matrix"):
-        kept_items = []
-        for item in (result.get(key) or []):
-            text = " ".join(str(v) for v in (item or {}).values())
-            if _directive_prices_match_plan(text, anchors):
-                kept_items.append(item)
-        result[key] = kept_items
-    # 全部节叙事（含技术章节等七维正文）同一边界：违规节清空，回退研究员叙述
+        result[key] = [
+            item for item in (result.get(key) or [])
+            if not _prose_carries_directive_price(" ".join(str(v) for v in (item or {}).values()))
+        ]
     result["section_narratives"] = {
-        section: (value if _directive_prices_match_plan(value, anchors) else "")
+        section: ("" if _prose_carries_directive_price(value) else value)
         for section, value in (manager.get("section_narratives") or {}).items()
         if complete and ((section in dims and dims[section].status == "ok")
                          or section in SECTION_FALLBACK_TITLES)
@@ -167,12 +144,7 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
         if evidence is not None:
             result["section_narratives"][section] = evidence.narrative
             result["section_titles"][section] = SECTION_FALLBACK_TITLES[section]
-    # 投资正文/内容概括含矛盾或角色错位执行指令时丢弃，回退模板已有的规则叙述链
-    investment_narrative = result["section_narratives"].get("investment")
-    if investment_narrative and not _directive_prices_match_plan(investment_narrative, anchors):
-        result["section_narratives"]["investment"] = ""
-    summary = result.get("executive_summary")
-    if summary and not _directive_prices_match_plan(summary, anchors):
+    if result.get("executive_summary") and _prose_carries_directive_price(result["executive_summary"]):
         result["executive_summary"] = ""
     return result
 
@@ -222,8 +194,9 @@ _STYLE_RULES = (
     "先验 0.27、Edge -0.23 等标签或数值；这些是内部状态，不是投资论点。\n"
     "12. 结论段必须给出斩钉截铁的操作判断：现在买不买、等什么价格或事件才买、仓位上限多少、"
     "跌破哪里就放弃；禁止给出「中性偏谨慎」「谨慎乐观」这类没有操作含义的话。\n"
-    "13. 执行指令价格只能复用 dims.plan 作战计划已给出的点位（首批/补仓/止损/止盈）；"
-    "计划无点位时只描述状态与条件，不写任何买卖价格；买入、止损、止盈价位不得自拟或互换。\n"
+    "13. 正文与论点禁止出现任何执行价位（买入/建仓/止损/止盈/清仓等动作的具体价格）；"
+    "具体点位以报告作战计划表为准，正文只做定性解释（如「按作战计划触发条件执行」「等待回调触发」），"
+    "可引用现价、估值、量比等非执行数字。\n"
     "14. 只输出 JSON，不要输出任何 JSON 以外的内容。"
 )
 
@@ -354,27 +327,6 @@ def _clean_money_paths(value: Any) -> List[Dict[str, str]]:
             out.append({"name": name, "win_rate": win_rate, "playbook": playbook})
     return out
 
-
-def _clean_decision_matrix(value: Any) -> List[Dict[str, str]]:
-    """操作决策矩阵：persona（持仓状态）/action（指令）/price_range/rationale。
-
-    对标"按持仓状态分行"的决策表；不超过 5 行。
-    """
-    if not isinstance(value, list):
-        return []
-    out: List[Dict[str, str]] = []
-    for item in value[:5]:
-        if not isinstance(item, dict):
-            continue
-        persona = _clean_header(item.get("persona"), limit=16)
-        action = _clean_narrative(item.get("action"))[:40]
-        price_range = _clean_narrative(item.get("price_range"))[:24]
-        rationale = _clean_narrative(item.get("rationale"))[:120]
-        if persona and action:
-            out.append(
-                {"persona": persona, "action": action, "price_range": price_range, "rationale": rationale}
-            )
-    return out
 
 
 def _clean_scenario_triggers(value: Any) -> Dict[str, str]:
@@ -539,7 +491,7 @@ def generate_manager_writeup(
     except Exception as exc:  # noqa: BLE001 - 单波失败只降级
         logger.warning("[DualTrack] 经理终稿波A失败: %s", exc)
 
-    # 波 B：主干四节叙事 + 首屏论点 + 风险矩阵 + 赚钱路径/决策矩阵/情景触发/维度定性
+    # 波 B：主干四节叙事 + 首屏论点 + 风险矩阵 + 赚钱路径/情景触发/维度定性（决策表由规则生成，模型不产出）
     try:
         parsed = _call_wave(
             llm_adapter,
@@ -552,9 +504,7 @@ def generate_manager_writeup(
             "{\"risk\": \"…(≤30字)\", \"impact\": \"…(≤40字影响路径)\", \"trigger\": \"…(≤40字可验证阈值，如 毛利率破28%/跌破31.3)\"}"
             " × ≤5 条], \"money_paths\": ["
             "{\"name\": \"…(≤16字路径名，如 财报验证驱动)\", \"win_rate\": \"…(胜率估计，如 约50%)\", \"playbook\": \"…(触发条件+目标位，≤80字)\"}"
-            " × ≤3 条，按确定性降序], \"decision_matrix\": ["
-            "{\"persona\": \"…(持仓状态，如 空仓者/持仓高位)\", \"action\": \"…(指令)\", \"price_range\": \"…\", \"rationale\": \"…(≤60字)\"}"
-            " × ≤5 行]（price_range 只能使用 dims.plan 作战计划已给出的点位价格；计划无点位时只写状态与动作，不写价格）, \"scenario_triggers\": {"
+            " × ≤3 条，按确定性降序], \"scenario_triggers\": {"
             "\"optimistic\": \"…(可验证触发条件)\", \"neutral\": \"…\", \"pessimistic\": \"…\"}}",
             _wave_b_facts(stock_name, stock_code, dims),
         )
@@ -567,7 +517,6 @@ def generate_manager_writeup(
         out["thesis_points"] = _clean_thesis_points(parsed.get("thesis_points"))
         out["risk_matrix"] = _clean_risk_matrix(parsed.get("risk_matrix"))
         out["money_paths"] = _clean_money_paths(parsed.get("money_paths"))
-        out["decision_matrix"] = _clean_decision_matrix(parsed.get("decision_matrix"))
         out["scenario_triggers"] = _clean_scenario_triggers(parsed.get("scenario_triggers"))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 经理终稿波B失败: %s", exc)

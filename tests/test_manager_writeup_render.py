@@ -225,8 +225,10 @@ class TestGenerateManagerWriteup:
         # 波 B 扩展：赚钱路径/决策矩阵/情景触发
         assert len(out["money_paths"]) == 3
         assert all(p["name"] and p["playbook"] for p in out["money_paths"])
-        assert len(out["decision_matrix"]) == 3
-        assert all(r["persona"] and r["action"] for r in out["decision_matrix"])
+        # 决策表由规则 plan 生成（_dims 默认无点位 → 观察行），模型矩阵不采信
+        assert len(out["decision_matrix"]) == 1
+        assert out["decision_matrix"][0]["action"] == "观察"
+        assert out["decision_matrix"][0]["price_range"] == "—"
         assert set(out["scenario_triggers"]) == {"optimistic", "neutral", "pessimistic"}
         # 波 A 扩展：六维小计定性
         assert out["dim_verdicts"]["基本面"] == "基本面定性"
@@ -262,7 +264,12 @@ class TestGenerateManagerWriteup:
 
     def test_llm_down_returns_empty(self):
         out = generate_manager_writeup(_WaveLLM(raise_all=True), "贵州茅台", "600519", _dims(), [])
-        assert out == {
+        # 决策表由规则作战计划生成（观察行），不依赖模型输出
+        assert out["decision_matrix"] and out["decision_matrix"][0]["action"] == "观察"
+        assert out["decision_matrix"][0]["price_range"] == "—"
+        assert {
+            k: v for k, v in out.items() if k != "decision_matrix"
+        } == {
             "title_angle": "",
             "executive_summary": "",
             "section_titles": {"market": "盘面解读", "valuation": "估值锚从哪里来"},
@@ -270,7 +277,6 @@ class TestGenerateManagerWriteup:
             "thesis_points": [],
             "risk_matrix": [],
             "money_paths": [],
-            "decision_matrix": [],
             "scenario_triggers": {},
             "dim_verdicts": {},
         }
@@ -735,7 +741,8 @@ class TestSellSideView:
         assert "## 三条赚钱路径（按确定性排序）" in md
         assert "**财报验证驱动**（胜率 约50%）" in md
         assert "**按持仓状态的操作决策**" in md
-        assert "| 空仓者 | 现在不买，挂左侧试仓单 | 27.5 |" in md
+        assert "| 空仓/未入场 | 条件买入 | 27.5 / 26.5 |" in md
+        assert "| 已持仓（参考） | 止损/止盈纪律 | 24 / 33 |" in md
         # 台账编号
         assert "T1-0" in md and "T1-L" in md and "T1-R" in md and "T1-SL" in md and "T1-S1" in md
         # 情景触发条件列
@@ -811,8 +818,8 @@ def test_manager_cannot_rewrite_degraded_or_skipped_dimension_as_valid_conclusio
     assert "主力净买入1亿元" not in rendered and "资金单位未确认" in rendered
 
 
-def test_manager_decision_matrix_cannot_restore_contradictory_levels():
-    """审查 P1-1：经理改写不得在操作表恢复与规则方案矛盾的买卖点位。"""
+def test_decision_matrix_is_rule_generated_not_manager_rewritten():
+    """终局语义：决策表由规则 plan 生成，经理矩阵（含矛盾点位/自拟价）整体不采信。"""
     from src.schemas.report_schema import SniperPoints
 
     dims = _dims()
@@ -823,84 +830,37 @@ def test_manager_decision_matrix_cannot_restore_contradictory_levels():
         "decision_matrix": [
             {"persona": "空仓者", "action": "买入", "price_range": "133.16", "rationale": "回调到位分批买入"},
             {"persona": "持仓者", "action": "止损", "price_range": "跌破148.66", "rationale": "经理自拟止损线"},
-            {"persona": "观望者", "action": "等待企稳", "price_range": "", "rationale": "无价格指令"},
+            # 第五轮 Standards 原始反例：action/price_range 裸 8.5
+            {"persona": "空仓者", "action": "买入", "price_range": "8.5", "rationale": "单价买入"},
         ]
     }
     view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
     rendered = render_markdown(view)
-    # 方案内点位（133.16）与无价格行保留；方案外止损线（148.66）不得回到操作表
-    assert "133.16" in rendered
-    assert "等待企稳" in rendered
+    # 规则行（方案点位）呈现；经理行的任意价格（含 8.5、148.66）不进入操作表
+    assert "| 空仓/未入场 | 条件买入 | 133.16 / 128.66 |" in rendered
+    assert "| 已持仓（参考） | 止损/止盈纪律 | 119.66 / 189.15 |" in rendered
     assert "148.66" not in rendered
+    assert "8.5" not in rendered
+    assert "回调到位分批买入" not in rendered  # 经理 rationale 不采信
 
 
-def test_manager_decision_matrix_no_prices_when_plan_is_watch_only():
-    """观察方案（无点位）下，决策行不得携带任何价格指令。"""
-    dims = _dims()  # plan 默认 sniper_points=None（观察）
+def test_rule_decision_matrix_watch_only_plan():
+    """观察方案：规则生成单行观察决策（无任何价格指令），经理自拟价不出现。"""
+    dims = _dims()  # plan 默认无点位
     manager = {
         "decision_matrix": [
             {"persona": "空仓者", "action": "买入", "price_range": "100.5", "rationale": "自拟买点"},
-            {"persona": "观望者", "action": "观察", "price_range": "", "rationale": "保留观察"},
         ]
     }
     view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
     rendered = render_markdown(view)
     assert "自拟买点" not in rendered
-    assert "保留观察" in rendered
+    assert "100.5" not in rendered
+    assert "| 所有持仓状态 | 观察 | — |" in rendered
 
 
-def test_manager_price_check_covers_action_field_and_role_mismatch():
-    """审查 P1：矛盾句放进 action 字段、或买入价与止损价互换，都不得进入最终报告。"""
-    from src.schemas.report_schema import SniperPoints
-
-    dims = _dims()
-    dims["plan"] = dims["plan"].model_copy(
-        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
-    )
-    manager = {
-        "decision_matrix": [
-            # 反例 a：矛盾指令藏在 action 字段（35 是止盈锚，被当买入价）
-            {"persona": "空仓者", "action": "35 附近买入", "price_range": "", "rationale": "看突破"},
-            # 反例 b：把止损价当买入价（角色互换）
-            {"persona": "空仓者", "action": "买入", "price_range": "24", "rationale": "低价买入"},
-            # 合规：止损句用止损锚
-            {"persona": "持仓者", "action": "止损", "price_range": "跌破24", "rationale": "纪律执行"},
-            # 合规：买入句用首批锚
-            {"persona": "空仓者", "action": "买入", "price_range": "30", "rationale": "回调到位"},
-        ]
-    }
-    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
-    rendered = render_markdown(view)
-    assert "看突破" not in rendered  # 角色错位行被丢弃
-    assert "低价买入" not in rendered  # 止损价当买价被丢弃
-    assert "纪律执行" in rendered
-    assert "回调到位" in rendered
-
-
-def test_manager_investment_narrative_contradictory_directive_dropped():
-    """审查 P1：投资正文/内容概括含与方案矛盾的执行指令时丢弃，回退规则叙述。"""
-    from src.schemas.report_schema import SniperPoints
-
-    dims = _dims()
-    dims["plan"] = dims["plan"].model_copy(
-        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
-    )
-    dims["signal"] = dims["signal"].model_copy(update={"narrative": "规则信号叙述：观察为主。"})
-    manager = {
-        "section_narratives": {
-            "investment": "回调至 30 买入；跌破 48 止损，纪律第一。",  # 48 非止损锚
-        },
-        "executive_summary": "现价 31.92 观察，等待回落至 30 再买入。",  # 合规叙事
-    }
-    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
-    rendered = render_markdown(view)
-    assert "跌破 48" not in rendered  # 矛盾叙事被丢弃
-    assert "规则信号叙述" in rendered  # 回退规则叙述
-    assert "等待回落至 30 再买入" in rendered  # 合规内容概括保留
-
-
-def test_unified_boundary_covers_all_prose_outlets():
-    """第四轮审查 P1：同一矛盾指令不得从赚钱路径/核心论点/技术章节等出口进入最终报告。"""
+def test_prose_rejects_any_directive_price_including_reused_plan_levels():
+    """终局语义：经理正文不承载执行价位——即使价格恰为方案点位（含第五轮反例「跌破35清仓」）。"""
     from src.schemas.report_schema import SniperPoints
 
     dims = _dims()
@@ -909,31 +869,35 @@ def test_unified_boundary_covers_all_prose_outlets():
     )
     manager = {
         "thesis_points": [
-            {"header": "合规论点", "body": "回落至 30 买入并在 24 止损，纪律执行。这是方案复用。"},
-            {"header": "矛盾论点", "body": "回调至30买入，跌破48止损。这是经理自拟点位。"},
+            {"header": "定性论点", "body": "赔率不足，按作战计划触发条件执行，等待量能确认。"},
+            {"header": "复用论点", "body": "回落至 30 买入并在 24 止损，纪律执行。"},
         ],
         "money_paths": [
-            {"name": "路径甲", "win_rate": "约50%", "playbook": "三季报后回调至 30 买入（方案点位）。"},
-            {"name": "路径乙", "win_rate": "约60%", "playbook": "回调至30买入，跌破48止损，持有至 35。"},
+            {"name": "路径甲", "win_rate": "约50%", "playbook": "三季报验证后按计划触发执行，不追高。"},
+            {"name": "路径乙", "win_rate": "约60%", "playbook": "30元买入，跌破35元清仓。"},  # 第五轮 P1 反例
         ],
         "section_narratives": {
-            "technical": "技术形态上回调至30买入，跌破48止损；MACD 金叉。",  # 矛盾指令进技术正文
-            "capital": "资金面正常描述：主力净流入，量比 1.5，现价 31.92。",  # 无指令叙事
+            "technical": "技术形态上回调至30买入，跌破48止损；MACD 金叉。",
+            "capital": "资金面正常描述：主力净流入，量比 1.5，现价 31.92。",
         },
+        "executive_summary": "现价 31.92 观察，等待触发条件；按作战计划执行。",
     }
     view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
     rendered = render_markdown(view)
-    assert "跌破48" not in rendered and "跌破 48" not in rendered  # 矛盾指令全出口拦截
-    assert "经理自拟点位" not in rendered  # 矛盾论点整条丢弃
-    assert "路径乙" not in rendered  # 矛盾路径整条丢弃
-    assert "这是方案复用" in rendered  # 合法多动作句不误删（30买入+24止损均属方案）
-    assert "路径甲" in rendered
-    assert "MACD 金叉" not in rendered  # 技术节含矛盾指令 → 整节清空回退研究员叙述
-    assert "量比 1.5" in rendered  # 无指令叙事（量比/现价）不受影响
+    # 执行价位（无论矛盾 48、角色错位 35、还是合法复用 30/24）一律不进入正文
+    assert "跌破48" not in rendered and "跌破 48" not in rendered
+    assert "跌破35" not in rendered and "跌破 35" not in rendered
+    assert "回落至 30 买入" not in rendered
+    assert "这是经理自拟" not in rendered
+    assert "路径乙" not in rendered  # 反例路径丢弃
+    assert "路径甲" in rendered  # 定性路径保留
+    assert "按作战计划触发条件执行" in rendered  # 定性论点保留
+    assert "量比 1.5" in rendered  # 无指令叙事不受影响
+    assert "MACD 金叉" not in rendered  # 技术节含执行价位 → 整节回退
 
 
 def test_price_recognition_edges():
-    """第四轮 Standards 观察：个位数单价、负价格、均线误提取。"""
+    """第四/五轮 Standards：个位数单价（裸 8.5）、负价格、均线误提取。"""
     from src.schemas.report_schema import SniperPoints
 
     dims = _dims()
@@ -941,20 +905,22 @@ def test_price_recognition_edges():
         update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
     )
     manager = {
-        "executive_summary": "现价 31.92 观察，100日均线拐头，量比 1.5 正常。",  # 无指令、无价格误提取
+        "executive_summary": "现价 31.92 观察，100日均线拐头，量比 1.5 正常。",
         "thesis_points": [
-            {"header": "负价格", "body": "挂单 -133.16 买入，异常价位。"},  # 负价格不得当作合法锚
+            {"header": "负价格", "body": "挂单 -133.16 买入，异常价位。"},
+            {"header": "裸单价", "body": "8.5 买入是经理自拟单价。"},
         ],
     }
     view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
     rendered = render_markdown(view)
-    assert "100日均线拐头" in rendered  # 均线数字不再被误提取成价格
+    assert "100日均线拐头" in rendered  # 均线数字不误提取
     assert "量比 1.5" in rendered
-    assert "异常价位" not in rendered  # 负价格指令条目丢弃
+    assert "异常价位" not in rendered  # 负价格条目丢弃
+    assert "经理自拟单价" not in rendered  # 裸个位数单价（无"元"）同样拦下
 
     watch_dims = _dims()  # 观察方案：无任何锚
     watch_manager = {
-        "executive_summary": "无方案锚点时现价 8.5元买入 是经理自拟指令。",
+        "executive_summary": "无方案锚点时 8.5元买入 是经理自拟指令。",
     }
     view2 = build_view("fixture", "300260", "2026-10-13", [], watch_dims, [], manager=watch_manager)
-    assert "经理自拟指令" not in render_markdown(view2)  # 观察方案下个位数单价指令拦下
+    assert "经理自拟指令" not in render_markdown(view2)
