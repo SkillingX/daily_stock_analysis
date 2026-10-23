@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 六维补充评分不再覆盖已有研究员评分：LLM 只补真正缺项、失败或返回空时保留 80/76/72 等已采用值，缺口文案区分模型不可用、调用失败、输出截断、响应无效与缺依据句，不推断欠费；评分事实改为整键有界序列化（恒为完整合法 JSON，省略字段明示），单次调用超时继承全局配置上限并受研究剩余预算限制，预算耗尽不再发请求，移除写死的 90 秒常量。
 - [修复] 作战计划统一条件买入方案的计算语境：止损改为相对首批入场锚（MA20/1.5×ATR 孰近下沿）计算，不再与现价锚混用；入场、补仓、止损、止盈不满足同一多头方案价格关系时明确保留观察、不输出可执行点位，入场计划与风控文案区分未持仓条件买入与已有持仓参考边界。
 - [修复] 股权资料缺口兼容模型返回的 item 对象并保留可识别文字；供应商缺口在校验后统一合并，避免整维校验失败丢失有效研究，真实缺口仍披露并停用评分。
 - [改进] 默认 MiniMax 模型切换为 M3.1-Flash，全局请求按 MINIMAX_REASONING_EFFORT（默认 low）设置推理强度并保持 thinking 开启；基本面专项研究预算默认值和上限放宽到 300 秒，页面等待 330 秒，超时保留部分报告并刷新历史，历史刷新失败不再误报生成失败。
