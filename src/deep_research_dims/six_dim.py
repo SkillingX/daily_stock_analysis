@@ -228,30 +228,63 @@ def _scoring_timeout() -> float:
     return cap
 
 
-def _bounded_facts_json(facts: Dict[str, Any], limit: int = 2500) -> tuple[str, List[str]]:
-    """有界序列化：超预算丢弃整键，dict 键降级为子键裁剪，输出恒为完整合法 JSON。
+# 待补指标 → fundamental 相关子键（按需选取：缺哪类评分就优先保留其证据字段）
+_INDICATOR_FACT_PRIORITY: Dict[str, tuple] = {
+    "equity_mgmt": ("research",),
+    "institute_view": ("research", "institution_holding_change"),
+    "community_view": ("research",),
+    "liquidity": ("sector_rankings", "research"),
+    "risk_appetite": ("sector_rankings", "research"),
+}
 
-    返回 (JSON 块, 被省略字段名，形如 "fundamental.research")；键/子键序即保留优先级。
-    大对象按子键保留前缀字段（估值/财务核心字段靠前），避免相关证据整块丢失。
+
+def _bounded_facts_json(
+    facts: Dict[str, Any], limit: int = 2500, priority: tuple = ()
+) -> tuple[str, List[str]]:
+    """有界序列化：超预算丢弃整键，dict 键降级为子键（固定两层），输出恒为完整合法 JSON。
+
+    返回 (JSON 块, 被省略字段名，形如 "fundamental.research.financial_series")。
+    ``priority`` 为待补指标相关子键：fundamental 下钻时排最前优先保留；
+    其余子键按序列化长度升序累加，小而关键的证据（控制人、公告来源）天然先于
+    大块序列（financial_series）保留（issue #41：不建设通用递归裁剪器）。
     """
     def _encode(obj: Dict[str, Any]) -> str:
         return json.dumps(obj, ensure_ascii=False, default=str)
 
-    kept: Dict[str, Any] = {}
+    def _ordered(items: Any) -> list:
+        head = [kv for kv in items if kv[0] in priority]
+        tail = sorted(
+            (kv for kv in items if kv[0] not in priority),
+            key=lambda kv: len(_encode(kv[1])),
+        )
+        return head + tail
+
     omitted: List[str] = []
+    kept: Dict[str, Any] = {}
     for key, value in facts.items():
         if kept and len(_encode({**kept, key: value})) > limit:
-            if isinstance(value, dict) and value:
-                sub_kept: Dict[str, Any] = {}
-                for sub_key, sub_value in value.items():
-                    if len(_encode({**kept, key: {**sub_kept, sub_key: sub_value}})) <= limit:
-                        sub_kept[sub_key] = sub_value
-                    else:
-                        omitted.append(f"{key}.{sub_key}")
-                if sub_kept:
-                    kept[key] = sub_kept
+            if not (isinstance(value, dict) and value):
+                omitted.append(key)
                 continue
-            omitted.append(key)
+            sub_kept: Dict[str, Any] = {}
+            for sub_key, sub_value in _ordered(value.items()):
+                if len(_encode({**kept, key: {**sub_kept, sub_key: sub_value}})) <= limit:
+                    sub_kept[sub_key] = sub_value
+                    continue
+                # 第二层：大 dict 子键（如 research.financial_series）按序保留小字段
+                inner: Dict[str, Any] = {}
+                if isinstance(sub_value, dict) and sub_value:
+                    for inner_key, inner_value in _ordered(sub_value.items()):
+                        if len(_encode({**kept, key: {**sub_kept, sub_key: {**inner, inner_key: inner_value}}})) <= limit:
+                            inner[inner_key] = inner_value
+                        else:
+                            omitted.append(f"{key}.{sub_key}.{inner_key}")
+                if inner:
+                    sub_kept[sub_key] = inner
+                    continue
+                omitted.append(f"{key}.{sub_key}")
+            if sub_kept:
+                kept[key] = sub_kept
             continue
         kept[key] = value
     return _encode(kept), omitted
@@ -299,7 +332,11 @@ def _score_llm_indicators(
         "intel_brief": intel_summary or None,
         "limitations": ctx.limitations,
     }
-    facts_json, omitted = _bounded_facts_json(facts)
+    # 按待补指标选取 fundamental 相关子键：缺哪类评分就优先保留其证据字段
+    priority = tuple(dict.fromkeys(
+        key for ind_id in missing for key in _INDICATOR_FACT_PRIORITY.get(ind_id, ())
+    ))
+    facts_json, omitted = _bounded_facts_json(facts, priority=priority)
     user_content = f"## 事实\n```json\n{facts_json}\n```"
     if omitted:
         user_content += f"\n（因长度上限省略字段：{', '.join(omitted)}；剩余事实不足以评分的指标不要评分）"

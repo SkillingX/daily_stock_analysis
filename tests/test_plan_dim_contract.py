@@ -127,6 +127,33 @@ class TestPlanDegradation:
         nan_sniper = SniperPoints(ideal_buy=float("nan"), secondary_buy=1.0, stop_loss=0.5, take_profit=2.0)
         assert sniper_relation_violation(nan_sniper) is not None
 
+    def test_flat_history_atr_zero_degrades_not_crashes(self):
+        """审查反例：15 根平价日线 ATR=0 触发契约 ViolationError → 降级观察而非异常。"""
+        ctx = SharedContext("fixture", "fixture", "2026-10-23")
+        ctx.quote = {"price": 100.0}
+        ctx.history = [
+            {"high": 100.0, "low": 100.0, "close": 100.0} for _ in range(15)
+        ]
+        plan = build_plan_dim(ctx, _payload(100.0, support=95.0), "观察")
+        assert plan.status == "degraded"
+        assert "ATR" in (plan.degraded_reason or "")
+
+    def test_nan_history_degrades_not_crashes(self):
+        ctx = SharedContext("fixture", "fixture", "2026-10-23")
+        ctx.quote = {"price": 100.0}
+        history = _ctx(100.0).history
+        history[3] = {"high": float("nan"), "low": 99.0, "close": 100.0}
+        ctx.history = history
+        plan = build_plan_dim(ctx, _payload(100.0, support=95.0), "观察")
+        assert plan.status == "degraded"
+
+    def test_missing_high_column_degrades_not_crashes(self):
+        ctx = SharedContext("fixture", "fixture", "2026-10-23")
+        ctx.quote = {"price": 100.0}
+        ctx.history = [{"low": 99.0, "close": 100.0} for _ in range(15)]
+        plan = build_plan_dim(ctx, _payload(100.0, support=95.0), "观察")
+        assert plan.status == "degraded"
+
 
 class TestPlanWording:
     def test_valid_plan_marks_conditional_entry(self):
