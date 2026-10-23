@@ -31,15 +31,11 @@ def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
                for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"))
 
 
-_PLAN_PRICE_RE = re.compile(
-    r"(?<![\d.-])(-?(?:\d{2,6}(?:\.\d+)?|\d\.\d+))(?!\s*(?:\d|日线|周线|均线|日|周|线|分|%|点|倍|亿|万))"
-)
 _DIRECTIVE_WORDS = (
-    "买入", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单买", "吸纳",
-    "止损", "跌破", "止盈", "卖出", "减仓", "兑现", "清仓",
+    "买", "卖", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单", "吸纳",
+    "止损", "跌破", "止盈", "减仓", "兑现", "清仓", "入场", "进场", "离场", "平仓",
+    "增持", "减持", "仓位", "退出",
 )
-# 执行词与价格的关联窗口（字符）：窗口内即视为该价格构成经理自拟指令
-_DIRECTIVE_PROXIMITY = 6
 
 
 def _rule_decision_matrix(plan: Any) -> List[Dict[str, str]]:
@@ -83,28 +79,13 @@ def _rule_decision_matrix(plan: Any) -> List[Dict[str, str]]:
     ]
 
 
-def _prose_carries_directive_price(text: str) -> bool:
-    """经理叙事是否承载执行价位：执行词邻近出现价格即不可采信（issue #39）。
+def _prose_carries_directive(text: str) -> bool:
+    """保守拒绝含交易动作的经理内容块，不推断价格距离或自然语言角色。
 
-    可执行指令由规则方案承载（决策表/操作表/行动清单）；经理正文只解释或
-    引用其结果——定性解释（"按作战计划执行""等待触发条件"）不受影响，
-    出现具体买卖/止损/止盈价位的叙事块整体丢弃，回退规则叙述。
-    负价格出现在任何位置都视为异常。
+    操作只采用规则计划；即使是在转述计划或历史交易，也回退既有研究员正文。
+    事实数字本身不触发拒绝，原始研究资料与规则表不会被此边界改写。
     """
-    text = str(text or "")
-    for match in _PLAN_PRICE_RE.finditer(text):
-        raw = match.group(1)
-        try:
-            price = float(raw)
-        except ValueError:
-            continue
-        if price < 0:
-            return True
-        before = text[max(0, match.start() - _DIRECTIVE_PROXIMITY) : match.start()]
-        after = text[match.end() : match.end() + _DIRECTIVE_PROXIMITY]
-        if any(word in before or word in after for word in _DIRECTIVE_WORDS):
-            return True
-    return False
+    return any(word in str(text or "") for word in _DIRECTIVE_WORDS)
 
 
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
@@ -122,14 +103,14 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
     # 经理矩阵不采信，决策表直接采用规则行（含价格与动作）。
     if complete:
         result["decision_matrix"] = _rule_decision_matrix(dims.get("plan"))
-    # 经理叙事不承载执行价位：执行词邻近出现价格的条目/章节丢弃，回退规则叙述
+    # 经理只解释事实；交易动作块整块回退，不维护平行的指令/价格解析器。
     for key in ("thesis_points", "money_paths", "risk_matrix"):
         result[key] = [
             item for item in (result.get(key) or [])
-            if not _prose_carries_directive_price(" ".join(str(v) for v in (item or {}).values()))
+            if not _prose_carries_directive(" ".join(str(v) for v in (item or {}).values()))
         ]
     result["section_narratives"] = {
-        section: ("" if _prose_carries_directive_price(value) else value)
+        section: ("" if _prose_carries_directive(value) else value)
         for section, value in (manager.get("section_narratives") or {}).items()
         if complete and ((section in dims and dims[section].status == "ok")
                          or section in SECTION_FALLBACK_TITLES)
@@ -138,14 +119,21 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
         section: value for section, value in (manager.get("section_titles") or {}).items()
         if complete and ((section in dims and dims[section].status == "ok")
                          or section in SECTION_FALLBACK_TITLES)
+        and not _prose_carries_directive(value)
     }
     for section, dim in (("market", "data"), ("valuation", "scenarios")):
         evidence = dims.get(dim)
         if evidence is not None:
             result["section_narratives"][section] = evidence.narrative
             result["section_titles"][section] = SECTION_FALLBACK_TITLES[section]
-    if result.get("executive_summary") and _prose_carries_directive_price(result["executive_summary"]):
-        result["executive_summary"] = ""
+    for key in ("title_angle", "executive_summary"):
+        if _prose_carries_directive(result.get(key, "")):
+            result[key] = ""
+    for key in ("scenario_triggers", "dim_verdicts"):
+        result[key] = {
+            name: value for name, value in (result.get(key) or {}).items()
+            if not _prose_carries_directive(value)
+        }
     return result
 
 # 主干节 key → 规则回退标题（LLM 缺席时模板用）
@@ -176,12 +164,12 @@ _STYLE_RULES = (
     "3. 节标题必须是斩钉截铁的判断句（例如「不是 X，而是 Y」「为什么 X」「X 背后的 Y」），"
     "不超过 40 字，标题内部不要用冒号（用逗号或顿号代替）。\n"
     "4. 每节叙事按四段式写：先给明确判断 → 再讲机制（为什么会这样）→ 引用数据支撑 → "
-    "最后给触发条件（什么情况会让这个判断失效，用「跌破/站上/增速低于/毛利率破」这类可验证的触发词，"
+    "最后给研究判断的验证条件（例如营收增速低于或毛利率低于某个已知财务阈值，"
     "禁止用「若」「如果」开头的假设句式）。\n"
     "5. 禁用模糊词（零容忍）：可能、或许、大概、也许、一定程度上、或将、有望、预期向好、"
     "存在不确定性、需谨慎、建议关注、值得关注、拭目以待。这些词一个都不允许出现。\n"
     "6. 每个判断必须用确定性动词收口：是/不是、会/不会、已经/尚未、强/弱、值得/不值得、"
-    "买/卖/持有/观察、低估/高估、兑现/未兑现、拐点已到/拐点未到。\n"
+    "观察、低估/高估、拐点已到/拐点未到。\n"
     "7. 观点必须独有、有差异化认知：不要重复市场共识（「国产替代空间广阔」「AI 带来增长」这类"
     "所有人都会说的话），必须给出你自己基于输入事实推出的、市场尚未充分定价的判断"
     "（例如「市场按晶闸管给估值，但增长引擎已经切换成 MOSFET，这是定价错位」）。\n"
@@ -192,11 +180,12 @@ _STYLE_RULES = (
     "（例如：年报披露后看分产品收入拆分；机构持仓季报后看基金进出名单），不要只说缺什么。\n"
     "11. 不要泄露内部流水线状态：禁止出现 score_journal、recommendation_journal、GR8/GR9、"
     "先验 0.27、Edge -0.23 等标签或数值；这些是内部状态，不是投资论点。\n"
-    "12. 结论段必须给出斩钉截铁的操作判断：现在买不买、等什么价格或事件才买、仓位上限多少、"
-    "跌破哪里就放弃；禁止给出「中性偏谨慎」「谨慎乐观」这类没有操作含义的话。\n"
-    "13. 正文与论点禁止出现任何执行价位（买入/建仓/止损/止盈/清仓等动作的具体价格）；"
-    "具体点位以报告作战计划表为准，正文只做定性解释（如「按作战计划触发条件执行」「等待回调触发」），"
-    "可引用现价、估值、量比等非执行数字。\n"
+    "12. 结论段解释研究依据及下一项待验证的事实；操作及仓位条件只引用报告规则计划，"
+    "不得自行生成或重复转述交易指令。\n"
+    "13. 全部经理字段（含标题、小计、风险、情景和路径）只作事实分析与定性解释，"
+    "不写交易动作或风控执行条件（包括买、卖、建仓、止损、止盈、清仓等表述），"
+    "无论是否带价格、是否与方案一致，都不重复；统一写「操作条件见规则作战计划」。"
+    "可引用现价、估值、量比等事实数字，财务阈值不等于交易条件。\n"
     "14. 只输出 JSON，不要输出任何 JSON 以外的内容。"
 )
 
@@ -294,7 +283,7 @@ def _clean_thesis_points(value: Any) -> List[Dict[str, str]]:
 
 
 def _clean_risk_matrix(value: Any) -> List[Dict[str, str]]:
-    """风险矩阵清洗：risk/impact/trigger 三键；trigger 必须可验证（含数字或价位词）。"""
+    """风险矩阵：保留事实风险、影响和研究判断验证条件，不生成交易指令。"""
     if not isinstance(value, list):
         return []
     out: List[Dict[str, str]] = []
@@ -310,7 +299,7 @@ def _clean_risk_matrix(value: Any) -> List[Dict[str, str]]:
 
 
 def _clean_money_paths(value: Any) -> List[Dict[str, str]]:
-    """三条赚钱路径：name（路径名）/win_rate（胜率估计）/playbook（触发+目标）。
+    """三条研究路径：name（路径名）/win_rate（胜率估计）/playbook（验证事实）。
 
     对标卖方"按确定性排序的路径表"；不超过 3 条。
     """
@@ -501,9 +490,9 @@ def generate_manager_writeup(
             + "}, \"thesis_points\": ["
             "{\"header\": \"…(≤20字斩钉截铁判断句)\", \"body\": \"…(3-5句，第一句必须含数字)\"}"
             " × 3 条], \"risk_matrix\": ["
-            "{\"risk\": \"…(≤30字)\", \"impact\": \"…(≤40字影响路径)\", \"trigger\": \"…(≤40字可验证阈值，如 毛利率破28%/跌破31.3)\"}"
+            "{\"risk\": \"…(≤30字)\", \"impact\": \"…(≤40字影响路径)\", \"trigger\": \"…(≤40字事实验证条件，如 毛利率低于已披露阈值，不写交易条件)\"}"
             " × ≤5 条], \"money_paths\": ["
-            "{\"name\": \"…(≤16字路径名，如 财报验证驱动)\", \"win_rate\": \"…(胜率估计，如 约50%)\", \"playbook\": \"…(触发条件+目标位，≤80字)\"}"
+            "{\"name\": \"…(≤16字路径名，如 财报验证驱动)\", \"win_rate\": \"…(胜率估计，如 约50%)\", \"playbook\": \"…(研究验证事件与依据，≤80字；操作条件只引用规则作战计划)\"}"
             " × ≤3 条，按确定性降序], \"scenario_triggers\": {"
             "\"optimistic\": \"…(可验证触发条件)\", \"neutral\": \"…\", \"pessimistic\": \"…\"}}",
             _wave_b_facts(stock_name, stock_code, dims),
