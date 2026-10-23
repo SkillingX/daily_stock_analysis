@@ -154,6 +154,72 @@ class HistoryLoaderTestCase(unittest.TestCase):
         self.assertIsNone(df)
         self.assertEqual(source, "none")
 
+    # ------------------------------------------------------------------
+    # min_records：长历史请求不得被短缓存误命中（issue #42）
+    # ------------------------------------------------------------------
+    @patch("src.services.history_loader._get_fetcher_manager")
+    @patch("src.storage.get_db")
+    def test_min_records_misses_short_cache_and_falls_back(self, mock_get_db, mock_get_fm):
+        from src.services.history_loader import load_history_df
+
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {
+            "date": "2026-04-17", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100,
+        }
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 260  # 只有最近 260 条
+        mock_get_db.return_value = mock_db
+
+        long_df = pd.DataFrame(
+            {"date": [f"2022-01-{(i % 28) + 1:02d}" for i in range(1050)], "close": range(1050)}
+        )
+        mock_fm = MagicMock()
+        mock_fm.get_daily_data.return_value = (long_df, "eastmoney")
+        mock_get_fm.return_value = mock_fm
+
+        df, source = load_history_df(
+            "600519", days=1200, target_date=date(2026, 4, 17), min_records=1000
+        )
+
+        self.assertEqual(source, "eastmoney")  # 260 条 < 1000 门槛 → 不命中 db_cache
+        self.assertEqual(len(df), 1050)
+        mock_fm.get_daily_data.assert_called_once_with("600519", days=1200)
+
+    @patch("src.storage.get_db")
+    def test_min_records_satisfied_by_db_keeps_cache_hit(self, mock_get_db):
+        from src.services.history_loader import load_history_df
+
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {
+            "date": "2026-04-17", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100,
+        }
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 1050
+        mock_get_db.return_value = mock_db
+
+        df, source = load_history_df(
+            "600519", days=1200, target_date=date(2026, 4, 17), min_records=1000
+        )
+
+        self.assertEqual(source, "db_cache")
+        self.assertEqual(len(df), 1050)
+
+    @patch("src.storage.get_db")
+    def test_legacy_threshold_unchanged_without_min_records(self, mock_get_db):
+        from src.services.history_loader import load_history_df
+
+        fake_bar = MagicMock()
+        fake_bar.to_dict.return_value = {
+            "date": "2026-04-17", "open": 10, "high": 11, "low": 9, "close": 10.5, "volume": 100,
+        }
+        mock_db = MagicMock()
+        mock_db.get_data_range.return_value = [fake_bar] * 40  # 40 条 ≥ 30 条旧门槛
+        mock_get_db.return_value = mock_db
+
+        df, source = load_history_df("600519", days=60, target_date=date(2026, 4, 17))
+
+        self.assertEqual(source, "db_cache")  # 短请求行为不变，不放大网络请求
+
 
 if __name__ == "__main__":
     unittest.main()

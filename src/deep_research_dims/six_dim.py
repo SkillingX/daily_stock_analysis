@@ -127,22 +127,65 @@ def _score_chanlun(ctx: SharedContext) -> Optional[Dict[str, Any]]:
         return None
 
 
+# 周线过滤需要 ≥200 周样本（derive_l0 契约），约 1000 个交易日；共享快照
+# 固定 260 根日线恒不足，不足时按需有界补取一次。
+_WEEKLY_MIN_DAILY_BARS = 1000
+
+
+def _weekly_close_series(ctx: SharedContext) -> Optional[Any]:
+    """按交易日期归并的周收盘（复用 compass 的 W-FRI 重采样，issue #42）。
+
+    每周取该周最后有效收盘（不再按 5 日收盘求和）；乱序按日期排序、
+    重复日期取后者、缺值剔除。共享快照不足 1050 根时在原加载能力内
+    补取一次（DB 优先），失败或不足返回 None，由调用方按缺口处理。
+    """
+    import pandas as pd
+
+    from src.services.compass.fetcher import derive_weekly_closes
+
+    records = list(ctx.history)
+    if len(records) < _WEEKLY_MIN_DAILY_BARS + 50:
+        from src.services.history_loader import load_history_df
+
+        try:
+            df, _src = load_history_df(
+                ctx.stock_code, days=1200, min_records=_WEEKLY_MIN_DAILY_BARS
+            )
+        except Exception as exc:  # noqa: BLE001 - 补取失败按样本不足处理
+            logger.warning("[SixDimV2] 周线历史补取失败 %s: %s", ctx.stock_code, exc)
+            return None
+        if df is None or df.empty or "close" not in getattr(df, "columns", []):
+            return None
+        records = df.to_dict(orient="records")
+    closes: Dict[Any, float] = {}
+    for row in records:
+        raw_close = row.get("close")
+        raw_date = row.get("date")
+        if raw_close is None or raw_date in (None, ""):
+            continue
+        try:
+            key = pd.to_datetime(str(raw_date)[:10])
+            closes[key] = float(raw_close)
+        except (ValueError, TypeError):
+            continue
+    if not closes:
+        return None
+    series = pd.Series(closes, name="close").sort_index()
+    series = series[~series.index.duplicated(keep="last")]
+    return derive_weekly_closes(series)
+
+
 def _score_compass_weekly(ctx: SharedContext) -> Optional[Dict[str, Any]]:
     """趋势罗盘周线过滤（derive_l0）。样本不足 200 周 → weekly_disabled 记缺口。"""
     try:
         from src.services.compass.engine import derive_l0
 
-        daily_closes = _closes(ctx)
-        if len(daily_closes) < 100:
-            return None
-        # 周线重采样（近似：按 5 根日线一组，尾部不足丢弃）
-        weekly = [
-            float(sum(daily_closes[i : i + 5]))
-            for i in range(0, len(daily_closes) - 4, 5)
-        ]
-        import pandas as pd
-
-        status, snapshot = derive_l0(pd.Series(weekly))
+        weekly = _weekly_close_series(ctx)
+        if weekly is None:
+            return gap_indicator(
+                "compass_weekly", "周线历史未取得（历史加载失败或无有效样本）"
+            )
+        status, snapshot = derive_l0(weekly)
         if status == "weekly_disabled":
             return gap_indicator(
                 "compass_weekly",
