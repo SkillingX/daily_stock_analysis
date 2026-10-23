@@ -741,7 +741,7 @@ class TestSellSideView:
         assert "**小计：最大拖累项，改善需证据**" in md
 
     def test_event_plans_date_cleaned_in_report(self):
-        """P0-4 集成：脏日期经 event_plans 视图清洗后进报告。"""
+        """P0-4 集成：脏日期经 event_plans 视图清洗后进事件表格。"""
         from src.schemas.deep_research_dims import EventPlan
 
         dims = self._dims_full()
@@ -754,7 +754,7 @@ class TestSellSideView:
         )
         view = build_view("至纯科技", "603690", "2026-10-04T08:42:06", [], dims, [], report_id="r5", manager=_MANAGER)
         md = render_markdown(view)
-        assert "（未知）" in md
+        assert "| 未知 | 2026年三季报 |" in md
         assert "未知(按A股规则需在2026年4月30日" not in md
 
 
