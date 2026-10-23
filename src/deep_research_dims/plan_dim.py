@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Optional
 
-from icontract import ensure, require
+from icontract import ViolationError, ensure, require
 
 from src.deep_research_dims.context import SharedContext
 from src.schemas.deep_research_dims import PlanDim
@@ -88,7 +88,15 @@ def build_plan_dim(
         return PlanDim(status="degraded", degraded_reason="现价缺失或非法，无法计算点位")
     current = float(current)
 
-    atr = compute_atr14(ctx.history)
+    # ATR 契约（@ensure > 0）对平价日线（TR=0）或含 NaN 输入会抛 ViolationError，
+    # 缺列/类型异常同样在入口转为降级观察，不移除契约本身。
+    try:
+        atr = compute_atr14(ctx.history)
+    except (ViolationError, KeyError, TypeError, ValueError) as exc:
+        return PlanDim(
+            status="degraded",
+            degraded_reason=f"ATR 计算输入或结果非法（{exc}），本次不形成点位方案",
+        )
     if not math.isfinite(atr) or atr <= 0:
         return PlanDim(status="degraded", degraded_reason=f"ATR 计算结果非法（{atr}），无法计算点位")
     support = price_pos.get("support_level")

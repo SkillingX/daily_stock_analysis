@@ -778,6 +778,22 @@ class TestSellSideView:
         assert "内容限制披露" in md
         assert "未来事件超出 10 项上限，丢弃 1 项" in md
 
+    def test_truncation_notes_rendered_in_both_report_templates(self):
+        """审查 P2：两种深研模板（v2 与 v1 回溯）都渲染披露，兼容路径不缺。"""
+        from src.schemas.deep_research_dims import EventPlan
+
+        dims = self._dims_full()
+        dims["intel"] = dims["intel"].model_copy(
+            update={
+                "event_calendar": [EventPlan(event="三季报", date="2026-10-30")],
+                "truncation_notes": ["未来事件超出 10 项上限，丢弃 1 项"],
+            }
+        )
+        view = build_view("至纯科技", "603690", "2026-10-04T08:42:06", [], dims, [], report_id="r5", manager=_MANAGER)
+        for template in ("deep_research_report_v2.j2", "deep_research_dual_track.j2"):
+            md = render_markdown(view, template_name=template)
+            assert "未来事件超出 10 项上限，丢弃 1 项" in md, template
+
 
 def test_manager_cannot_rewrite_degraded_or_skipped_dimension_as_valid_conclusion():
     dims = _dims()
@@ -831,3 +847,53 @@ def test_manager_decision_matrix_no_prices_when_plan_is_watch_only():
     rendered = render_markdown(view)
     assert "自拟买点" not in rendered
     assert "保留观察" in rendered
+
+
+def test_manager_price_check_covers_action_field_and_role_mismatch():
+    """审查 P1：矛盾句放进 action 字段、或买入价与止损价互换，都不得进入最终报告。"""
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(
+        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
+    )
+    manager = {
+        "decision_matrix": [
+            # 反例 a：矛盾指令藏在 action 字段（35 是止盈锚，被当买入价）
+            {"persona": "空仓者", "action": "35 附近买入", "price_range": "", "rationale": "看突破"},
+            # 反例 b：把止损价当买入价（角色互换）
+            {"persona": "空仓者", "action": "买入", "price_range": "24", "rationale": "低价买入"},
+            # 合规：止损句用止损锚
+            {"persona": "持仓者", "action": "止损", "price_range": "跌破24", "rationale": "纪律执行"},
+            # 合规：买入句用首批锚
+            {"persona": "空仓者", "action": "买入", "price_range": "30", "rationale": "回调到位"},
+        ]
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    assert "看突破" not in rendered  # 角色错位行被丢弃
+    assert "低价买入" not in rendered  # 止损价当买价被丢弃
+    assert "纪律执行" in rendered
+    assert "回调到位" in rendered
+
+
+def test_manager_investment_narrative_contradictory_directive_dropped():
+    """审查 P1：投资正文/内容概括含与方案矛盾的执行指令时丢弃，回退规则叙述。"""
+    from src.schemas.report_schema import SniperPoints
+
+    dims = _dims()
+    dims["plan"] = dims["plan"].model_copy(
+        update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
+    )
+    dims["signal"] = dims["signal"].model_copy(update={"narrative": "规则信号叙述：观察为主。"})
+    manager = {
+        "section_narratives": {
+            "investment": "回调至 30 买入；跌破 48 止损，纪律第一。",  # 48 非止损锚
+        },
+        "executive_summary": "现价 31.92 观察，等待回落至 30 再买入。",  # 合规叙事
+    }
+    view = build_view("fixture", "300260", "2026-10-13", [], dims, [], manager=manager)
+    rendered = render_markdown(view)
+    assert "跌破 48" not in rendered  # 矛盾叙事被丢弃
+    assert "规则信号叙述" in rendered  # 回退规则叙述
+    assert "等待回落至 30 再买入" in rendered  # 合规内容概括保留

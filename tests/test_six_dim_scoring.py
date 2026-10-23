@@ -180,6 +180,31 @@ class TestScoringFactsJson:
         user = captured[-1][-1]["content"]
         assert "fundamental.large_evidence" in user.split("```", 2)[2]
 
+    def test_nested_research_keeps_short_evidence_for_missing_indicator(self):
+        """审查 P2：research 含大 financial_series 时，简短控制人/公告来源仍保留给股权补评。"""
+        ctx = _ctx()
+        ctx.fundamental = {
+            "pe_ttm": 12.5,
+            "research": {
+                "financial_series": "营收与净利十年序列" * 400,
+                "controller": "实控人：张某（公告 2026-08-30 披露）",
+                "holder_notice": "股东增持公告来源：巨潮资讯 2026-09-12",
+            },
+        }
+        adapter_cls, captured = self._captured_user_content()
+        # 只缺 equity_mgmt → research 按优先键最先进裁剪
+        results = six_dim._score_llm_indicators(
+            ctx, "fixture", adapter_cls(), None,
+            existing={k: {"score": 60.0} for k in ("institute_view", "community_view", "liquidity", "risk_appetite")},
+        )
+        raw = captured[-1][-1]["content"].split("```json\n", 1)[1].split("\n```", 1)[0]
+        parsed = json.loads(raw)
+        research = parsed.get("fundamental", {}).get("research", {})
+        assert research.get("controller") == "实控人：张某（公告 2026-08-30 披露）"
+        assert "holder_notice" in research
+        assert "financial_series" not in research
+        assert "fundamental.research.financial_series" in captured[-1][-1]["content"].split("```", 2)[2]
+
     def test_omitted_fields_disclosed(self):
         ctx = _ctx()
         ctx.fundamental = {"large_evidence": "证据" * 2000}

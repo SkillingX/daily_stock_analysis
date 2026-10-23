@@ -32,37 +32,75 @@ def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
 
 
 _PLAN_PRICE_TOLERANCE = 0.005
-_PLAN_PRICE_RE = re.compile(r"\d{2,6}(?:\.\d+)?")
+# 价格形态：2-6 位整数 + 可选小数；排除均线/周期/百分比/评分等非价格后缀
+_PLAN_PRICE_RE = re.compile(r"\d{2,6}(?:\.\d+)?(?!\s*(?:日线|周线|均线|日|周|线|分|%|点))")
+_SENTENCE_SPLIT_RE = re.compile(r"[，。；！？!?\n]")
+_BUY_ROLE_WORDS = ("买入", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单买")
+_STOP_ROLE_WORDS = ("止损", "跌破")
+_SELL_ROLE_WORDS = ("止盈", "卖出", "减仓", "兑现", "清仓")
 
 
-def _plan_price_anchors(plan: Any) -> List[float]:
-    """规则作战计划的有效点位锚（观察方案返回空列表）。"""
+def _plan_price_anchors(plan: Any) -> Dict[str, float]:
+    """规则作战计划的有效点位锚（按角色），观察方案返回空 dict。"""
     sniper = getattr(plan, "sniper_points", None)
     if sniper is None:
-        return []
-    anchors: List[float] = []
+        return {}
+    anchors: Dict[str, float] = {}
     for key in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
         value = getattr(sniper, key, None)
         if isinstance(value, (int, float)) and float(value) > 0:
-            anchors.append(float(value))
+            anchors[key] = float(value)
     return anchors
 
 
-def _decision_row_uses_plan_prices(row: Mapping[str, str], anchors: List[float]) -> bool:
-    """决策行的价格指令必须与规则方案同源（±0.5% 容差）；观察方案不得携带价格。
+def _extract_prices(text: str) -> List[float]:
+    return [float(x) for x in _PLAN_PRICE_RE.findall(str(text or ""))]
 
-    经理终稿可以解释方案，不能引入与规则点位不一致的买卖价格（issue #39：
-    最终正文与操作表使用同一方案，经理改写不得恢复矛盾指令）。
+
+def _price_in(price: float, candidates: List[float]) -> bool:
+    return any(abs(price - anchor) <= max(0.01, anchor * _PLAN_PRICE_TOLERANCE) for anchor in candidates)
+
+
+def _directive_sentences_match_plan(text: str, anchors: Dict[str, float]) -> bool:
+    """执行性指令句的价格角色必须与规则方案一致。
+
+    - 买入类句（买入/建仓/加仓…）的价格只能是首批/补仓锚；
+    - 止损类句只能是止损锚；卖出/止盈类句只能是止盈锚；
+    - 无角色词的句子不校验价格（叙事可引用现价、估值等非方案数字）；
+    - 观察方案（无锚）下，任何角色句不得携带价格（issue #39：经理只解释，不造指令）。
     """
-    prices = [float(x) for x in _PLAN_PRICE_RE.findall(str(row.get("price_range") or ""))]
-    if not prices:
-        return True
-    if not anchors:
-        return False
-    return all(
-        any(abs(price - anchor) <= max(0.01, anchor * _PLAN_PRICE_TOLERANCE) for anchor in anchors)
-        for price in prices
-    )
+    buy = [anchors[k] for k in ("ideal_buy", "secondary_buy") if k in anchors]
+    stop = [anchors["stop_loss"]] if "stop_loss" in anchors else []
+    take_profit = [anchors["take_profit"]] if "take_profit" in anchors else []
+    for sentence in _SENTENCE_SPLIT_RE.split(str(text or "")):
+        prices = _extract_prices(sentence)
+        if not prices:
+            continue
+        if any(word in sentence for word in _BUY_ROLE_WORDS):
+            if not buy or not all(_price_in(p, buy) for p in prices):
+                return False
+        if any(word in sentence for word in _STOP_ROLE_WORDS):
+            if not stop or not all(_price_in(p, stop) for p in prices):
+                return False
+        if any(word in sentence for word in _SELL_ROLE_WORDS):
+            if not take_profit or not all(_price_in(p, take_profit) for p in prices):
+                return False
+    return True
+
+
+def _decision_row_matches_plan(row: Mapping[str, str], anchors: Dict[str, float]) -> bool:
+    """决策行的执行指令（全字段价格 + 动作角色）必须与规则方案同源。
+
+    经理终稿可以解释方案，不能引入与规则点位不一致或角色错位的买卖价格
+    （issue #39：最终正文与操作表使用同一方案，经理改写不得恢复矛盾指令）。
+    """
+    text = " ".join(str(row.get(key) or "") for key in ("action", "price_range", "rationale"))
+    prices = _extract_prices(text)
+    if prices:
+        all_anchors = list(anchors.values())
+        if not all_anchors or not all(_price_in(p, all_anchors) for p in prices):
+            return False
+    return _directive_sentences_match_plan(text, anchors)
 
 
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
@@ -76,11 +114,11 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
             result[key] = []
         for key in ("scenario_triggers", "dim_verdicts"):
             result[key] = {}
-    # 操作决策表与规则方案同源：无论证据是否完整，经理改写不得引入方案外价格
+    # 操作决策表与规则方案同源：经理改写不得引入方案外价格或角色错位指令
     anchors = _plan_price_anchors(dims.get("plan"))
     result["decision_matrix"] = [
         row for row in (result.get("decision_matrix") or [])
-        if _decision_row_uses_plan_prices(row, anchors)
+        if _decision_row_matches_plan(row, anchors)
     ]
     for key in ("section_titles", "section_narratives"):
         result[key] = {
@@ -93,6 +131,14 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
         if evidence is not None:
             result["section_narratives"][section] = evidence.narrative
             result["section_titles"][section] = SECTION_FALLBACK_TITLES[section]
+    # 投资正文与内容概括（经理重写版）出现与方案矛盾/错位的执行指令时丢弃，
+    # 回退模板已有的规则叙述链（signal.narrative / final_conclusion）
+    investment_narrative = result["section_narratives"].get("investment")
+    if investment_narrative and not _directive_sentences_match_plan(investment_narrative, anchors):
+        result["section_narratives"]["investment"] = ""
+    summary = result.get("executive_summary")
+    if summary and not _directive_sentences_match_plan(summary, anchors):
+        result["executive_summary"] = ""
     return result
 
 # 主干节 key → 规则回退标题（LLM 缺席时模板用）
