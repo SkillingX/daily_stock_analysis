@@ -198,6 +198,7 @@ def adopt_published_history(ctx: "SharedContext") -> bool:
     if slot.get("as_of") != required.isoformat():
         return False
     ctx.history = [dict(row) for row in slot["records"]]
+    ctx.history_source = str(slot.get("source") or "")
     return True
 
 
@@ -205,12 +206,18 @@ def load_history_df(
     stock_code: str,
     days: int = 60,
     target_date: Optional[date] = None,
+    min_records: Optional[int] = None,
 ) -> Tuple[Optional[pd.DataFrame], str]:
     """Load K-line history, DB first with DataFetcherManager fallback.
 
     Returns ``(df, source)`` where *source* is ``"db_cache"`` on DB hit or the
     actual provider name on network fallback.  Returns ``(None, "none")`` when
     both paths fail.
+
+    ``min_records`` raises the DB-cache hit threshold for callers that need a
+    longer window (e.g. weekly resampling needs ~1000 bars): without it a DB
+    holding only the latest ~260 bars satisfies the legacy 30-bar floor and a
+    1200-day request would silently return the short cache (issue #42).
     """
     from src.storage import get_db
 
@@ -221,7 +228,10 @@ def load_history_df(
     else:
         required = cache_session_date(stock_code)
     start = required - timedelta(days=int(days * 1.8) + 10)
-    required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
+    if min_records is not None:
+        required_records = min(int(min_records), days)
+    else:
+        required_records = max(min(days, _CACHE_MIN_RECORDS), 1)
 
     try:
         db = get_db()

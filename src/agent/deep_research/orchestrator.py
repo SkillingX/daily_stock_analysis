@@ -138,13 +138,32 @@ def _emit(cb: ProgressCb, event: Dict[str, Any]) -> None:
             pass
 
 
+# 情报正文大界防御（issue #40）：合理长度原文保留，只有极端超长才截断并披露，
+# 不再按 200/100/120/80 字符静默硬截半句话。
+_ROOT_CAUSE_LIMIT = 2000
+_EVIDENCE_LIMIT = 2000
+_EVENT_TEXT_LIMIT = 400
+_EVENT_DATE_LIMIT = 24  # 与展示层 _clean_event_date 的收口上限一致，避免双层截断吞掉披露
+_EVENT_ITEM_LIMIT = 500
+_OUTCOMES_MAX = 8
+_PLANS_MAX = 8
+_CALENDAR_MAX = 10
+
+
+def _bounded(text: Any, limit: int) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "（内容超长，已截断）"
+
+
 def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
     evidence: List[EvidenceItem] = []
     for raw in parsed.get("evidence_items") or []:
         try:
             evidence.append(
                 EvidenceItem(
-                    evidence=str(raw.get("evidence") or "")[:500],
+                    evidence=_bounded(raw.get("evidence"), _EVIDENCE_LIMIT),
                     strength=raw.get("strength") or "neutral",
                     lr=float(raw.get("lr") or 1.0),
                     posterior_p=0.5,
@@ -164,29 +183,61 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
     root_cause = None
     if any(rc_raw.get(k) for k in ("event", "mechanism", "magnitude")):
         root_cause = {
-            "event": str(rc_raw.get("event") or "")[:200],
-            "mechanism": str(rc_raw.get("mechanism") or "")[:200],
-            "magnitude": str(rc_raw.get("magnitude") or "")[:100],
-            "persistence": str(rc_raw.get("persistence") or "")[:100],
+            "event": _bounded(rc_raw.get("event"), _ROOT_CAUSE_LIMIT),
+            "mechanism": _bounded(rc_raw.get("mechanism"), _ROOT_CAUSE_LIMIT),
+            "magnitude": _bounded(rc_raw.get("magnitude"), _ROOT_CAUSE_LIMIT),
+            "persistence": _bounded(rc_raw.get("persistence"), _ROOT_CAUSE_LIMIT),
         }
     calendar = []
+    truncation_notes: List[str] = []
+    dropped_events = 0
     for item in parsed.get("event_calendar") or []:
         if not isinstance(item, dict):
             continue
+        if len(calendar) >= _CALENDAR_MAX:
+            dropped_events += 1
+            continue
+        raw_outcomes = item.get("outcomes") or []
+        raw_plans = item.get("plans") or []
+        event_label = str(item.get("event") or "未知")[:30]
+        if len(raw_outcomes) > _OUTCOMES_MAX:
+            truncation_notes.append(
+                f"事件「{event_label}」可能结果超出 {_OUTCOMES_MAX} 条上限，丢弃 {len(raw_outcomes) - _OUTCOMES_MAX} 条"
+            )
+        if len(raw_plans) > _PLANS_MAX:
+            truncation_notes.append(
+                f"事件「{event_label}」应对预案超出 {_PLANS_MAX} 条上限，丢弃 {len(raw_plans) - _PLANS_MAX} 条"
+            )
         calendar.append(
             {
-                "event": str(item.get("event") or "")[:120],
-                "date": str(item.get("date") or "")[:20],
-                "outcomes": [str(x)[:80] for x in (item.get("outcomes") or [])][:4],
-                "plans": [str(x)[:120] for x in (item.get("plans") or [])][:4],
+                "event": _bounded(item.get("event"), _EVENT_TEXT_LIMIT),
+                "date": _bounded(item.get("date"), _EVENT_DATE_LIMIT),
+                "outcomes": [
+                    _bounded(x, _EVENT_ITEM_LIMIT)
+                    for x in raw_outcomes[:_OUTCOMES_MAX]
+                ],
+                "plans": [
+                    _bounded(x, _EVENT_ITEM_LIMIT)
+                    for x in raw_plans[:_PLANS_MAX]
+                ],
             }
         )
+    if dropped_events:
+        truncation_notes.append(
+            f"未来事件超出 {_CALENDAR_MAX} 项上限，丢弃 {dropped_events} 项"
+        )
+        logger.warning(
+            "[DualTrack] 事件日历超上限，丢弃 %d 项（上限 %d）", dropped_events, _CALENDAR_MAX
+        )
+    for note in truncation_notes:
+        logger.warning("[DualTrack] %s", note)
     dim = IntelDim(
         intelligence=intelligence,
         evidence_items=evidence,
         unverified_count=int(parsed.get("unverified_count") or 0),
         root_cause=root_cause,
-        event_calendar=calendar[:6],
+        event_calendar=calendar,
+        truncation_notes=truncation_notes,
     )
     return dim, steps
 

@@ -28,6 +28,7 @@ class SharedContext:
     as_of: str  # ISO，阶段 0 装配完成时点
     quote: Dict[str, Any] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)  # OHLCV dicts, 升序
+    history_source: str = ""  # 阶段 0 日线实际来源（db_cache / 供应商名）
     fundamental: Dict[str, Any] = field(default_factory=dict)
     chip: Dict[str, Any] = field(default_factory=dict)
     history_reports: List[Dict[str, Any]] = field(default_factory=list)
@@ -43,6 +44,7 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
         from src.services.history_loader import load_history_df
 
         df, source = load_history_df(code, days=days)
+        ctx.history_source = str(source or "")
         if df is None or df.empty:
             ctx.limitation(HISTORY_MISSING_NOTE)
             return []
@@ -338,6 +340,8 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
         for key, future in futures.items():
             if future.done():
                 setattr(ctx, key, future.result())
+                if key == "history":
+                    ctx.history_source = workers[key].history_source
                 for limitation in workers[key].limitations:
                     ctx.limitation(limitation)
             else:
