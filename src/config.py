@@ -3429,7 +3429,7 @@ class Config:
                 ConfigIssue(
                     severity="info",
                     message="未配置套餐搜索能力（MiniMax 或智谱 Coding Plan），新闻搜索功能将不可用",
-                    field="BOCHA_API_KEYS",
+                    field="CODING_PLAN_SEARCH_PROVIDER",
                 )
             )
 

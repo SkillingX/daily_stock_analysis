@@ -221,13 +221,15 @@ def test_keyless_html_provider_enters_scraper(monkeypatch):
     assert response.error_message != 'html_scrape 未配置 API Key'
 
 
-def test_public_fallback_not_used_while_configured_provider_works():
-    public = _DummyProvider('html_scrape')
+def test_retired_html_scrape_provider_is_not_registered():
     configured = _DummyProvider('Configured')
-    service = TestSearchComprehensiveIntel()._build_service([public, configured])
+    service = SearchService(searxng_public_instances_enabled=False)
+    assert all(provider.name != 'html_scrape' for provider in service._providers)
+
+    service = TestSearchComprehensiveIntel()._build_service([configured])
     with patch('src.search_service.time.sleep'):
         results = service.search_comprehensive_intel('300260', '新莱应材', max_searches=4)
-    assert len(results) == 4 and len(configured.calls) == 4 and not public.calls
+    assert len(results) == 4 and len(configured.calls) == 4
 
 
 def test_expired_tool_deadline_stops_further_searches():

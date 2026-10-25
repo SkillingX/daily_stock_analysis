@@ -49,49 +49,25 @@ class TestRunner:
 
 
 def test_concept_board_provider(runner: TestRunner):
-    """测试概念板块数据 Provider"""
-    from data_provider.supply_chain import ConceptBoardProvider
+    """公开概念板块 Provider 已退役；最新概念归属由 iFinD 适配器提供。"""
+    from data_provider import supply_chain
+    from src.agent.tools.supply_chain_tools import ALL_SUPPLY_CHAIN_TOOLS
 
     print("\n" + "=" * 60)
-    print("1. 概念板块数据 Provider (ConceptBoardProvider)")
+    print("1. 公开概念板块 Provider 已退役")
     print("=" * 60)
 
-    provider = ConceptBoardProvider()
-
-    # 测试 Mock 数据
-    mock_boards = provider._get_mock_concept_boards()
     runner.record(
-        "Mock 数据返回列表",
-        isinstance(mock_boards, list) and len(mock_boards) > 0,
-        f"类型: {type(mock_boards)}, 长度: {len(mock_boards)}",
+        "ConceptBoardProvider 未从生产包导出",
+        not hasattr(supply_chain, "ConceptBoardProvider"),
+        "iFinD adapter owns latest concept membership",
     )
-
     runner.record(
-        "Mock 数据包含必要字段",
-        all(k in mock_boards[0] for k in ["code", "name", "change_pct"])
-        if mock_boards
-        else False,
-        f"字段: {list(mock_boards[0].keys()) if mock_boards else 'N/A'}",
+        "公开概念校验工具未注册",
+        "verify_supply_chain_evidence"
+        not in {tool.name for tool in ALL_SUPPLY_CHAIN_TOOLS},
+        "no Eastmoney/THS public concept validation tool",
     )
-
-    # 测试 Provider 实例化
-    runner.record("Provider 实例化成功", provider is not None, "ConceptBoardProvider()")
-
-    # 测试 get_hot_concepts
-    hot = provider.get_hot_concepts(limit=3)
-    runner.record(
-        "get_hot_concepts 返回数据",
-        isinstance(hot, list),
-        f"返回 {len(hot)} 个热门板块",
-    )
-
-    # 测试数据格式
-    if hot:
-        runner.record(
-            "热门板块包含涨跌幅",
-            "change_pct" in hot[0],
-            f"第一个板块: {hot[0].get('name', 'N/A')}",
-        )
 
 
 def test_institutional_provider(runner: TestRunner):
@@ -453,11 +429,7 @@ def test_e2e_scenario(runner: TestRunner):
     print("8. 端到端场景测试")
     print("=" * 60)
 
-    from data_provider.supply_chain import (
-        ConceptBoardProvider,
-        InstitutionalHoldingsProvider,
-        NorthboundFlowProvider,
-    )
+    from data_provider.supply_chain import InstitutionalHoldingsProvider, NorthboundFlowProvider
     from src.services.research_scoring_service import ResearchScoringService
 
     # 场景: 分析贵州茅台
@@ -465,16 +437,14 @@ def test_e2e_scenario(runner: TestRunner):
     stock_name = "贵州茅台"
 
     # Step 1: 获取数据
-    cb = ConceptBoardProvider()
     ih = InstitutionalHoldingsProvider()
     nf = NorthboundFlowProvider()
 
-    concepts = cb._get_mock_concept_boards()
     shareholders = ih._get_mock_shareholders(stock_code)
     flows = nf._get_mock_northbound_flow()
 
     runner.record(
-        f"Step 1: 数据获取 - {len(concepts)} 个概念, {len(shareholders.get('holders', []))} 个股东, {len(flows)} 天资金流",
+        f"Step 1: 数据获取 - {len(shareholders.get('holders', []))} 个股东, {len(flows)} 天资金流",
         True,
         "数据获取成功",
     )
