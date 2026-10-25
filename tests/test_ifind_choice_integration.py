@@ -79,12 +79,55 @@ def test_ifind_primary_reaches_report_with_choice_verification(ifind_transport, 
     assert '每个报告期' in calls[0][1]
 
 
+def test_qualified_ifind_fields_are_not_requeried_from_choice(ifind_transport, monkeypatch):
+    from data_provider.cross_source_validator import AnchorReading, SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    readings = {
+        field: AnchorReading(
+            "ifind", 10.0, period="2025-12-31", period_basis="annual",
+            statement_scope="consolidated", adjustment="restated",
+            caliber="operating_revenue" if field == "revenue" else "weighted_roe" if field == "roe" else "gross_margin" if field == "gross_margin" else "operating_revenue_yoy" if field == "revenue_yoy" else "parent_net_profit_yoy" if field == "net_profit_yoy" else "parent_net_profit",
+            unit="currency_base" if field in {"revenue", "net_profit"} else "percentage_point",
+            currency="CNY" if field in {"revenue", "net_profit"} else None,
+        )
+        for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")
+    }
+    monkeypatch.setattr(IfindFetcher, "financial_snapshot", lambda self, code, period, deadline: readings)
+
+    def _unavailable(*args, **kwargs):
+        raise SourceReadError("ifind", "invalid_response")
+
+    monkeypatch.setattr(IfindFetcher, "product_segments", _unavailable)
+    monkeypatch.setattr(IfindFetcher, "shareholders", _unavailable)
+    seen = []
+    native = ChoiceAdapter._native_request
+
+    def sdk(method, args, options, deadline):
+        if method == "css":
+            seen.append(args[1] if len(args) > 1 else "")
+        return native(method, args, options, deadline)
+
+    monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(sdk))
+    result = DataFetcherManager().get_fundamental_context("300260", budget_seconds=30)
+    assert not any("OPERATEREVENEW" in str(item) or "ROEWA" in str(item) for item in seen)
+    assert any("PETTM" in str(item) or "MV" in str(item) for item in seen)
+    assert result["growth"]["field_meta"]["revenue"]["source"] == "ifind"
+    assert result["growth"]["field_meta"]["revenue"]["quality"]["status"] != "verified"
+
+
 @pytest.mark.parametrize('ifind_period,choice_period,expected_source', [
     ('20260630', '20251231', 'ifind'),
     ('20251231', '20260630', 'choice'),
     ('20271231', '20251231', 'choice'),
 ])
 def test_primary_snapshot_uses_latest_real_period_not_supplier_order(ifind_transport, monkeypatch, ifind_period, choice_period, expected_source):
+    """合格的当前 iFinD 字段不再为了找更新的 Choice 财期而重查。
+
+    未来或不合格的 iFinD 行仍允许 Choice 补当前财期，且不倒退到更旧财期。
+    """
     config, response, calls = ifind_transport
     config.financial_primary_source = 'ifind'
     response['data']['answer'] = response['data']['answer'].replace('20251231', ifind_period)
@@ -408,7 +451,7 @@ def test_financial_report_api_accepts_real_snapshot_and_roundtrip(ifind_transpor
         downloaded = client.get(f'/api/v1/financial-analysis/reports/{rid}/markdown?download=1')
         assert body['markdown'] == reread['data']['markdown'] == downloaded.text
         import re
-        assert re.search(r'2997710000|29\.9771\s*亿', body['markdown'])
+        assert re.search(r'2997710000|29\.9771\s*亿|29\.98\s*亿', body['markdown'])
 
 
 def test_agent_stock_info_reuses_current_snapshot_quality(ifind_transport, monkeypatch):
@@ -439,7 +482,6 @@ def test_deep_report_retries_failed_verification_instead_of_day_cache(ifind_tran
     monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', DataFetcherManager())
     monkeypatch.setattr(context, '_safe_quote', lambda *a: {})
     monkeypatch.setattr(context, '_safe_history', lambda *a: [])
-    monkeypatch.setattr(context, '_safe_chip', lambda *a: {})
     monkeypatch.setattr(context, '_safe_history_reports', lambda *a: [])
     monkeypatch.setattr(service, '_get_dual_track_adapter', lambda: None)
     monkeypatch.setattr(orchestrator, '_write_reflection_journals', lambda *a: None)

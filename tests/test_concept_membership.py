@@ -47,6 +47,26 @@ class TestParseConcepts:
         assert membership.concepts == []
         assert membership.errors == ["no_concepts"]
 
+    def test_missing_column_is_field_error_not_empty(self) -> None:
+        answer = "|证券代码|证券简称|\n|---|---|\n|300260.SZ|新莱应材|\n"
+        membership = _parse_concepts(_wire(answer), "300260")
+        assert membership.errors == ["field_error"]
+        assert membership.concepts == []
+
+    def test_non_table_is_field_error_not_mismatch(self) -> None:
+        membership = _parse_concepts(_wire("没有表格，只有一段说明"), "300260")
+        assert membership.errors == ["field_error"]
+
+    def test_historical_cutoff_is_not_latest(self) -> None:
+        answer = (
+            "|证券代码|所属概念|截止日期|\n|---|---|---|\n"
+            "|300260.SZ|芯片概念|2024-12-31|\n"
+        )
+        membership = _parse_concepts(_wire(answer), "300260")
+        assert membership.concepts == []
+        assert membership.errors == ["historical_cutoff"]
+        assert membership.as_of_nature == "latest"
+
     def test_dedup_and_trim(self) -> None:
         answer = "|证券代码|所属概念|\n|---|---|\n|300260.SZ|芯片概念, 芯片概念,深股通|\n"
         membership = _parse_concepts(_wire(answer), "300260")

@@ -543,20 +543,45 @@ class ConceptMembership(BaseModel):
 
 
 def _parse_concepts(data: IfindData, code: str) -> ConceptMembership:
-    """所属概念单元格 → 概念名列表；证券不匹配或字段缺失记错误。"""
+    """所属概念单元格 → 概念名列表。
+
+    无表格/缺列、证券不匹配、空单元格、历史截止日期各自记不同错误。
+    历史截止日期不能标成最新，也不补造日期。
+    """
     errors: list[str] = []
     concepts: list[str] = []
     matched = False
-    for table in _ifind_tables(data.answer):
+    saw_security_column = False
+    field_present = False
+    historical = False
+    tables = _ifind_tables(data.answer)
+    if not tables:
+        return ConceptMembership(code=code, errors=["field_error"])
+    for table in tables:
         for row in table:
+            if "证券代码" in row:
+                saw_security_column = True
             if not _same_security(row.get("证券代码"), code):
                 continue
             matched = True
-            raw = (row.get("所属概念") or "").strip()
+            if "所属概念" not in row:
+                continue
+            field_present = True
+            cutoff = (row.get("截止日期") or "").strip()
+            if cutoff and cutoff not in {"最新", "最新日期", "-"} and re.search(r"\d{4}", cutoff):
+                historical = True
+                continue
+            raw = row.get("所属概念", "").strip()
             if raw:
                 concepts.extend(name.strip() for name in raw.split(",") if name.strip())
-    if not matched:
+    if historical and not concepts:
+        errors.append("historical_cutoff")
+    elif not saw_security_column:
+        errors.append("field_error")
+    elif not matched:
         errors.append("security_mismatch")
+    elif not field_present:
+        errors.append("field_error")
     elif not concepts:
         errors.append("no_concepts")
     return ConceptMembership(code=code, concepts=list(dict.fromkeys(concepts)), errors=errors)

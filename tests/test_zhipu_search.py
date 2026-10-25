@@ -46,6 +46,15 @@ def test_tavily_residual_key_cannot_construct_or_call_a_provider(monkeypatch):
     service = SearchService(tavily_keys=['leftover'], searxng_public_instances_enabled=False)
     assert 'Tavily' not in [provider.name for provider in service._providers]
     assert not Config(tavily_api_keys=['leftover'], searxng_public_instances_enabled=False).has_search_capability_enabled()
+    # 默认公开实例开关和残留 Key 都不能把退休渠道算成已配置搜索。
+    assert not Config(
+        tavily_api_keys=['leftover'],
+        bocha_api_keys=['leftover'],
+        brave_api_keys=['leftover'],
+        serpapi_keys=['leftover'],
+        anspire_api_keys=['leftover'],
+        searxng_base_urls=['https://fixture.invalid'],
+    ).has_search_capability_enabled()
     forbidden.assert_not_called()
 
 

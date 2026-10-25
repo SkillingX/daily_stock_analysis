@@ -816,12 +816,9 @@ def _fetch_quote_v3(manager: Any, ticker: str) -> Any:
 
 
 def _fetch_boards_v3(manager: Any, ticker: str) -> List[Dict[str, Any]]:
-    """[v3] 拉取所属板块；失败返回空 list。"""
-    try:
-        return manager.get_belong_boards(ticker) or []
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("[SupplyChain v3] boards 失败 %s: %s", ticker, exc)
-        return []
+    """公开概念探针已退役（issue #45）。概念归属走 get_stock_info，不在这里取东财板块。"""
+    del manager, ticker
+    return []
 
 
 def _fetch_cross_validation_v3(ticker: str) -> Any:
@@ -996,15 +993,20 @@ def _format_fundamental_lines(info: Dict[str, Any], parts: List[str]) -> None:
 
 
 def _append_board_lines(info: Dict[str, Any], parts: List[str]) -> None:
-    """[拆分] 板块字段格式化到 parts。"""
+    """行业板块与最新概念归属分开写，概念不标成所属板块。"""
     boards = info.get("belong_boards") or []
-    if not boards:
-        return
-    board_names = [b.get("name") for b in boards[:10] if b.get("name")]
+    board_names = [b.get("name") for b in boards[:10] if isinstance(b, dict) and b.get("name")]
     if board_names:
+        parts.append("所属板块=" + ",".join([_safe_format_value(n) for n in board_names]))
+    membership = info.get("concept_membership") or {}
+    concepts = [item.get("name") for item in membership.get("concepts") or [] if isinstance(item, dict) and item.get("name")]
+    if concepts:
         parts.append(
-            "所属板块=" + ",".join([_safe_format_value(n) for n in board_names])
+            "最新概念归属=" + ",".join(concepts)
+            + f"（{membership.get('source') or 'ifind'}，{membership.get('as_of_nature') or 'latest'}）"
         )
+    elif membership.get("error"):
+        parts.append(f"最新概念归属未取得：{membership.get('error')}")
 
 
 def _append_valuation_lines(valuation: Dict[str, Any], parts: List[str]) -> None:
@@ -2245,10 +2247,13 @@ def _build_real_red_flags(quote: Dict[str, Any], info: Dict[str, Any]) -> List[s
         flags.append(f"当日涨幅={change_pct}%，触及涨停/跌停，短期波动剧烈")
     if mv is not None and mv > 0:
         flags.append(f"总市值={mv / 1e8:.2f}亿元")
-    boards = info.get("belong_boards") or []
-    board_names = [b.get("name", "") for b in boards[:10] if b.get("name")]
-    if any(n in {"半导体", "光伏", "新能源", "医药"} for n in board_names):
-        flags.append("所属板块含半导体/新能源/医药等热门概念，估值易受市场情绪影响")
+    concepts = [
+        item.get("name", "")
+        for item in ((info.get("concept_membership") or {}).get("concepts") or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    if any(n in {"半导体", "光伏", "新能源", "医药", "芯片概念"} for n in concepts):
+        flags.append("最新概念归属含半导体/新能源/医药等热门概念，估值易受市场情绪影响；概念标签不是客户事实")
     return flags
 
 

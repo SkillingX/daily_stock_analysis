@@ -2647,20 +2647,6 @@ class SearchService:
             return candidate_preferred_count > best_preferred_count
         return len(candidate.results) > len(best_response.results)
 
-    @classmethod
-    def _brave_search_locale(
-        cls,
-        stock_code: str,
-        *,
-        prefer_chinese: bool,
-    ) -> Dict[str, str]:
-        """Resolve Brave locale hints without forcing US bias onto non-US symbols."""
-        if prefer_chinese:
-            return {"search_lang": "zh-hans", "country": "CN"}
-        if cls._is_us_stock(stock_code):
-            return {"search_lang": "en", "country": "US"}
-        return {}
-
     # A-share ETF code prefixes (Shanghai 51/52/56/58, Shenzhen 15/16/18)
     _A_ETF_PREFIXES = ("51", "52", "56", "58", "15", "16", "18")
     _ETF_NAME_KEYWORDS = (
@@ -3968,13 +3954,6 @@ class SearchService:
                     continue
 
                 search_kwargs: Dict[str, Any] = {}
-                if isinstance(provider, BraveSearchProvider):
-                    search_kwargs.update(
-                        self._brave_search_locale(
-                            stock_code,
-                            prefer_chinese=prefer_chinese,
-                        )
-                    )
                 started_at = time.monotonic()
                 try:
                     record_provider_run_started(
@@ -4378,8 +4357,6 @@ class SearchService:
             if search_count >= max_searches or deadline is not None and time.monotonic() >= deadline:
                 break
             available_providers = [p for p in self._providers if p.is_available]
-            # Configured providers precede public discovery and HTML fallbacks.
-            available_providers.sort(key=lambda p: p.name == "html_scrape" or isinstance(p, SearXNGSearchProvider) and p._use_public_instances)
             if not available_providers:
                 break
 
