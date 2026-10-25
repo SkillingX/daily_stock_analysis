@@ -100,9 +100,10 @@ class TestGetStockInfoContract(unittest.TestCase):
         self.assertEqual(result["pe_ratio"], 12.3)
         self.assertEqual(result["pb_ratio"], 2.1)
 
-        # Contract: boards is compatibility alias of belong_boards.
-        self.assertEqual(result["belong_boards"], manager._belong_boards)
+        # issue #45：概念归属来自 iFinD 适配入口，不再取公开概念接口。
         self.assertEqual(result["boards"], result["belong_boards"])
+        self.assertEqual(result["concept_membership"]["source"], "ifind")
+        self.assertEqual(result["concept_membership"]["as_of_nature"], "latest")
 
         # Contract: sector_rankings comes from fundamental_context.boards.data.
         self.assertEqual(result["sector_rankings"], manager._context["boards"]["data"])
@@ -205,7 +206,10 @@ class TestGrowthBackfillE2E(unittest.TestCase):
             captured["period"] = period
             return self._fake_cv()
 
+        from src.config import get_config
+        config = get_config()
         with patch("src.agent.tools.data_tools._get_fetcher_manager", return_value=manager), \
+             patch.object(config, "data_source_profile", "legacy"), \
              patch("src.agent.tools.data_tools.build_cross_validation_block", side_effect=fake_build):
             result = _handle_get_stock_info("688486")
 

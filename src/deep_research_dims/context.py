@@ -30,7 +30,6 @@ class SharedContext:
     history: List[Dict[str, Any]] = field(default_factory=list)  # OHLCV dicts, 升序
     history_source: str = ""  # 阶段 0 日线实际来源（db_cache / 供应商名）
     fundamental: Dict[str, Any] = field(default_factory=dict)
-    chip: Dict[str, Any] = field(default_factory=dict)
     history_reports: List[Dict[str, Any]] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
 
@@ -238,33 +237,6 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         return {}
 
 
-def _safe_chip(code: str, ctx: SharedContext) -> Dict[str, Any]:
-    try:
-        from src.agent.tools.data_tools import _get_fetcher_manager
-
-        dist = _get_fetcher_manager().get_chip_distribution(code)
-        if dist is None:
-            from src.agent.tools.data_tools import _estimate_chip_fallback
-
-            estimated = _estimate_chip_fallback(code)
-            if estimated is not None:
-                ctx.limitation("原始筹码分布数据未取得，资金面采用历史行情估算（精度有限）")
-                return estimated
-            ctx.limitation("筹码分布数据缺失")
-            return {}
-        data = getattr(dist, "to_dict", None)
-        result: Dict[str, Any] = {}
-        if callable(data):
-            result = data()  # type: ignore[assignment]
-        elif isinstance(dist, dict):
-            result = dict(dist)
-        return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[DualTrack] 筹码装配失败 %s: %s", code, exc)
-        ctx.limitation(f"筹码分布装配失败: {exc}")
-        return {}
-
-
 def _safe_history_reports(code: str, ctx: SharedContext) -> List[Dict[str, Any]]:
     try:
         from src.storage import get_db
@@ -282,8 +254,9 @@ def _safe_history_reports(code: str, ctx: SharedContext) -> List[Dict[str, Any]]
 def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | None = None) -> SharedContext:
     """装配共享快照。设计原则：尽力装配、失败只记录不抛（阶段 0 之后才允许整票失败）。
 
-    行情、日线和筹码在线程池运行，与本身已限时的财务装配并行。
+    行情和日线在线程池运行，与本身已限时的财务装配并行。
     各路共用阶段截止时间；超时保留可用数据及失败证据，不占用后续研究预算。
+    筹码分布已随 issue #46 退休，不再装配。
     """
     from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
     from src.core.research_run import current_research, ResearchStopped
@@ -303,9 +276,9 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
     stage_deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     if deadline is not None:
         stage_deadline = min(stage_deadline, deadline)
-    pool = ThreadPoolExecutor(max_workers=3)
+    pool = ThreadPoolExecutor(max_workers=2)
     # Each worker owns its limitations so late IO cannot mutate a returned context.
-    workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history", "chip")}
+    workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history")}
     from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
     eastmoney_patch(budget_only=True)
     if outer := request_deadline.get():
@@ -316,7 +289,6 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
         futures = {
             "quote": pool.submit(copy_context().run, _safe_quote, stock_code, workers["quote"]),
             "history": pool.submit(copy_context().run, _safe_history, stock_code, 260, workers["history"]),
-            "chip": pool.submit(copy_context().run, _safe_chip, stock_code, workers["chip"]),
         }
         if run is not None:
             for future in futures.values():

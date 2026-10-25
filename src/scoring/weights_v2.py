@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 
 from icontract import require
 
-SCORING_VERSION_V2 = "v2.0"
+SCORING_VERSION_V2 = "v2.1"
 
 # 维度 → 权重
 DIMENSION_WEIGHTS_V2: Dict[str, float] = {
@@ -28,6 +28,8 @@ DIMENSION_WEIGHTS_V2: Dict[str, float] = {
 
 # 维度 → [(指标 id, 指标名, 维度内权重, 打分来源)]
 # 打分来源：rule=机器规则 / llm=LLM 依据句打分 / f1/f2/intel=对应维度供数（P1 接线）
+# v2.1（issue #46）：筹码成本与社区评价退休。资金面剩余资金流/机构变动按原 34:33
+# 归一；情绪面仅机构评价（100%）。退休项不评分、不补 50、不算缺口。
 INDICATORS_V2: Dict[str, List[Tuple[str, str, float, str]]] = {
     "基本面": [
         ("sector_vs_leader", "大盘/板块/龙头对比", 0.25, "f2"),
@@ -40,13 +42,11 @@ INDICATORS_V2: Dict[str, List[Tuple[str, str, float, str]]] = {
         ("event_plan", "未来事件与预案", 0.50, "intel"),
     ],
     "资金面": [
-        ("capital_flow", "资金流向", 0.34, "rule"),
-        ("institution_change", "机构/大户持仓变动", 0.33, "rule"),
-        ("chip_cost", "筹码成本结构", 0.33, "rule"),
+        ("capital_flow", "资金流向", round(34 / 67, 6), "rule"),
+        ("institution_change", "机构/大户持仓变动", round(33 / 67, 6), "rule"),
     ],
     "情绪面": [
-        ("institute_view", "机构评价", 0.50, "llm"),
-        ("community_view", "社区评价", 0.50, "llm"),
+        ("institute_view", "机构评价", 1.00, "llm"),
     ],
     "技术面": [
         ("chanlun_struct", "缠论结构", 0.40, "chanlun"),

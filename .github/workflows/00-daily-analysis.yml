@@ -256,12 +256,8 @@ jobs:
           ANSPIRE_LLM_MODEL: ${{ vars.ANSPIRE_LLM_MODEL || secrets.ANSPIRE_LLM_MODEL }}
           ANSPIRE_LLM_BASE_URL: ${{ vars.ANSPIRE_LLM_BASE_URL || secrets.ANSPIRE_LLM_BASE_URL }}
           ANSPIRE_LLM_ENABLED: ${{ vars.ANSPIRE_LLM_ENABLED || secrets.ANSPIRE_LLM_ENABLED }}
-          BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
-          SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
           MINIMAX_API_KEYS: ${{ secrets.MINIMAX_API_KEYS }}
-          BRAVE_API_KEYS: ${{ secrets.BRAVE_API_KEYS }}
-          SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
-          SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
+          # 搜索渠道收敛（issue #47）：Bocha/SerpAPI/Brave/SearXNG 已退役，不再注入。
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）
@@ -368,8 +364,6 @@ jobs:
           # ==========================================
           LOG_LEVEL: INFO
           MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
-          # 筹码分布：默认 false（云端接口不稳定）；需启用时在 Settings → Variables 添加 ENABLE_CHIP_DISTRIBUTION=true
-          ENABLE_CHIP_DISTRIBUTION: ${{ vars.ENABLE_CHIP_DISTRIBUTION || secrets.ENABLE_CHIP_DISTRIBUTION || 'false' }}
           # 实时行情数据源优先级（腾讯有量比且稳定，推荐首选）
           # 可选值: tencent, akshare_sina, efinance, akshare_em, tushare
           # 如果有 Tushare Pro 高积分账号，可将 tushare 放在首位
@@ -424,22 +418,8 @@ jobs:
           fi
           echo ""
           echo "【搜索引擎】"
-          echo "  Bocha API Keys: $([ -n "$BOCHA_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  SerpAPI Keys: $([ -n "$SERPAPI_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
           echo "  MiniMax API Keys: $([ -n "$MINIMAX_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  Brave API Keys: $([ -n "$BRAVE_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          echo "  SearXNG Base URLs: $([ -n "$SEARXNG_BASE_URLS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
-          case "${SEARXNG_PUBLIC_INSTANCES_ENABLED,,}" in
-            0|false|no|off)
-              echo "  SearXNG Public Instances: ❌ 已禁用"
-              ;;
-            "")
-              echo "  SearXNG Public Instances: ✅ 默认开启"
-              ;;
-            *)
-              echo "  SearXNG Public Instances: ✅ 已启用"
-              ;;
-          esac
+          echo "  套餐搜索提供器: ${CODING_PLAN_SEARCH_PROVIDER:-minimax}（Bocha/SerpAPI/Brave/SearXNG 已退役）"
           echo ""
           echo "【通知渠道】"
           echo "  PushPlus: $([ -n "$PUSHPLUS_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"

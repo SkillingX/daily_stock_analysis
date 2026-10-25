@@ -27,7 +27,6 @@ class _ServiceFields(TypedDict, total=False):
     """可选注入的运行时服务实例。新模块可加，老模块按需补充。"""
 
     search_service: Any
-    social_sentiment_service: Any
     notification_service: Any
 
 
@@ -51,7 +50,6 @@ class PipelineContextDict(_ServiceFields, total=False):
     market_phase_context: NotRequired[dict[str, Any]]
     skills: NotRequired[Any]
     realtime_quote: NotRequired[dict[str, Any]]
-    chip_distribution: NotRequired[dict[str, Any]]
     trend_result: NotRequired[dict[str, Any]]
     news_context: NotRequired[dict[str, Any]]
     analysis_context_pack_summary: NotRequired[str]

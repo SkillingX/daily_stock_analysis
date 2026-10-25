@@ -12,7 +12,7 @@ from src.deep_research.researchers.base import generic_parse
 DIM_ID = "sentiment"
 DISPLAY_NAME = "情绪面研究员"
 SKILL_MD = "researchers/sentiment/SKILL.md"
-TOOLS = frozenset(frozenset({'search_market_discussion', 'search_stock_news'}))
+TOOLS = frozenset({'search_stock_news'})
 TTL_HOURS = 24.0
 SCORE_KEY = 'score'
 

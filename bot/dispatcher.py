@@ -426,7 +426,7 @@ User: "analyze TSLA and NVDA using trend strategy"
         r'|(?<![a-zA-Z])[A-Z]{2,5}(?![a-zA-Z])'  # US ticker — UPPERCASE only, no IGNORECASE
         r'|分析|看看|查一?下|研究|诊断|怎么样|走势|趋势'
         r'|能买|可以买|涨还是跌|怎么看|能追|建议|目标价'
-        r'|支撑|压力|阻力|止损|买点|卖点|技术面|基本面|筹码'
+        r'|支撑|压力|阻力|止损|买点|卖点|技术面|基本面'
         r'|(?i:analyz|stock|buy|sell|trend|backtest|strateg)',
     )
 

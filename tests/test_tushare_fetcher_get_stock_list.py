@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for TushareFetcher.get_stock_list(), _fetch_raw_data(), _normalize_data(), get_chip_distribution().
+"""Unit tests for TushareFetcher.get_stock_list(), _fetch_raw_data(), _normalize_data().
 
 This test file is intentionally isolated from other test modules.
 It loads repo-root `.env` and stubs optional runtime deps so it can run
@@ -264,28 +264,6 @@ class TestTushareFetcherNormalizeData(unittest.TestCase):
         self.assertEqual(out.iloc[0]["amount"], 50000.0)
 
 
-class TestTushareFetcherChipDistribution(unittest.TestCase):
-    """get_chip_distribution: HK early exit."""
-
-    @staticmethod
-    def _make_fetcher() -> TushareFetcher:
-        with patch.object(TushareFetcher, "_init_api", return_value=None):
-            fetcher = TushareFetcher()
-        fetcher._api = MagicMock()
-        fetcher.priority = 2
-        return fetcher
-
-    def test_get_chip_distribution_returns_none_for_hk_canonical(self) -> None:
-        fetcher = self._make_fetcher()
-        with patch.object(fetcher, "_call_api_with_rate_limit") as api_mock:
-            self.assertIsNone(fetcher.get_chip_distribution("HK00700"))
-        api_mock.assert_not_called()
-
-    def test_get_chip_distribution_returns_none_for_hk_ts_suffix(self) -> None:
-        fetcher = self._make_fetcher()
-        with patch.object(fetcher, "_call_api_with_rate_limit") as api_mock:
-            self.assertIsNone(fetcher.get_chip_distribution("00700.HK"))
-        api_mock.assert_not_called()
 
 
 if __name__ == "__main__":

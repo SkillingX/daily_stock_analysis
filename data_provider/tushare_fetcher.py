@@ -42,7 +42,7 @@ from .base import (
     normalize_stock_code,
     _is_hk_market,
 )
-from .realtime_types import UnifiedRealtimeQuote, ChipDistribution
+from .realtime_types import UnifiedRealtimeQuote
 from src.config import get_config
 import os
 from zoneinfo import ZoneInfo
@@ -1204,170 +1204,6 @@ class TushareFetcher(BaseFetcher):
         # 获取为空或者接口调用失败，返回 None
         return None
 
-    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
-        """
-        获取筹码分布数据
-
-        数据来源：ts.pro_api().cyq_chips()
-        包含：获利比例、平均成本、筹码集中度
-
-        注意：ETF/指数没有筹码分布数据，会直接返回 None；港股不支持，直接返回 None。
-        5000积分以下每天访问15次,每小时访问5次
-
-        Args:
-            stock_code: 股票代码
-
-        Returns:
-            ChipDistribution 对象（最新交易日的数据），获取失败返回 None
-
-        """
-        if _is_us_code(stock_code):
-            logger.warning(
-                f"[Tushare] TushareFetcher 不支持美股 {stock_code} 的筹码分布"
-            )
-            return None
-
-        if _is_etf_code(stock_code):
-            logger.warning(
-                f"[Tushare] TushareFetcher 不支持 ETF {stock_code} 的筹码分布"
-            )
-            return None
-
-        if _is_hk_market(stock_code):
-            logger.warning(
-                f"[Tushare] TushareFetcher 不支持港股 {stock_code} 的筹码分布"
-            )
-            return None
-
-        try:
-            # 19点之后才有当天数据
-            start_date = self.get_trade_time(early_time="00:00", late_time="19:00")
-            if not start_date:
-                return None
-
-            ts_code = self._convert_stock_code(stock_code)
-
-            df = self._call_api_with_rate_limit(
-                "cyq_chips",
-                ts_code=ts_code,
-                start_date=start_date,
-                end_date=start_date,
-            )
-            if df is not None and not df.empty:
-                daily_df = self._call_api_with_rate_limit(
-                    "daily",
-                    ts_code=ts_code,
-                    start_date=start_date,
-                    end_date=start_date,
-                )
-                if daily_df is None or daily_df.empty:
-                    return None
-                current_price = daily_df.iloc[0]["close"]
-                metrics = self.compute_cyq_metrics(df, current_price)
-
-                chip = ChipDistribution(
-                    code=stock_code,
-                    date=datetime.strptime(start_date, "%Y%m%d").strftime("%Y-%m-%d"),
-                    profit_ratio=metrics["获利比例"],
-                    avg_cost=metrics["平均成本"],
-                    cost_90_low=metrics["90成本-低"],
-                    cost_90_high=metrics["90成本-高"],
-                    concentration_90=metrics["90集中度"],
-                    cost_70_low=metrics["70成本-低"],
-                    cost_70_high=metrics["70成本-高"],
-                    concentration_70=metrics["70集中度"],
-                )
-
-                logger.info(
-                    f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
-                    f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
-                    f"70%集中度={chip.concentration_70:.2%}"
-                )
-                return chip
-
-            return None
-
-        except Exception as e:
-            logger.warning(f"[Tushare] 获取筹码分布失败 {stock_code}: {e}")
-            return None
-
-    def compute_cyq_metrics(
-        self, df: pd.DataFrame, current_price: float
-    ) -> dict[str, Any]:
-        """
-        基于 Tushare 的筹码分布明细表 (cyq_chips) 计算常用筹码指标
-        :param df: 包含 'price' 和 'percent' 列的 DataFrame
-        :param current_price: 股票当天的当前价/收盘价 (用于计算获利比例)
-        :return: 包含各项筹码指标的字典
-        """
-        import numpy as np
-
-        # 1. 确保按价格从小到大排序 (Tushare 返回的数据往往是纯倒序的)
-        df_sorted = df.sort_values(by="price", ascending=True).reset_index(drop=True)
-
-        # 2. 防止原始数据 percent 总和产生浮点数误差，归一化到 100%
-        total_percent = df_sorted["percent"].sum()
-
-        df_sorted["norm_percent"] = df_sorted["percent"] / total_percent * 100
-
-        # 3. 计算筹码的累积分布
-        df_sorted["cumsum"] = df_sorted["norm_percent"].cumsum()
-
-        # --- 获利比例 ---
-        # 所有价格 <= 当前价的筹码之和
-        winner_rate = df_sorted[df_sorted["price"] <= current_price][
-            "norm_percent"
-        ].sum()
-
-        # --- 平均成本 ---
-        # 价格的加权平均值
-        avg_cost = np.average(df_sorted["price"], weights=df_sorted["norm_percent"])
-
-        # --- 辅助函数：求指定累积比例处的价格 ---
-        def get_percentile_price(target_pct: float) -> float:
-            # 寻找累积求和第一次大于等于目标百分比的行索引
-            idx = df_sorted["cumsum"].searchsorted(target_pct)
-            max_idx: int = int(len(df_sorted)) - 1
-            clamped = int(idx) if int(idx) < max_idx else max_idx
-            raw_price: Any = df_sorted.iloc[clamped]["price"]
-            return float(raw_price)
-
-        # --- 90% 成本区与集中度 ---
-        # 去头去尾各 5%
-        cost_90_low: float = get_percentile_price(5)
-        cost_90_high: float = get_percentile_price(95)
-        if (cost_90_high + cost_90_low) != 0:
-            concentration_90: float = (
-                (cost_90_high - cost_90_low) / (cost_90_high + cost_90_low) * 100
-            )
-        else:
-            concentration_90 = 0.0
-
-        # --- 70% 成本区与集中度 ---
-        # 去头去尾各 15%
-        cost_70_low: float = get_percentile_price(15)
-        cost_70_high: float = get_percentile_price(85)
-        if (cost_70_high + cost_70_low) != 0:
-            concentration_70: float = (
-                (cost_70_high - cost_70_low) / (cost_70_high + cost_70_low) * 100
-            )
-        else:
-            concentration_70 = 0.0
-
-        # 返回格式化结果
-        return {
-            "获利比例": round(
-                winner_rate / 100, 4
-            ),  # /100 与akshare保持一致，返回小数格式
-            "平均成本": round(float(avg_cost), 4),
-            "90成本-低": round(cost_90_low, 4),
-            "90成本-高": round(cost_90_high, 4),
-            "90集中度": round(concentration_90 / 100, 4),
-            "70成本-低": round(cost_70_low, 4),
-            "70成本-高": round(cost_70_high, 4),
-            "70集中度": round(concentration_70 / 100, 4),
-        }
-
 
 if __name__ == "__main__":
     # 测试代码
@@ -1406,15 +1242,6 @@ if __name__ == "__main__":
             print("Failed to compute market stats.")
     except Exception as e:
         print(f"Failed to compute market stats: {e}")
-
-    # 测试筹码分布数据
-    print("\n" + "=" * 50)
-    print("测试筹码分布数据获取")
-    print("=" * 50)
-    try:
-        chip = fetcher.get_chip_distribution("600519")  # 茅台
-    except Exception as e:
-        print(f"[筹码分布] 获取失败: {e}")
 
     # 测试行业板块排名
     print("\n" + "=" * 50)

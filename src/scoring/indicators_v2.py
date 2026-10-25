@@ -138,24 +138,6 @@ def score_valuation(pe_ttm: Optional[float], pb: Optional[float]) -> Optional[Di
     return None
 
 
-def score_chip_cost(
-    current: Optional[float], avg_cost: Optional[float], profit_ratio: Optional[float]
-) -> Optional[Dict[str, Any]]:
-    """筹码成本结构：现价相对平均成本的位置 + 获利盘比例。"""
-    if current and avg_cost and avg_cost > 0:
-        dev = (current - avg_cost) / avg_cost * 100
-        if profit_ratio is not None:
-            summary = (
-                f"现价较平均成本 {dev:+.1f}%，获利盘 {float(profit_ratio):.0f}%"
-                + ("，上方套牢盘轻" if dev > 0 else "，现价处于成本区下方")
-            )
-        else:
-            summary = f"现价较平均成本 {dev:+.1f}%"
-        score = 65.0 if dev > 0 else 45.0
-        return scored_indicator("chip_cost", score, summary, "rule", "medium")
-    return None
-
-
 def score_institution_change(institution_holding_change: Optional[Any]) -> Optional[Dict[str, Any]]:
     """机构/大户持仓变动（fundamental_context institution 块）。"""
     if institution_holding_change is None:

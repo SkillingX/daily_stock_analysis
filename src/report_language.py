@@ -158,11 +158,6 @@ _NO_DATA_BY_LANGUAGE = {
     "en": "Data unavailable",
 }
 
-_CHIP_UNAVAILABLE_BY_LANGUAGE = {
-    "zh": "筹码分布未启用或数据源暂不可用，未纳入筹码判断。",
-    "en": "Chip distribution is disabled or temporarily unavailable; chip signals were not used.",
-}
-
 _CHIP_PLACEHOLDER_EXACT = {
     "",
     "n/a",
@@ -503,11 +498,6 @@ def get_no_data_text(language: Optional[str]) -> str:
     return _NO_DATA_BY_LANGUAGE[normalize_report_language(language)]
 
 
-def get_chip_unavailable_text(language: Optional[str]) -> str:
-    """Return the localized one-line chip distribution fallback text."""
-    return _CHIP_UNAVAILABLE_BY_LANGUAGE[normalize_report_language(language)]
-
-
 # 基本面快照（最新报告期）段 i18n 提示
 _FUNDAMENTAL_SNAPSHOT_TABLE_HEADER = {
     "zh": ("指标", "数值"),
@@ -720,6 +710,20 @@ def is_chip_placeholder_value(value: Any) -> bool:
     return any(hint in lowered for hint in _CHIP_PLACEHOLDER_HINTS)
 
 
+def strip_retired_chip_structure(dashboard: Optional[Dict[str, Any]]) -> None:
+    """Drop the retired chip_structure block from a freshly adopted dashboard (issue #46).
+
+    Shared by the LLM and Agent adoption boundaries so new reports never carry
+    model-invented chip facts; historical stored reports replay their own data
+    unchanged.
+    """
+    if not isinstance(dashboard, dict):
+        return
+    data_perspective = dashboard.get("data_perspective")
+    if isinstance(data_perspective, dict):
+        data_perspective.pop("chip_structure", None)
+
+
 def is_chip_structure_unavailable(chip_data: Any) -> bool:
     """Detect chip_structure blocks that contain only unavailable placeholders."""
     if not isinstance(chip_data, dict) or not chip_data:
@@ -740,20 +744,20 @@ def is_chip_structure_unavailable(chip_data: Any) -> bool:
 
 
 def get_chip_unavailable_reason(value: Any, language: Optional[str]) -> str:
-    """Return the explicit or default chip unavailable reason for rendering."""
+    """Return the explicitly stored chip unavailable reason (historical reports only).
+
+    Chip analysis retired with issue #46; this only replays reasons stored on old
+    reports and never synthesizes a new "chip unavailable" line.
+    """
     if not isinstance(value, dict) or not value:
         return ""
     for key in _CHIP_UNAVAILABLE_REASON_KEYS:
         raw = value.get(key)
         if isinstance(raw, bool):
-            if raw:
-                return get_chip_unavailable_text(language)
             continue
         text = str(raw or "").strip()
         if text:
             return text
-    if is_chip_structure_unavailable(value):
-        return get_chip_unavailable_text(language)
     return ""
 
 

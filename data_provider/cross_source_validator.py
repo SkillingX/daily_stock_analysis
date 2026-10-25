@@ -463,19 +463,54 @@ def has_current_financial_period(reading: AnchorReading) -> bool:
             and (disclosed is None or disclosed <= today))
 
 
-@ensure(lambda result: all(reading.period == result[0] for reading in result[1].values()), "Current financial snapshot cannot mix reporting periods")
+def _eligible_current_financial(reading: Optional[AnchorReading], field: str) -> bool:
+    """Qualification gate shared with the Choice omission decision (issue #45)."""
+    return (reading is not None and reading.period is not None
+            and has_current_financial_period(reading)
+            and not reading_input_reasons(reading, field)
+            and reading.statement_scope == "consolidated" and reading.adjustment == "restated")
+
+
+@ensure(lambda ifind, result: all(
+    reading.period == result[0]
+    or (reading is ifind.get(field) and _eligible_current_financial(reading, field))
+    for field, reading in result[1].items()),
+    "Current financial snapshot cannot mix periods except adopted qualified iFinD fields")
 def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str, AnchorReading]) -> tuple[Optional[str], dict[str, AnchorReading]]:
-    """Latest confirmed cumulative period wins; supplier priority applies within it."""
-    periods = [reading.period for reading in (*ifind.values(), *choice.values())
-               if has_current_financial_period(reading) and reading.period is not None]
+    """Latest confirmed period wins; Choice fills gaps only inside that period.
+
+    A newer Choice reading cannot become the snapshot period when that would
+    drop a qualified iFinD field Choice did not also return for the newer period.
+    A field whose qualified iFinD reading was omitted from the Choice query stays
+    adopted at its own period instead of turning into a gap.
+    """
+    protected = {field: reading for field, reading in ifind.items()
+                 if reading.period is not None and _eligible_current_financial(reading, field)}
+    protected_period = max((reading.period for reading in protected.values() if reading.period is not None), default=None)
+
+    def choice_can_advance_to(candidate: Optional[str]) -> bool:
+        if candidate is None or protected_period is None or candidate <= protected_period:
+            return True
+        for field, reading in protected.items():
+            if reading.period == candidate:
+                continue
+            other = choice.get(field)
+            if other is None or other.period != candidate or not _eligible_current_financial(other, field):
+                return False
+        return True
+
+    periods = [reading.period for field, reading in (*ifind.items(), *choice.items())
+               if reading.period is not None and _eligible_current_financial(reading, field)
+               and choice_can_advance_to(reading.period)]
     period = max(periods) if periods else None
-    selected = {}
+    selected: dict[str, AnchorReading] = {}
     for field in dict.fromkeys((*ifind, *choice)):
+        # 未重查 Choice 的合格 iFinD 字段按自身财期保留，不因快照财期更新丢成缺项
+        if field in protected:
+            selected[field] = protected[field]
+            continue
         for reading in (ifind.get(field), choice.get(field)):
-            if (reading is not None and period is not None and reading.period == period
-                    and has_current_financial_period(reading)
-                    and not reading_input_reasons(reading, field)
-                    and reading.statement_scope == "consolidated" and reading.adjustment == "restated"):
+            if reading is not None and _eligible_current_financial(reading, field) and reading.period == period:
                 selected[field] = reading
                 break
     return period, selected

@@ -46,11 +46,20 @@ def test_tavily_residual_key_cannot_construct_or_call_a_provider(monkeypatch):
     service = SearchService(tavily_keys=['leftover'], searxng_public_instances_enabled=False)
     assert 'Tavily' not in [provider.name for provider in service._providers]
     assert not Config(tavily_api_keys=['leftover'], searxng_public_instances_enabled=False).has_search_capability_enabled()
+    # 默认公开实例开关和残留 Key 都不能把退休渠道算成已配置搜索。
+    assert not Config(
+        tavily_api_keys=['leftover'],
+        bocha_api_keys=['leftover'],
+        brave_api_keys=['leftover'],
+        serpapi_keys=['leftover'],
+        anspire_api_keys=['leftover'],
+        searxng_base_urls=['https://fixture.invalid'],
+    ).has_search_capability_enabled()
     forbidden.assert_not_called()
 
 
 def test_replacement_keeps_other_providers_and_minimax_default(zhipu_wire):
-    config = dict(anspire_keys=['a'], bocha_keys=['b'], brave_keys=['c'], serpapi_keys=['d'], minimax_keys=['e'], searxng_base_urls=['https://fixture.invalid'], x_keys=['f'])
+    config = dict(anspire_keys=['a'], bocha_keys=['b'], brave_keys=['c'], serpapi_keys=['d'], minimax_keys=['e'], searxng_base_urls=['https://fixture.invalid'])
     original = SearchService(**config)
     replaced = SearchService(**config, coding_plan_search_provider='zhipu', zhipu_api_key='test-only')
     original_names = [provider.name for provider in original._providers]
@@ -184,7 +193,7 @@ def test_all_runtime_factories_forward_the_same_search_selection(monkeypatch, en
         search_service.reset_search_service()
     elif entrypoint == 'pipeline':
         monkeypatch.setattr(pipeline, 'SearchService', create)
-        for name in ('get_db', 'DataFetcherManager', 'StockTrendAnalyzer', 'GeminiAnalyzer', 'NotificationService', 'SocialSentimentService'):
+        for name in ('get_db', 'DataFetcherManager', 'StockTrendAnalyzer', 'GeminiAnalyzer', 'NotificationService'):
             monkeypatch.setattr(pipeline, name, MagicMock())
         pipeline.StockAnalysisPipeline(config=config)
     elif entrypoint == 'market_review':
@@ -192,17 +201,21 @@ def test_all_runtime_factories_forward_the_same_search_selection(monkeypatch, en
     else:
         alphasift_service._build_hotspot_event_routes_from_search('新莱应材', config)
     assert len(built) == 1
-    assert [p.name for p in built[0]._providers] == ['Zhipu', 'html_scrape']
+    # html_scrape 搜索回退已随 issue #47 退役，套餐入口失败不再回退。
+    assert [p.name for p in built[0]._providers] == ['Zhipu']
 
 
-def test_settings_and_status_do_not_offer_tavily_as_available():
-    from src.core.config_registry import get_field_definition
+def test_settings_and_status_do_not_offer_retired_search_channels():
+    from src.core.config_registry import get_registered_field_keys
     from bot.commands.status import StatusCommand
-    assert not get_field_definition('TAVILY_API_KEYS')['is_editable']
-    config = Config(tavily_api_keys=['leftover'], coding_plan_search_provider='zhipu', zhipu_api_key='test-only')
+    # issue #47：退休渠道不出现在设置页与状态展示。
+    assert 'TAVILY_API_KEYS' not in get_registered_field_keys()
+    config = Config(tavily_api_keys=['leftover'], bocha_api_keys=['leftover'], coding_plan_search_provider='zhipu', zhipu_api_key='test-only')
     status = StatusCommand()._collect_status(config)
     assert status['search_zhipu'] and not status['search_minimax']
-    assert 'Tavily: 已停用' in StatusCommand()._format_status(status, 'telegram')
+    formatted = StatusCommand()._format_status(status, 'telegram')
+    for retired in ('Tavily', 'Bocha', 'Brave', 'SerpAPI', 'SearXNG'):
+        assert retired not in formatted
 
 
 def test_readonly_provider_credentials_are_masked_before_reaching_settings(tmp_path, monkeypatch):
@@ -213,8 +226,9 @@ def test_readonly_provider_credentials_are_masked_before_reaching_settings(tmp_p
     env.write_text('IFIND_MCP_TOKEN=private-fixture-token\nTAVILY_API_KEYS=retired-fixture-key\n')
     monkeypatch.setenv('ENV_FILE', str(env))
     result = SystemConfigService(manager=ConfigManager(env_path=env)).get_config()
-    for name in ('IFIND_MCP_TOKEN', 'TAVILY_API_KEYS'):
-        item = next(item for item in result['items'] if item['key'] == name)
-        assert item['value'] == '******' and item['is_masked']
+    # 退休渠道不进入设置页载荷；保留渠道的密钥仍打码。
+    assert all(item['key'] != 'TAVILY_API_KEYS' for item in result['items'])
+    item = next(item for item in result['items'] if item['key'] == 'IFIND_MCP_TOKEN')
+    assert item['value'] == '******' and item['is_masked']
     for name in ('FINANCIAL_PRIMARY_SOURCE', 'CODING_PLAN_SEARCH_PROVIDER'):
         assert all(option['label'] != option['value'] for option in get_field_definition(name)['options'])

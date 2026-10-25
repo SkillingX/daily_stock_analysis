@@ -3,7 +3,7 @@
 
 对 Agent 产出的 Markdown 报告做结构化质量校验：
 1. 新八章结构完整性：投资结论 + 消息面与产业政策 + 产业链位置 + 国产替代 +
-   材料工艺独特地位 + 中美产业链关系 + 财务与估值 + 技术面与筹码节奏 + 风险证伪。
+   材料工艺独特地位 + 中美产业链关系 + 财务与估值 + 技术面节奏 + 风险证伪。
 2. 结论前置：每个一级章节首句是否为结论句。
 3. 三情景概率和：是否落在 [95%, 105%] 容差区间。
 
@@ -12,7 +12,7 @@
   国产替代 / 材料工艺 / 中美链 / 财务估值 / 技术面 / 风险证伪）。
 - 旧"宏观"被并入"消息面与产业政策"；"财务"与"估值"合并为"财务与估值验证"。
 - 国产替代与中美链各自必含**适用性判断**（强相关 / 低相关 / 不适用），否则降分。
-- **技术面降权**：技术面与筹码节奏层缺工具不阻断报告（标记"缺少择时信息"），
+- **技术面降权**：技术面节奏层缺工具不阻断报告（标记"缺少择时信息"），
   关键词缺失只降分；其它层缺失仍按"必要工具未调用"或"内容关键词缺失"扣分。
 
 校验结果驱动 executor 的 L3 兜底（失败→追加提示重生成；再失败→标注降级）。
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # 每层要求：关键词（内容覆盖，命中其一即可）+ 工具组（每组任一即可，所有组都要满足）。
 # 与 system_prompt.md 第二章「强制工具调用检查点」保持一致。
 #
-# ``optional=True`` 的层（当前仅"技术面与筹码节奏"）即使缺工具或缺关键词也不阻断
+# ``optional=True`` 的层（当前仅"技术面节奏"）即使缺工具或缺关键词也不阻断
 # passed 判定；只降分并写入 details 提示"缺少择时信息"。其它层缺失会阻断。
 _LAYER_REQUIREMENTS: Dict[str, Dict[str, object]] = {
     "消息面与产业政策": {
@@ -40,7 +40,6 @@ _LAYER_REQUIREMENTS: Dict[str, Dict[str, object]] = {
             "消息",
             "公告",
             "新闻",
-            "社区",
             "政策",
             "监管",
             "分歧",
@@ -141,9 +140,8 @@ _LAYER_REQUIREMENTS: Dict[str, Dict[str, object]] = {
         ],
         "tool_groups": [{"get_stock_info"}],
     },
-    "技术面与筹码节奏": {
+    "技术面节奏": {
         "keywords": [
-            "筹码",
             "均线",
             "K线",
             "量能",
@@ -156,7 +154,7 @@ _LAYER_REQUIREMENTS: Dict[str, Dict[str, object]] = {
             "阻力",
             "技术面",
         ],
-        "tool_groups": [{"analyze_trend", "get_chip_distribution", "get_capital_flow"}],
+        "tool_groups": [{"analyze_trend", "get_capital_flow"}],
         "optional": True,  # P0 框架调整：技术面降权，缺不阻断
     },
 }
@@ -171,7 +169,7 @@ _REQUIRED_SECTIONS = [
     "材料",
     "中美产业链关系",
     "财务与估值",
-    "技术面与筹码节奏",
+    "技术面节奏",
     "风险",
 ]
 
@@ -428,7 +426,7 @@ class DeepResearchValidator:
                         # 缺工具 + 缺内容 → 标记"缺少择时信息"但不阻断
                         if not check["content_ok"]:
                             details.append(
-                                f"{layer}层：缺少择时信息（工具与关键词均未覆盖，建议补 analyze_trend / get_chip_distribution / get_capital_flow 至少其一）"
+                                f"{layer}层：缺少择时信息（工具与关键词均未覆盖，建议补 analyze_trend / get_capital_flow 至少其一）"
                             )
                 else:
                     layer_point = 0.0
@@ -551,7 +549,7 @@ def _section_present(markdown: str, layer_key: str) -> bool:
     """粗粒度判断 markdown 是否包含指定层对应的章节标题（按 _REQUIRED_SECTIONS 关键字）。
 
     例如 ``layer_key='国产替代'`` 会匹配「国产替代与平行替换」；``layer_key='中美产业链关系'``
-    会匹配「中美产业链关系」；技术面层匹配「技术面与筹码节奏」。
+    会匹配「中美产业链关系」；技术面层匹配「技术面节奏」。
     """
     if not markdown:
         return False

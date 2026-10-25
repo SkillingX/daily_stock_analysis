@@ -2,7 +2,7 @@
 """Regression tests for pipeline-level related board enrichment."""
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.core.pipeline import StockAnalysisPipeline
 
@@ -20,11 +20,18 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
             "boards": {"status": "ok", "data": {"top": [], "bottom": []}},
         }
 
-        enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", cached_context)
+        with unittest.mock.patch.object(
+            StockAnalysisPipeline, "_attach_concept_membership",
+            side_effect=lambda code, ctx: ctx.__setitem__("concept_membership", {"concepts": [{"name": "白酒概念"}], "source": "ifind", "as_of_nature": "latest", "error": None}),
+        ):
+            enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", cached_context)
 
         self.assertIsNot(enriched, cached_context)
         self.assertNotIn("belong_boards", cached_context)
-        self.assertEqual(enriched["belong_boards"], [{"name": "白酒", "type": "行业"}])
+        # issue #45：不再把东财所属板块注入报告，概念走 concept_membership。
+        self.assertEqual(enriched["belong_boards"], [])
+        pipeline.fetcher_manager.get_belong_boards.assert_not_called()
+        self.assertEqual(enriched["concept_membership"]["source"], "ifind")
 
     def test_attach_belong_boards_copies_existing_board_list(self) -> None:
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
@@ -39,7 +46,8 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
             "boards": {"status": "ok", "data": {"top": [], "bottom": []}},
         }
 
-        enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", context)
+        with patch.object(StockAnalysisPipeline, "_attach_concept_membership"):
+            enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", context)
 
         self.assertIsNot(enriched, context)
         self.assertEqual(enriched["belong_boards"], existing_boards)
@@ -83,7 +91,8 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
             "errors": ["etf not fully supported"],
         }
 
-        enriched = pipeline._attach_belong_boards_to_fundamental_context("159915", context)
+        with patch.object(StockAnalysisPipeline, "_attach_concept_membership"):
+            enriched = pipeline._attach_belong_boards_to_fundamental_context("159915", context)
 
         self.assertEqual(enriched["belong_boards"], [])
         pipeline.fetcher_manager.get_belong_boards.assert_not_called()
@@ -100,7 +109,8 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
             "errors": ["fundamental pipeline disabled"],
         }
 
-        enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", context)
+        with patch.object(StockAnalysisPipeline, "_attach_concept_membership"):
+            enriched = pipeline._attach_belong_boards_to_fundamental_context("600519", context)
 
         self.assertEqual(enriched["belong_boards"], [])
         pipeline.fetcher_manager.get_belong_boards.assert_not_called()
@@ -116,10 +126,11 @@ class PipelineRelatedBoardsTestCase(unittest.TestCase):
             "boards": {"status": "ok", "data": {"top": [], "bottom": []}},
         }
 
-        enriched = pipeline._attach_belong_boards_to_fundamental_context("SH600519", context)
+        with patch.object(StockAnalysisPipeline, "_attach_concept_membership"):
+            enriched = pipeline._attach_belong_boards_to_fundamental_context("SH600519", context)
 
-        self.assertEqual(enriched["belong_boards"], [{"name": "白酒"}])
-        pipeline.fetcher_manager.get_belong_boards.assert_called_once_with("SH600519")
+        self.assertEqual(enriched["belong_boards"], [])
+        pipeline.fetcher_manager.get_belong_boards.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

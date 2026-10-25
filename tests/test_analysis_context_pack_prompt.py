@@ -146,7 +146,6 @@ def _builder_artifacts(*, fundamental_context: dict) -> PipelineAnalysisArtifact
         enhanced_context={},
         realtime_quote={"price": 1880.0, "source": "mock_quote"},
         trend_result={"trend_status": "available"},
-        chip_data={"source": "mock_chip", "date": "2026-03-26"},
         fundamental_context=fundamental_context,
         news_context="新闻摘要",
         news_result_count=1,
@@ -302,7 +301,8 @@ def test_builder_to_prompt_renders_aux_fetch_failed_without_confidence_cap() -> 
 
     assert pack.data_quality.limitations == ["fundamentals: fetch_failed"]
     assert "数据限制" in section
-    assert "数据质量评分：92/100（良好）" in section
+    # chip 退休后 fundamentals 权重 10→15：fetch_failed 25 分 → 总分 89
+    assert "数据质量评分：89/100（良好）" in section
     assert "已知限制：基本面：抓取失败" in section
     assert "置信度规则" not in section
     assert "confidence_level" not in section

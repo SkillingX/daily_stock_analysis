@@ -169,7 +169,6 @@ def test_renderer_outputs_only_public_schema_fields() -> None:
             "technical": 75,
             "news": 35,
             "fundamentals": 100,
-            "chip": 100,
         },
         "limitations": ["quote: fallback", "technical: partial"],
     }

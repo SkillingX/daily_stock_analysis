@@ -502,26 +502,26 @@ class RunFlowTestCase(unittest.TestCase):
         self.assertIn("provider_run_started", {event.type for event in snapshot.events})
         self.assertIn("llm_run_started", {event.type for event in snapshot.events})
 
-    def test_active_chip_started_event_updates_same_provider_node(self) -> None:
+    def test_active_fundamental_started_event_updates_same_provider_node(self) -> None:
         flow_events: list[dict] = []
         token = activate_run_diagnostic_context(
-            trace_id="trace-chip-started",
-            task_id="task-chip-started",
-            query_id="query-chip-started",
+            trace_id="trace-fund-started",
+            task_id="task-fund-started",
+            query_id="query-fund-started",
             stock_code="600519",
             trigger_source="api",
             event_sink=flow_events.append,
         )
         try:
             record_provider_run_started(
-                data_type="chip",
-                provider="ChipFetcher",
-                operation="get_chip_distribution",
+                data_type="fundamental",
+                provider="FundFetcher",
+                operation="get_fundamental_context",
             )
             record_provider_run(
-                data_type="chip",
-                provider="ChipFetcher",
-                operation="get_chip_distribution",
+                data_type="fundamental",
+                provider="FundFetcher",
+                operation="get_fundamental_context",
                 success=True,
                 latency_ms=80,
                 record_count=1,
@@ -531,8 +531,8 @@ class RunFlowTestCase(unittest.TestCase):
 
         snapshot = build_task_run_flow_snapshot(
             TaskInfo(
-                task_id="task-chip-started",
-                trace_id="trace-chip-started",
+                task_id="task-fund-started",
+                trace_id="trace-fund-started",
                 stock_code="600519",
                 stock_name="贵州茅台",
                 status=TaskStatus.PROCESSING,
@@ -541,12 +541,12 @@ class RunFlowTestCase(unittest.TestCase):
             )
         )
 
-        chip_nodes = [node for node in snapshot.nodes if node.id == "provider_chip_chipfetcher_1"]
+        fund_nodes = [node for node in snapshot.nodes if node.id == "provider_fundamental_fundfetcher_1"]
 
-        self.assertEqual(len(chip_nodes), 1)
-        self.assertEqual(chip_nodes[0].status, "success")
-        self.assertEqual(chip_nodes[0].record_count, 1)
-        self.assertEqual(chip_nodes[0].label, "筹码结构 · ChipFetcher")
+        self.assertEqual(len(fund_nodes), 1)
+        self.assertEqual(fund_nodes[0].status, "success")
+        self.assertEqual(fund_nodes[0].record_count, 1)
+        self.assertEqual(fund_nodes[0].label, "基本面 · FundFetcher")
         self.assertIn("provider_run_started", {event.type for event in snapshot.events})
 
     def test_llm_started_and_result_match_by_call_type_when_model_alias_differs(self) -> None:

@@ -133,7 +133,6 @@ module = [
     "src.services.knowledge_base_service",
     "src.services.image_stock_extractor",
     "src.services.backtest_service",
-    "src.services.social_sentiment_service",
     "src.services.market_light_alerts",
     "src.services.alert_service",
     "src.repositories.portfolio_repo",

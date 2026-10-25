@@ -42,7 +42,6 @@ const BLOCK_LABELS: Record<ReportLanguage, Record<string, string>> = {
     technical: '技术',
     news: '新闻',
     fundamentals: '基本面',
-    chip: '筹码',
   },
   en: {
     quote: 'quote',
@@ -50,7 +49,6 @@ const BLOCK_LABELS: Record<ReportLanguage, Record<string, string>> = {
     technical: 'technical',
     news: 'news',
     fundamentals: 'fundamentals',
-    chip: 'chip',
   },
 };
 
@@ -124,7 +122,6 @@ const MISSING_REASON_LABELS: Record<ReportLanguage, Record<string, string>> = {
     realtime_quote_missing: '未进入分析输入',
     trend_result_missing: '未进入分析输入',
     fundamental_context_missing: '未进入分析输入',
-    chip_distribution_missing: '未进入分析输入',
     today_missing: '今日数据未进入分析输入',
     yesterday_missing: '昨日数据未进入分析输入',
   },
@@ -134,7 +131,6 @@ const MISSING_REASON_LABELS: Record<ReportLanguage, Record<string, string>> = {
     realtime_quote_missing: 'Not included in analysis input',
     trend_result_missing: 'Not included in analysis input',
     fundamental_context_missing: 'Not included in analysis input',
-    chip_distribution_missing: 'Not included in analysis input',
     today_missing: 'Today data not included in analysis input',
     yesterday_missing: 'Yesterday data not included in analysis input',
   },

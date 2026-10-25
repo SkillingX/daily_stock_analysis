@@ -8,7 +8,6 @@ Provides supply chain, concept board, institutional holdings, and northbound flo
 from datetime import date
 from typing import Optional
 
-from data_provider.supply_chain.concept_board import ConceptBoardProvider
 from data_provider.supply_chain.institutional_holdings import (
     InstitutionalHoldingsProvider,
 )
@@ -26,7 +25,6 @@ def latest_fiscal_year(today: Optional[date] = None) -> int:
 
 
 __all__ = [
-    "ConceptBoardProvider",
     "InstitutionalHoldingsProvider",
     "NorthboundFlowProvider",
     "TushareSupplyChainProvider",

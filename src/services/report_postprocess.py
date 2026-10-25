@@ -191,7 +191,6 @@ def _build_action_checklist(
         ("乖离率合理", factors.get("bias_ma5_safe"), "bias_ma5 < 5%"),
         ("量能配合", factors.get("volume_status"), "缩量回调或放量突破"),
         ("无重大利空", factors.get("risk_count"), "无利空事件"),
-        ("筹码健康", factors.get("chip_health"), "chip_structure 正常"),
         ("PE 估值合理", factors.get("pe_ratio"), "PE < 50 或负值"),
     ]
 
@@ -294,8 +293,6 @@ def _data_limitations_for(missing_dimensions: List[str]) -> List[str]:
     for d in missing_dimensions:
         if d == "news":
             out.append("news: 搜索 0 条结果")
-        elif d == "chip":
-            out.append("chip: 筹码分布数据缺失")
         elif d == "fundamental_valuation":
             out.append("fundamental_valuation: 估值字段缺失")
         elif d == "realtime_pe":
@@ -357,9 +354,6 @@ def postprocess_report(
     risk_alerts = (
         _extract_factor(raw, ("dashboard", "intelligence", "risk_alerts")) or []
     )
-    chip_health = _extract_factor(
-        raw, ("dashboard", "data_perspective", "chip_structure", "chip_health")
-    )
     current_price = _extract_factor(
         raw, ("dashboard", "data_perspective", "price_position", "current_price")
     )
@@ -394,7 +388,6 @@ def postprocess_report(
         ),
         "volume_status": volume_status,
         "risk_count": risk_count,
-        "chip_health": chip_health,
         "pe_ratio": pe_ratio,
         "current_price": current_price,
         "ma5": ma5,

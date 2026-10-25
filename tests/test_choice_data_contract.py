@@ -57,6 +57,35 @@ def test_current_snapshot_without_confirmed_period_preserves_gap():
     assert select_current_financials({'revenue': reading}, {}) == (None, {})
 
 
+def test_qualified_older_period_ifind_field_stays_adopted_beside_newer_period():
+    revenue = AnchorReading('ifind', 10.0, period='2025-12-31', period_basis='annual', caliber='operating_revenue', unit='currency_base', currency='CNY', statement_scope='consolidated', adjustment='restated')
+    net_profit = AnchorReading('ifind', 20.0, period='2026-06-30', period_basis='YTD', caliber='parent_net_profit', unit='currency_base', currency='CNY', statement_scope='consolidated', adjustment='restated')
+    gap = AnchorReading('choice', 9.0, period='2026-06-30', period_basis='YTD', caliber='weighted_roe', unit='percentage_point', statement_scope='consolidated', adjustment='restated')
+    period, selected = select_current_financials({'revenue': revenue, 'net_profit': net_profit}, {'roe': gap})
+    assert period == '2026-06-30'
+    # 被省略的合格字段按自身财期保留，不丢成缺项；缺口字段仍按同期补位
+    assert selected['revenue'] is revenue
+    assert selected['revenue'].period == '2025-12-31'
+    assert selected['net_profit'] is net_profit
+    assert selected['roe'] is gap
+
+
+def test_choice_reading_cannot_displace_qualified_ifind_field():
+    revenue = AnchorReading('ifind', 10.0, period='2025-12-31', period_basis='annual', caliber='operating_revenue', unit='currency_base', currency='CNY', statement_scope='consolidated', adjustment='restated')
+    competing = AnchorReading('choice', 99.0, period='2025-12-31', period_basis='annual', caliber='operating_revenue', unit='currency_base', currency='CNY', statement_scope='consolidated', adjustment='restated')
+    period, selected = select_current_financials({'revenue': revenue}, {'revenue': competing})
+    assert period == '2025-12-31'
+    assert selected['revenue'] is revenue
+
+
+def test_newer_choice_gap_does_not_drop_qualified_ifind_field():
+    revenue = AnchorReading('ifind', 10.0, period='2025-12-31', period_basis='annual', caliber='operating_revenue', unit='currency_base', currency='CNY', statement_scope='consolidated', adjustment='restated')
+    newer_gap = AnchorReading('choice', 9.0, period='2026-06-30', period_basis='YTD', caliber='weighted_roe', unit='percentage_point', statement_scope='consolidated', adjustment='restated')
+    period, selected = select_current_financials({'revenue': revenue}, {'roe': newer_gap})
+    assert period == '2025-12-31'
+    assert selected == {'revenue': revenue}
+
+
 def test_explicit_future_disclosure_cannot_be_adopted_as_current():
     from dataclasses import replace
     from datetime import date

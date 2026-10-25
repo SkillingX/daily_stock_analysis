@@ -55,7 +55,6 @@ def _make_pipeline(*, agent_mode: bool = False, save_context_snapshot: bool = Tr
     pipeline.config = SimpleNamespace(
             enabled_markets=("cn", "hk", "us"),
         enable_realtime_quote=False,
-        enable_chip_distribution=False,
         realtime_source_priority=[],
         agent_mode=agent_mode,
         agent_skills=[],
@@ -71,12 +70,10 @@ def _make_pipeline(*, agent_mode: bool = False, save_context_snapshot: bool = Tr
     pipeline.progress_callback = None
     pipeline.analysis_skills = None
     pipeline.analysis_phase = "auto"
-    pipeline.social_sentiment_service = None
 
     pipeline.fetcher_manager = MagicMock()
     pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
     pipeline.fetcher_manager.get_realtime_quote.return_value = None
-    pipeline.fetcher_manager.get_chip_distribution.return_value = None
     pipeline.fetcher_manager.get_fundamental_context.return_value = {
         "market": "cn",
         "coverage": {"boards": "not_supported"},
@@ -147,7 +144,7 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         enhanced_context = {"realtime": {"price": 1888.0}, "stock_name": "贵州茅台"}
         realtime_quote = {"price": 1888.0, "source": "test"}
         trend_result = {"ma_trend": "up"}
-        chip_data = {"concentration": "medium"}
+
         fundamental_context = {"market": "cn", "pe": 28}
         news_context = "news summary"
 
@@ -160,7 +157,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             enhanced_context=enhanced_context,
             realtime_quote=realtime_quote,
             trend_result=trend_result,
-            chip_data=chip_data,
             fundamental_context=fundamental_context,
             news_context=news_context,
             news_result_count=3,
@@ -175,7 +171,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertIs(artifacts.enhanced_context, enhanced_context)
         self.assertIs(artifacts.realtime_quote, realtime_quote)
         self.assertIs(artifacts.trend_result, trend_result)
-        self.assertIs(artifacts.chip_data, chip_data)
         self.assertIs(artifacts.fundamental_context, fundamental_context)
         self.assertEqual(artifacts.news_context, news_context)
         self.assertEqual(artifacts.news_result_count, 3)
@@ -200,7 +195,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
             },
             news_content=None,
             realtime_quote=None,
-            chip_data=None,
         )
 
         self.assertNotIn("market_phase_context", snapshot["enhanced_context"])
@@ -214,12 +208,10 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         phase = _phase_payload()
         realtime_quote = {"price": 1888.0, "source": "test"}
         trend_result = {"ma_trend": "up"}
-        chip_distribution = {"concentration": "medium"}
         fundamental_context = {"market": "cn", "pe": 28}
         initial_context = {
             "realtime_quote": realtime_quote,
             "trend_result": trend_result,
-            "chip_distribution": chip_distribution,
             "news_context": "prefetched news",
         }
 
@@ -251,7 +243,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertEqual(artifacts.enhanced_context, {})
         self.assertIs(artifacts.realtime_quote, realtime_quote)
         self.assertIs(artifacts.trend_result, trend_result)
-        self.assertIs(artifacts.chip_data, chip_distribution)
         self.assertIs(artifacts.fundamental_context, fundamental_context)
         self.assertEqual(artifacts.news_context, "prefetched news")
         self.assertIsNone(artifacts.news_result_count)
@@ -280,16 +271,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
         self.assertEqual(artifacts_with_daily.base_context["yesterday"]["close"], 1860.0)
         self.assertNotIn("data_missing", artifacts_with_daily.base_context)
 
-        artifacts_without_chip = pipeline._build_agent_analysis_artifacts(
-            code="600519",
-            stock_name="贵州茅台",
-            market="cn",
-            phase=phase,
-            initial_context={},
-            fundamental_context=fundamental_context,
-            query_id="q-agent-no-chip",
-        )
-        self.assertIsNone(artifacts_without_chip.chip_data)
 
     def test_legacy_pipeline_passes_market_phase_context_to_analyzer_only(self):
         pipeline = _make_pipeline(agent_mode=False, save_context_snapshot=True)
@@ -414,7 +395,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                 query_id="q-agent",
                 stock_name="贵州茅台",
                 realtime_quote=None,
-                chip_data=None,
                 fundamental_context={"market": "cn"},
                 trend_result=None,
                 market_phase_context=phase_payload,
@@ -454,11 +434,7 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
     def test_agent_pack_summary_uses_prefetched_news_context_when_present(self):
         pipeline = _make_pipeline(agent_mode=True, save_context_snapshot=True)
         pipeline._ensure_agent_history = MagicMock()
-        pipeline.social_sentiment_service = MagicMock()
-        pipeline.social_sentiment_service.is_available = True
-        pipeline.social_sentiment_service.get_social_context.return_value = (
-            "Social sentiment raw payload should stay in legacy news_context only."
-        )
+        pipeline.db.get_analysis_context.return_value = None
 
         from src.agent.executor import AgentResult
 
@@ -483,7 +459,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                 query_id="q-agent-news",
                 stock_name="Apple",
                 realtime_quote=None,
-                chip_data=None,
                 fundamental_context={"market": "us"},
                 trend_result=None,
                 market_phase_context=_phase_payload(),
@@ -491,11 +466,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
 
         self.assertIsNotNone(result)
         run_context = executor.run.call_args.kwargs["context"]
-        self.assertIn("Social sentiment raw payload", run_context["news_context"])
-        summary = run_context["analysis_context_pack_summary"]
-        self.assertIn("新闻: available", summary)
-        self.assertNotIn("新闻: missing", summary)
-        self.assertNotIn("Social sentiment raw payload", summary)
 
         save_kwargs = pipeline.db.save_analysis_history.call_args.kwargs
         self.assertNotIn("analysis_context_pack_summary", save_kwargs["context_snapshot"])
@@ -539,7 +509,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                 query_id="q-agent-daily",
                 stock_name="贵州茅台",
                 realtime_quote=None,
-                chip_data=None,
                 fundamental_context={"market": "cn"},
                 trend_result=None,
                 market_phase_context=_phase_payload(),
@@ -599,7 +568,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                 query_id="q-agent",
                 stock_name="贵州茅台",
                 realtime_quote=None,
-                chip_data=None,
                 fundamental_context={"market": "cn"},
                 trend_result=None,
                 market_phase_context=phase_payload,
@@ -652,7 +620,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                     query_id="q-agent",
                     stock_name="贵州茅台",
                     realtime_quote=None,
-                    chip_data=None,
                     fundamental_context={"market": "cn"},
                     trend_result=None,
                     market_phase_context=phase_payload,
@@ -711,7 +678,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                     query_id="q-agent",
                     stock_name="贵州茅台",
                     realtime_quote=None,
-                    chip_data=None,
                 )
 
             self.assertIsNotNone(result)
@@ -868,7 +834,6 @@ class PipelineMarketPhaseContextTestCase(unittest.TestCase):
                 query_id="q-agent-signal",
                 stock_name="贵州茅台",
                 realtime_quote=None,
-                chip_data=None,
                 fundamental_context={"market": "cn"},
                 trend_result=None,
                 market_phase_context=phase_payload,

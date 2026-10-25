@@ -81,7 +81,7 @@ def _patch_service(monkeypatch: pytest.MonkeyPatch, provider: _FakeProvider):
 
 class TestBuildClueHypeQuery:
     def test_with_site_prefixes_site_operator(self):
-        assert _build_clue_hype_query("xueqiu.com", "新凯来") == "site:xueqiu.com 新凯来"
+        assert _build_clue_hype_query("finance.sina.com.cn", "新凯来") == "site:finance.sina.com.cn 新凯来"
 
     def test_without_site_is_bare_clue(self):
         assert _build_clue_hype_query(None, "新凯来 供应商") == "新凯来 供应商"
@@ -90,7 +90,7 @@ class TestBuildClueHypeQuery:
         assert _build_clue_hype_query("10jqka.com.cn", "  新凯来  ") == "site:10jqka.com.cn 新凯来"
 
     def test_empty_clue_with_site(self):
-        assert _build_clue_hype_query("xueqiu.com", "   ") == "site:xueqiu.com"
+        assert _build_clue_hype_query("cninfo.com.cn", "   ") == "site:cninfo.com.cn"
 
     def test_none_clue_without_site(self):
         assert _build_clue_hype_query(None, None) == ""
@@ -138,23 +138,19 @@ class TestSearchClueHypeHandler:
         monkeypatch.setattr(sct, "_get_search_service", lambda: _FakeSearchService([prov]))
         result = _handle_search_clue_hype("新凯来")
         assert "error" in result and "不可用" in result["error"]
+        assert "SERPAPI" not in result["error"]
         assert result["clue"] == "新凯来"
 
     def test_success_multi_source_aggregation_and_hype_signal(self, monkeypatch):
-        # 全网源 + 雪球 + 新浪 各命中若干 → mention_sources 含这 3 个 → 中信号（3-4）
+        # 全网源 + 同花顺 + 新浪 各命中 → mention_sources 含这 3 个 → 中信号（3-4）
         def resp_for(query):
-            if "xueqiu.com" in query:
-                return _FakeSearchResponse([_FakeResult("雪球帖", "https://xueqiu.com/a")])
+            if "10jqka.com.cn" in query:
+                return _FakeSearchResponse([_FakeResult("同花顺", "https://10jqka.com.cn/a")])
             if "finance.sina.com.cn" in query:
                 return _FakeSearchResponse([_FakeResult("新浪", "https://finance.sina.com.cn/b")])
             if query.startswith("新凯来"):  # 全网源（无 site:）
                 return _FakeSearchResponse([_FakeResult("全网", "https://g.cn/c")])
-            return _FakeSearchResponse([])  # 同花顺/巨潮 无命中
-        prov = _FakeProvider(per_query={q: resp_for(q) for q in [
-            "site:finance.sina.com.cn 新凯来", "site:xueqiu.com 新凯来",
-            "site:10jqka.com.cn 新凯来", "site:cninfo.com.cn 新凯来", "新凯来",
-        ]})
-        # 简化：让 provider 按 query 动态返回
+            return _FakeSearchResponse([])
         prov = _FakeProvider()
         prov.search = lambda query, max_results=3, days=180: (prov.calls.append({"query": query}) or resp_for(query))
         _patch_service(monkeypatch, prov)
@@ -163,30 +159,24 @@ class TestSearchClueHypeHandler:
 
         assert "error" not in result
         assert result["clue"] == "新凯来"
-        assert len(result["queried"]) == len(_CLUE_HYPE_SOURCES)  # 5 源全查
-        # 每源 query 站点限定正确（全网源裸 clue）
+        assert len(result["queried"]) == len(_CLUE_HYPE_SOURCES)
         queries = [q["query"] for q in result["queried"]]
-        assert "site:xueqiu.com 新凯来" in queries
+        assert all("xueqiu.com" not in query for query in queries)
         assert "新凯来" in queries  # 全网源
-        # 提及源聚合：雪球/新浪/全网（3 个）
-        assert set(result["mention_sources"]) == {"新浪财经", "雪球", "全网/Google"}
+        assert set(result["mention_sources"]) == {"新浪财经", "同花顺", "全网/Google"}
         assert result["total_mentions"] == 3
         assert result["hype_signal"] == "中"  # 3 源 → 中
         assert "题材炒作信号" in result["note"] or "炒作信号" in result["note"]
-        # 每个提及源结果含 url
-        xueqiu_entry = [q for q in result["queried"] if q["source"] == "雪球"][0]
-        assert xueqiu_entry["results"][0]["url"] == "https://xueqiu.com/a"
-        assert xueqiu_entry["mention_count"] == 1
+        sina = [q for q in result["queried"] if q["source"] == "新浪财经"][0]
+        assert sina["results"][0]["url"] == "https://finance.sina.com.cn/b"
+        assert sina["mention_count"] == 1
 
     def test_per_source_resilience_one_raises_others_continue(self, monkeypatch):
         # 同花顺源抛异常，其它源正常 → 该源计 0 且带 error，总体仍返回
         def resp_for(query):
-            if "xueqiu.com" in query:
-                return _FakeSearchResponse([_FakeResult("雪球", "https://xueqiu.com/x")])
+            if "finance.sina.com.cn" in query:
+                return _FakeSearchResponse([_FakeResult("新浪", "https://finance.sina.com.cn/x")])
             return _FakeSearchResponse([])
-        prov = _FakeProvider()
-        prov.search = lambda query, max_results=3, days=180: (prov.calls.append({"query": query}) or resp_for(query))
-        # 改成对 10jqka 抛错：用 raise_on
         prov2 = _FakeProvider(raise_on=("10jqka.com.cn",))
         prov2.search = lambda query, max_results=3, days=180: (
             prov2.calls.append({"query": query})
@@ -200,8 +190,7 @@ class TestSearchClueHypeHandler:
         ths = [q for q in result["queried"] if q["source"] == "同花顺"][0]
         assert ths["mention_count"] == 0
         assert "error" in ths and "boom" in ths["error"]
-        # 雪球仍命中
-        assert "雪球" in result["mention_sources"]
+        assert "新浪财经" in result["mention_sources"]
         assert result["hype_signal"] == "弱"  # 仅 1 源
 
     def test_all_sources_no_hit_yields_none_signal(self, monkeypatch):
@@ -215,8 +204,8 @@ class TestSearchClueHypeHandler:
     def test_search_failure_marks_source_error(self, monkeypatch):
         # response.success=False 的源计入 error、0 提及
         def resp_for(query):
-            if "xueqiu.com" in query:
-                return _FakeSearchResponse([_FakeResult("雪球", "https://xueqiu.com/x")])
+            if "cninfo.com.cn" in query:
+                return _FakeSearchResponse([_FakeResult("公告", "https://cninfo.com.cn/x")])
             return _FakeSearchResponse([], success=False, error_message="quota")
         prov = _FakeProvider()
         prov.search = lambda query, max_results=3, days=180: (prov.calls.append({"query": query}) or resp_for(query))
@@ -224,21 +213,98 @@ class TestSearchClueHypeHandler:
         result = _handle_search_clue_hype("新凯来")
         sina = [q for q in result["queried"] if q["source"] == "新浪财经"][0]
         assert sina["mention_count"] == 0 and sina.get("error") == "quota"
-        assert result["mention_sources"] == ["雪球"]
+        assert result["mention_sources"] == ["巨潮资讯/公司公告"]
 
     def test_max_results_per_source_caps_items(self, monkeypatch):
         def resp_for(query):
-            if "xueqiu.com" in query:
-                return _FakeSearchResponse([_FakeResult(f"t{i}", f"https://xueqiu.com/{i}") for i in range(10)])
+            if "finance.sina.com.cn" in query:
+                return _FakeSearchResponse([_FakeResult(f"t{i}", f"https://finance.sina.com.cn/{i}") for i in range(10)])
             return _FakeSearchResponse([])
         prov = _FakeProvider()
         prov.search = lambda query, max_results=3, days=180: (prov.calls.append({"query": query, "max_results": max_results}) or resp_for(query))
         _patch_service(monkeypatch, prov)
         result = _handle_search_clue_hype("新凯来", max_results_per_source=2)
-        xueqiu = [q for q in result["queried"] if q["source"] == "雪球"][0]
-        assert xueqiu["mention_count"] == 2  # 封顶 2
-        # 透传 cap
+        sina = [q for q in result["queried"] if q["source"] == "新浪财经"][0]
+        assert sina["mention_count"] == 2  # 封顶 2
         assert prov.calls[0]["max_results"] == 2
+
+    @pytest.mark.parametrize("community_url", [
+        "https://xueqiu.com/a",
+        "https://www.reddit.com/r/stocks/x",
+        "https://guba.eastmoney.com/news,300260.html",
+        "https://t.10jqka.com.cn/12345678/",
+        "https://weibo.com/u/123",
+        "https://stocktwits.com/symbol/AAPL",
+        "https://forum.example.com/a",
+        "https://forums.example.com/a",
+        "https://bbs.example.com/a",
+        "https://mobile.x.com/a",
+    ])
+    def test_community_urls_do_not_raise_hype_score(self, monkeypatch, community_url):
+        def resp_for(query):
+            if query.startswith("新凯来"):
+                return _FakeSearchResponse([
+                    _FakeResult("社区帖", community_url),
+                    _FakeResult("新浪", "https://finance.sina.com.cn/a"),
+                ])
+            return _FakeSearchResponse([])
+        prov = _FakeProvider()
+        prov.search = lambda query, max_results=3, days=180: resp_for(query)
+        _patch_service(monkeypatch, prov)
+        result = _handle_search_clue_hype("新凯来")
+        assert all("xueqiu.com" not in item["query"] for item in result["queried"])
+        web = [q for q in result["queried"] if q["source"] == "全网/Google"][0]
+        # 社区链接被过滤：不进 results、不增加提及数与炒作分
+        assert web["mention_count"] == 1
+        assert web["results"][0]["url"] == "https://finance.sina.com.cn/a"
+        assert all(community_url not in item["url"] for item in web["results"])
+        assert result["total_mentions"] == 1
+        assert result["hype_signal"] == "弱"
+
+    @pytest.mark.parametrize("community_url", [
+        "https://xueqiu.com/a",
+        "https://www.reddit.com/r/stocks/x",
+        "https://guba.eastmoney.com/news,300260.html",
+        "https://t.10jqka.com.cn/12345678/",
+        "https://weibo.com/u/123",
+        "https://stocktwits.com/symbol/AAPL",
+        "https://forum.example.com/a",
+        "https://forums.example.com/a",
+        "https://bbs.example.com/a",
+        "https://mobile.x.com/a",
+    ])
+    def test_community_only_web_result_yields_no_hype(self, monkeypatch, community_url):
+        # 仅全网源返回一条社区链接：不进 results、不计提及、炒作信号为无
+        def resp_for(query):
+            if query.startswith("新凯来"):
+                return _FakeSearchResponse([_FakeResult("社区帖", community_url)])
+            return _FakeSearchResponse([])
+        prov = _FakeProvider()
+        prov.search = lambda query, max_results=3, days=180: resp_for(query)
+        _patch_service(monkeypatch, prov)
+        result = _handle_search_clue_hype("新凯来")
+        web = [q for q in result["queried"] if q["source"] == "全网/Google"][0]
+        assert web["results"] == []
+        assert web["mention_count"] == 0
+        assert result["mention_sources"] == []
+        assert result["total_mentions"] == 0
+        assert result["hype_signal"] == "无"
+
+    def test_news_web_result_still_counts_as_hype(self, monkeypatch):
+        # 新闻链接照常计数，不被社区过滤误伤
+        def resp_for(query):
+            if query.startswith("新凯来"):
+                return _FakeSearchResponse([_FakeResult("新浪", "https://finance.sina.com.cn/a")])
+            return _FakeSearchResponse([])
+        prov = _FakeProvider()
+        prov.search = lambda query, max_results=3, days=180: resp_for(query)
+        _patch_service(monkeypatch, prov)
+        result = _handle_search_clue_hype("新凯来")
+        web = [q for q in result["queried"] if q["source"] == "全网/Google"][0]
+        assert web["mention_count"] == 1
+        assert result["mention_sources"] == ["全网/Google"]
+        assert result["total_mentions"] == 1
+        assert result["hype_signal"] == "弱"
 
     def test_days_window_passed_through(self, monkeypatch):
         prov = _FakeProvider(default_response=_FakeSearchResponse(results=[]))
@@ -281,7 +347,10 @@ class TestSearchClueHypeToolMetadata:
 
     def test_sources_constant_covers_named_media(self):
         names = {n for n, _ in _CLUE_HYPE_SOURCES}
-        assert {"新浪财经", "雪球", "同花顺", "巨潮资讯/公司公告", "全网/Google"} == names
+        sites = {site for _, site in _CLUE_HYPE_SOURCES}
+        assert {"新浪财经", "同花顺", "巨潮资讯/公司公告", "全网/Google"} == names
+        assert "xueqiu.com" not in sites
+        assert all("xueqiu.com" not in (site or "") for site in sites)
 
 
 # ============================================================
@@ -296,7 +365,10 @@ class TestClueHypePromptRule:
 
     def test_prompt_names_media_and_hype_risk_linkage(self):
         tpl = _SUPPLY_CHAIN_SYSTEM_PROMPT_TEMPLATE
-        for media in ("新浪财经", "雪球", "同花顺"):
+        for media in ("新浪财经", "同花顺"):
             assert media in tpl
+        assert "雪球" not in tpl
+        assert "xueqiu.com" not in tpl
+        assert "社区讨论" not in tpl or "不要求社区讨论" in tpl
         assert "hype_risk" in tpl  # 与炒作风险评分联动
         assert "加分项" in tpl

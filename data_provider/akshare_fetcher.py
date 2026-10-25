@@ -28,7 +28,6 @@ import multiprocessing
 import os
 import random
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple, cast
 
@@ -56,14 +55,12 @@ from .base import (
 )
 from .realtime_types import (
     UnifiedRealtimeQuote,
-    ChipDistribution,
     RealtimeSource,
     get_realtime_circuit_breaker,
-    get_chip_circuit_breaker,
     safe_float,
     safe_int,  # 使用统一的类型转换函数
 )
-from .us_index_mapping import is_us_index_code, is_us_stock_code
+from .us_index_mapping import is_us_stock_code
 
 
 # 保留旧的 RealtimeQuote 别名，用于向后兼容
@@ -1743,160 +1740,9 @@ class AkshareFetcher(BaseFetcher):
             circuit_breaker.record_failure(sina_key, str(e))
             return None
 
-    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
-        """
-        获取筹码分布数据
-
-        数据来源：ak.stock_cyq_em()
-        包含：获利比例、平均成本、筹码集中度
-
-        注意：ETF/指数没有筹码分布数据，会直接返回 None
-
-        Args:
-            stock_code: 股票代码
-
-        Returns:
-            ChipDistribution 对象（最新一天的数据），获取失败返回 None
-        """
-        import akshare as ak
-
-        # 美股没有筹码分布数据（Akshare 不支持）
-        if _is_us_code(stock_code):
-            logger.debug(f"[API跳过] {stock_code} 是美股，无筹码分布数据")
-            return None
-
-        # 港股没有筹码分布数据（stock_cyq_em 是 A 股专属接口）
-        if _is_hk_code(stock_code):
-            logger.debug(f"[API跳过] {stock_code} 是港股，无筹码分布数据")
-            return None
-
-        # ETF/指数没有筹码分布数据
-        if _is_etf_code(stock_code):
-            logger.debug(f"[API跳过] {stock_code} 是 ETF/指数，无筹码分布数据")
-            return None
-
-        try:
-            # 防封禁策略
-            self._set_random_user_agent()
-            self._enforce_rate_limit()
-
-            logger.info(
-                f"[API调用] ak.stock_cyq_em(symbol={stock_code}) 获取筹码分布..."
-            )
-            import time as _time
-
-            # P3-2 fix (2026-07-17): Eastmoney's push2his.eastmoney.com
-            # often closes the connection mid-request (RemoteDisconnected)
-            # when the system has a SOCKS proxy in env (all_proxy=
-            # socks://...). The HTTP proxy at 127.0.0.1:7890 works better.
-            # We temporarily strip SOCKS env, retry up to 3 times with
-            # exponential backoff, and prefer the HTTP proxy if set.
-            df = None
-            api_start = _time.time()
-            _saved_env: Dict[str, str] = {}
-            _socks_keys = (
-                "all_proxy",
-                "ALL_PROXY",
-                "SOCKS_PROXY",
-                "socks_proxy",
-            )
-            try:
-                for _k in _socks_keys:
-                    if _k in os.environ:
-                        _saved_env[_k] = os.environ[_k]
-                        del os.environ[_k]
-                for _attempt in range(3):
-                    try:
-                        df = ak.stock_cyq_em(symbol=stock_code)
-                        if df is not None and not df.empty:
-                            break
-                    except Exception as _exc:
-                        logger.warning(
-                            f"[chip retry] ak.stock_cyq_em {stock_code} "
-                            f"attempt {_attempt + 1}/3 failed: "
-                            f"{type(_exc).__name__}: {_exc}"
-                        )
-                        if _attempt < 2:
-                            _time.sleep(0.5 * (2**_attempt))
-                        else:
-                            raise
-            finally:
-                for _k, _v in _saved_env.items():
-                    os.environ[_k] = _v
-            if df is None:
-                return None
-
-            api_elapsed = _time.time() - api_start
-
-            if df.empty:
-                logger.warning(
-                    f"[API返回] ak.stock_cyq_em 返回空数据, 耗时 {api_elapsed:.2f}s"
-                )
-                return None
-
-            logger.info(
-                f"[API返回] ak.stock_cyq_em 成功: 返回 {len(df)} 天数据, 耗时 {api_elapsed:.2f}s"
-            )
-            logger.debug(f"[API返回] 筹码数据列名: {list(df.columns)}")
-
-            # 取最新一天的数据
-            latest = df.iloc[-1]
-
-            # 使用 realtime_types.py 中的统一转换函数
-            profit_ratio = safe_float(latest.get("获利比例"))
-            avg_cost = safe_float(latest.get("平均成本"))
-            cost_90_low = safe_float(latest.get("90成本-低"))
-            cost_90_high = safe_float(latest.get("90成本-高"))
-            concentration_90 = safe_float(latest.get("90集中度"))
-            cost_70_low = safe_float(latest.get("70成本-低"))
-            cost_70_high = safe_float(latest.get("70成本-高"))
-            concentration_70 = safe_float(latest.get("70集中度"))
-
-            if any(
-                v is None
-                for v in [
-                    profit_ratio,
-                    avg_cost,
-                    cost_90_low,
-                    cost_90_high,
-                    concentration_90,
-                    cost_70_low,
-                    cost_70_high,
-                    concentration_70,
-                ]
-            ):
-                logger.warning(
-                    f"[筹码分布] {stock_code} 字段缺失，跳过本次筹码分布构建"
-                )
-                return None
-
-            chip = ChipDistribution(
-                code=stock_code,
-                date=str(latest.get("日期", "")),
-                profit_ratio=profit_ratio,  # type: ignore[arg-type]
-                avg_cost=avg_cost,  # type: ignore[arg-type]
-                cost_90_low=cost_90_low,  # type: ignore[arg-type]
-                cost_90_high=cost_90_high,  # type: ignore[arg-type]
-                concentration_90=concentration_90,  # type: ignore[arg-type]
-                cost_70_low=cost_70_low,  # type: ignore[arg-type]
-                cost_70_high=cost_70_high,  # type: ignore[arg-type]
-                concentration_70=concentration_70,  # type: ignore[arg-type]
-            )
-
-            logger.info(
-                f"[筹码分布] {stock_code} 日期={chip.date}: 获利比例={chip.profit_ratio:.1%}, "
-                f"平均成本={chip.avg_cost}, 90%集中度={chip.concentration_90:.2%}, "
-                f"70%集中度={chip.concentration_70:.2%}"
-            )
-            return chip
-
-        except Exception as e:
-            logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
-            return None
-
     def get_enhanced_data(self, stock_code: str, days: int = 60) -> Dict[str, Any]:
         """
-        获取增强数据（历史K线 + 实时行情 + 筹码分布）
+        获取增强数据（历史K线 + 实时行情）
 
         Args:
             stock_code: 股票代码
@@ -1909,7 +1755,6 @@ class AkshareFetcher(BaseFetcher):
             "code": stock_code,
             "daily_data": None,
             "realtime_quote": None,
-            "chip_distribution": None,
         }
 
         # 获取日线数据
@@ -1921,9 +1766,6 @@ class AkshareFetcher(BaseFetcher):
 
         # 获取实时行情
         result["realtime_quote"] = self.get_realtime_quote(stock_code)
-
-        # 获取筹码分布
-        result["chip_distribution"] = self.get_chip_distribution(stock_code)
 
         return result
 
@@ -2312,7 +2154,6 @@ class AkshareFetcher(BaseFetcher):
                 "东方财富飙升榜",
                 lambda top_n: self._get_eastmoney_hot_up_stocks(ak, top_n),
             ),
-            ("雪球关注榜", lambda top_n: self._get_xueqiu_hot_stocks(ak, top_n)),
         )
         last_error = ""
         for source, fetch in fetch_attempts:
@@ -2389,32 +2230,6 @@ class AkshareFetcher(BaseFetcher):
                     if change_col
                     else None,
                     "source": "东方财富飙升榜",
-                }
-            )
-        return rows
-
-    def _get_xueqiu_hot_stocks(
-        self, ak: Any, n: int = 10
-    ) -> Optional[List[Dict[str, Any]]]:
-        """获取雪球关注榜兜底。该接口较慢，仅在人气榜失败后尝试。"""
-        self._set_random_user_agent()
-        self._enforce_rate_limit()
-
-        logger.info("[API调用] ak.stock_hot_follow_xq() 获取雪球关注榜...")
-        df = ak.stock_hot_follow_xq(symbol="最热门")
-        if df is None or df.empty:
-            return None
-
-        rows: List[Dict[str, Any]] = []
-        for idx, (_, row) in enumerate(df.head(n).iterrows(), 1):
-            rows.append(
-                {
-                    "rank": idx,
-                    "code": str(row.get("股票代码", "")).strip(),
-                    "name": str(row.get("股票简称", "")).strip(),
-                    "price": self._safe_float(row.get("最新价")),
-                    "change_pct": None,
-                    "source": "雪球关注榜",
                 }
             )
         return rows
@@ -2638,15 +2453,6 @@ if __name__ == "__main__":
             print("Failed to compute market stats.")
     except Exception as e:
         print(f"Failed to compute market stats: {e}")
-
-    # 测试筹码分布数据
-    print("\n" + "=" * 50)
-    print("测试筹码分布数据获取")
-    print("=" * 50)
-    try:
-        chip = fetcher.get_chip_distribution("600519")  # 茅台
-    except Exception as e:
-        print(f"[筹码分布] 获取失败: {e}")
 
     # 测试行业板块排名
     print("\n" + "=" * 50)

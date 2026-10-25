@@ -66,7 +66,8 @@ def test_actual_researcher_consumer_removes_unsupported_scores(native_flow, monk
     dim, _ = parse(result["data"], 1)
     assert dim.status == "degraded"
     assert dim.flow_score is None and dim.score is None
-    assert dim.chip_score == 60
+    # issue #46：模型返回的筹码分在解析层丢弃，不能形成分数。
+    assert not hasattr(dim, "chip_score")
     assert dim.institution_score is None
     assert "机构减持" not in dim.institution_summary
     assert "窗口" in dim.narrative

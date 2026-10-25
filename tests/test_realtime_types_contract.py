@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from icontract import ViolationError
 
-from data_provider.realtime_types import ChipDistribution, safe_float, safe_int
+from data_provider.realtime_types import safe_float, safe_int
 
 
 class TestSafeFloatContract(unittest.TestCase):
@@ -41,36 +41,6 @@ class TestSafeIntContract(unittest.TestCase):
             safe_int("123", default=1.5)  # type: ignore
 
 
-class TestChipDistributionContract(unittest.TestCase):
-    def test_get_chip_status_with_valid_state(self):
-        chip = ChipDistribution(
-            code="600519",
-            profit_ratio=0.5,
-            avg_cost=100.0,
-            concentration_90=0.1,
-        )
-        status = chip.get_chip_status(current_price=110.0)
-        self.assertGreater(len(status), 0)
-
-    def test_violates_when_profit_ratio_out_of_range(self):
-        chip = ChipDistribution(
-            code="600519",
-            profit_ratio=1.5,
-            avg_cost=100.0,
-            concentration_90=0.1,
-        )
-        with self.assertRaises(ViolationError):
-            chip.get_chip_status(current_price=110.0)
-
-    def test_violates_when_current_price_negative(self):
-        chip = ChipDistribution(
-            code="600519",
-            profit_ratio=0.5,
-            avg_cost=100.0,
-            concentration_90=0.1,
-        )
-        with self.assertRaises(ViolationError):
-            chip.get_chip_status(current_price=-1.0)
 
 
 if __name__ == "__main__":

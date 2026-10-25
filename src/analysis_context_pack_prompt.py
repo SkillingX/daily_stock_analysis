@@ -11,7 +11,6 @@ BLOCK_LABELS_ZH = {
     "quote": "行情",
     "daily_bars": "日线",
     "technical": "技术",
-    "chip": "筹码",
     "fundamentals": "基本面",
     "news": "新闻",
 }
@@ -20,7 +19,6 @@ BLOCK_LABELS_EN = {
     "quote": "quote",
     "daily_bars": "daily bars",
     "technical": "technical",
-    "chip": "chip",
     "fundamentals": "fundamentals",
     "news": "news",
 }

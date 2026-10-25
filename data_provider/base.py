@@ -213,40 +213,6 @@ def _is_etf_code(code: str) -> bool:
     )
 
 
-@ensure(
-    lambda result: result is None or isinstance(result, float),
-    "result must be a float or None",
-)
-def _coerce_chip_metric(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        numeric = float(value)
-        if np.isnan(numeric):
-            return None
-        return numeric
-    except (TypeError, ValueError):
-        return None
-
-
-@ensure(lambda result: isinstance(result, bool), "result must be a boolean")
-def _is_meaningful_chip_distribution(chip: Any) -> bool:
-    """Validate that a provider returned usable core chip metrics."""
-    if chip is None:
-        return False
-    avg_cost = _coerce_chip_metric(getattr(chip, "avg_cost", None))
-    concentration_90 = _coerce_chip_metric(getattr(chip, "concentration_90", None))
-    concentration_70 = _coerce_chip_metric(getattr(chip, "concentration_70", None))
-    return (
-        avg_cost is not None
-        and avg_cost > 0
-        and (
-            (concentration_90 is not None and concentration_90 >= 0)
-            or (concentration_70 is not None and concentration_70 >= 0)
-        )
-    )
-
-
 def _market_tag(code: str) -> str:
     """返回市场标签: cn/us/hk."""
     if _is_us_market(code):
@@ -650,6 +616,63 @@ def daily_attempt_budget(reserve_fallback: bool) -> Iterator[None]:
 
 def _daily_budget_exhausted(deadline: Optional[float]) -> bool:
     return deadline is not None and deadline <= time.monotonic()
+
+
+_CHOICE_GROWTH_INDICATORS = {
+    "revenue": "OPERATEREVENEW",
+    "net_profit": "PARENTNETPROFITNEW",
+    "roe": "ROEWA",
+    "gross_margin": "GPMARGIN",
+    "revenue_yoy": "YOYOR",
+    "net_profit_yoy": "YOYPNI",
+}
+
+
+def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ...]:
+    """Omit each qualified iFinD growth field from Choice; unqualified fields stay.
+
+    Uses the same qualification gate as snapshot selection, so a field omitted
+    here can never later be dropped as unqualified by select_current_financials.
+    """
+    from data_provider.cross_source_validator import _eligible_current_financial
+
+    return tuple(
+        indicator
+        for field, indicator in _CHOICE_GROWTH_INDICATORS.items()
+        if _eligible_current_financial(readings.get(field), field)
+    )
+
+
+def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any) -> Dict[str, Any]:
+    """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。"""
+    from data_provider.cross_source_validator import SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+
+    period = next((reading.period for reading in readings.values() if getattr(reading, "period", None)), None)
+    fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+    omitted: list[str] = []
+    payload: Dict[str, Any] = {}
+    if time.monotonic() >= deadline:
+        return {"omit": ()}
+    try:
+        products = fetcher.product_segments(code, period, deadline=deadline)
+        if products.items and not products.errors:
+            omitted.extend(["MAINBUSINESS", "MAINPRODUCT"])
+            payload["product_segments"] = products.model_dump(mode="json")
+    except SourceReadError:
+        pass
+    if time.monotonic() >= deadline:
+        payload["omit"] = tuple(omitted)
+        return payload
+    try:
+        holders = fetcher.shareholders(code, period, deadline=deadline)
+        if holders.items and not holders.errors:
+            omitted.extend(["AHOLDER", "AHOLDERTYPE", "HOLDNAMER", "HOLDPCTR"])
+            payload["shareholder_details"] = holders.model_dump(mode="json")
+    except SourceReadError:
+        pass
+    payload["omit"] = tuple(omitted)
+    return payload
 
 
 class DataFetcherManager:
@@ -2298,126 +2321,6 @@ class DataFetcherManager:
     def _supplement_from_longbridge(self, stock_code: str, primary_quote):
         """Shortcut kept for backward-compat with A-share general loop."""
         return self._supplement_quote(stock_code, primary_quote, "LongbridgeFetcher")
-
-    def get_chip_distribution(self, stock_code: str):
-        """
-        获取筹码分布数据（带熔断和多数据源降级）
-
-        策略：
-        1. 检查配置开关
-        2. 检查熔断器状态
-        3. 依次尝试多个数据源：数据源优先级与获取daily的数据优先级一致
-        4. 所有数据源失败则返回 None（降级兜底）
-
-        Args:
-            stock_code: 股票代码
-
-        Returns:
-            ChipDistribution 对象，失败则返回 None
-        """
-        # Normalize code (strip SH/SZ prefix etc.)
-        stock_code = normalize_stock_code(stock_code)
-
-        from .realtime_types import get_chip_circuit_breaker
-        from src.config import get_config
-
-        config = get_config()
-
-        # 如果筹码分布功能被禁用，直接返回 None
-        if not config.enable_chip_distribution:
-            logger.debug(f"[筹码分布] 功能已禁用，跳过 {stock_code}")
-            return None
-
-        circuit_breaker = get_chip_circuit_breaker()
-
-        candidate_fetchers = []
-        # 直接遍历管理器已经按 priority 排好序的数据源列表
-        for fetcher in self._get_fetchers_snapshot():
-            # 只处理实现了筹码分布逻辑的数据源
-            if not hasattr(fetcher, "get_chip_distribution"):
-                continue
-
-            fetcher_name = fetcher.name
-            # 动态生成熔断器的 key，例如 "TushareFetcher" -> "tushare_chip"
-            source_key = f"{fetcher_name.replace('Fetcher', '').lower()}_chip"
-
-            # 检查熔断器状态
-            if not circuit_breaker.is_available(source_key):
-                logger.debug(f"[熔断] {fetcher_name} 筹码接口处于熔断状态，尝试下一个")
-                continue
-
-            candidate_fetchers.append((fetcher, fetcher_name, source_key))
-
-        for index, (fetcher, fetcher_name, source_key) in enumerate(candidate_fetchers):
-            fallback_to = (
-                candidate_fetchers[index + 1][1]
-                if index + 1 < len(candidate_fetchers)
-                else None
-            )
-            attempt_start = time.time()
-            try:
-                record_provider_run_started(
-                    data_type="chip",
-                    provider=fetcher_name,
-                    operation="get_chip_distribution",
-                )
-                chip = self._call_fetcher_method(
-                    fetcher, "get_chip_distribution", stock_code
-                )
-                latency_ms = int((time.time() - attempt_start) * 1000)
-                if _is_meaningful_chip_distribution(chip):
-                    record_provider_run(
-                        data_type="chip",
-                        provider=fetcher_name,
-                        operation="get_chip_distribution",
-                        success=True,
-                        latency_ms=latency_ms,
-                        record_count=1,
-                    )
-                    circuit_breaker.record_success(source_key)
-                    logger.info(
-                        f"[筹码分布] {stock_code} 成功获取 (来源: {fetcher_name})"
-                    )
-                    return chip
-                else:
-                    record_provider_run(
-                        data_type="chip",
-                        provider=fetcher_name,
-                        operation="get_chip_distribution",
-                        success=False,
-                        latency_ms=latency_ms,
-                        error_type="empty",
-                        error_message="empty or incomplete chip distribution",
-                        fallback_to=fallback_to,
-                        record_count=0,
-                    )
-                    if chip is not None:
-                        logger.warning(
-                            "[筹码分布] %s 返回字段不完整或占位值，继续尝试下一个数据源",
-                            fetcher_name,
-                        )
-                    # 空结果或占位结果：释放 HALF_OPEN 探测名额，避免卡死
-                    circuit_breaker.record_inconclusive(source_key)
-            except ResearchStopped:
-                raise
-            except Exception as e:
-                error_type, error_reason = summarize_exception(e)
-                record_provider_run(
-                    data_type="chip",
-                    provider=fetcher_name,
-                    operation="get_chip_distribution",
-                    success=False,
-                    latency_ms=int((time.time() - attempt_start) * 1000),
-                    error_type=error_type,
-                    error_message=error_reason,
-                    fallback_to=fallback_to,
-                )
-                logger.warning(f"[筹码分布] {fetcher_name} 获取 {stock_code} 失败: {e}")
-                circuit_breaker.record_failure(source_key, str(e))
-                continue
-
-        logger.warning(f"[筹码分布] {stock_code} 所有数据源均失败")
-        return None
 
     def get_stock_name(
         self, stock_code: str, allow_realtime: bool = True
@@ -4298,7 +4201,14 @@ class DataFetcherManager:
                 # Keep any completed sources; stopping research is not a vendor failure.
                 pass
         verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
-        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget)
+        omit = _qualified_ifind_choice_omissions(readings) if prefer_ifind else ()
+        ifind_research: Dict[str, Any] = {}
+        if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+            ifind_research = _ifind_research_omissions(code, readings, deadline, config)
+            omit = tuple(dict.fromkeys((*omit, *ifind_research.pop("omit", ()))))
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget, omit_indicators=omit)
+        if ifind_research:
+            snapshot.setdefault("research", {}).update(ifind_research)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         if source_error:
             errors.append(f"ifind:{source_error}")
