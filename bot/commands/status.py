@@ -103,13 +103,9 @@ class StatusCommand(BotCommand):
             and (has_direct_env_model or (llm_model_list and primary_model_reachable))
         )
         
-        # 搜索服务状态
-        status["search_bocha"] = len(config.bocha_api_keys) > 0
-        status["search_brave"] = len(config.brave_api_keys) > 0
-        status["search_serpapi"] = len(config.serpapi_keys) > 0
+        # 搜索服务状态（issue #47：只保留套餐入口，退休渠道不展示）
         status["search_minimax"] = config.coding_plan_search_provider == "minimax" and bool(config.minimax_api_keys)
         status["search_zhipu"] = config.coding_plan_search_provider == "zhipu" and bool(config.zhipu_api_key)
-        status["search_searxng"] = config.has_searxng_enabled()
         
         # 通知渠道状态
         status["notify_wechat"] = bool(config.wechat_webhook_url)
@@ -181,13 +177,8 @@ class StatusCommand(BotCommand):
             ),
             "",
             "**🔍 搜索服务**",
-            f"• Bocha: {icon(status['search_bocha'])}",
-            "• Tavily: 已停用",
-            f"• Brave: {icon(status['search_brave'])}",
-            f"• SerpAPI: {icon(status['search_serpapi'])}",
             f"• MiniMax: {icon(status['search_minimax'])}",
             f"• 智谱 Coding Plan: {icon(status['search_zhipu'])}",
-            f"• SearXNG: {icon(status['search_searxng'])}",
             "",
             "**📢 通知渠道**",
             f"• 企业微信: {icon(status['notify_wechat'])}",

@@ -392,52 +392,6 @@ class TestAnspireSearchService(unittest.TestCase):
         Config._Config__instance = None
         reset_search_service()
 
-    def test_search_service_with_anspire(self):
-        """测试 SearchService 正确初始化 Anspire Provider"""
-        service = SearchService(
-            anspire_keys=["test_key"],
-            bocha_keys=[],
-            tavily_keys=[],
-            searxng_public_instances_enabled=False,
-            news_max_age_days=3,
-            news_strategy_profile="short"
-        )
-        
-        self.assertTrue(hasattr(service, '_providers'))
-        self.assertGreater(len(service._providers), 0)
-        
-        first_provider = service._providers[0]
-        self.assertIsInstance(first_provider, AnspireSearchProvider)
-        self.assertEqual(first_provider.name, "Anspire")
-    
-    def test_search_service_without_anspire(self):
-        """测试未配置 Anspire 时的行为"""
-        service = SearchService(
-            anspire_keys=[],
-            tavily_keys=["tavily_key"],
-            bocha_keys=[],
-            searxng_public_instances_enabled=False,
-            news_max_age_days=3,
-            news_strategy_profile="short"
-        )
-        
-        # 验证没有 Anspire Provider
-        anspire_providers = [p for p in service._providers if isinstance(p, AnspireSearchProvider)]
-        self.assertEqual(len(anspire_providers), 0)
-    
-    def test_search_service_priority(self):
-        """测试 Anspire 优先级"""
-        service = SearchService(
-            anspire_keys=["anspire_key"],
-            bocha_keys=["bocha_key"],
-            tavily_keys=["tavily_key"],
-            searxng_public_instances_enabled=False,
-            news_max_age_days=3,
-            news_strategy_profile="short"
-        )
-        
-        self.assertIsInstance(service._providers[0], AnspireSearchProvider)
-
 
 class TestAnspireIntegration(unittest.TestCase):
     """Anspire 集成测试（需要真实 API Key）"""

@@ -5,9 +5,7 @@ import { getFieldDescriptionZh, getFieldOptionLabelZh, getFieldTitleZh } from '.
 const requiredLocalizedKeys = [
   'TICKFLOW_API_KEY',
   'STOCK_INDEX_REMOTE_UPDATE_ENABLED',
-  'SEARXNG_BASE_URLS',
   'ENABLE_REALTIME_QUOTE',
-  'ENABLE_CHIP_DISTRIBUTION',
   'PYTDX_HOST',
   'PYTDX_PORT',
   'PYTDX_SERVERS',
@@ -87,11 +85,11 @@ describe('systemConfigI18n required key coverage', () => {
     });
   });
 
-  it('uses a Chinese primary title for SearXNG base URLs', () => {
-    const title = getFieldTitleZh('SEARXNG_BASE_URLS', 'SEARXNG_BASE_URLS');
-
-    expect(title).toBe('SearXNG 自建实例地址');
-    expect(title).not.toBe('SearXNG Base URLs');
+  it('does not offer settings copy for retired search and chip channels', () => {
+    // issue #46/#47：退休渠道不出现在设置页文案。
+    for (const key of ['SEARXNG_BASE_URLS', 'ENABLE_CHIP_DISTRIBUTION', 'TAVILY_API_KEYS']) {
+      expect(getFieldTitleZh(key, key)).toBe(key);
+    }
   });
 
   it('documents LLM usage HMAC privacy boundaries', () => {
