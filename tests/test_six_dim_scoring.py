@@ -63,7 +63,8 @@ class TestExistingScoresPreserved:
         assert _scores(dim.framework.dimensions, "基本面")["股权架构与高管"] == (80.0, False)
         sentiment = _scores(dim.framework.dimensions, "情绪面")
         assert sentiment["机构评价"] == (76.0, False)
-        assert sentiment["社区评价"] == (72.0, False)
+        # issue #46：社区评价退休，不再出现在情绪面指标中（也不算缺口）
+        assert "社区评价" not in sentiment
 
     def test_adapter_failure_keeps_researcher_scores(self):
         ctx = _ctx()
@@ -75,7 +76,7 @@ class TestExistingScoresPreserved:
         assert _scores(dim.framework.dimensions, "基本面")["股权架构与高管"] == (80.0, False)
         sentiment = _scores(dim.framework.dimensions, "情绪面")
         assert sentiment["机构评价"] == (76.0, False)
-        assert sentiment["社区评价"] == (72.0, False)
+        assert "社区评价" not in sentiment
         # 宏观两项保持缺口，不冒称模型真实中性判断
         assert _scores(dim.framework.dimensions, "宏观")["宏观流动性"] == (50.0, True)
 

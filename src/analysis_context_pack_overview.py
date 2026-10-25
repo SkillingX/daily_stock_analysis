@@ -26,7 +26,6 @@ _DATA_QUALITY_BLOCK_KEYS = {
     "technical",
     "news",
     "fundamentals",
-    "chip",
 }
 logger = logging.getLogger(__name__)
 

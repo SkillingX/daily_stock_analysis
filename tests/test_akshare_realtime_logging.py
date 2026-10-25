@@ -240,48 +240,6 @@ def test_hot_stocks_uses_eastmoney_hot_ranking_when_available(monkeypatch, aksha
     assert result[0]["name"] == "中国长城"
 
 
-def test_hot_stocks_falls_back_to_xueqiu_when_primary_sources_empty(monkeypatch, akshare_fetcher):
-    call_order = []
-
-    def _eastmoney(_ak, _n):
-        call_order.append("eastmoney_hot")
-        return None
-
-    def _up(_ak, _n):
-        call_order.append("eastmoney_hot_up")
-        return []
-
-    def _xueqiu(_ak, _n):
-        call_order.append("xueqiu")
-        return [
-            {
-                "rank": 1,
-                "code": "SH600004",
-                "name": "华夏银行",
-                "price": 7.21,
-                "change_pct": None,
-                "source": "雪球关注榜",
-            }
-        ]
-
-    monkeypatch.setattr(akshare_fetcher, "_get_eastmoney_hot_stocks", _eastmoney)
-    monkeypatch.setattr(akshare_fetcher, "_get_eastmoney_hot_up_stocks", _up)
-    monkeypatch.setattr(akshare_fetcher, "_get_xueqiu_hot_stocks", _xueqiu)
-
-    result = akshare_fetcher.get_hot_stocks(5)
-
-    assert call_order == ["eastmoney_hot", "eastmoney_hot_up", "xueqiu"]
-    assert result == [
-        {
-            "rank": 1,
-            "code": "SH600004",
-            "name": "华夏银行",
-            "price": 7.21,
-            "change_pct": None,
-            "source": "雪球关注榜",
-        }
-    ]
-
 
 def test_limit_up_pool_zero_pads_first_seal_times_before_sorting(monkeypatch, akshare_fetcher):
     df = pd.DataFrame(
@@ -341,3 +299,33 @@ def test_limit_up_pool_zero_pads_first_seal_times_before_sorting(monkeypatch, ak
     assert [row["code"] for row in result] == ["000001", "000003", "000002"]
     assert result[0]["first_limit_time"] == "092500"
     assert result[0]["last_limit_time"] == "093000"
+
+
+def test_hot_stocks_falls_back_to_hot_up_when_popularity_empty(monkeypatch, akshare_fetcher):
+    call_order = []
+
+    def _eastmoney(_ak, _n):
+        call_order.append("eastmoney_hot")
+        return None
+
+    def _up(_ak, _n):
+        call_order.append("eastmoney_hot_up")
+        return [
+            {
+                "rank": 1,
+                "code": "600004",
+                "name": "华夏银行",
+                "price": 7.21,
+                "change_pct": 1.2,
+                "source": "东方财富飙升榜",
+            }
+        ]
+
+    monkeypatch.setattr(akshare_fetcher, "_get_eastmoney_hot_stocks", _eastmoney)
+    monkeypatch.setattr(akshare_fetcher, "_get_eastmoney_hot_up_stocks", _up)
+
+    result = akshare_fetcher.get_hot_stocks(5)
+
+    # 雪球关注榜兜底已随 issue #46 退役；人气榜为空时只回退飙升榜
+    assert call_order == ["eastmoney_hot", "eastmoney_hot_up"]
+    assert result[0]["source"] == "东方财富飙升榜"

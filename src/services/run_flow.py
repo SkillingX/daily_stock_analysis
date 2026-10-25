@@ -47,7 +47,6 @@ _DATA_TYPE_LABELS = {
     "fundamental": "基本面",
     "fundamentals": "基本面",
     "belong_boards": "所属板块",
-    "chip": "筹码结构",
 }
 
 _DATA_TYPE_TO_BLOCK_KEY = {
@@ -60,7 +59,6 @@ _DATA_TYPE_TO_BLOCK_KEY = {
     "fundamental": "fundamentals",
     "fundamentals": "fundamentals",
     "belong_boards": "fundamentals",
-    "chip": "chip",
 }
 
 _CONTEXT_STATUS_TO_FLOW = {
@@ -811,7 +809,6 @@ _STOCK_CONTEXT_PROVIDER_DATA_TYPES = {
     "fundamental",
     "fundamentals",
     "belong_boards",
-    "chip",
 }
 
 

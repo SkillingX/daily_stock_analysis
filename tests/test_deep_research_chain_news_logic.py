@@ -4,12 +4,11 @@
 按 ``docs/deep-research-chain-news-logic-plan.md``：
 
 - 新八章结构（投资结论 + 一~八）
-- 技术面与筹码节奏层为 optional（缺工具不阻断）
+- 技术面节奏层为 optional（缺工具不阻断）
 - 国产替代 / 中美链必须显式给出适用性判断（强相关/低相关/不适用）
 - 缺适用性扣 5 分 / 个
 - PE 估值口径一致性检测保留
-- 工具集（_DEEP_RESEARCH_TOOL_NAMES）含 ``verify_supply_chain_evidence`` (P1)
-- search 工具集含 ``search_market_discussion`` (P2)
+- search 工具集（社区讨论工具已随 issue #46 退役）
 """
 
 from __future__ import annotations
@@ -165,15 +164,15 @@ PE 40x 未明显透支；牛市情景 PE 区间 45-50x 高于当前 PE(TTM) 40x�
 
 ---
 
-## 七、技术面与筹码节奏（次要，≤ 15% 篇幅）
+## 七、技术面节奏（次要，≤ 15% 篇幅）
 
 **【结论】** 资金流与产业逻辑共振，技术面仅回答节奏。
 
 ### 7.1 价格位置与支撑阻力
 MA5 178 / MA10 175 / MA20 168，支撑 165 阻力 195。
 
-### 7.2 资金流与筹码共振
-主力近 5 日净流入 +3.2 亿元，筹码集中度提升。
+### 7.2 资金流共振
+主力近 5 日净流入 +3.2 亿元。
 
 ### 7.3 交易节奏建议
 回踩 175 附近可建仓。
@@ -202,10 +201,7 @@ FULL_TOOLS: List[Dict[str, Any]] = [
     {"tool": "get_sector_rankings"},
     {"tool": "get_stock_info"},
     {"tool": "analyze_trend"},
-    {"tool": "get_chip_distribution"},
     {"tool": "get_capital_flow"},
-    {"tool": "verify_supply_chain_evidence"},  # P1
-    {"tool": "search_market_discussion"},  # P2
 ]
 
 
@@ -226,15 +222,15 @@ class TestNewFrameworkSchema:
             "材料工艺独特地位",
             "中美产业链关系",
             "财务与估值",
-            "技术面与筹码节奏",
+            "技术面节奏",
         ]
 
     def test_technical_layer_is_optional(self):
-        tech = _LAYER_REQUIREMENTS["技术面与筹码节奏"]
+        tech = _LAYER_REQUIREMENTS["技术面节奏"]
         assert tech.get("optional") is True
         # 其它层都不能是 optional
         for k, v in _LAYER_REQUIREMENTS.items():
-            if k == "技术面与筹码节奏":
+            if k == "技术面节奏":
                 continue
             assert not v.get("optional"), f"{k} 不应为 optional"
 
@@ -245,7 +241,7 @@ class TestNewFrameworkSchema:
         assert "消息面与产业政策" in _REQUIRED_SECTIONS
         assert "产业链位置与瓶颈环节" in _REQUIRED_SECTIONS
         assert "国产替代与平行替换" in _REQUIRED_SECTIONS
-        assert "技术面与筹码节奏" in _REQUIRED_SECTIONS
+        assert "技术面节奏" in _REQUIRED_SECTIONS
 
     def test_no_legacy_five_layer_keys(self):
         # 旧"五层穿透"层名不应再出现
@@ -292,7 +288,7 @@ class TestDeepResearchValidatorNew:
         )
         # 移除技术面章节
         baijiu = (
-            baijiu.split("## 七、技术面与筹码节奏（次要")[0]
+            baijiu.split("## 七、技术面节奏（次要")[0]
             + "## 八、风险、证伪条件与下一步验证\n\n风险 1。"
         )
         # 缺技术面工具
@@ -300,16 +296,16 @@ class TestDeepResearchValidatorNew:
             t
             for t in FULL_TOOLS
             if t["tool"]
-            not in {"analyze_trend", "get_chip_distribution", "get_capital_flow"}
+            not in {"analyze_trend", "get_capital_flow"}
         ]
         result = self.validator.validate(baijiu, tools_no_tech)
         assert result.passed is True
         # 技术面 optional 缺不阻断
-        assert "技术面与筹码节奏" in [d for d in result.details if "技术面" in d][
+        assert "技术面节奏" in [d for d in result.details if "技术面" in d][
             0
         ] or any("技术面" in d for d in result.details)
         # 茅台 report 不应被误判 missing_layer
-        assert "技术面与筹码节奏" not in result.missing_layers
+        assert "技术面节奏" not in result.missing_layers
 
     def test_strong_related_without_applicability_keyword_penalized(self):
         """强相关行业但章节未出现「强相关/低相关/不适用/适用性判断」 → score-10"""
@@ -344,7 +340,7 @@ class TestDeepResearchValidatorNew:
 ## 六、财务与估值验证
 **【结论】** 当前 PE(TTM)=40。
 
-## 七、技术面与筹码节奏（次要）
+## 七、技术面节奏（次要）
 **【结论】** 平稳。
 
 ## 八、风险、证伪条件与下一步验证
@@ -387,7 +383,7 @@ class TestDeepResearchValidatorNew:
 ## 六、财务与估值验证
 **【结论】** 当前 PE(TTM)=40。
 
-## 七、技术面与筹码节奏（次要）
+## 七、技术面节奏（次要）
 **【结论】** 平稳。
 
 ## 八、风险、证伪条件与下一步验证
@@ -496,18 +492,19 @@ class TestApplicabilityHelpers:
 
 
 class TestDeepResearchToolSet:
-    """P1: 工具集必须含 ``verify_supply_chain_evidence``。"""
+    """issue #45: 公开双源校验工具已退役。"""
 
-    def test_tool_name_set_contains_p1_tool(self):
+    def test_retired_probe_tool_not_registered(self):
         from src.agent.factory import _DEEP_RESEARCH_TOOL_NAMES
 
-        assert "verify_supply_chain_evidence" in _DEEP_RESEARCH_TOOL_NAMES
+        assert "verify_supply_chain_evidence" not in _DEEP_RESEARCH_TOOL_NAMES
 
     def test_tool_registry_builds_with_p1(self):
         """build_deep_research_executor 工具数 ≥ 11。"""
         from src.agent.factory import _DEEP_RESEARCH_TOOL_NAMES
 
-        assert len(_DEEP_RESEARCH_TOOL_NAMES) >= 11
+        # issue #45 退役 verify_supply_chain_evidence 后为 9 个
+        assert len(_DEEP_RESEARCH_TOOL_NAMES) >= 9
 
     def test_factory_comment_matches_new_framework(self):
         from src.agent.factory import _DEEP_RESEARCH_TOOL_NAMES
@@ -516,7 +513,6 @@ class TestDeepResearchToolSet:
         expected = {
             "get_realtime_quote",
             "get_daily_history",
-            "get_chip_distribution",
             "get_stock_info",
             "get_capital_flow",
             "analyze_trend",
@@ -524,128 +520,9 @@ class TestDeepResearchToolSet:
             "search_comprehensive_intel",
             "get_market_indices",
             "get_sector_rankings",
-            "verify_supply_chain_evidence",
         }
         assert _DEEP_RESEARCH_TOOL_NAMES == expected
 
-
-class TestSearchMarketDiscussionTool:
-    """P2: search_market_discussion 工具契约（fail-open + reliability_hint=low）。"""
-
-    def test_registered_in_all_search_tools(self):
-        from src.agent.tools.search_tools import ALL_SEARCH_TOOLS
-
-        names = {t.name for t in ALL_SEARCH_TOOLS}
-        assert "search_market_discussion" in names
-
-    def test_handler_unavailable_returns_empty_not_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """agent_reach 不可用时返回 status=unavailable，不抛异常。"""
-        from src.agent.tools import search_tools
-
-        # 强制让 AgentReachService.is_available 返回 False
-        class _Fake:
-            def is_available(self) -> bool:
-                return False
-
-            def unavailable_reason(self) -> str:
-                return "agent_reach 强制不可用"
-
-        monkeypatch.setattr(
-            search_tools, "_get_search_service", lambda: None
-        )  # 仅占位，避免与 search_service 单例冲突
-        # 直接 patch 模块内的 import
-        import src.services.agent_reach_service as reach_mod
-
-        monkeypatch.setattr(
-            reach_mod.AgentReachService, "is_available", lambda self: False
-        )
-        monkeypatch.setattr(
-            reach_mod.AgentReachService,
-            "unavailable_reason",
-            lambda self: "agent_reach 强制不可用",
-        )
-
-        out = search_tools._handle_search_market_discussion(
-            stock_code="600519", stock_name="贵州茅台", source="xueqiu_hot", limit=5
-        )
-        assert out["status"] == "unavailable"
-        assert out["results"] == []
-        assert "不可用" in out["error"]
-
-    def test_handler_unknown_source_returns_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """未知 source 走 source 校验分支返回 unavailable（仅在 agent_reach 可用时）。"""
-        from src.agent.tools import search_tools
-        import src.services.agent_reach_service as reach_mod
-
-        # 让 agent_reach 强制可用
-        monkeypatch.setattr(
-            reach_mod.AgentReachService, "is_available", lambda self: True
-        )
-        monkeypatch.setattr(
-            reach_mod.AgentReachService, "unavailable_reason", lambda self: None
-        )
-
-        out = search_tools._handle_search_market_discussion(
-            stock_code="600519", source="unknown_source", limit=5
-        )
-        assert out["status"] == "unavailable"
-        assert "未知 source" in out["error"]
-
-    def test_handler_x_global_returns_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """海外渠道未接入时返回 unavailable，不抛异常。"""
-        from src.agent.tools import search_tools
-        import src.services.agent_reach_service as reach_mod
-
-        monkeypatch.setattr(
-            reach_mod.AgentReachService, "is_available", lambda self: True
-        )
-        monkeypatch.setattr(
-            reach_mod.AgentReachService, "unavailable_reason", lambda self: None
-        )
-
-        out = search_tools._handle_search_market_discussion(
-            stock_code="AAPL", source="x_global", limit=5
-        )
-        assert out["status"] == "unavailable"
-        assert out["source_type"] == "community_global"
-
-    def test_normalize_items_marks_reliability_low(self) -> None:
-        from src.agent.tools.search_tools import _normalize_discussion_items
-
-        class _Item:
-            platform = "xueqiu"
-            title = "贵州茅台目标价 2000"
-            url = "https://xueqiu.com/1"
-            content = "讨论茅台替代进口高端白酒的可能性..."
-            snippet = "讨论茅台替代进口高端白酒"
-            source = "雪球"
-            author = "用户A"
-            published_at = "2026-07-03"
-
-        out = _normalize_discussion_items(
-            [_Item()],
-            source_type="community_cn",
-            source_name="雪球热帖",
-            stock_code="600519",
-        )
-        assert len(out) == 1
-        item = out[0]
-        assert item["source_type"] == "community_cn"
-        assert item["source_name"] == "雪球热帖"
-        assert item["reliability_hint"] == "low"  # 社区源绝不标 high
-        assert item["stock_code"] == "600519"
-        assert "茅台" in item["claim"]
-
-
-# ---------------------------------------------------------------------------
-# _build_user_message / system_prompt 反射测试
-# ---------------------------------------------------------------------------
 
 
 class TestExecutorUserMessage:
@@ -662,7 +539,7 @@ class TestExecutorUserMessage:
             "国产替代",
             "中美",
             "财务与估值",
-            "技术面与筹码",
+            "技术面节奏",
             "适用性",
             "替代阶段",
         ):
@@ -682,7 +559,7 @@ class TestExecutorUserMessage:
             "四、材料 / 工艺 / 环节独特地位",
             "五、中美产业链关系",
             "六、财务与估值验证",
-            "七、技术面与筹码节奏（次要",
+            "七、技术面节奏（次要",
             "八、风险、证伪条件与下一步验证",
         ):
             assert section in prompt, f"system_prompt.md 缺失新章节: {section}"

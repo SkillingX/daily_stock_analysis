@@ -529,7 +529,7 @@ def _run_dual_track(
             save_cached_dim(stock_code, dim_id, dim.model_dump())
 
     # ---- 阶段 0 + 前置 S2 ----
-    _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/筹码/历史）..."})
+    _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/历史）..."})
     from data_provider.mx_data_adapter import financial_refresh
     from uuid import uuid4
     refresh_marker = (stock_code, uuid4().hex) if force_refresh else None
@@ -545,7 +545,7 @@ def _run_dual_track(
             financial_refresh.reset(refresh_token)
     _perf_mark("stage0_context")
 
-    _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力/筹码）..."})
+    _emit(progress_callback, {"type": "thinking", "step": 0, "message": "计算数据透视（均线/量比/支撑阻力）..."})
     # ---- 波次 1：探索 Agent 线程池 + 主线程纯规则 ----
     _emit(progress_callback, {"type": "thinking", "step": 1, "message": "并行执行情报/产业链探索与规则维度..."})
 

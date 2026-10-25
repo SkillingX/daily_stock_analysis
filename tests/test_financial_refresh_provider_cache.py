@@ -52,7 +52,6 @@ def provider_cache(refresh_inputs: dict[str, Any], request: pytest.FixtureReques
     manager = DataFetcherManager(fetchers=[fetcher])
     manager._mx_source = refresh_inputs["manager"]._mx_source
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", manager)
-    monkeypatch.setattr(manager, "get_chip_distribution", lambda code: None)
     monkeypatch.setattr(service, "_research_dim", lambda *args, **kwargs: {"status": "degraded"})
     state["fetcher"] = fetcher
     return state

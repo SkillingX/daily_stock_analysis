@@ -544,7 +544,6 @@ _DATA_TYPE_LABELS = {
     "fundamental": "基本面",
     "fundamentals": "基本面",
     "belong_boards": "所属板块",
-    "chip": "筹码结构",
 }
 
 

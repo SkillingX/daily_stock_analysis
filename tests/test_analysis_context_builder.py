@@ -27,13 +27,6 @@ class _FakeTrend:
 
 
 @dataclass
-class _FakeChip:
-    data: dict
-
-    def to_dict(self) -> dict:
-        return dict(self.data)
-
-
 class _BrokenTrend:
     def to_dict(self) -> dict:
         raise RuntimeError("broken trend artifact")
@@ -83,15 +76,6 @@ def _artifacts(**overrides) -> PipelineAnalysisArtifacts:
                 "ma5": 1800.0,
                 "ma10": 1780.0,
                 "rsi_6": 66.0,
-            }
-        ),
-        "chip_data": _FakeChip(
-            {
-                "code": "600519",
-                "date": "2026-05-24",
-                "source": "akshare",
-                "profit_ratio": 0.72,
-                "avg_cost": 1700.0,
             }
         ),
         "fundamental_context": {
@@ -332,23 +316,6 @@ def test_technical_missing_and_realtime_overlay_statuses_are_explicit() -> None:
     assert explicit_block.metadata["estimated_fields"] == ["close", "ma5"]
 
 
-def test_chip_missing_defaults_to_missing_and_explicit_not_supported() -> None:
-    missing = AnalysisContextBuilder.build(_artifacts(chip_data=None)).blocks["chip"]
-    assert missing.status == ContextFieldStatus.MISSING
-    assert (
-        missing.items["chip_distribution"].missing_reason
-        == "chip_distribution_missing"
-    )
-
-    not_supported = AnalysisContextBuilder.build(
-        _artifacts(chip_data=None, metadata={"chip_not_supported": True})
-    ).blocks["chip"]
-    assert not_supported.status == ContextFieldStatus.NOT_SUPPORTED
-    assert (
-        not_supported.items["chip_distribution"].missing_reason
-        == "chip_not_supported"
-    )
-
 
 @pytest.mark.parametrize(
     ("payload_status", "expected_status"),
@@ -427,8 +394,8 @@ def test_data_quality_scores_fixed_blocks_and_limits_auxiliary_missing() -> None
         "technical": 100,
         "news": 100,
         "fundamentals": 100,
-        "chip": 100,
     }
+    assert "chip" not in pack.blocks
     assert pack.data_quality.limitations == []
 
     failed_fundamentals = AnalysisContextBuilder.build(
@@ -444,7 +411,8 @@ def test_data_quality_scores_fixed_blocks_and_limits_auxiliary_missing() -> None
     )
     assert failed_fundamentals.blocks["fundamentals"].status == ContextFieldStatus.FETCH_FAILED
     assert failed_fundamentals.data_quality.block_scores["fundamentals"] == 25
-    assert failed_fundamentals.data_quality.overall_score == 92
+    # chip 退休后 fundamentals 权重 10→15：(100*25*3 + 100*10 + 25*15)/100 = 88.75 → 89
+    assert failed_fundamentals.data_quality.overall_score == 89
     assert failed_fundamentals.data_quality.level == "good"
     assert failed_fundamentals.data_quality.limitations == ["fundamentals: fetch_failed"]
 

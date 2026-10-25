@@ -165,7 +165,7 @@ class SignalDim(DimEnvelope):
 
 
 class DataDim(DimEnvelope):
-    """S2 数据透视：趋势/价格/量能/筹码，纯规则装配。"""
+    """S2 数据透视：趋势/价格/量能，纯规则装配。"""
 
     dim: Literal["data"] = "data"
     perspective: Optional[DataPerspective] = None
@@ -287,7 +287,7 @@ class ConclusionDim(DimEnvelope):
 
 
 class SupplyChainDim(DimEnvelope):
-    """L4 产业链：探索型 Agent + verify_supply_chain_evidence 双源校验。"""
+    """L4 产业链：探索型 Agent（公开双源校验已随 issue #45 退役）。"""
 
     dim: Literal["supply_chain"] = "supply_chain"
     supply_chain: Optional[SupplyChain] = None
@@ -382,31 +382,23 @@ class TechnicalDim(DimEnvelope):
 
 
 class CapitalDim(DimEnvelope):
-    """资金研究员：资金流向 + 机构/大户持仓变动 + 筹码成本结构。"""
+    """资金研究员：资金流向 + 机构/大户持仓变动（筹码成本已随 issue #46 退休）。"""
 
     dim: Literal["capital"] = "capital"
     flow_summary: str = ""
     flow_score: Optional[float] = Field(None, ge=0, le=100)
     institution_summary: str = ""
     institution_score: Optional[float] = Field(None, ge=0, le=100)
-    chip_summary: Optional[str] = None
-    """筹码摘要文本：LLM 返回 dict（{text, status}）由 ``_coerce_researcher_value``
-    提取 ``text`` 子字段；schema 用 str 与精校后路径一致（Pydantic strict 模式
-    拒绝 dict→str 隐式转换，必须在精校阶段定型）。"""
-    chip_score: Optional[float] = Field(None, ge=0, le=100)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""
 
 
 class SentimentDim(DimEnvelope):
-    """情绪研究员：机构评价 + 社区评价（来源等级强制）。"""
+    """情绪研究员：机构评价（社区评价已随 issue #46 退休）。"""
 
     dim: Literal["sentiment"] = "sentiment"
     institute_view: str = ""
     institute_score: Optional[float] = Field(None, ge=0, le=100)
-    community_view: str = ""
-    community_score: Optional[float] = Field(None, ge=0, le=100)
-    unverified_count: int = Field(0, ge=0)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""
 

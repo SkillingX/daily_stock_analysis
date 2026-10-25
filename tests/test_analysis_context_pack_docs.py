@@ -152,7 +152,7 @@ def test_analysis_context_pack_doc_records_p1_block_catalog() -> None:
         "`fundamentals`",
         "`news`",
         "`portfolio`",
-        "`chip` / `capital_flow`",
+        "`capital_flow`",
         "`events` / `market_context`",
         "不重复新增 `identity` block",
     ):
@@ -267,7 +267,7 @@ def test_analysis_context_pack_doc_defines_p3_runtime_consumption_boundaries() -
         "`format_analysis_context_pack_prompt_section()`",
         "`analysis_context_pack_summary`",
         "基础信息 -> #1386 `market_phase_context` 渲染区块 -> `analysis_context_pack_summary`",
-        "`news.content`、`trend_result`、`chip`、`fundamental_context` 等原始 payload",
+        "`news.content`、`trend_result`、`fundamental_context` 等原始 payload",
         "`AgentExecutor._build_user_message()`",
         "`AgentOrchestrator._build_context()`",
         "`ctx.meta[\"analysis_context_pack_summary\"]`",

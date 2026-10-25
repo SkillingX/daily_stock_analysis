@@ -23,9 +23,6 @@ def _make_config() -> SimpleNamespace:
         news_strategy_profile="short",
         enable_realtime_quote=False,
         realtime_source_priority=[],
-        enable_chip_distribution=False,
-        social_sentiment_api_key="",
-        social_sentiment_api_url="https://example.invalid/social",
     )
 
 
@@ -40,11 +37,8 @@ def _build_pipeline(config: SimpleNamespace) -> StockAnalysisPipeline:
 
 def test_search_service_init_failure_logs_traceback_and_failure_state(caplog):
     config = _make_config()
-    social_service = MagicMock()
-    social_service.is_available = False
 
     with patch("src.core.pipeline.SearchService", side_effect=RuntimeError("search init boom")), \
-         patch("src.core.pipeline.SocialSentimentService", return_value=social_service), \
          caplog.at_level(logging.WARNING, logger="src.core.pipeline"):
         pipeline = _build_pipeline(config)
 
@@ -57,25 +51,6 @@ def test_search_service_init_failure_logs_traceback_and_failure_state(caplog):
     assert init_failure_records[0].exc_info is not None
     assert "搜索服务未启用（初始化失败或依赖缺失）" in caplog.text
     assert "搜索服务未启用（未配置搜索能力）" not in caplog.text
-
-
-def test_social_sentiment_init_failure_logs_traceback(caplog):
-    config = _make_config()
-    search_service = MagicMock()
-    search_service.is_available = False
-
-    with patch("src.core.pipeline.SearchService", return_value=search_service), \
-         patch("src.core.pipeline.SocialSentimentService", side_effect=RuntimeError("social init boom")), \
-         caplog.at_level(logging.WARNING, logger="src.core.pipeline"):
-        pipeline = _build_pipeline(config)
-
-    assert pipeline.social_sentiment_service is None
-
-    init_failure_records = [
-        record for record in caplog.records if "社交舆情服务初始化失败，将跳过舆情分析" in record.message
-    ]
-    assert len(init_failure_records) == 1
-    assert init_failure_records[0].exc_info is not None
 
 
 def test_emit_progress_logs_context_when_callback_fails(caplog):

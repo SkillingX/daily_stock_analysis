@@ -23,7 +23,6 @@ _LONG_TASK_BUSY_MESSAGE = "长任务线程池已满，请稍后重试"
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
     "get_realtime_quote": "获取实时行情",
     "get_daily_history": "获取历史K线",
-    "get_chip_distribution": "分析筹码分布",
     "get_analysis_context": "获取分析上下文",
     "get_stock_info": "获取股票基本面",
     "search_stock_news": "搜索股票新闻",

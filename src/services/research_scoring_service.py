@@ -53,20 +53,17 @@ class ResearchScoringService:
             return
 
         self._data_providers_initialized = True
-        self._concept_provider = None
         self._institutional_provider = None
         self._northbound_provider = None
         self._tushare_supply_chain = None
 
         try:
             from data_provider.supply_chain import (
-                ConceptBoardProvider,
                 InstitutionalHoldingsProvider,
                 NorthboundFlowProvider,
                 TushareSupplyChainProvider,
             )
 
-            self._concept_provider = ConceptBoardProvider()
             self._institutional_provider = InstitutionalHoldingsProvider()
             self._northbound_provider = NorthboundFlowProvider()
             self._tushare_supply_chain = TushareSupplyChainProvider()
@@ -165,7 +162,6 @@ class ResearchScoringService:
             institutional_holding_change=raw_data.get("institutional_holding_change"),
             northbound_flow_20d=raw_data.get("northbound_flow_20d"),
             margin_balance_change=raw_data.get("margin_balance_change"),
-            chip_concentration=raw_data.get("chip_concentration"),
             foreign_ratio=raw_data.get("foreign_ratio"),
             evidence=raw_data.get("capital_evidence"),
         )
@@ -381,25 +377,6 @@ class ResearchScoringService:
             except Exception as e:
                 logger.warning(
                     f"[ResearchScoringService] Failed to get institutional data: {e}"
-                )
-
-        if self._concept_provider:
-            try:
-                concepts = self._concept_provider.get_stock_concepts(stock_code)
-                if concepts:
-                    avg_change = (
-                        sum(c.get("change_pct", 0) for c in concepts) / len(concepts)
-                        if concepts
-                        else 0
-                    )
-                    enriched["concept_boards"] = concepts
-                    enriched["concept_performance"] = avg_change
-                    logger.debug(
-                        f"[ResearchScoringService] Enriched with concept data: {len(concepts)} boards, avg_change={avg_change:.2f}%"
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[ResearchScoringService] Failed to get concept data: {e}"
                 )
 
         if self._northbound_provider:

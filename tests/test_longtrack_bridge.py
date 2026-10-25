@@ -428,10 +428,11 @@ class TestResearcherParseCoercion:
             {
                 "flow_summary": {"status": "data_unavailable", "summary": "流向数据不可用"},
                 "institution_summary": {"note": "机构持仓无变动"},
+                # issue #46：模型仍返回筹码字段时在解析层丢弃，不形成事实或分数
                 "chip_summary": {"text": "筹码集中度 12%"},
+                "chip_score": 88,
                 "flow_score": {"score": 40.0},
                 "institution_score": "45",
-                "chip_score": None,
                 "score": {"value": 42},
             },
             1,
@@ -439,10 +440,9 @@ class TestResearcherParseCoercion:
         assert dim.status == "ok"
         assert dim.flow_summary == "流向数据不可用"
         assert dim.institution_summary == "机构持仓无变动"
-        assert dim.chip_summary == "筹码集中度 12%"
+        assert not hasattr(dim, "chip_summary") and not hasattr(dim, "chip_score")
         assert dim.flow_score == 40.0
         assert dim.institution_score == 45.0
-        assert dim.chip_score is None
         assert dim.score == 42.0
 
     def test_unknown_dict_becomes_compact_json(self):

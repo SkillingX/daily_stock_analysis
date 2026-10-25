@@ -5,7 +5,6 @@ Data tools — wraps DataFetcherManager methods as agent-callable tools.
 Tools:
 - get_realtime_quote: real-time stock quote
 - get_daily_history: historical OHLCV data
-- get_chip_distribution: chip distribution analysis
 - get_analysis_context: historical analysis context from DB
 """
 
@@ -540,136 +539,6 @@ get_daily_history_tool = ToolDefinition(
 
 
 # ============================================================
-# get_chip_distribution
-# ============================================================
-
-
-def _estimate_chip_from_history(
-    stock_code: str, df: Any, current_price: Optional[float]
-) -> Optional[Dict[str, Any]]:
-    """em 筹码源不可用时，用历史K线估算筹码核心指标（降级）。
-
-    akshare ``stock_cyq_em`` 是唯一筹码源，em 网络/代理不可达时全部失败（无 fallback）。
-    此函数用历史K线（tencent 等可用源）+ 当前价按成交量加权估算：
-    - ``avg_cost``: VWAP（成交量加权均价）
-    - ``profit_ratio``: 成交量加权获利盘比例（close ≤ 当前价的成交量占比）
-    - ``cost_70/90``: 价格 15/5% 与 85/95% 分位
-    - ``concentration``: 成本区间 / 均价
-
-    返回带 ``estimated=True`` 标记的 dict（供 LLM 标注精度有限）；数据不足返回 None。
-    """
-    if df is None or getattr(df, "empty", True) or len(df) < 10:
-        return None
-    if not current_price or current_price <= 0:
-        try:
-            current_price = float(df.iloc[-1]["close"])
-        except (KeyError, ValueError, TypeError):
-            return None
-    try:
-        close = df["close"].astype(float)
-        volume = df["volume"].astype(float)
-    except (KeyError, ValueError, TypeError):
-        return None
-    total_vol = float(volume.sum())
-    if total_vol <= 0:
-        return None
-    avg_cost = float((close * volume).sum() / total_vol)
-    profit_ratio = float(volume[close <= current_price].sum() / total_vol)
-    cost_70_low = float(close.quantile(0.15))
-    cost_70_high = float(close.quantile(0.85))
-    cost_90_low = float(close.quantile(0.05))
-    cost_90_high = float(close.quantile(0.95))
-    return {
-        "code": stock_code,
-        "date": str(df.iloc[-1].get("date", "")),
-        "source": "estimated_from_history",
-        "estimated": True,
-        "profit_ratio": profit_ratio,
-        "avg_cost": avg_cost,
-        "cost_90_low": cost_90_low,
-        "cost_90_high": cost_90_high,
-        "concentration_90": (cost_90_high - cost_90_low) / avg_cost,
-        "cost_70_low": cost_70_low,
-        "cost_70_high": cost_70_high,
-        "concentration_70": (cost_70_high - cost_70_low) / avg_cost,
-    }
-
-
-def _estimate_chip_fallback(stock_code: str) -> Optional[Dict[str, Any]]:
-    """em 筹码源不可用时的历史K线估算降级入口（工具与共享上下文共用）。
-
-    数据不足或装配失败返回 None；成功时返回带 ``source=estimated_from_history``
-    与 ``estimated=True`` 标记的估算载荷。
-    """
-    manager = _get_fetcher_manager()
-    try:
-        from src.services.history_loader import load_history_df
-
-        df, _ = load_history_df(stock_code, days=60)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("chip estimation fallback(%s) failed: %s", stock_code, exc)
-        return None
-    # 实时价取不到时用最后一根收盘价估算，不让报价异常带走整次估算。
-    try:
-        quote = manager.get_realtime_quote(stock_code)
-        current_price = getattr(quote, "price", None) if quote else None
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("chip estimation fallback(%s) quote failed: %s", stock_code, exc)
-        current_price = None
-    return _estimate_chip_from_history(stock_code, df, current_price)
-
-
-def _handle_get_chip_distribution(stock_code: str) -> dict[str, Any]:
-    """Get chip distribution data."""
-    from src.core.market_policy import require_stock_market
-    require_stock_market(stock_code)
-
-    manager = _get_fetcher_manager()
-    chip = manager.get_chip_distribution(stock_code)
-
-    if chip is None:
-        # fail-open：em 筹码源不可用时，用历史K线估算降级（标注 estimated）
-        estimated = _estimate_chip_fallback(stock_code)
-        if estimated:
-            logger.info(
-                "get_chip_distribution(%s): em 源不可用，历史K线估算降级", stock_code
-            )
-            return estimated
-        return {"error": f"No chip distribution data available for {stock_code}"}
-
-    return {
-        "code": chip.code,
-        "date": chip.date,
-        "source": chip.source,
-        "profit_ratio": chip.profit_ratio,
-        "avg_cost": chip.avg_cost,
-        "cost_90_low": chip.cost_90_low,
-        "cost_90_high": chip.cost_90_high,
-        "concentration_90": chip.concentration_90,
-        "cost_70_low": chip.cost_70_low,
-        "cost_70_high": chip.cost_70_high,
-        "concentration_70": chip.concentration_70,
-    }
-
-
-get_chip_distribution_tool = ToolDefinition(
-    name="get_chip_distribution",
-    description="Get chip distribution analysis for a stock. Returns profit ratio, "
-    "average cost, chip concentration at 90% and 70% levels. "
-    "Useful for judging support/resistance and holding structure.",
-    parameters=[
-        ToolParameter(
-            name="stock_code",
-            type="string",
-            description="A-share stock code, e.g., '600519'",
-        ),
-    ],
-    handler=_handle_get_chip_distribution,
-    category="data",
-)
-
-
-# ============================================================
 # get_analysis_context
 # ============================================================
 
@@ -755,6 +624,40 @@ def _fallback_valuation_from_quote(
     return merged
 
 
+
+
+def _concept_membership(stock_code: str, deadline: float) -> dict[str, Any]:
+    """个股最新概念归属（iFinD 适配入口，issue #45）。
+
+    返回 {concepts, source, as_of_nature, error}；无数据/字段错误/证券不匹配/
+    鉴权拒绝/超时以 error 区分，不补造日期、不回退公开概念接口。
+    """
+    from data_provider.cross_source_validator import SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+    from src.config import get_config
+    from src.core.research_run import current_research, ResearchStopped
+
+    config = get_config()
+    if not config.enable_ifind_mcp:
+        return {"concepts": [], "source": "ifind", "as_of_nature": "latest", "error": "ifind_disabled"}
+    if run := current_research.get():
+        run.check()
+    try:
+        membership = IfindFetcher(
+            config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds,
+        ).concept_membership(stock_code, deadline=deadline)
+    except ResearchStopped:
+        raise
+    except SourceReadError as exc:
+        return {"concepts": [], "source": "ifind", "as_of_nature": "latest", "error": exc.reason_code}
+    return {
+        "concepts": [{"name": name, "source": "ifind", "as_of_nature": "latest"} for name in membership.concepts],
+        "source": membership.source,
+        "as_of_nature": membership.as_of_nature,
+        "error": membership.errors[0] if membership.errors else None,
+    }
+
+
 def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None) -> dict[str, Any]:
     """Get stock fundamental information through unified fundamental context."""
     from src.core.market_policy import require_stock_market
@@ -836,19 +739,16 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
         }
 
     sector_rankings = compact_context.get("boards", {}).get("data", {})
-    belong_boards = fundamental_context.get("belong_boards") or []
+    # 个股最新概念归属走 iFinD 适配入口（issue #45）：不再访问东财公开概念接口。
+    concept_membership = _concept_membership(stock_code, deadline)
+    belong_boards = concept_membership["concepts"]
     stock_name = stock_code.upper()
     if hasattr(manager, "_run_with_timeout"):
-        budget_seconds = min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))
-        if not belong_boards and budget_seconds > 0:
-            fetched_boards, _, _ = manager._run_with_timeout(lambda: manager.get_belong_boards(stock_code), budget_seconds, "stock_info_boards")
-            belong_boards = fetched_boards or []
         budget_seconds = min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))
         if budget_seconds > 0:
             fetched_name, _, _ = manager._run_with_timeout(lambda: manager.get_stock_name(stock_code), budget_seconds, "stock_info_name")
             stock_name = fetched_name or stock_name
     else:
-        belong_boards = manager.get_belong_boards(stock_code)
         stock_name = manager.get_stock_name(stock_code) or stock_name
 
     response = {
@@ -863,6 +763,7 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
         # Compatibility alias for existing callers; prefer belong_boards.
         # Planned for future deprecation in a major version.
         "boards": belong_boards,
+        "concept_membership": concept_membership,
         "sector_rankings": sector_rankings,
     }
     if _cv:
@@ -1010,7 +911,6 @@ get_portfolio_snapshot_tool = ToolDefinition(
 ALL_DATA_TOOLS = [
     get_realtime_quote_tool,
     get_daily_history_tool,
-    get_chip_distribution_tool,
     get_analysis_context_tool,
     get_stock_info_tool,
     get_portfolio_snapshot_tool,

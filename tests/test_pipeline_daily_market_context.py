@@ -32,9 +32,6 @@ def _pipeline_config(*, daily_market_context_enabled: bool) -> SimpleNamespace:
         news_strategy_profile="short",
         enable_realtime_quote=False,
         realtime_source_priority=[],
-        enable_chip_distribution=False,
-        social_sentiment_api_key="",
-        social_sentiment_api_url="https://example.invalid/social",
         daily_market_context_enabled=daily_market_context_enabled,
     )
 
@@ -45,16 +42,12 @@ def _build_initialized_pipeline(
 ) -> StockAnalysisPipeline:
     search_service = MagicMock()
     search_service.is_available = False
-    social_sentiment_service = MagicMock()
-    social_sentiment_service.is_available = False
-
     with patch("src.core.pipeline.get_db", return_value=MagicMock()), \
          patch("src.core.pipeline.DataFetcherManager", return_value=MagicMock()), \
          patch("src.core.pipeline.StockTrendAnalyzer", return_value=MagicMock()), \
          patch("src.core.pipeline.GeminiAnalyzer", return_value=MagicMock()), \
          patch("src.core.pipeline.NotificationService", return_value=MagicMock()), \
-         patch("src.core.pipeline.SearchService", return_value=search_service), \
-         patch("src.core.pipeline.SocialSentimentService", return_value=social_sentiment_service):
+         patch("src.core.pipeline.SearchService", return_value=search_service):
         return StockAnalysisPipeline(config=config, **kwargs)
 
 
@@ -265,7 +258,6 @@ def test_pipeline_uses_market_phase_effective_date_for_daily_market_context() ->
     )
     pipeline.config = SimpleNamespace(
         enable_realtime_quote=False,
-        enable_chip_distribution=False,
         market_review_enabled=True,
         report_language="zh",
         agent_mode=False,
@@ -278,7 +270,6 @@ def test_pipeline_uses_market_phase_effective_date_for_daily_market_context() ->
     pipeline.portfolio_context = None
     pipeline.fetcher_manager = MagicMock()
     pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
-    pipeline.fetcher_manager.get_chip_distribution.return_value = None
     pipeline.fetcher_manager.get_fundamental_context.return_value = {}
     pipeline.fetcher_manager.build_failed_fundamental_context.return_value = {}
     pipeline.db = MagicMock()

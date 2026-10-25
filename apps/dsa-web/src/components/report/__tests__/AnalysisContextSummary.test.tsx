@@ -65,7 +65,6 @@ const overview: AnalysisContextPackOverview = {
       technical: 100,
       news: 35,
       fundamentals: 25,
-      chip: 100,
     },
     limitations: ['fundamentals: fetch_failed'],
   },

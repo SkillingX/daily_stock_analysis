@@ -353,7 +353,6 @@ def test_stage_deadline_preserves_research_budget_and_rejects_late_quote(monkeyp
     monkeypatch.setattr(context, '_safe_quote', slow_quote)
     monkeypatch.setattr(context, '_safe_fundamental', lambda *args: {'roe': 4.56})
     monkeypatch.setattr(context, '_safe_history', lambda *args: [])
-    monkeypatch.setattr(context, '_safe_chip', lambda *args: {})
     monkeypatch.setattr(context, '_safe_history_reports', lambda *args: [])
     started = monotonic()
     try:

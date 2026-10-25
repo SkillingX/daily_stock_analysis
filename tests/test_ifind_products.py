@@ -85,7 +85,6 @@ def fundamentals_runtime(ifind_transport, monkeypatch, tmp_path):
     # Unrelated quote/history/chip transports and the model boundary only.
     monkeypatch.setattr(context, '_safe_quote', lambda *a: {})
     monkeypatch.setattr(context, '_safe_history', lambda *a: [])
-    monkeypatch.setattr(context, '_safe_chip', lambda *a: {})
     monkeypatch.setattr(explore_agents, '_run_explore', lambda *a, **kw: {'ok': False, 'error': 'model unavailable'})
     monkeypatch.setattr(deep_research_service, '_get_dual_track_adapter', lambda: None)
     monkeypatch.setattr(service, '_REPORT_DIR', tmp_path / 'reports')

@@ -584,7 +584,6 @@ class TestAgentResultConversion(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1523,7 +1522,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1569,7 +1567,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1580,7 +1577,6 @@ class TestPipelineRouting(unittest.TestCase):
 
             # Mock the fetcher_manager to return None for realtime
             pipeline.fetcher_manager.get_realtime_quote.return_value = None
-            pipeline.fetcher_manager.get_chip_distribution.return_value = None
             # Mock search service
             pipeline.search_service.is_available = False
             # Mock DB context
@@ -1616,7 +1612,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1662,7 +1657,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1739,7 +1733,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -1831,7 +1824,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -1936,7 +1928,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -2015,7 +2006,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = True
             mock_cfg.report_language = "zh"
@@ -2786,7 +2776,6 @@ class TestSafeInt(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -2929,7 +2918,6 @@ class TestSkillActivation(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg

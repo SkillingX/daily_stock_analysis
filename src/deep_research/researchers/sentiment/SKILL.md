@@ -2,7 +2,7 @@
 name: researcher_sentiment
 display_name: 情绪面研究员
 category: research
-required_tools: ['search_market_discussion', 'search_stock_news']
+required_tools: ['search_stock_news']
 ---
 
 # 情绪面研究员

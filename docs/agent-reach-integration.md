@@ -1,5 +1,8 @@
 # AgentReachService 接入指南
 
+> **状态更新（2026-10，issue #46）**：雪球渠道（热帖/报价/搜索/热榜）与依赖它的社区评价能力已退役，`AgentReachService` 已删除；本文保留为历史集成说明。网页正文阅读由 `src/search_service.fetch_url_content` 独立保留。
+
+
 > 封装 Agent-Reach web（Jina Reader）+ 雪球（官方 API + cookie）双渠道，统一输出 frozen dataclass。`agent_reach` 为可选外部依赖，**不配置也可运行，配置后增强能力**，符合本仓库稳定性护栏。
 
 ## 外部前置条件

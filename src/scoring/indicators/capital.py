@@ -6,7 +6,6 @@ This dimension evaluates:
 1. Institutional holdings changes
 2. Northbound (陆股通) flow
 3. Margin financing (融资融券) balance
-4. Chip distribution (筹码分布)
 """
 
 from typing import Optional, Dict, Any
@@ -18,7 +17,6 @@ def score_capital(
     institutional_holding_change: Optional[float] = None,
     northbound_flow_20d: Optional[float] = None,
     margin_balance_change: Optional[float] = None,
-    chip_concentration: Optional[str] = None,
     foreign_ratio: Optional[float] = None,
     evidence: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -29,7 +27,6 @@ def score_capital(
         institutional_holding_change: Change in institutional holdings (%) over quarter
         northbound_flow_20d: Northbound flow in last 20 trading days (billion CNY)
         margin_balance_change: Margin balance change (%) over 20 days
-        chip_concentration: high/medium/low (from LLM analysis)
         foreign_ratio: Foreign investor ratio (%), if available
         evidence: Additional evidence summary
 
@@ -81,20 +78,6 @@ def score_capital(
         )
         total_score += margin_score * 0.20
         total_weight += 0.20
-
-    if chip_concentration:
-        chip_score = _score_chip_concentration(chip_concentration)
-        indicators.append(
-            {
-                "name": "筹码分布",
-                "score": chip_score,
-                "weight": 0.15,
-                "basis": "llm",
-                "summary": f"筹码集中度:{chip_concentration}",
-            }
-        )
-        total_score += chip_score * 0.15
-        total_weight += 0.15
 
     if foreign_ratio is not None:
         foreign_score = _score_foreign_ratio(foreign_ratio)
@@ -180,15 +163,6 @@ def _score_margin_change(change: float) -> float:
     else:
         return 25
 
-
-def _score_chip_concentration(level: str) -> float:
-    """Score chip concentration. Moderate concentration = good."""
-    level_map = {
-        "low": 55,
-        "medium": 70,
-        "high": 60,
-    }
-    return float(level_map.get(level.lower(), DEFAULT_NEUTRAL_SCORE))
 
 
 def _score_foreign_ratio(ratio: float) -> float:

@@ -199,7 +199,6 @@ def test_cancelled_stage_zero_retains_completed_financial_and_quote_facts(choice
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", DataFetcherManager())
     monkeypatch.setattr(context, "_safe_quote", quote)
     monkeypatch.setattr(context, "_safe_history", lambda *a: [{"date": "2026-10-15", "close": 52.0}])
-    monkeypatch.setattr(context, "_safe_chip", lambda *a: {})
     with run.bind():
         result = context.build_shared_context("300260", "新莱应材")
         assert result is run.context
@@ -335,7 +334,7 @@ def test_source_timeout_stays_pending_until_real_worker_completion(choice_transp
 
 
 @pytest.mark.parametrize("reason", ["cancelled", "report_budget"])
-@pytest.mark.parametrize("operation", ["get_realtime_quote", "get_daily_data", "get_chip_distribution"])
+@pytest.mark.parametrize("operation", ["get_realtime_quote", "get_daily_data"])
 def test_manager_stops_quote_history_chip_fallback_after_first_response(monkeypatch, operation, reason):
     from src.config import Config
     from types import SimpleNamespace
@@ -356,9 +355,9 @@ def test_manager_stops_quote_history_chip_fallback_after_first_response(monkeypa
             if len(calls) == 1:
                 run.stop(reason)
             return pd.DataFrame() if operation == "get_daily_data" else None
-        get_realtime_quote = get_daily_data = get_chip_distribution = request
+        get_realtime_quote = get_daily_data = request
 
-    monkeypatch.setattr(Config, "_instance", Config(enable_realtime_quote=True, enable_chip_distribution=True, realtime_source_priority="efinance,akshare_sina,akshare_qq"))
+    monkeypatch.setattr(Config, "_instance", Config(enable_realtime_quote=True, realtime_source_priority="efinance,akshare_sina,akshare_qq"))
     first, fallback = Fetcher("EfinanceFetcher"), Fetcher("AkshareFetcher")
     manager = DataFetcherManager(fetchers=[first, fallback])
     with run.bind(), pytest.raises(ResearchStopped):

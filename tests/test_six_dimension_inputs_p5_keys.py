@@ -40,13 +40,13 @@ class TestSixDimSchemaKeys:
             "cognitive_difference",
             "recent_catalysts",
             "news_sentiment",
-            "chip_concentration",
         ):
             assert k in _SIX_DIM_KEYS, f"missing {k}"
 
     def test_six_dim_keys_count(self) -> None:
-        """原 10 个 + 2 个新 = 12 个"""
-        assert len(_SIX_DIM_KEYS) == 12
+        """v2.1（issue #46）chip_concentration 退休：12 - 1 = 11 个"""
+        assert len(_SIX_DIM_KEYS) == 11
+        assert "chip_concentration" not in _SIX_DIM_KEYS
 
 
 class TestEnumLikeKeys:

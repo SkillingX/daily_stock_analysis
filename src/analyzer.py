@@ -57,10 +57,8 @@ from src.report_language import (
     get_no_data_text,
     get_placeholder_text,
     get_unknown_text,
-    get_chip_unavailable_text,
     infer_decision_type_from_advice,
     is_chip_placeholder_value,
-    localize_chip_health,
     localize_confidence_level,
     normalize_report_language,
 )
@@ -399,21 +397,6 @@ def apply_placeholder_fill(result: "AnalysisResult", missing_fields: List[str]) 
                     )
 
 
-# ---------- chip_structure fallback (Issue #589) ----------
-
-_CHIP_KEYS: tuple[str, ...] = (
-    "profit_ratio",
-    "avg_cost",
-    "concentration",
-    "chip_health",
-)
-
-
-def _is_value_placeholder(v: Any) -> bool:
-    """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
-    return is_chip_placeholder_value(v)
-
-
 _RISK_WARNING_PLACEHOLDER_TEXTS = {
     "",
     "n/a",
@@ -491,7 +474,7 @@ def _is_meaningful_text(value: Any) -> bool:
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
-    """Safely convert to float; return default on failure. Private helper for chip fill."""
+    """Safely convert to float; return default on failure."""
     if v is None:
         return default
     if isinstance(v, (int, float)):
@@ -505,18 +488,9 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
-def _coerce_chip_metric(v: Any) -> Optional[float]:
-    """Convert chip metrics while preserving the distinction between missing and zero."""
-    if v is None:
-        return None
-    try:
-        numeric = float(v)
-    except (TypeError, ValueError):
-        try:
-            numeric = float(str(v).strip())
-        except (TypeError, ValueError):
-            return None
-    return None if math.isnan(numeric) else numeric
+def _is_value_placeholder(v: Any) -> bool:
+    """True if value is empty or placeholder (N/A, 数据缺失, etc.)."""
+    return is_chip_placeholder_value(v)
 
 
 _BULLISH_TREND_HINTS: Tuple[str, ...] = (
@@ -783,7 +757,6 @@ _SIX_DIM_KEYS: Tuple[str, ...] = (
     "cognitive_difference",
     "recent_catalysts",
     "news_sentiment",
-    "chip_concentration",
 )
 
 # Enum-like scalar fields whose value is a single token. We strip parenthetical
@@ -811,9 +784,6 @@ def _coerce_six_dim_value(key: str, raw: str) -> Any:
         return None
     if key == "customer_concentration":
         match = re.search(r"[-+]?\d*\.?\d+", text)
-        return float(match.group()) if match else None
-    if key == "chip_concentration":
-        match = re.search(r"\d+(?:\.\d+)?", text)
         return float(match.group()) if match else None
     if key == "recent_catalysts":
         stripped = text.strip()
@@ -1145,124 +1115,6 @@ def _sanitize_trend_analysis_for_prompt(
     trend_dict["prompt_consistency_notes"] = prompt_notes
     trend_dict["prompt_trend_direction"] = trend_direction
     return trend_dict
-
-
-def _derive_chip_health(
-    profit_ratio: float, concentration_90: float, language: str = "zh"
-) -> str:
-    """Derive chip_health from profit_ratio and concentration_90."""
-    if profit_ratio >= 0.9:
-        return localize_chip_health("警惕", language)  # 获利盘极高
-    if concentration_90 >= 0.25:
-        return localize_chip_health("警惕", language)  # 筹码分散
-    if concentration_90 < 0.15 and 0.3 <= profit_ratio < 0.9:
-        return localize_chip_health("健康", language)  # 集中且获利比例适中
-    return localize_chip_health("一般", language)
-
-
-def _build_chip_structure_from_data(
-    chip_data: Any, language: str = "zh"
-) -> Dict[str, Any]:
-    """Build chip_structure dict from ChipDistribution or dict."""
-    if hasattr(chip_data, "profit_ratio"):
-        pr = _safe_float(chip_data.profit_ratio)
-        ac = chip_data.avg_cost
-        c90 = _safe_float(chip_data.concentration_90)
-    else:
-        d = chip_data if isinstance(chip_data, dict) else {}
-        pr = _safe_float(d.get("profit_ratio"))
-        ac = d.get("avg_cost")
-        c90 = _safe_float(d.get("concentration_90"))
-    chip_health = _derive_chip_health(pr, c90, language=language)
-    return {
-        "profit_ratio": f"{pr:.1%}",
-        "avg_cost": ac if (ac is not None and _safe_float(ac) != 0.0) else "N/A",
-        "concentration": f"{c90:.2%}",
-        "chip_health": chip_health,
-    }
-
-
-def _has_meaningful_chip_data(chip_data: Any) -> bool:
-    """Return True when chip data has the core metrics required for reporting."""
-    if not chip_data:
-        return False
-    if hasattr(chip_data, "avg_cost"):
-        avg_cost = _coerce_chip_metric(getattr(chip_data, "avg_cost", None))
-        concentration_90 = _coerce_chip_metric(
-            getattr(chip_data, "concentration_90", None)
-        )
-        concentration_70 = _coerce_chip_metric(
-            getattr(chip_data, "concentration_70", None)
-        )
-    else:
-        d = chip_data if isinstance(chip_data, dict) else {}
-        avg_cost = _coerce_chip_metric(d.get("avg_cost"))
-        concentration_90_value = d.get("concentration_90")
-        if concentration_90_value is None:
-            concentration_90_value = d.get("concentration")
-        concentration_90 = _coerce_chip_metric(concentration_90_value)
-        concentration_70 = _coerce_chip_metric(d.get("concentration_70"))
-    return (
-        avg_cost is not None
-        and avg_cost > 0
-        and (
-            (concentration_90 is not None and concentration_90 >= 0)
-            or (concentration_70 is not None and concentration_70 >= 0)
-        )
-    )
-
-
-def _mark_chip_structure_unavailable(result: "AnalysisResult", language: str) -> None:
-    if not result or not isinstance(result.dashboard, dict):
-        return
-    data_perspective = result.dashboard.get("data_perspective")
-    if not isinstance(data_perspective, dict):
-        return
-    data_perspective["chip_structure"] = {}
-    data_perspective["chip_unavailable_reason"] = get_chip_unavailable_text(language)
-
-
-def normalize_chip_structure_availability(
-    result: "AnalysisResult", chip_data: Any
-) -> None:
-    """Fill valid chip metrics or collapse placeholder-only chip fields to one fallback line."""
-    if not result:
-        return
-    language = getattr(result, "report_language", "zh")
-    if _has_meaningful_chip_data(chip_data):
-        fill_chip_structure_if_needed(result, chip_data)
-        return
-    _mark_chip_structure_unavailable(result, language)
-
-
-def fill_chip_structure_if_needed(result: "AnalysisResult", chip_data: Any) -> None:
-    """When chip_data exists, fill chip_structure placeholder fields from chip_data (in-place)."""
-    if not result or not _has_meaningful_chip_data(chip_data):
-        return
-    try:
-        if not result.dashboard:
-            result.dashboard = {}
-        dash = result.dashboard
-        # Use `or {}` rather than setdefault so that an explicit `null` from LLM is also replaced
-        dp = dash.get("data_perspective") or {}
-        dash["data_perspective"] = dp
-        cs = dp.get("chip_structure") or {}
-        filled = _build_chip_structure_from_data(
-            chip_data,
-            language=getattr(result, "report_language", "zh"),
-        )
-        # Start from a copy of cs to preserve any extra keys the LLM may have added
-        merged = dict(cs)
-        for k in _CHIP_KEYS:
-            if _is_value_placeholder(merged.get(k)):
-                merged[k] = filled[k]
-        if merged != cs:
-            dp["chip_structure"] = merged
-            logger.info(
-                "[chip_structure] Filled placeholder chip fields from data source (Issue #589)"
-            )
-    except Exception as e:
-        logger.warning("[chip_structure] Fill failed, skipping: %s", e)
 
 
 _PRICE_POS_KEYS = (
@@ -2305,12 +2157,6 @@ class GeminiAnalyzer:
                 "volume_status": "放量/缩量/平量",
                 "turnover_rate": 换手率百分比,
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
-            },
-            "chip_structure": {
-                "profit_ratio": 获利比例,
-                "avg_cost": 平均成本,
-                "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
             }
         },
 
@@ -2339,8 +2185,7 @@ class GeminiAnalyzer:
                 "✅/⚠️/❌ 检查项2：乖离率合理（强势趋势可放宽）",
                 "✅/⚠️/❌ 检查项3：量能配合",
                 "✅/⚠️/❌ 检查项4：无重大利空",
-                "✅/⚠️/❌ 检查项5：筹码健康",
-                "✅/⚠️/❌ 检查项6：PE估值合理"
+                "✅/⚠️/❌ 检查项5：PE估值合理"
             ]
         },
 
@@ -2385,7 +2230,6 @@ class GeminiAnalyzer:
 - ✅ 多头排列：MA5 > MA10 > MA20
 - ✅ 低乖离率：<2%，最佳买点
 - ✅ 缩量回调或放量突破
-- ✅ 筹码集中健康
 - ✅ 消息面有利好催化
 
 ### 买入（60-79分）：
@@ -2416,7 +2260,7 @@ class GeminiAnalyzer:
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
@@ -2476,12 +2320,6 @@ class GeminiAnalyzer:
                 "volume_status": "放量/缩量/平量",
                 "turnover_rate": 换手率百分比,
                 "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
-            },
-            "chip_structure": {
-                "profit_ratio": 获利比例,
-                "avg_cost": 平均成本,
-                "concentration": 筹码集中度,
-                "chip_health": "健康/一般/警惕"
             }
         },
 
@@ -2508,7 +2346,7 @@ class GeminiAnalyzer:
             "action_checklist": [
                 "✅/⚠️/❌ 检查项1：当前结构是否满足激活技能条件",
                 "✅/⚠️/❌ 检查项2：入场位置与风险回报是否合理",
-                "✅/⚠️/❌ 检查项3：量价/波动/筹码是否支持判断",
+                "✅/⚠️/❌ 检查项3：量价/波动是否支持判断",
                 "✅/⚠️/❌ 检查项4：无重大利空",
                 "✅/⚠️/❌ 检查项5：仓位与止损计划明确",
                 "✅/⚠️/❌ 检查项6：估值/业绩/催化与结论匹配"
@@ -2584,7 +2422,7 @@ class GeminiAnalyzer:
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
@@ -3703,7 +3541,6 @@ class GeminiAnalyzer:
                 result.market_snapshot = self._build_market_snapshot(context)
                 result.model_used = model_used
                 result.report_language = report_language
-                normalize_chip_structure_availability(result, context.get("chip"))
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -3790,7 +3627,7 @@ class GeminiAnalyzer:
         """
         格式化分析提示词（决策仪表盘 v2.0）
 
-        包含：技术指标、实时行情（量比/换手率）、筹码分布、趋势分析、新闻
+        包含：技术指标、实时行情（量比/换手率）、趋势分析、新闻
 
         Args:
             context: 技术面数据上下文（包含增强数据）
@@ -4068,34 +3905,6 @@ class GeminiAnalyzer:
 > 资金流向只能作为价格位置的过滤器：接近压力且主力流出时不得追买；接近支撑且未放量跌破时，优先判断为持有观察、震荡或洗盘观察。
 """
 
-        # 添加筹码分布数据
-        if "chip" in context:
-            chip = context["chip"]
-            profit_ratio = chip.get("profit_ratio", 0)
-            prompt += f"""
-### 筹码分布数据（效率指标）
-| 指标 | 数值 | 健康标准 |
-|------|------|----------|
-| **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
-| 平均成本 | {chip.get("avg_cost", "N/A")} 元 | 现价应高于5-15% |
-| 90%筹码集中度 | {chip.get("concentration_90", 0):.2%} | <15%为集中 |
-| 70%筹码集中度 | {chip.get("concentration_70", 0):.2%} | |
-| 筹码状态 | {chip.get("chip_status", unknown_text)} | |
-"""
-        else:
-            chip_unavailable_text = get_chip_unavailable_text(report_language)
-            chip_instruction = (
-                "Do not fabricate profit ratio, average cost, or concentration. Mention chip data "
-                "unavailability only once in the report; do not repeat per-field no-data text in `chip_structure`."
-                if report_language == "en"
-                else "请勿编造获利比例、平均成本或集中度；报告中只说明一次筹码数据不可用，不要把“数据缺失，无法判断”逐字段重复写入 `chip_structure`。"
-            )
-            prompt += f"""
-### 筹码分布数据（效率指标）
-> {chip_unavailable_text}
-> {chip_instruction}
-"""
-
         # 添加趋势分析结果（仅隐式内建 bull_trend 默认回退保留旧口径）
         if "trend_analysis" in context:
             trend = _sanitize_trend_analysis_for_prompt(
@@ -4264,8 +4073,7 @@ class GeminiAnalyzer:
 1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
 2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
 3. ❓ 量能是否配合（缩量回调/放量突破）？
-4. ❓ 筹码结构是否健康？
-5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+4. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
 """
         else:
             prompt += f"""
@@ -4273,7 +4081,7 @@ class GeminiAnalyzer:
 ### 重点关注（必须明确回答）：
 1. ❓ 当前结构是否满足激活技能的关键触发条件？
 2. ❓ 当前入场位置与风险回报是否合理？若偏离过大，请明确说明等待条件
-3. ❓ 量能、波动与筹码结构是否支持当前结论？
+3. ❓ 量能与波动是否支持当前结论？
 4. ❓ 消息面有无重大利空或与技能结论冲突的信息？
 5. ❓ 若结论成立，具体触发条件、止损位、观察点分别是什么？
 """
@@ -4330,7 +4138,6 @@ class GeminiAnalyzer:
 - `cognitive_difference`: `market_underestimating | market_fair | market_overestimating`
 - `recent_catalysts`: 字符串数组，列最近 30 天内 1~3 个事件驱动；`risk_alerts` 已写过的不要重复
 - `news_sentiment`: `positive | neutral | negative` 一句话客观判断
-- `chip_concentration`: 0~100 整数筹码集中度百分比（如无数据填 `null`）
 
 **重点**：这些字段仅用于辅助打分 `research_framework.dimensions`，不在 decision dashboard 渲染，对 `sentiment_score / trend_prediction / operation_advice / decision_type` **完全不产生影响**。填错不会扣分；漏写不会扣分；请按事实判断自由发挥。
 
@@ -4343,7 +4150,6 @@ class GeminiAnalyzer:
 | 乖离率安全（bias_ma5 < 5%）| 20 | +20 | -20（>5% 减 20）|
 | 量能配合（缩量回调 / 放量突破）| 20 | +20 | -20（放量杀跌）|
 | 无重大利空（风险事件）| 10 | 0 | -10 |
-| 筹码健康（数据可获时）| 10 | +10 | -10（数据缺失=0）|
 | PE 估值合理（PE<50 / PE<-50）| 10 | +10 | -10（极端值）|
 
 **最终 score 必须等于 `50 + Σ(权重项) + 大盘环境调整`**，不得自由打分。
@@ -4354,12 +4160,12 @@ class GeminiAnalyzer:
 |---|---|---|---|
 | 0 缺失 | 0-100 自由 | 自由 | 自由 |
 | 缺 1 项 | 10-90 | 自由 | 自由 |
-| 缺 2 项（含 chip 或 news）| 15-85 | 自由 | 自由 |
+| 缺 2 项（含 news）| 15-85 | 自由 | 自由 |
 | 缺 3 项 | 20-80 | "震荡" | `hold` |
 | 缺 4+ 项 | 35-65 | "震荡" + 标注"数据缺失无法判断方向" | `hold` |
 | 大盘高风险（high_risk）| 任何区间再额外压 5 分 | - | - |
 
-**显示你的计算过程**（在 `analysis_summary` 字段）："score = 50 + 30(多头) + 20(乖离) + 20(量能) + 0(无利空) + 10(筹码) + 10(PE) + 0(大盘) = 140 → 钳到 100"。
+**显示你的计算过程**（在 `analysis_summary` 字段）："score = 50 + 30(多头) + 20(乖离) + 20(量能) + 0(无利空) + 10(PE) + 0(大盘) = 130 → 钳到 100"。
 """
 
         return prompt
@@ -4701,11 +4507,6 @@ class GeminiAnalyzer:
                 )
 
                 _missing_dims: List[str] = []
-                _chip_ctx = (
-                    (data.get("context_snapshot") or {}).get("enhanced_context") or {}
-                ).get("chip_context") or {}
-                if not _chip_ctx.get("data"):
-                    _missing_dims.append("chip")
                 if (
                     not data.get("news_content")
                     or len(str(data.get("news_content") or "")) <= 200
@@ -4760,7 +4561,7 @@ class GeminiAnalyzer:
                     # 核心指标
                     # P1 fix (2026-07-17): re-compute sentiment_score from
                     # observed factors (ma_alignment / bias_ma5 / volume /
-                    # chip / PE / market risk). The LLM's score is recorded
+                    # PE / market risk). The LLM's score is recorded
                     # under _reanchor_log.original_score for audit.
                     sentiment_score=int(data.get("sentiment_score", 50)),
                     trend_prediction=data.get(
