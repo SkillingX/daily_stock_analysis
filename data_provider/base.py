@@ -629,22 +629,18 @@ _CHOICE_GROWTH_INDICATORS = {
 
 
 def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ...]:
-    """合格 iFinD 财务字段不再向 Choice 重复查询（issue #45）。"""
-    from data_provider.cross_source_validator import has_current_financial_period, reading_input_reasons
+    """Omit each qualified iFinD growth field from Choice; unqualified fields stay.
 
-    omitted = []
-    for field, indicator in _CHOICE_GROWTH_INDICATORS.items():
-        reading = readings.get(field)
-        if not (
-            reading is not None
-            and has_current_financial_period(reading)
-            and not reading_input_reasons(reading, field)
-            and reading.statement_scope == "consolidated"
-            and reading.adjustment == "restated"
-        ):
-            return ()
-        omitted.append(indicator)
-    return tuple(omitted)
+    Uses the same qualification gate as snapshot selection, so a field omitted
+    here can never later be dropped as unqualified by select_current_financials.
+    """
+    from data_provider.cross_source_validator import _eligible_current_financial
+
+    return tuple(
+        indicator
+        for field, indicator in _CHOICE_GROWTH_INDICATORS.items()
+        if _eligible_current_financial(readings.get(field), field)
+    )
 
 
 def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any) -> Dict[str, Any]:

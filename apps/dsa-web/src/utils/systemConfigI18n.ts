@@ -193,7 +193,7 @@ const fieldTitleMap: Record<string, string> = {
 const fieldDescriptionMap: Record<string, string> = {
   STOCK_LIST: '使用逗号分隔股票代码，例如：600519,300750。',
   TUSHARE_TOKEN: '用于接入 Tushare Pro 数据服务的凭据。',
-  ANSPIRE_API_KEYS: 'Anspire Open 密钥，支持逗号分隔多个；默认同时用于大模型网关和新闻检索。',
+  ANSPIRE_API_KEYS: 'Anspire Open 密钥，支持逗号分隔多个；仅用于 Anspire 大模型网关，不用于新闻检索（搜索渠道已收敛为套餐入口）。',
   STOCK_INDEX_REMOTE_UPDATE_ENABLED: '控制是否从 GitHub main 远程刷新股票自动补全索引；失败会降级到本地缓存或内置索引，不影响主分析流程。',
   MINIMAX_API_KEYS: 'MiniMax Coding Plan 搜索密钥；可用 CODING_PLAN_SEARCH_PROVIDER=zhipu 替代此位置，其他工具顺序不变。',
   NEWS_STRATEGY_PROFILE: '新闻窗口档位：ultra_short=1天，short=3天，medium=7天，long=30天。',

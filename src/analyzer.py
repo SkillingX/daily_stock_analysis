@@ -61,6 +61,7 @@ from src.report_language import (
     is_chip_placeholder_value,
     localize_confidence_level,
     normalize_report_language,
+    strip_retired_chip_structure,
 )
 from src.schemas.decision_action import build_action_fields
 from src.schemas.report_schema import AnalysisReportSchema
@@ -4533,6 +4534,8 @@ class GeminiAnalyzer:
 
                 # 提取 dashboard 数据
                 dashboard = data.get("dashboard", None)
+                # 筹码结构已随 issue #46 退休：与 Agent 路径共用同一采用边界剥离
+                strip_retired_chip_structure(dashboard)
 
                 # 优先使用 AI 返回的股票名称（如果原名称无效或包含代码）
                 ai_stock_name = data.get("stock_name")

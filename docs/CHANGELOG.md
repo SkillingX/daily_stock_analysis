@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 合格 iFinD 财务字段按字段省略 Choice 重查：单项缺项不再迫使其他合格字段重查；Choice 缺口只允许在同财期内补位，不因另一字段财期更新而丢掉已合格的 iFinD 字段；估值/目标价/行业 Choice 查询保留，单一 iFinD 来源不标记为已核验。
+- [修复] 社区评价不再作为必填或计分来源：深研提示词删除必填社区讨论章节与社区工具调用要求（保留社区传闻不能确认事实的分级规则）；search_clue_hype 不再查询雪球，社区链接不计入炒作分；报告不再要求 Xueqiu/X/Reddit 取数。
+- [修复] 文档与设置页不再把 Anspire/SerpAPI/Bocha/Brave/SearXNG 搜索写成可用配置：完整指南（中英）与设置描述改为退休说明（残留配置仅兼容读取，不触发请求），不再指导配置 SearXNG 公共实例；ANSPIRE_API_KEYS 只描述为 Anspire 大模型网关密钥。
 - [修复] 搜索渠道收敛为套餐入口：线上 MiniMax、本机同位置智谱 Coding Plan；SearXNG 公共实例自动发现、html_scrape 搜索回退、Bocha/Brave/SerpAPI/Anspire 全部退休，残留 Key 与旧配置不再触发请求，失败不回退其他渠道；网页正文阅读能力保留；设置页与每日分析工作流不再展示或注入退休渠道。回滚须使用仍禁用退休渠道的配套版本：公开探针与公共实例无需 Key，仅不恢复凭据不能停用，不能直接回退会重新启用公开工具的旧版本。
 - [修复] 个股最新概念归属改用 iFinD 适配入口（get_stock_info 返回 concept_membership：证券代码、概念列表、来源与"最新"时点性质），退役东财公开概念/成分股与同花顺概念网页探针（verify_supply_chain_evidence 工具、EastMoneyProbe/ThsAkshareProbe 与默认双源校验器删除）；概念标签不再写成客户或供应链事实，候选表以概念归属列替代"双源状态"占位，无数据/拒绝/超时按原因披露不补造日期。回滚须使用仍删除公开探针的配套版本，不能直接回退会重新启用东财/同花顺探针的旧版本。
 - [修复] 完整关闭筹码分析与社区评价能力：停用东财/Tushare 筹码取数、历史行情估算回填、共享快照装配、chip_structure 占位回填与模型补造，退役雪球热帖、雪球报价/搜索/热榜旁路与 X/Reddit 社区入口（删除 search_market_discussion 工具、AgentReachService 雪球渠道、SocialSentimentService 与 XSearchProvider）；资金流、机构持仓与机构评价保留并继续披露真实失败。回滚须使用仍停用筹码估算与社区入口的配套版本，不能直接回退会自动启用公开筹码工具或日线估算的旧版本。

@@ -75,11 +75,8 @@ GOOD_MD = """# 韦尔股份(603501)深度投研报告
 ### 1.3 政策敏感度与监管风险
 工信部 / 证监会出台相关支持政策，监管风险低。
 
-### 1.4 国内外社区讨论与市场分歧（community_cn / community_global）
-雪球 / 东方财富股吧关注度高；社区讨论出现分歧（看多/看空共存）。
-
-### 1.5 消息面可信度分层
-primary 支撑事实；community_cn 仅做线索。
+### 1.4 消息面可信度分层
+primary 支撑事实；新闻线索不升级为已确认订单。
 
 ---
 
@@ -571,6 +568,10 @@ class TestExecutorUserMessage:
         # 技术面降权 / 15% 篇幅上限
         assert "15%" in prompt
         assert "不得推翻产业链主判断" in prompt
+        assert "国内外社区讨论" not in prompt
+        assert "search_market_discussion" not in prompt
+        assert "社区讨论" not in _REQUIRED_SECTIONS
+        assert not any("社区" in section for section in _REQUIRED_SECTIONS)
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,24 @@ def test_daily_analysis_workflow_does_not_inject_searxng() -> None:
     assert "SEARXNG_PUBLIC_INSTANCES_ENABLED" not in workflow
 
 
+def test_full_guide_does_not_present_retired_search_as_active() -> None:
+    """issue #47：完整指南不再把退休搜索渠道写成可用搜索配置。"""
+    guide = (ROOT_DIR / "docs" / "full-guide.md").read_text(encoding="utf-8")
+
+    assert "SEARXNG_PUBLIC_INSTANCES_ENABLED=true" not in guide
+    assert "searx.space" not in guide
+    assert "留空时默认自动发现公共实例" not in guide
+    assert "自动发现公共实例" not in guide
+    for banned in ("博查搜索", "Brave Search", "适合实时金融新闻"):
+        assert banned not in guide, f"退休搜索渠道仍按可用配置展示: {banned}"
+    for key in ("SERPAPI_API_KEYS", "BOCHA_API_KEYS", "BRAVE_API_KEYS", "SEARXNG_BASE_URLS", "SEARXNG_PUBLIC_INSTANCES_ENABLED"):
+        for line in guide.splitlines():
+            if key in line and line.lstrip().startswith("|"):
+                assert "已停用" in line, f"{key} 仍按可用搜索配置展示: {line}"
+    assert "一 Key 同时启用大模型和" not in guide
+    assert "不触发请求" in guide
+
+
 def test_changelog_records_search_channel_retirement() -> None:
     changelog = (ROOT_DIR / "docs" / "CHANGELOG.md").read_text(encoding="utf-8")
     unreleased = changelog.split("## [", 2)[1]
