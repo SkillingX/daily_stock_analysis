@@ -42,8 +42,8 @@
 | 章节 | 必须调用的工具（满足其一即可，除非标注「且」） |
 |------|-----------------------------------------------|
 | **消息面与产业政策** | `search_stock_news` 或 `search_comprehensive_intel`（**且** `get_market_indices`） |
-| **产业链位置** | `get_sector_rankings`（**且** `search_comprehensive_intel`）；P1 后**必调** `verify_supply_chain_evidence` |
-| **国产替代 / 中美平行链** | 内容必含「适用性判断」；强相关行业用 `search_comprehensive_intel` 查进度；P2 后可调 `search_market_discussion` 补充社区线索 |
+| **产业链位置** | `get_sector_rankings`（**且** `search_comprehensive_intel`）；最新概念归属读 `get_stock_info` 的 `concept_membership`，概念标签不是客户事实 |
+| **国产替代 / 中美平行链** | 内容必含「适用性判断」；强相关行业用 `search_comprehensive_intel` 查进度 |
 | **材料 / 工艺 / 环节独特地位** | 内容必含；用 `get_stock_info` + `search_comprehensive_intel` 收集壁垒/扩产/认证线索 |
 | **财务与估值** | `get_stock_info` |
 | **技术面节奏（次要）** | `analyze_trend` / `get_capital_flow` 满足其一即可；**不调用不阻断** |
@@ -59,8 +59,7 @@
 - `search_comprehensive_intel`：多维情报检索（宏观政策/行业动态/产业链）
 - `get_market_indices`：大盘指数（上证/深证/创业板/科创板）
 - `get_sector_rankings`：板块涨跌排名
-- `verify_supply_chain_evidence`（P1）：A 股公司 / 板块归属的东方财富 + 同花顺双源校验
-- `search_market_discussion`（P2）：国内/海外社区讨论与分歧检索
+- `get_stock_info` 的 `concept_membership`：iFinD 最新概念归属（只证明最新时点，不证明客户或供应链事实；无数据按 error 披露，不补造）
 
 ## 四、ReAct 纪律（防止提前终止）
 
@@ -93,7 +92,7 @@
 - 上游 / 中游 / 下游图谱
 - 公司所在环节与利润分配
 - 是否属于卡点 / 瓶颈 / 关键材料 / 关键设备 / 关键工艺 / 关键客户入口
-- 东方财富 + 同花顺双源校验状态（P1 后用 `verify_supply_chain_evidence` 标注 `confirmed / partial / conflict / unverified / not_applicable`）
+- 最新概念归属（取 `concept_membership`，标注来源与“最新”时点；无数据按原因披露，不写双源确认）
 
 ### 三、国产替代与平行替换
 **【结论】**（**先答适用性**！强相关再展开；低相关写固定句）

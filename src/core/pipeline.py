@@ -1068,6 +1068,7 @@ class StockAnalysisPipeline:
         existing_boards = enriched_context.get("belong_boards")
         if isinstance(existing_boards, list):
             enriched_context["belong_boards"] = list(existing_boards)
+            self._attach_concept_membership(code, enriched_context)
             return enriched_context
 
         boards_block = enriched_context.get("boards")
@@ -1090,18 +1091,29 @@ class StockAnalysisPipeline:
 
         if boards_status == "not_supported" or boards_coverage == "not_supported":
             enriched_context["belong_boards"] = []
+            self._attach_concept_membership(code, enriched_context)
             return enriched_context
 
-        boards: List[Dict[str, Any]] = []
-        try:
-            raw_boards = self.fetcher_manager.get_belong_boards(code)
-            if isinstance(raw_boards, list):
-                boards = raw_boards
-        except Exception as e:
-            logger.debug("%s attach belong_boards failed (fail-open): %s", code, e)
-
-        enriched_context["belong_boards"] = boards
+        # issue #45：个股概念归属走 iFinD，不再调用东财公开所属板块/概念接口。
+        # 行业分类留在 Choice research.industry，不把概念写进 belong_boards。
+        enriched_context["belong_boards"] = []
+        self._attach_concept_membership(code, enriched_context)
         return enriched_context
+
+    @staticmethod
+    def _attach_concept_membership(code: str, enriched_context: Dict[str, Any]) -> None:
+        """A 股最新概念归属只走 iFinD 适配入口，失败记 error，不打公开探针。"""
+        market = enriched_context.get("market")
+        if market not in (None, "", "cn"):
+            return
+        if isinstance(enriched_context.get("concept_membership"), dict):
+            return
+        from time import monotonic
+        from src.agent.tools.data_tools import _concept_membership
+        from src.config import get_config
+
+        timeout = getattr(get_config(), "ifind_mcp_timeout_seconds", 30)
+        enriched_context["concept_membership"] = _concept_membership(code, monotonic() + float(timeout))
 
     def _ensure_agent_history(self, code: str, min_days: int = 240) -> None:
         """Ensure at least *min_days* of K-line history is in DB for agent tools."""

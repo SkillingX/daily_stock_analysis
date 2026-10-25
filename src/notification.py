@@ -2143,6 +2143,7 @@ class NotificationService(
         self._append_financial_summary(lines, blocks, labels)
         self._append_shareholder_return(lines, blocks, labels)
         self._append_related_boards(lines, blocks, labels)
+        self._append_concept_membership(lines, result)
 
     def _append_financial_summary(
         self,
@@ -2333,6 +2334,31 @@ class NotificationService(
             lines.append("|:-----|:----:|")
             for name, board_type, _, _ in prepared:
                 lines.append(f"| {name} | {board_type} |")
+        lines.append("")
+
+    def _append_concept_membership(self, lines: List[str], result: AnalysisResult) -> None:
+        """最新概念归属单独成段，不写进所属板块，也不把缺失说成双源校验失败。"""
+        ctx = getattr(result, "fundamental_context", None)
+        membership = ctx.get("concept_membership") if isinstance(ctx, dict) else None
+        if not isinstance(membership, dict):
+            return
+        names = [
+            str(item.get("name")).strip()
+            for item in membership.get("concepts") or []
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        error = str(membership.get("error") or "").strip()
+        if not names and not error:
+            return
+        lines.append("### 最新概念归属")
+        lines.append("")
+        if names:
+            lines.append(
+                f"来源：{membership.get('source') or 'ifind'}（{membership.get('as_of_nature') or 'latest'}）"
+            )
+            lines.append("、".join(names))
+        else:
+            lines.append(f"未取得：{error}")
         lines.append("")
 
     def _should_use_image_for_channel(

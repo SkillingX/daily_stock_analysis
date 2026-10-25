@@ -3127,22 +3127,15 @@ class Config:
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
         cls._BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
 
-    def has_searxng_enabled(self) -> bool:
-        """Whether SearXNG fallback is enabled via self-hosted or public mode."""
-        return bool(self.searxng_base_urls) or bool(
-            self.searxng_public_instances_enabled
-        )
-
     def has_search_capability_enabled(self) -> bool:
-        """Whether any search provider is configured or SearXNG fallback is enabled."""
-        return bool(
-            self.anspire_api_keys
-            or self.bocha_api_keys
-            or (self.minimax_api_keys if self.coding_plan_search_provider == "minimax" else self.zhipu_api_key)
-            or self.brave_api_keys
-            or self.serpapi_keys
-            or self.has_searxng_enabled()
-        )
+        """Whether the retained plan search slot is configured.
+
+        issue #47：只认 MiniMax 或本机智谱套餐。残留的 Bocha/Brave/SerpAPI/
+        Anspire/Tavily/SearXNG 配置不构成搜索能力，也不能抑制缺搜索告警。
+        """
+        if self.coding_plan_search_provider == "zhipu":
+            return bool(self.zhipu_api_key)
+        return bool(self.minimax_api_keys)
 
     def is_agent_available(self) -> bool:
         """Check whether agent capabilities are usable.
@@ -3435,7 +3428,7 @@ class Config:
             issues.append(
                 ConfigIssue(
                     severity="info",
-                    message="未配置搜索引擎能力 (Bocha/套餐搜索/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
+                    message="未配置套餐搜索能力（MiniMax 或智谱 Coding Plan），新闻搜索功能将不可用",
                     field="BOCHA_API_KEYS",
                 )
             )

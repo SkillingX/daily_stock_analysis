@@ -328,9 +328,10 @@ class ChoiceAdapter:
             raise SourceReadError("choice", "invalid_response")
         return number
 
-    def snapshot(self, code: str, *, deadline: float) -> dict[str, Any]:
+    def snapshot(self, code: str, *, deadline: float, omit_indicators: tuple[str, ...] = ()) -> dict[str, Any]:
         today = date.today()
         out: dict[str, Any] = {"growth": {}, "valuation": {}, "field_meta": {}, "errors": [], "contract": self.contract_version}
+        omitted = set(omit_indicators)
         field_errors: dict[str, str] = {}
         from src.core.research_run import ResearchStopped
         report, disclosure, trade_day = None, None, None
@@ -346,20 +347,32 @@ class ChoiceAdapter:
                 out["errors"].append(str(exc))
                 field_errors["growth"] = exc.reason_code
             if report is not None:
-                try:
-                    fields = self.css(code, "OPERATEREVENEW,PARENTNETPROFITNEW,ROEWA,GPMARGIN,YOYOR,YOYPNI,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
-                    if fields.get("ACTUALISSUINGDATE"):
-                        disclosure = self.report_date(fields["ACTUALISSUINGDATE"])
-                    for field, indicator, caliber in (("roe", "ROEWA", "weighted_roe"), ("gross_margin", "GPMARGIN", "gross_margin"), ("revenue_yoy", "YOYOR", "operating_revenue_yoy"), ("net_profit_yoy", "YOYPNI", "parent_net_profit_yoy")):
-                        self._adopt(out, "growth", field, fields.get(indicator), "percentage_point", caliber, report, disclosure, "restated", indicator,
-                                    None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
-                    for field, indicator, caliber in (("revenue", "OPERATEREVENEW", "operating_revenue"), ("net_profit", "PARENTNETPROFITNEW", "parent_net_profit")):
-                        self._adopt(out, "growth", field, fields.get(indicator), "currency_base", caliber, report, disclosure, "restated", indicator,
-                                    None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
-                    out["growth"].update(report_date=report, disclosure_date=disclosure)
-                except SourceReadError as exc:
-                    out["errors"].append(str(exc))
-                    field_errors["growth"] = exc.reason_code
+                growth_indicators = [
+                    name for name in (
+                        "OPERATEREVENEW", "PARENTNETPROFITNEW", "ROEWA", "GPMARGIN",
+                        "YOYOR", "YOYPNI", "ACTUALISSUINGDATE",
+                    )
+                    if name not in omitted or name == "ACTUALISSUINGDATE"
+                ]
+                if any(name not in omitted for name in growth_indicators if name != "ACTUALISSUINGDATE"):
+                    try:
+                        fields = self.css(code, ",".join(growth_indicators), f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
+                        if fields.get("ACTUALISSUINGDATE"):
+                            disclosure = self.report_date(fields["ACTUALISSUINGDATE"])
+                        for field, indicator, caliber in (("roe", "ROEWA", "weighted_roe"), ("gross_margin", "GPMARGIN", "gross_margin"), ("revenue_yoy", "YOYOR", "operating_revenue_yoy"), ("net_profit_yoy", "YOYPNI", "parent_net_profit_yoy")):
+                            if indicator in omitted:
+                                continue
+                            self._adopt(out, "growth", field, fields.get(indicator), "percentage_point", caliber, report, disclosure, "restated", indicator,
+                                        None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
+                        for field, indicator, caliber in (("revenue", "OPERATEREVENEW", "operating_revenue"), ("net_profit", "PARENTNETPROFITNEW", "parent_net_profit")):
+                            if indicator in omitted:
+                                continue
+                            self._adopt(out, "growth", field, fields.get(indicator), "currency_base", caliber, report, disclosure, "restated", indicator,
+                                        None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
+                        out["growth"].update(report_date=report, disclosure_date=disclosure)
+                    except SourceReadError as exc:
+                        out["errors"].append(str(exc))
+                        field_errors["growth"] = exc.reason_code
                 try:
                     balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
                     disclosed = self.report_date(balance["ACTUALISSUINGDATE"]) if balance.get("ACTUALISSUINGDATE") else None
@@ -385,15 +398,17 @@ class ChoiceAdapter:
             out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
             for name, indicators, options in (
                 ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
-                ("company", "MAINBUSINESS,MAINPRODUCT,COMPROFILE,AHOLDER,AHOLDERTYPE", f"EndDate={today}"),
+                ("company", ",".join(name for name in ("MAINBUSINESS", "MAINPRODUCT", "COMPROFILE", "AHOLDER", "AHOLDERTYPE") if name not in omitted), f"EndDate={today}"),
                 ("targets", "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180"),
             ):
+                if not indicators:
+                    continue
                 try:
                     out["research"][name] = self.css(code, indicators, options, deadline=deadline)
                 except SourceReadError as exc:
                     out["research"]["errors"].append(f"choice:{name}:{exc.reason_code}")
             out["research"]["target_window_days"] = 180
-            if report and disclosure:
+            if report and disclosure and "HOLDNAMER" not in omitted:
                 try:
                     holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
                     out["research"]["holders"] = {**holders, "period": report, "disclosed_at": disclosure,

@@ -618,6 +618,67 @@ def _daily_budget_exhausted(deadline: Optional[float]) -> bool:
     return deadline is not None and deadline <= time.monotonic()
 
 
+_CHOICE_GROWTH_INDICATORS = {
+    "revenue": "OPERATEREVENEW",
+    "net_profit": "PARENTNETPROFITNEW",
+    "roe": "ROEWA",
+    "gross_margin": "GPMARGIN",
+    "revenue_yoy": "YOYOR",
+    "net_profit_yoy": "YOYPNI",
+}
+
+
+def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ...]:
+    """合格 iFinD 财务字段不再向 Choice 重复查询（issue #45）。"""
+    from data_provider.cross_source_validator import has_current_financial_period, reading_input_reasons
+
+    omitted = []
+    for field, indicator in _CHOICE_GROWTH_INDICATORS.items():
+        reading = readings.get(field)
+        if not (
+            reading is not None
+            and has_current_financial_period(reading)
+            and not reading_input_reasons(reading, field)
+            and reading.statement_scope == "consolidated"
+            and reading.adjustment == "restated"
+        ):
+            return ()
+        omitted.append(indicator)
+    return tuple(omitted)
+
+
+def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any) -> Dict[str, Any]:
+    """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。"""
+    from data_provider.cross_source_validator import SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+
+    period = next((reading.period for reading in readings.values() if getattr(reading, "period", None)), None)
+    fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
+    omitted: list[str] = []
+    payload: Dict[str, Any] = {}
+    if time.monotonic() >= deadline:
+        return {"omit": ()}
+    try:
+        products = fetcher.product_segments(code, period, deadline=deadline)
+        if products.items and not products.errors:
+            omitted.extend(["MAINBUSINESS", "MAINPRODUCT"])
+            payload["product_segments"] = products.model_dump(mode="json")
+    except SourceReadError:
+        pass
+    if time.monotonic() >= deadline:
+        payload["omit"] = tuple(omitted)
+        return payload
+    try:
+        holders = fetcher.shareholders(code, period, deadline=deadline)
+        if holders.items and not holders.errors:
+            omitted.extend(["AHOLDER", "AHOLDERTYPE", "HOLDNAMER", "HOLDPCTR"])
+            payload["shareholder_details"] = holders.model_dump(mode="json")
+    except SourceReadError:
+        pass
+    payload["omit"] = tuple(omitted)
+    return payload
+
+
 class DataFetcherManager:
     """
     数据源策略管理器
@@ -4144,7 +4205,14 @@ class DataFetcherManager:
                 # Keep any completed sources; stopping research is not a vendor failure.
                 pass
         verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
-        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget)
+        omit = _qualified_ifind_choice_omissions(readings) if prefer_ifind else ()
+        ifind_research: Dict[str, Any] = {}
+        if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+            ifind_research = _ifind_research_omissions(code, readings, deadline, config)
+            omit = tuple(dict.fromkeys((*omit, *ifind_research.pop("omit", ()))))
+        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget, omit_indicators=omit)
+        if ifind_research:
+            snapshot.setdefault("research", {}).update(ifind_research)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         if source_error:
             errors.append(f"ifind:{source_error}")

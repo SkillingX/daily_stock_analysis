@@ -739,9 +739,10 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
         }
 
     sector_rankings = compact_context.get("boards", {}).get("data", {})
-    # 个股最新概念归属走 iFinD 适配入口（issue #45）：不再访问东财公开概念接口。
+    # 概念归属与行业板块分开（issue #45）：概念只进 concept_membership，
+    # 不再覆盖 belong_boards，也不再访问东财公开概念接口。
     concept_membership = _concept_membership(stock_code, deadline)
-    belong_boards = concept_membership["concepts"]
+    belong_boards: list[dict[str, Any]] = []
     stock_name = stock_code.upper()
     if hasattr(manager, "_run_with_timeout"):
         budget_seconds = min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))
@@ -774,8 +775,8 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
 get_stock_info_tool = ToolDefinition(
     name="get_stock_info",
     description="Get stock fundamental information: valuation, growth, earnings, institution flow, "
-    "stock sector membership (belong_boards; boards is compatibility alias) and "
-    "sector rankings. Returns a compact fundamental_context to reduce token usage.",
+    "and latest concept membership (concept_membership; not industry classification). "
+    "Returns a compact fundamental_context to reduce token usage.",
     parameters=[
         ToolParameter(
             name="stock_code",
