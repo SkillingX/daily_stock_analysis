@@ -78,7 +78,8 @@ def _no_real_data_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestV3ToolRegistration:
     def test_all_tools_registered(self) -> None:
         """v2 5 个 + v3 6 个 = 11 个工具。"""
-        assert len(ALL_SUPPLY_CHAIN_TOOLS) == 11
+        # issue #45 退役 verify_supply_chain_evidence 后为 10 个
+        assert len(ALL_SUPPLY_CHAIN_TOOLS) == 10
         names = {t.name for t in ALL_SUPPLY_CHAIN_TOOLS}
         assert V3_TOOL_NAMES <= names
 
@@ -696,7 +697,6 @@ class TestV3FactoryWiring:
             "score_supply_chain_bottleneck",
             "search_semianalysis",
             "search_clue_hype",
-            "verify_supply_chain_evidence",
             "search_supply_chain_kb",
         } <= names
 

@@ -7,7 +7,6 @@ v2 旧工具（2 个）：
 
 v2 中间工具（3 个）：
 - ``search_clue_hype``（线索炒作信号）
-- ``verify_supply_chain_evidence``（双源校验）
 - ``search_supply_chain_kb``（知识库检索）
 
 v3 深度小节工具（5 个）：
@@ -607,92 +606,12 @@ search_supply_chain_kb_tool = ToolDefinition(
 
 
 # ============================================================
-# 供应链双源校验（公司 / 板块归属，东方财富 + 同花顺结构化核验）
-# ============================================================
-
-
-def _get_supply_chain_validator() -> Any:
-    """Lazy 默认双源校验器访问器（测试可 monkeypatch 替换为注入 fake 探针的实例）。"""
-    from data_provider.supply_chain.cross_source import get_default_validator
-
-    return get_default_validator()
-
-
-def _handle_verify_supply_chain_evidence(
-    stock_code: str,
-    stock_name: str,
-    claim: str,
-    board_hint: str = "",
-    topic: str = "",
-) -> Dict[str, Any]:
-    """对单条供应链事实做「东方财富 + 同花顺」双源结构化校验。
-
-    复用 ``data_provider.supply_chain.cross_source`` 的纯逻辑判定 + fail-open 探针：
-    非 A 股 → ``not_applicable``；A 股按决策表产出 ``confirmed / partial /
-    conflict / unverified`` 与 ``high / medium / low`` 置信度。校验失败不阻断
-    报告生成，agent 据状态文案标注「待核验」「单源支持」「双源冲突」。
-    """
-    validator = _get_supply_chain_validator()
-    result = validator.verify(
-        stock_code, stock_name, claim=claim, board_hint=board_hint, topic=topic
-    )
-    return cast(Dict[str, Any], result.to_dict())
-
-
-verify_supply_chain_evidence_tool = ToolDefinition(
-    name="verify_supply_chain_evidence",
-    description=(
-        "对供应链报告中的「公司 / 板块归属」事实做双源结构化校验（东方财富 + 同花顺），"
-        "返回 status(confirmed/partial/conflict/unverified/not_applicable) + "
-        "confidence(high/medium/low) + 东财/同花顺证据 + 成分股重合度。"
-        "**A 股候选标的进入最终候选表前必调**；未得到 confirmed 的结论不得写成已确认事实，"
-        "只能按状态写「双源确认 / 单源支持待核验 / 口径冲突 / 待核验」。仅支持 A 股，"
-        "港股/美股返回 not_applicable。"
-    ),
-    parameters=[
-        ToolParameter(
-            name="stock_code",
-            type="string",
-            description="A 股代码（如 300750，允许 SH/SZ/BJ 前缀或 .SH/.SZ/.BJ 后缀）",
-            required=True,
-        ),
-        ToolParameter(
-            name="stock_name",
-            type="string",
-            description="公司名称（用于名称匹配与报告展示）",
-            required=True,
-        ),
-        ToolParameter(
-            name="claim",
-            type="string",
-            description="需要校验的供应链事实陈述（如『宁德时代是动力电池产业链核心中游制造商』）",
-            required=True,
-        ),
-        ToolParameter(
-            name="board_hint",
-            type="string",
-            description="板块 / 主题提示（如『动力电池』），优先用于定位东财 / 同花顺板块或概念",
-            required=False,
-            default="",
-        ),
-        ToolParameter(
-            name="topic",
-            type="string",
-            description="主题（如『新能源车电池供应链』），无 board_hint 时用于构造检索关键词",
-            required=False,
-            default="",
-        ),
-    ],
-    handler=_handle_verify_supply_chain_evidence,
-    category="analysis",
-)
 
 
 ALL_SUPPLY_CHAIN_TOOLS = [
     score_supply_chain_bottleneck_tool,
     search_semianalysis_tool,
     search_clue_hype_tool,
-    verify_supply_chain_evidence_tool,
     search_supply_chain_kb_tool,
 ]
 
@@ -2908,7 +2827,6 @@ ALL_SUPPLY_CHAIN_TOOLS = [
     score_supply_chain_bottleneck_tool,
     search_semianalysis_tool,
     search_clue_hype_tool,
-    verify_supply_chain_evidence_tool,
     search_supply_chain_kb_tool,
     # [v3] 深度小节工具（产品·客户·竞争·前景 产能 五维补强）
     analyze_product_matrix_tool,

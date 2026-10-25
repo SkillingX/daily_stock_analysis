@@ -246,15 +246,12 @@ def score_supply_chain_with_data(
         Dict with score, indicators, and data enrichment info
     """
     institutional_score = None
+    # 概念板块表现取数（东财公开概念接口）已随 issue #45 退役，不再参与评分。
     concept_score = None
 
     try:
-        from data_provider.supply_chain import (
-            ConceptBoardProvider,
-            InstitutionalHoldingsProvider,
-        )
+        from data_provider.supply_chain import InstitutionalHoldingsProvider
 
-        concept_provider = ConceptBoardProvider()
         institutional_provider = InstitutionalHoldingsProvider()
 
         institutional_data = institutional_provider.calculate_institutional_score(
@@ -262,16 +259,6 @@ def score_supply_chain_with_data(
         )
         if institutional_data:
             institutional_score = institutional_data.get("score")
-
-        stock_concepts = concept_provider.get_stock_concepts(stock_code)
-        if stock_concepts:
-            concept_performance = [c.get("change_pct", 0) for c in stock_concepts]
-            avg_concept_change = (
-                sum(concept_performance) / len(concept_performance)
-                if concept_performance
-                else 0
-            )
-            concept_score = _score_concept_performance(avg_concept_change)
 
     except ImportError:
         pass

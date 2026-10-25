@@ -311,7 +311,6 @@
 {% endif %}
 - 板块：{{ sector.sector_hint or '未识别' }} ｜ 政策倾向：{{ sector.policy_lean or '未知' }} ｜ 行业基率：{{ sector.base_rate }}（{{ sector.base_rate_basis }}）{% if sector.sector_score is not none %} ｜ 板块得分：{{ sector.sector_score }}/100{% endif %}
 {% elif s.id == 'supply_chain' %}
-- 双源校验状态：{{ supply_chain.verification_status }}
 {% if supply_chain.supply_chain %}
 - 公司定位：{{ supply_chain.supply_chain.company_position }}
 {% if supply_chain.supply_chain.chokepoints %}

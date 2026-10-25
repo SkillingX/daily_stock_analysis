@@ -30,7 +30,7 @@
 | 瓶颈打分 | "给 XX 打供应链瓶颈分" | `score_supply_chain_bottleneck`（8 因子 + 8 惩罚，满分 100） |
 | 半导体/AI 一级研究 | "HBM3E 供给""CoWoS 产能""Blackwell 供应链" | `search_semianalysis`（站点限定检索 semianalysis.com，返回带原文 url 的分析文章） |
 | 线索炒作信号 | 用户提供线索时 | `search_clue_hype`（跨新浪财经/雪球/同花顺/巨潮公司公告/全网检索线索，任一媒体提及=题材炒作加分项，返回提及源+信号强度无/弱/中/强） |
-| 双源校验 | A 股候选标的进最终表前 / 涉及 A 股公司板块的线索 | `verify_supply_chain_evidence`（东方财富 + 同花顺结构化校验公司/板块归属，返回 status+confidence+两源证据+成分股重合度） |
+| 概念归属 | 个股最新所属概念 | `get_stock_info` 的 `concept_membership`（iFinD 最新归属，只证明最新时点，不证明客户/供应链事实；公开双源校验已退役） |
 | 研究/学习对话 | "带我学这套方法" | serenity-dialogue-protocol（每轮一问） |
 
 ## 合规红线（必须遵守）
@@ -87,17 +87,14 @@
 - SSE 进度事件（thinking/tool_start/tool_done）实时显示调研过程，是天然进度条
 - `max_steps` 硬编码在 `build_supply_chain_executor`（方案 A），**不碰 `config.agent_max_steps`**，问股/郑希零影响
 
-## 双源校验（公司 / 板块归属）
+## 概念归属（iFinD 最新，issue #45）
 
-为防止 LLM 把单源搜索结果写成已确认事实，供应链报告中的「公司 / 板块归属」类事实必须经过东方财富 + 同花顺双源结构化校验（A 股限定）。
+公开双源校验（东财概念板块 + 同花顺概念网页探针）已退役：该路径曾出现单次 1400 秒超时，且公开探针无需 Key 无法靠撤凭据停用。
 
-- **工具**：`verify_supply_chain_evidence(stock_code, stock_name, claim, board_hint?, topic?)`。
-- **判定层**：`data_provider/supply_chain/cross_source.py` —— 纯逻辑判定（代码归一 / 名称标准化 / 板块匹配 / 成分股 Jaccard 重合度 / 决策表）+ `SupplyChainSourceProbe` Protocol（N 源可插拔）+ fail-open IO 探针。镜像 `data_provider/cross_source_validator.py` 设计，判定与取数解耦。
-- **状态枚举**：`confirmed`（双源命中）/ `partial`（仅一源支持，另一源不可用或未定位到板块）/ `conflict`（两源均定位到相关板块但归属相反）/ `unverified`（两源不可用或均无命中）/ `not_applicable`（非 A 股）。对应置信度 high / medium / low。
-- **降级语义**：单源异常 / 不可用绝不拖垮另一源（逐源 try/except）；公开源失败 = "未核验"而非"否定"。校验失败不阻断报告生成，报告按状态标注「待核验 / 单源支持 / 双源冲突」。
-- **范围限定**：只支持 A 股（6 位代码）。港股、美股、无法归一到 6 位代码的标的直接 `not_applicable`。
-- **同花顺来源**：akshare `stock_board_concept_name_ths()`（概念列表，列 `name`/`code`）+ 同花顺概念详情页 `q.10jqka.com.cn/gn/detail/code/{code}/order/desc/page/{N}/`（GBK 正则解析成分股，分页至空页、封顶 10 页）。源标记 `akshare_ths`（akshare 1.18 已无 `stock_board_concept_cons_ths`，故成分股走详情页抓取；`http_get` 可注入便于离线单测）。iFinD MCP 当前仅覆盖估值/财务数值锚点，不支持板块成分股结构化查询；如需 iFinD 优先，可新增实现 `SupplyChainSourceProbe` 的探针注入 validator，无需改判定层。
-- **报告契约**：A 股标的最终候选表必须含「东财校验 / 同花顺校验 / 双源状态」三列；未得 `confirmed` 不得写成已确认事实。`search_clue_hype` / `search_semianalysis` 只证「被提及」，与「板块归属支持」不可混用。
+- **入口**：`get_stock_info` 返回 `concept_membership`（iFinD `get_stock_info` 适配，证券代码 + 概念列表 + 来源 + "最新"时点性质）。
+- **边界**：只证明查询时点的最新归属，不补造历史日期，不混用行业分类；概念标签不是客户或供应链事实，供应链与中美分析仍以新闻/公告证据为准。
+- **错误可区分**：无数据、字段错误、证券不匹配、鉴权/额度拒绝、超时分别披露，不回退公开概念接口，不写"待核验"占位。
+- **报告契约**：候选表含「概念归属」列并标注来源；不得写成"双源确认"或独立核验通过。
 
 ## 成本预期
 

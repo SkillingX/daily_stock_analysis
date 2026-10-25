@@ -185,7 +185,6 @@
 
 {{ dim_links('supply_chain') }}
 {{ degraded_note(supply_chain) }}
-- 双源校验状态：{{ supply_chain.verification_status }}
 {% if supply_chain.supply_chain %}
 - 公司定位：{{ supply_chain.supply_chain.company_position }}
 {% if supply_chain.supply_chain.chokepoints %}

@@ -529,6 +529,40 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
     return reading
 
 
+class ConceptMembership(BaseModel):
+    """个股最新概念归属（iFinD，issue #45）。
+
+    只证明查询时点的最新归属：不补造历史日期，不混用行业分类。
+    """
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    code: str
+    concepts: list[str] = Field(default_factory=list)
+    source: Literal["ifind"] = "ifind"
+    as_of_nature: Literal["latest"] = "latest"
+    errors: list[str] = Field(default_factory=list)
+
+
+def _parse_concepts(data: IfindData, code: str) -> ConceptMembership:
+    """所属概念单元格 → 概念名列表；证券不匹配或字段缺失记错误。"""
+    errors: list[str] = []
+    concepts: list[str] = []
+    matched = False
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if not _same_security(row.get("证券代码"), code):
+                continue
+            matched = True
+            raw = (row.get("所属概念") or "").strip()
+            if raw:
+                concepts.extend(name.strip() for name in raw.split(",") if name.strip())
+    if not matched:
+        errors.append("security_mismatch")
+    elif not concepts:
+        errors.append("no_concepts")
+    return ConceptMembership(code=code, concepts=list(dict.fromkeys(concepts)), errors=errors)
+
+
+
 class IfindFetcher:
     """One fresh MCP session per bounded batch; no background loop or hidden retry."""
     _instance: Optional["IfindFetcher"] = None
@@ -654,12 +688,24 @@ class IfindFetcher:
         complete = {item.rank for item in items} == set(range(1, 11)) and all(item.shares is not None and item.ratio is not None and not item.shares.normalization_error and not item.ratio.normalization_error for item in items) and not errors
         return IfindShareholders(items=items, coverage="complete" if complete else "partial", errors=list(dict.fromkeys(errors)))
 
+
+
     def fetch(self, code: str, field: str, period: str | None = None, *, deadline: float | None = None) -> AnchorReading | None:
         if not self.available or field not in _IFIND_ANCHOR_QUERIES:
             return None
         tool, template, keywords = _IFIND_ANCHOR_QUERIES[field]
         data = self.query(tool, template.format(code=code, period=period or ""), deadline=deadline)
         return _parse_ifind_response(json.dumps({"code": 1, "data": data.model_dump()}), keywords, field, period, code=code)
+
+    def concept_membership(self, code: str, *, deadline: float | None = None) -> ConceptMembership:
+        """个股最新所属概念（get_stock_info 适配入口，issue #45）。
+
+        只证明最新归属；空结果、字段错误、证券不匹配、鉴权/额度拒绝、超时
+        由 SourceReadError 或 ConceptMembership.errors 区分，不补造日期。
+        """
+        data = self.query("get_stock_info", f"{code} 所属概念", deadline=deadline)
+        return _parse_concepts(data, code)
+
 
     def fetch_main_inflow_series(self, code: str, days: int = 12, *, deadline: float | None = None) -> Optional[List[Tuple[str, float]]]:
         if not self.available:
