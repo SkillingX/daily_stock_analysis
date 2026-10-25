@@ -8,7 +8,6 @@ import pytest
 from data_provider.westock_fetcher import (
     _parse_md_tables,
     _to_number,
-    get_chip,
     get_margin,
     get_quote,
     get_shareholder,
@@ -108,12 +107,6 @@ class TestLiveCliSmoke:
         assert q["price"] > 0
         assert q["low_52week"] > 0
 
-    def test_chip(self):
-        chip = get_chip("603690")
-        assert chip is not None
-        assert 0 <= chip["chipProfitRate"] <= 100
-        assert chip["chipAvgCost"] > 0
-
     def test_margin(self):
         m = get_margin("603690")
         assert m is not None
@@ -129,4 +122,3 @@ class TestLiveCliSmoke:
     def test_cli_missing_degrades_gracefully(self, monkeypatch):
         monkeypatch.setattr("data_provider.westock_fetcher._cli_path", lambda: None)
         assert get_quote("603690") is None
-        assert get_chip("603690") is None

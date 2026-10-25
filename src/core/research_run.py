@@ -218,7 +218,6 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
 
     fields = {
         "get_capital_flow": {"main_net_inflow": "当日主力净流入", "inflow_5d": "5交易日主力净流入", "inflow_10d": "10交易日主力净流入"},
-        "get_chip_distribution": {"profit_ratio": "获利盘比例", "avg_cost": "平均成本", "cost_90_low": "90%成本下限", "cost_90_high": "90%成本上限", "concentration_90": "90%筹码集中度"},
         "get_realtime_quote": {"price": "价格", "change_pct": "涨跌幅", "volume": "成交量", "amount": "成交额"},
         "get_stock_info": {"name": "公司名称", "pe_ratio": "PE", "pb_ratio": "PB", "total_mv": "总市值", "circ_mv": "流通市值", "revenue": "营业收入", "net_profit": "归母净利润", "roe": "加权ROE", "gross_margin": "毛利率", "revenue_yoy": "营收同比", "net_profit_yoy": "归母净利同比"},
         "get_daily_history": {"open": "最近交易日开盘", "high": "最近交易日最高", "low": "最近交易日最低", "close": "最近交易日收盘", "volume": "最近交易日成交量"},

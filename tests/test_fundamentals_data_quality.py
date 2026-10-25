@@ -63,7 +63,6 @@ def financial_sources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[s
         monkeypatch.setattr(akshare, endpoint, lambda **kwargs: pd.DataFrame(), raising=False)
     # Unrelated history/chip/persistence reads are outside this financial seam.
     monkeypatch.setattr("src.services.history_loader.load_history_df", lambda *args, **kwargs: (pd.DataFrame(), "fixture"))
-    monkeypatch.setattr(manager, "get_chip_distribution", lambda code: None)
     monkeypatch.setattr(context, "_safe_history_reports", lambda code, ctx: [])
     return values
 

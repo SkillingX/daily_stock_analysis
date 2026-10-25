@@ -67,12 +67,13 @@ class TestCapitalFlowFailureNote:
         """status=ok → 有数据，不加失败 note。"""
         from src.agent.tools.data_tools import _handle_get_capital_flow
 
+        from src.config import get_config
         with patch(
             "src.agent.tools.data_tools._get_fetcher_manager",
             return_value=self._manager(
                 "ok", stock_flow={"main_net_inflow": 1.2e8, "inflow_5d": 3e8, "inflow_10d": 5e8}
             ),
-        ):
+        ), patch.object(get_config(), "data_source_profile", "legacy"):
             r = _handle_get_capital_flow("600176")
         assert r["status"] == "ok"
         assert "note" not in r  # 成功不加分流提示

@@ -142,16 +142,6 @@ def get_quote(code: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def get_chip(code: str) -> Optional[Dict[str, Any]]:
-    """筹码分布：平均成本/获利盘比例/集中度 70/90（仅 A 股）。"""
-    mc = to_market_code(code)
-    out = _run_cli(["chip", mc])
-    if not out:
-        return None
-    rows = _parse_md_tables(out).get("_default") or []
-    return rows[0] if rows else None
-
-
 def get_margin(code: str) -> Optional[Dict[str, Any]]:
     """融资融券：融资余额/融券余额/当日买入偿还（仅沪深）。"""
     mc = to_market_code(code)

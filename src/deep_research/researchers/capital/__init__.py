@@ -15,7 +15,7 @@ from src.schemas.deep_research_dims import DimEnvelope
 DIM_ID = "capital"
 DISPLAY_NAME = "资金面研究员"
 SKILL_MD = "researchers/capital/SKILL.md"
-TOOLS = frozenset(frozenset({'get_chip_distribution', 'get_capital_flow', 'get_stock_info'}))
+TOOLS = frozenset({'get_capital_flow', 'get_stock_info'})
 TTL_HOURS = 24.0
 SCORE_KEY = 'flow_score'
 

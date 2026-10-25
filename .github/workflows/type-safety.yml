@@ -48,7 +48,6 @@ jobs:
             -p src.services.knowledge_base_service \
             -p src.services.image_stock_extractor \
             -p src.services.backtest_service \
-            -p src.services.social_sentiment_service \
             -p src.services.market_light_alerts \
             -p src.services.alert_service \
             -p src.repositories.portfolio_repo \

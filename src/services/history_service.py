@@ -1169,17 +1169,6 @@ class HistoryService:
                             "",
                         ]
                     )
-            else:
-                chip_unavailable_reason = get_chip_unavailable_reason(
-                    data_persp, report_language
-                )
-                if chip_unavailable_reason:
-                    report_lines.extend(
-                        [
-                            f"**{labels['chip_label']}**: {chip_unavailable_reason}",
-                            "",
-                        ]
-                    )
 
         # ========== 作战计划 ==========
         battle = dashboard.get("battle_plan", {}) if dashboard else {}

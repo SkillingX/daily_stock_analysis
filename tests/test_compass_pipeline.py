@@ -250,7 +250,6 @@ class TestHistorySnapshotPersistsMidtrendCompass:
             enhanced_context={},
             news_content=None,
             realtime_quote=None,
-            chip_data=None,
             midtrend_compass=compass,
         )
 

@@ -26,12 +26,10 @@ from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Co
 from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
-from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
     AnalysisResult,
     fill_price_position_if_needed,
-    normalize_chip_structure_availability,
     populate_decision_action_fields,
     stabilize_decision_with_structure,
 )
@@ -57,7 +55,6 @@ from src.services.daily_market_context import (
     DailyMarketContextService,
     format_daily_market_context_prompt_section,
 )
-from src.services.social_sentiment_service import SocialSentimentService
 from src.services.analysis_context_builder import (
     AnalysisContextBuilder,
     PipelineAnalysisArtifacts,
@@ -178,10 +175,6 @@ class StockAnalysisPipeline:
             self.search_service: Optional[SearchService] = SearchService(
                 bocha_keys=self.config.bocha_api_keys,
                 anspire_keys=self.config.anspire_api_keys,
-                x_keys=[self.config.social_sentiment_api_key]
-                if self.config.social_sentiment_api_key
-                else None,
-                x_api_url=self.config.social_sentiment_api_url,
                 brave_keys=self.config.brave_api_keys,
                 serpapi_keys=self.config.serpapi_keys,
                 minimax_keys=self.config.minimax_api_keys,
@@ -202,43 +195,19 @@ class StockAnalysisPipeline:
 
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用技术分析引擎（均线/趋势/量价指标）")
-        # 打印实时行情/筹码配置状态
+        # 打印实时行情配置状态
         if self.config.enable_realtime_quote:
             logger.info(
                 f"实时行情已启用 (优先级: {self.config.realtime_source_priority})"
             )
         else:
             logger.info("实时行情已禁用，将使用历史收盘价")
-        if self.config.enable_chip_distribution:
-            logger.info("筹码分布分析已启用")
-        else:
-            logger.info("筹码分布分析已禁用")
         if self.search_service is None:
             logger.warning("搜索服务未启用（初始化失败或依赖缺失）")
         elif self.search_service.is_available:
             logger.info("搜索服务已启用")
         else:
             logger.warning("搜索服务未启用（未配置搜索能力）")
-
-        # 初始化社交舆情服务（仅美股，可选）
-        try:
-            self.social_sentiment_service: Optional[SocialSentimentService] = (
-                SocialSentimentService(
-                    api_key=self.config.social_sentiment_api_key,
-                    api_url=self.config.social_sentiment_api_url,
-                )
-            )
-            if self.social_sentiment_service.is_available:
-                logger.info(
-                    "Social sentiment service enabled (Reddit/X/Polymarket, US stocks only)"
-                )
-        except Exception as exc:
-            logger.warning(
-                "社交舆情服务初始化失败，将跳过舆情分析: %s",
-                exc,
-                exc_info=True,
-            )
-            self.social_sentiment_service = None
 
     def _emit_progress(self, progress: int, message: str) -> None:
         """Best-effort bridge from pipeline stages to task SSE progress."""
@@ -330,11 +299,10 @@ class StockAnalysisPipeline:
         current_time: Optional[datetime] = None,
     ) -> Optional[AnalysisResult]:
         """
-        分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
+        分析单只股票（增强版：含量比、换手率、多维度情报）
 
         流程：
         1. 获取实时行情（量比、换手率）- 通过 DataFetcherManager 自动故障切换
-        2. 获取筹码分布 - 通过 DataFetcherManager 带熔断保护
         3. 进行趋势分析（基于交易理念）
         4. 多维度情报搜索（最新消息+风险排查+业绩预期）
         5. 从数据库获取分析上下文
@@ -382,7 +350,7 @@ class StockAnalysisPipeline:
                 target_date=daily_market_target_date,
             )
 
-            self._emit_progress(18, f"{code}：正在获取行情与筹码数据")
+            self._emit_progress(18, f"{code}：正在获取行情数据")
             # 获取股票名称（先走轻量名称路径，后续若 realtime_quote 有 name 再覆盖）
             stock_name = (
                 self.fetcher_manager.get_stock_name(code, allow_realtime=False) or code
@@ -423,20 +391,6 @@ class StockAnalysisPipeline:
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
                 stock_name = f"股票{code}"
-
-            # Step 2: 获取筹码分布 - 使用统一入口，带熔断保护
-            chip_data = None
-            try:
-                chip_data = self.fetcher_manager.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(
-                        f"{stock_name}({code}) 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                        f"90%集中度={chip_data.concentration_90:.2%}"
-                    )
-                else:
-                    logger.debug(f"{stock_name}({code}) 筹码分布获取失败或已禁用")
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
 
             # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
             # NOTE: use config.agent_mode (explicit opt-in) instead of
@@ -532,7 +486,6 @@ class StockAnalysisPipeline:
                     query_id,
                     stock_name,
                     realtime_quote,
-                    chip_data,
                     fundamental_context,
                     trend_result,
                     market_phase_context=market_phase_context_dict,
@@ -585,29 +538,6 @@ class StockAnalysisPipeline:
             else:
                 logger.info(f"{stock_name}({code}) 搜索服务不可用，跳过情报搜索")
 
-            # Step 4.5: Social sentiment intelligence (US stocks only)
-            if (
-                self.social_sentiment_service is not None
-                and self.social_sentiment_service.is_available
-                and is_us_stock_code(code)
-            ):
-                try:
-                    social_context = self.social_sentiment_service.get_social_context(
-                        code
-                    )
-                    if social_context:
-                        logger.info(
-                            f"{stock_name}({code}) Social sentiment data retrieved"
-                        )
-                        if news_context:
-                            news_context = news_context + "\n\n" + social_context
-                        else:
-                            news_context = social_context
-                except Exception as e:
-                    logger.warning(
-                        f"{stock_name}({code}) Social sentiment fetch failed: {e}"
-                    )
-
             # Step 5: 获取分析上下文（技术面数据）
             self._emit_progress(58, f"{stock_name}：正在整理分析上下文")
             context = self.db.get_analysis_context(code)
@@ -628,11 +558,10 @@ class StockAnalysisPipeline:
                     "yesterday": {},
                 }
 
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            # Step 6: 增强上下文数据（添加实时行情、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(
                 context,
                 realtime_quote,
-                chip_data,
                 trend_result,
                 stock_name,  # 传入股票名称
                 fundamental_context,
@@ -665,7 +594,6 @@ class StockAnalysisPipeline:
                     enhanced_context=enhanced_context,
                     realtime_quote=realtime_quote,
                     trend_result=trend_result,
-                    chip_data=chip_data,
                     fundamental_context=fundamental_context,
                     news_context=news_context,
                     news_result_count=news_result_count,
@@ -738,11 +666,7 @@ class StockAnalysisPipeline:
                 result.current_price = realtime_data.get("price")
                 result.change_pct = realtime_data.get("change_pct")
 
-            # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
-            if result:
-                normalize_chip_structure_availability(result, chip_data)
-
-            # Step 7.7: price_position fallback
+            # Step 7.6: price_position fallback
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 action_source_advice = getattr(result, "operation_advice", None)
@@ -813,7 +737,6 @@ class StockAnalysisPipeline:
                         news_content=news_context,
                         news_result_count=news_result_count,
                         realtime_quote=realtime_quote,
-                        chip_data=chip_data,
                         analysis_context_pack_overview=analysis_context_pack_overview,
                         market_phase_summary=market_phase_summary,
                         midtrend_compass=getattr(result, "midtrend_compass", None),
@@ -866,7 +789,6 @@ class StockAnalysisPipeline:
         self,
         context: Dict[str, Any],
         realtime_quote,
-        chip_data: Optional[ChipDistribution],
         trend_result: Optional[TrendAnalysisResult],
         stock_name: str = "",
         fundamental_context: Optional[Dict[str, Any]] = None,
@@ -876,12 +798,11 @@ class StockAnalysisPipeline:
         """
         增强分析上下文
 
-        将实时行情、筹码分布、趋势分析结果、股票名称添加到上下文中
+        将实时行情、趋势分析结果、股票名称添加到上下文中
 
         Args:
             context: 原始上下文
             realtime_quote: 实时行情数据（UnifiedRealtimeQuote 或 None）
-            chip_data: 筹码分布数据
             trend_result: 趋势分析结果
             stock_name: 股票名称
             market_phase_context: 已构建的市场阶段上下文，用于标记盘中 partial bar
@@ -942,17 +863,6 @@ class StockAnalysisPipeline:
             # 移除 None 值以减少上下文大小
             enhanced["realtime"] = {
                 k: v for k, v in enhanced["realtime"].items() if v is not None
-            }
-
-        # 添加筹码分布
-        if chip_data:
-            current_price = getattr(realtime_quote, "price", 0) if realtime_quote else 0
-            enhanced["chip"] = {
-                "profit_ratio": chip_data.profit_ratio,
-                "avg_cost": chip_data.avg_cost,
-                "concentration_90": chip_data.concentration_90,
-                "concentration_70": chip_data.concentration_70,
-                "chip_status": chip_data.get_chip_status(current_price or 0),
             }
 
         # 添加趋势分析结果
@@ -1227,7 +1137,6 @@ class StockAnalysisPipeline:
         query_id: str,
         stock_name: str,
         realtime_quote: Any,
-        chip_data: Optional[ChipDistribution],
         fundamental_context: Optional[Dict[str, Any]] = None,
         trend_result: Optional[TrendAnalysisResult] = None,
         *,
@@ -1276,38 +1185,8 @@ class StockAnalysisPipeline:
 
             if realtime_quote:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
-            if chip_data:
-                initial_context["chip_distribution"] = self._safe_to_dict(chip_data)
             if trend_result:
                 initial_context["trend_result"] = self._safe_to_dict(trend_result)
-
-            # Agent path: inject social sentiment as news_context so both
-            # executor (_build_user_message) and orchestrator (ctx.set_data)
-            # can consume it through the existing news_context channel
-            if (
-                self.social_sentiment_service is not None
-                and self.social_sentiment_service.is_available
-                and is_us_stock_code(code)
-            ):
-                try:
-                    social_context = self.social_sentiment_service.get_social_context(
-                        code
-                    )
-                    if social_context:
-                        existing = initial_context.get("news_context")
-                        if existing:
-                            initial_context["news_context"] = (
-                                existing + "\n\n" + social_context
-                            )
-                        else:
-                            initial_context["news_context"] = social_context
-                        logger.info(
-                            f"[{code}] Agent mode: social sentiment data injected into news_context"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"[{code}] Agent mode: social sentiment fetch failed: {e}"
-                    )
 
             # Issue #1066: ensure deep history is in DB before agent tools run
             self._ensure_agent_history(code)
@@ -1404,11 +1283,7 @@ class StockAnalysisPipeline:
                         "[LLM完整性] integrity_mode=agent_weak 必填字段缺失 %s，已占位补全",
                         missing,
                     )
-            # chip_structure fallback (Issue #589), before save_analysis_history
-            if result and chip_data is not None:
-                normalize_chip_structure_availability(result, chip_data)
-
-            # price_position fallback (same as non-agent path Step 7.7)
+            # price_position fallback (same as non-agent path Step 7.6)
             if result:
                 fill_price_position_if_needed(result, trend_result, realtime_quote)
                 realtime_data = initial_context.get("realtime_quote", {})
@@ -1523,7 +1398,6 @@ class StockAnalysisPipeline:
                         },
                         news_content=initial_context.get("news_context"),
                         realtime_quote=realtime_quote,
-                        chip_data=chip_data,
                         analysis_context_pack_overview=analysis_context_pack_overview,
                         market_phase_summary=market_phase_summary,
                         midtrend_compass=getattr(result, "midtrend_compass", None),
@@ -2584,7 +2458,6 @@ class StockAnalysisPipeline:
         enhanced_context: Dict[str, Any],
         news_content: Optional[str],
         realtime_quote: Any,
-        chip_data: Optional[ChipDistribution],
         news_result_count: Optional[int] = None,
         analysis_context_pack_overview: Optional[Dict[str, Any]] = None,
         market_phase_summary: Optional[Dict[str, Any]] = None,
@@ -2597,7 +2470,6 @@ class StockAnalysisPipeline:
             "enhanced_context": self._without_runtime_prompt_context(enhanced_context),
             "news_content": news_content,
             "realtime_quote_raw": self._safe_to_dict(realtime_quote),
-            "chip_distribution_raw": self._safe_to_dict(chip_data),
         }
         if news_content is not None:
             snapshot["news_retrieval_content"] = news_content
@@ -2747,7 +2619,6 @@ class StockAnalysisPipeline:
         enhanced_context: Dict[str, Any],
         realtime_quote: Any,
         trend_result: Optional[TrendAnalysisResult],
-        chip_data: Optional[ChipDistribution],
         fundamental_context: Optional[Dict[str, Any]],
         news_context: Optional[str],
         news_result_count: Optional[int],
@@ -2763,7 +2634,6 @@ class StockAnalysisPipeline:
             enhanced_context=enhanced_context,
             realtime_quote=realtime_quote,
             trend_result=trend_result,
-            chip_data=chip_data,
             fundamental_context=fundamental_context,
             news_context=news_context,
             news_result_count=news_result_count,
@@ -2815,7 +2685,6 @@ class StockAnalysisPipeline:
             enhanced_context={},
             realtime_quote=initial_context.get("realtime_quote"),
             trend_result=initial_context.get("trend_result"),
-            chip_data=initial_context.get("chip_distribution"),
             fundamental_context=fundamental_context,
             news_context=initial_context.get("news_context"),
             news_result_count=None,

@@ -9,10 +9,10 @@
 | 术语 | 当前含义 | 当前主要消费方 | P0 边界 |
 | --- | --- | --- | --- |
 | `storage.get_analysis_context()` | `src/storage.py` 中从数据库最近两天 OHLCV 生成的技术面简上下文，包含 `today`、`yesterday`、`volume_change_ratio`、`price_change_ratio`、`ma_status` 等。当前实现接收 `target_date`，但实际仍取最新两天数据。 | 普通分析主链路、Agent 工具 `get_analysis_context` | 记录为历史技术面输入来源，不把它直接等同于未来 pack。 |
-| `enhanced_context` | 普通分析中由 `src/core/pipeline.py` 基于 DB 简上下文、实时行情、筹码、趋势、基本面和语言信息增强后的 prompt 上下文。 | `src/analyzer.py` prompt 渲染、`_build_context_snapshot()` | 记录当前 prompt 输入面；P0 不改变字段名或结构。 |
-| `analysis_history.context_snapshot` | 分析完成后写入历史表的持久化快照。普通分析通常包含 `enhanced_context`、`news_content`、`realtime_quote_raw`、`chip_distribution_raw`；Agent 路径保存 `initial_context`。 | 历史详情、同步 analysis/status 响应、回测、部分基本面 fallback 展示 | 记录为持久化消费面；必须保留 `context_snapshot.enhanced_context.date` 兼容。 |
-| Agent executor message context | `AgentExecutor._build_user_message()` 注入首轮用户消息的上下文，适用于 `AGENT_ARCH=single` 路径，目前包含股票代码、报告类型、输出语言、`realtime_quote`、`chip_distribution`、`news_context`。 | 单 Agent 首轮 LLM 消息 | 记录当前首轮可见字段；P0 不补 runtime 注入。 |
-| Agent orchestrator `AgentContext` | `AgentOrchestrator._build_context()` 写入多 Agent 共享上下文，适用于 `AGENT_ARCH=multi` 路径，可预注入 `realtime_quote`、`daily_history`、`chip_distribution`、`trend_result`、`news_context`。 | Technical / Intel / Risk / Decision 多 Agent 链路 | 记录为 orchestrator 内部共享数据面；不预注入 `fundamental_context`，`trend_result` 是否存在取决于 caller 是否传入。 |
+| `enhanced_context` | 普通分析中由 `src/core/pipeline.py` 基于 DB 简上下文、实时行情、趋势、基本面和语言信息增强后的 prompt 上下文（筹码已随 issue #46 退休）。 | `src/analyzer.py` prompt 渲染、`_build_context_snapshot()` | 记录当前 prompt 输入面；P0 不改变字段名或结构。 |
+| `analysis_history.context_snapshot` | 分析完成后写入历史表的持久化快照。普通分析通常包含 `enhanced_context`、`news_content`、`realtime_quote_raw`；Agent 路径保存 `initial_context`（`chip_distribution_raw` 已随 issue #46 退休，历史记录按自身版本解释）。 | 历史详情、同步 analysis/status 响应、回测、部分基本面 fallback 展示 | 记录为持久化消费面；必须保留 `context_snapshot.enhanced_context.date` 兼容。 |
+| Agent executor message context | `AgentExecutor._build_user_message()` 注入首轮用户消息的上下文，适用于 `AGENT_ARCH=single` 路径，目前包含股票代码、报告类型、输出语言、`realtime_quote`、`news_context`。 | 单 Agent 首轮 LLM 消息 | 记录当前首轮可见字段；P0 不补 runtime 注入。 |
+| Agent orchestrator `AgentContext` | `AgentOrchestrator._build_context()` 写入多 Agent 共享上下文，适用于 `AGENT_ARCH=multi` 路径，可预注入 `realtime_quote`、`daily_history`、`trend_result`、`news_context`。 | Technical / Intel / Risk / Decision 多 Agent 链路 | 记录为 orchestrator 内部共享数据面；不预注入 `fundamental_context`，`trend_result` 是否存在取决于 caller 是否传入。 |
 
 ## P0 范围与非目标
 
@@ -61,7 +61,7 @@ P1 Block Catalog：
 | `fundamentals` | 估值、成长、盈利、财报和股东回报 | P1 不新增基本面 fetcher。 |
 | `news` | 新闻、公告、舆情和催化事件输入 | P1 不改变新闻搜索。 |
 | `portfolio` | 是否持仓、账户摘要、成本、数量、仓位和 stale 摘要 | P1 不纳入交易流水、现金流水或完整账户隐私数据。 |
-| `chip` / `capital_flow` | 筹码、资金流和主力行为 | 后续扩展键，P1 只允许契约表达。 |
+| `capital_flow` | 资金流和主力行为 | 后续扩展键，P1 只允许契约表达（`chip` 已随 issue #46 退休）。 |
 | `events` / `market_context` | 风险事件、市场宽度、指数、板块和热点环境 | 后续扩展键，不把 `market_review` / `market_light` 作为首版单股 pack。 |
 
 `phase` 字段只接收 #1386 `MarketPhaseContext.to_dict()` 产物，保持 `Dict[str, Any]`，不重新定义 phase enum 或 phase 子模型。
@@ -74,9 +74,9 @@ P1 Block Catalog：
 
 ## P2 Builder 契约
 
-P2 新增 `AnalysisContextBuilder`，但首版只做 assembler：从普通分析 pipeline 已经拿到的 artifacts 组装内部 `AnalysisContextPack`。Issue 验收项里的“复用现有数据源”在本 slice 中解释为复用 pipeline 已 fetch 的 `realtime_quote`、`base_context`、`enhanced_context`、`trend_result`、`chip_data`、`fundamental_context`、`news_context` 等 artifacts；builder 本身 zero-fetch，不调用 DB、fetcher、SearchService、Agent 工具或具体 provider。
+P2 新增 `AnalysisContextBuilder`，但首版只做 assembler：从普通分析 pipeline 已经拿到的 artifacts 组装内部 `AnalysisContextPack`。Issue 验收项里的“复用现有数据源”在本 slice 中解释为复用 pipeline 已 fetch 的 `realtime_quote`、`base_context`、`enhanced_context`、`trend_result`、`fundamental_context`、`news_context` 等 artifacts；builder 本身 zero-fetch，不调用 DB、fetcher、SearchService、Agent 工具或具体 provider。
 
-P2 输入契约使用 `PipelineAnalysisArtifacts`：`code`、`stock_name`、`market`、`phase`、`base_context`、`enhanced_context`、`realtime_quote`、`trend_result`、`chip_data`、`fundamental_context`、`news_context`、`news_result_count`、`metadata`。单股 `build()` 与批量 `build_batch()` 复用同一结构，避免 P3 runtime 接入时再次改签名。
+P2 输入契约使用 `PipelineAnalysisArtifacts`：`code`、`stock_name`、`market`、`phase`、`base_context`、`enhanced_context`、`realtime_quote`、`trend_result`、`fundamental_context`、`news_context`、`news_result_count`、`metadata`。单股 `build()` 与批量 `build_batch()` 复用同一结构，避免 P3 runtime 接入时再次改签名。
 
 P2 block 组装边界：
 
@@ -87,7 +87,6 @@ P2 block 组装边界：
 - `daily_bars` 只表达完整日线窗口，优先读 `base_context.today`、`base_context.yesterday`、`base_context.date`、`base_context.data_missing`；date-only 放入 `value` 或 `metadata`，不写入 `timestamp`。
 - `enhanced_context.today` 上的 `is_partial_bar`、`is_estimated`、`estimated_fields` 优先进入 `technical`；缺失时仍兼容 `enhanced_context.today.data_source` 为 `realtime:*` 的旧 heuristic。partial/estimated 只进入 `technical`，`daily_bars` 不承载 partial/estimated，warning 使用 `intraday_realtime_overlay`。
 - `technical` 优先复用 `trend_result.to_dict()`；无 trend artifact 时为 `missing`。
-- `chip` 复用 `chip_data.to_dict()`；无 chip artifact 默认 `missing`，只有输入 metadata/artifact 明确 not_supported 时才标 `not_supported`。
 - `fundamentals` 只读 `fundamental_context` 参数；`ok` 映射为 `available`，`not_supported` 映射为 `not_supported`，`partial` 映射为 `partial`，P5 后 `failed` 映射为 `fetch_failed` + 稳定 reason code `fundamental_pipeline_failed`；不写入 `errors[]` 原文。
 - `news` 非空白字符串为 `available`，空白或缺失为 `missing`；`news_result_count` 写入 pack metadata。
 
@@ -97,7 +96,7 @@ P2 不组装 `portfolio`、`events`、`market_context`，也不把 `capital_flow
 
 P3 在 P2 `AnalysisContextBuilder` 之后接入运行态消费，但消费面限定为低敏 `analysis_context_pack_summary`。`StockAnalysisPipeline` 是 summary 的唯一生产者：在普通分析路径和 Agent 路径内完成 `PipelineAnalysisArtifacts` -> `AnalysisContextBuilder.build()` -> `format_analysis_context_pack_prompt_section()`，下游 analyzer、single-agent、multi-agent 只接收 summary 字符串，不自行构造完整 pack，也不读取 `AnalysisContextPack.to_safe_dict()` 的 block item 原始值。
 
-普通分析 Prompt 的顺序固定为：基础信息 -> #1386 `market_phase_context` 渲染区块 -> `analysis_context_pack_summary` -> 技术面、实时行情、新闻等既有区块。`analysis_context_pack_summary` 只包含 subject、`pack_version`、block `status` / `source` / `warnings` / `missing_reason`、`metadata.news_result_count`、`data_quality.warnings` 和 P5 低敏数据限制，不得输出 `news.content`、`trend_result`、`chip`、`fundamental_context` 等原始 payload。
+普通分析 Prompt 的顺序固定为：基础信息 -> #1386 `market_phase_context` 渲染区块 -> `analysis_context_pack_summary` -> 技术面、实时行情、新闻等既有区块。`analysis_context_pack_summary` 只包含 subject、`pack_version`、block `status` / `source` / `warnings` / `missing_reason`、`metadata.news_result_count`、`data_quality.warnings` 和 P5 低敏数据限制，不得输出 `news.content`、`trend_result`、`fundamental_context` 等原始 payload。
 
 Agent 路径同样只传 summary。`AgentExecutor._build_user_message()` 在 market phase 段之后、pre-fetched JSON 之前插入 summary；`AgentOrchestrator._build_context()` 只把 summary 放入 `ctx.meta["analysis_context_pack_summary"]`，禁止写入 `ctx.data`；`BaseAgent._build_messages()` 在 market phase user message 之后、`_inject_cached_data()` 之前插入 summary。Agent 路径会在 `_ensure_agent_history()` 预取后读取一次 `storage.get_analysis_context()` 作为 `daily_bars` 的低敏状态来源，读取失败或无可用上下文时才标记 `daily_bars_missing`，该读取 fail-open 且不把日线原始 payload 写入 Agent runtime context。Agent 首轮没有复用普通分析新闻检索，`news` block 为 `missing` 是当前 P3 的预期状态。
 
@@ -122,7 +121,7 @@ P3 当时不持久化完整 pack，不新增 API/Web/Bot/Desktop 字段，不改
 
 P4 把 P3 已构建的 `AnalysisContextPack` 投影为公共低敏 `analysis_context_pack_overview`。该 overview 由专用 renderer 生成，公共 API 不允许直接返回 `AnalysisContextPack.to_safe_dict()` 或完整 pack dump。renderer 只输出白名单字段：`pack_version`、`created_at`、`subject.code` / `stock_name` / `market`、数据块 `key` / `label` / `status` / `source` / `warnings` / `missing_reasons`、按 block status 计数的 `counts`、顶层 `data_quality.warnings` 和 `metadata.trigger_source` / `metadata.news_result_count`。P5 在同一 overview 上追加 `data_quality` 低敏对象，不重复顶层 `warnings`。
 
-overview 不输出 `blocks.*.items`、`items.value`、`news.content`、`trend_result`、`chip`、`fundamental_context` 原始 payload，也不输出 `api_key`、`token`、`cookie`、`webhook_url`、`password`、`secret`、`authorization`、`sendkey`、`license_key` 等敏感键或值。
+overview 不输出 `blocks.*.items`、`items.value`、`news.content`、`trend_result`、`fundamental_context` 原始 payload，也不输出 `api_key`、`token`、`cookie`、`webhook_url`、`password`、`secret`、`authorization`、`sendkey`、`license_key` 等敏感键或值。
 
 P4 持久化面只在 `analysis_history.context_snapshot` 顶层写入 `analysis_context_pack_overview`。运行态 prompt 字段仍会从 `enhanced_context` 和 history snapshot 中剥离：`market_phase_context`、`analysis_context_pack`、`analysis_context_pack_summary` 不进入公开历史详情或任务状态。`SAVE_CONTEXT_SNAPSHOT=false` 时不持久化整份 `analysis_history.context_snapshot`，因此也不会落库 overview、`market_phase_summary`、`enhanced_context` 或 raw snapshot 字段；旧记录或缺少 overview 的记录继续返回空字段，不影响历史详情读取。
 
@@ -140,7 +139,7 @@ P4 Web 展示只在报告详情页渲染 `AnalysisContextSummary`，位置在策
 
 P5 在不升级 `PACK_VERSION`、不新增 fetcher、不新增配置项、不做历史迁移的前提下补齐三件事：内部低敏数据质量评分、跨模型通用的 Prompt 数据限制区块，以及既有 `analysis_context_pack_overview` 的低敏可见性扩展。#1389 P5 仍不改变 LLM 输出 JSON schema，也不做后处理强制改写；#1386 P5 会消费这里的低敏输入质量，在报告 `dashboard.phase_decision` 中输出盘中动作字段与质量护栏结果。
 
-状态契约新增 `fetch_failed`，用于“当前字段或数据块本次抓取明确失败”。首版只在已有 artifact 明确失败时使用，例如 `fundamental_context.status == "failed"`；空新闻、未配置搜索、无实时 quote artifact 或 chip 缺失仍保持既有 `missing` / `not_supported` 语义，避免把未启用能力误报成抓取失败。`fetch_failed` 不代表整次分析失败。
+状态契约新增 `fetch_failed`，用于“当前字段或数据块本次抓取明确失败”。首版只在已有 artifact 明确失败时使用，例如 `fundamental_context.status == "failed"`；空新闻、未配置搜索或无实时 quote artifact 仍保持既有 `missing` / `not_supported` 语义（chip 已退休），避免把未启用能力误报成抓取失败。`fetch_failed` 不代表整次分析失败。
 
 `DataQuality` 追加以下低敏字段，并保留旧 `warnings` / `metadata`：
 
@@ -149,9 +148,9 @@ P5 在不升级 `PACK_VERSION`、不新增 fetcher、不新增配置项、不做
 - `block_scores: Dict[str, int]`：固定六块的状态分。
 - `limitations: List[str]`：最多 5 条稳定限制说明，使用 `block: status` 形式。
 
-评分只计算固定六块，不随辅助块缺失重归一化，未来新增 block 不自动影响总分。权重固定为 `quote=25`、`daily_bars=25`、`technical=25`、`news=10`、`fundamentals=10`、`chip=5`；状态分固定为 `available=100`、`partial=75`、`estimated=75`、`not_supported=70`、`fallback=65`、`stale=50`、`missing=35`、`fetch_failed=25`。总分公式为 `round(sum(block_score * weight) / 100)`。
+评分只计算固定六块，不随辅助块缺失重归一化，未来新增 block 不自动影响总分。权重固定为 `quote=25`、`daily_bars=25`、`technical=25`、`news=10`、`fundamentals=15`（issue #46 移除 `chip=5` 后并入 fundamentals）；状态分固定为 `available=100`、`partial=75`、`estimated=75`、`not_supported=70`、`fallback=65`、`stale=50`、`missing=35`、`fetch_failed=25`。总分公式为 `round(sum(block_score * weight) / 100)`。
 
-`limitations` 优先列出核心块 `quote` / `daily_bars` / `technical` 的 `stale`、`fallback`、`missing`、`fetch_failed`、`partial`、`estimated`；其次列出辅助块 `news` / `fundamentals` / `chip` 的 `fetch_failed`、`fallback`、`stale`。辅助块单纯缺失不进入限制列表，避免把新闻缺失、未配置搜索或不支持能力解释成利好/利空。
+`limitations` 优先列出核心块 `quote` / `daily_bars` / `technical` 的 `stale`、`fallback`、`missing`、`fetch_failed`、`partial`、`estimated`；其次列出辅助块 `news` / `fundamentals` 的 `fetch_failed`、`fallback`、`stale`。辅助块单纯缺失不进入限制列表，避免把新闻缺失、未配置搜索或不支持能力解释成利好/利空。
 
 Prompt 数据限制只在 `format_analysis_context_pack_prompt_section()` 内渲染，紧跟 pack summary，因此普通分析、single Agent 和 multi-agent 复用同一消费路径。中文输出 `数据限制`，英文输出 `Data Limitations`；只有真实 score 存在时才输出评分行。若 `quote`、`daily_bars` 或 `technical` 为 degraded 状态，Prompt 明确要求最终 JSON 的 `confidence_level` 不得为 `高` / `High`。Prompt 继续只使用 status/source/warnings/missing_reason/低敏评分，不输出 raw payload、新闻正文、趋势原始值、secret、token 或 webhook。
 
@@ -165,7 +164,7 @@ overview 只扩展现有公开面：`analysis_context_pack_overview.data_quality
 
 - 告警触发记录仍写入现有 `alert_triggers.diagnostics` 文本字段；当 diagnostics 可 JSON 化时，worker 会合并 `analysis_visibility.analysis_context_pack_overview`，来源只允许 evaluator 已带 overview 或最近 30 天历史 snapshot。旧纯文本 diagnostics 不被覆盖，API 派生字段为空且 source 为 `legacy_text`。
 - 持仓手动分析通过 API 构造低敏 `portfolio_context` 并传入 pipeline；builder 会在 pack 中加入可选 `portfolio` block。该 block 只包含账户 ID/name、symbol、market、currency、quantity、avg cost、total cost、unrealized PnL、price source/provider/date/stale/available 和 cost method，不包含交易流水、现金流水、新闻正文、Prompt、密钥或 webhook。
-- `portfolio` block 是辅助块，`metadata={"auxiliary": true, "quality_weighted": false}`，不改变 P5 固定六块 `quote`、`daily_bars`、`technical`、`news`、`fundamentals`、`chip` 的权重、总分或 limitations 口径。
+- `portfolio` block 是辅助块，`metadata={"auxiliary": true, "quality_weighted": false}`，不改变 P5 固定五块 `quote`、`daily_bars`、`technical`、`news`、`fundamentals` 的权重、总分或 limitations 口径。
 - `portfolio_context` 只在任务执行内部透传；`TaskInfo.to_dict()`、任务列表、SSE `task_created/task_started/task_completed/task_failed/task_progress` payload 不暴露该对象。
 - 历史列表、单股历史、StockBar 和回测结果只读取 `context_snapshot` 顶层的公开 `market_phase_summary`；旧记录、`SAVE_CONTEXT_SNAPSHOT=false` 或解析失败返回 `null` / `unknown`，不失败。
 - 回测 phase filter 只基于公开 summary 做 bucket：`premarket` 保持 premarket，`intraday|lunch_break|closing_auction` 归入 intraday，`postmarket` 保持 postmarket，`non_trading|missing|invalid` 归入 unknown。带 phase 过滤时 repository 先按 SQL 条件批量读取结果和 snapshot，服务层 bucket 后再分页和统计，避免 API 层分页后临时过滤。
@@ -202,7 +201,7 @@ P6 不改变 P1-P5 的运行时行为，只把已经落地的契约、可见性�
 
 - 完整 `AnalysisContextPack` 不进入公共 API、Web、通知、Bot 或 Desktop 专属展示。
 - `AnalysisContextPack.to_safe_dict()` 只作为内部安全序列化 helper；公共 overview 仍必须通过 `render_analysis_context_pack_overview()` 投影。
-- `analysis_context_pack_summary` 与 overview 都不得输出 `items.value`、新闻正文、`trend_result`、`chip`、`fundamental_context` 原始 payload、API key、token、cookie、完整 webhook URL、邮箱密码、secret、authorization、sendkey 或 license key。
+- `analysis_context_pack_summary` 与 overview 都不得输出 `items.value`、新闻正文、`trend_result`、`fundamental_context` 原始 payload、API key、token、cookie、完整 webhook URL、邮箱密码、secret、authorization、sendkey 或 license key。
 - 已持久化 overview 再读取时必须经过 `extract_analysis_context_pack_overview()` / persisted sanitizer；API 透明度面板必须继续通过 `sanitize_context_snapshot_for_api()` 剥离顶层稳定摘要。
 
 迁移边界：
@@ -262,9 +261,9 @@ P6 不改变 P1-P5 的运行时行为，只把已经落地的契约、可见性�
 
 ### Agent
 
-Agent 有三层需要分开记录的数据面。`src/core/pipeline.py` 的 Agent 路径会构造 `initial_context`，固定包含 `fundamental_context`，并在可用时加入 `trend_result`，最终作为 Agent 路径的 `context_snapshot` 持久化。`AgentExecutor._build_user_message()` 只适用于 `AGENT_ARCH=single`，首轮消息只显式注入 `realtime_quote`、`chip_distribution`、`news_context` 等已取上下文，不显式注入 `fundamental_context` 或 `trend_result`。`AgentOrchestrator._build_context()` 适用于 `AGENT_ARCH=multi`，可预注入 `realtime_quote`、`daily_history`、`chip_distribution`、`trend_result`、`news_context`，这些进入 `AgentContext` 的字段会作为 pre-fetched data 注入 stage agent 消息；但 orchestrator 不预注入 `fundamental_context`。`trend_result` 不是天然存在，取决于 caller 是否传入。
+Agent 有三层需要分开记录的数据面。`src/core/pipeline.py` 的 Agent 路径会构造 `initial_context`，固定包含 `fundamental_context`，并在可用时加入 `trend_result`，最终作为 Agent 路径的 `context_snapshot` 持久化。`AgentExecutor._build_user_message()` 只适用于 `AGENT_ARCH=single`，首轮消息只显式注入 `realtime_quote`、`news_context` 等已取上下文，不显式注入 `fundamental_context` 或 `trend_result`。`AgentOrchestrator._build_context()` 适用于 `AGENT_ARCH=multi`，可预注入 `realtime_quote`、`daily_history`、`trend_result`、`news_context`，这些进入 `AgentContext` 的字段会作为 pre-fetched data 注入 stage agent 消息；但 orchestrator 不预注入 `fundamental_context`。`trend_result` 不是天然存在，取决于 caller 是否传入。
 
-Agent 工具还会独立调用 `get_realtime_quote`、`get_daily_history`、`get_chip_distribution`、`get_analysis_context`、`get_stock_info` 等工具，容易与普通分析前置获取产生重复请求。当前 pack 生成只在 Agent 历史预取后复用 `storage.get_analysis_context()` 的日线可用性状态，不复用或暴露完整工具级 pack cache；P5 再决定是否做更深的数据质量评分与工具缓存复用。
+Agent 工具还会独立调用 `get_realtime_quote`、`get_daily_history`、`get_analysis_context`、`get_stock_info` 等工具，容易与普通分析前置获取产生重复请求。当前 pack 生成只在 Agent 历史预取后复用 `storage.get_analysis_context()` 的日线可用性状态，不复用或暴露完整工具级 pack cache；P5 再决定是否做更深的数据质量评分与工具缓存复用。
 
 ### 告警
 

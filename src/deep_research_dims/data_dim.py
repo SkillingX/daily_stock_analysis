@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""S2 数据透视：纯规则装配（MA/量比/支撑阻力/52周高点距离/筹码）。
+"""S2 数据透视：纯规则装配（MA/量比/支撑阻力/52周高点距离）。
 
 数据源：SharedContext（阶段 0 快照）。无 LLM。
+筹码分布已随 issue #46 退休，数据透视不再装配 chip_structure（API 字段保留兼容为空）。
 """
 
 from __future__ import annotations
@@ -11,7 +12,6 @@ from typing import Any, Dict, List, Optional
 from src.deep_research_dims.context import SharedContext
 from src.schemas.deep_research_dims import DataDim
 from src.schemas.report_schema import (
-    ChipStructure,
     DataPerspective,
     PricePosition,
     TrendStatus,
@@ -59,19 +59,6 @@ def _support_resistance(history: List[Dict[str, Any]], window: int = 60) -> tupl
     lows = [float(r["low"]) for r in recent if r.get("low") is not None]
     highs = [float(r["high"]) for r in recent if r.get("high") is not None]
     return (round(min(lows), 2) if lows else None, round(max(highs), 2) if highs else None)
-
-
-def _chip_structure(chip: Dict[str, Any]) -> ChipStructure:
-    if not chip:
-        return ChipStructure(chip_health="数据缺失")
-    estimated = chip.get("source") == "estimated_from_history"
-    return ChipStructure(
-        profit_ratio=chip.get("profit_ratio") or chip.get("winner_percent"),
-        avg_cost=chip.get("avg_cost") or chip.get("average_cost"),
-        concentration=chip.get("concentration") or chip.get("concentration_70"),
-        chip_health="见数据（历史行情估算，精度有限）" if estimated else "见数据",
-        estimated=True if estimated else None,
-    )
 
 
 def build_data_dim(ctx: SharedContext) -> DataDim:
@@ -124,7 +111,6 @@ def build_data_dim(ctx: SharedContext) -> DataDim:
             resistance_level=resistance,
         ),
         volume_analysis=_volume_analysis(ctx.history),
-        chip_structure=_chip_structure(ctx.chip),
     )
     return DataDim(
         perspective=perspective,

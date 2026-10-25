@@ -16,7 +16,6 @@ SWITCH_CLEANUP_KEYS = {
     "previous_change_pct",
     "realtime_quote",
     "daily_history",
-    "chip_distribution",
     "trend_result",
     "news_context",
     "fundamental_context",
