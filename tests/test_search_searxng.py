@@ -435,11 +435,11 @@ class TestSearXNGSearchProvider(unittest.TestCase):
         self.assertTrue(resp.success)
         mock_public_instances.assert_not_called()
 
-    def test_search_service_adds_public_searxng_provider_when_enabled(self):
+    def test_public_searxng_retired_from_search_service(self):
+        # issue #47：公共 SearXNG 自动发现已退役，残留开关不再装配搜索提供器。
         service = SearchService(searxng_public_instances_enabled=True)
 
-        self.assertTrue(service.is_available)
-        self.assertTrue(any(provider.name == "SearXNG" for provider in service._providers))
+        self.assertFalse(any(provider.name == "SearXNG" for provider in service._providers))
 
 
 if __name__ == "__main__":
