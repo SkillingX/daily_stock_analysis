@@ -650,6 +650,70 @@ class TestAgentResultConversion(unittest.TestCase):
         self.assertIn("agent:gemini", result.data_sources)
         self.assertIsNotNone(result.dashboard)
 
+    def test_agent_chip_structure_stripped_through_parse_adopt_render(self):
+        """Issue #46：Agent 路径完整链路（parse → adopt → render）不携带退休的筹码块。"""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.agent.runner import parse_dashboard_json
+        from src.enums import ReportType
+        from src.services.report_renderer import render
+
+        content = json.dumps(
+            {
+                "sentiment_score": 60,
+                "operation_advice": "持有",
+                "dashboard": {
+                    "core_conclusion": {"one_sentence": "观察"},
+                    "data_perspective": {
+                        "chip_structure": {
+                            "profit_ratio": "80%",
+                            "avg_cost": 30,
+                            "concentration": "10%",
+                            "chip_health": "健康",
+                        }
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        dashboard = parse_dashboard_json(content)
+        self.assertIsNotNone(dashboard)
+
+        agent_result = AgentResult(
+            success=True,
+            content=content,
+            dashboard=dashboard,
+            tool_calls_log=[],
+            total_steps=3,
+            total_tokens=500,
+            provider="gemini",
+        )
+
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "600519", "贵州茅台", ReportType.FULL, "q-chip"
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.sentiment_score, 60)
+        self.assertNotIn(
+            "chip_structure", result.dashboard.get("data_perspective", {})
+        )
+        # 同级其余 dashboard 事实保留
+        self.assertEqual(
+            result.dashboard.get("core_conclusion", {}).get("one_sentence"), "观察"
+        )
+
+        renderer_config = MagicMock()
+        renderer_config.report_templates_dir = "templates"
+        renderer_config.report_language = "zh"
+        renderer_config.report_show_llm_model = True
+        with patch(
+            "src.services.report_renderer.get_config", return_value=renderer_config
+        ):
+            markdown = render("markdown", [result], summary_only=False)
+        self.assertIsNotNone(markdown)
+        self.assertNotIn("**筹码**", markdown)
+
     def test_convert_preserves_top_level_phase_decision_with_nested_dashboard(self):
         """Agent top-level phase_decision should survive nested dashboard unwrapping."""
         pipeline = self._make_pipeline()

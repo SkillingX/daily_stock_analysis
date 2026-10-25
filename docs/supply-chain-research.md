@@ -29,7 +29,7 @@
 | 候选对比 | "比较几家光通信设备商" | 复用问股工具 + 横向排序 |
 | 瓶颈打分 | "给 XX 打供应链瓶颈分" | `score_supply_chain_bottleneck`（8 因子 + 8 惩罚，满分 100） |
 | 半导体/AI 一级研究 | "HBM3E 供给""CoWoS 产能""Blackwell 供应链" | `search_semianalysis`（站点限定检索 semianalysis.com，返回带原文 url 的分析文章） |
-| 线索炒作信号 | 用户提供线索时 | `search_clue_hype`（跨新浪财经/雪球/同花顺/巨潮公司公告/全网检索线索，任一媒体提及=题材炒作加分项，返回提及源+信号强度无/弱/中/强） |
+| 线索炒作信号 | 用户提供线索时 | `search_clue_hype`（跨新浪财经/同花顺/巨潮公司公告/全网检索线索；不查询社区，社区提及不计分；新闻或公告提及=题材炒作加分项，返回提及源+信号强度无/弱/中/强） |
 | 概念归属 | 个股最新所属概念 | `get_stock_info` 的 `concept_membership`（iFinD 最新归属，只证明最新时点，不证明客户/供应链事实；公开双源校验已退役） |
 | 研究/学习对话 | "带我学这套方法" | serenity-dialogue-protocol（每轮一问） |
 
@@ -44,8 +44,8 @@
 
 - **executor**：`src/agent/supply_chain_executor.py` 的 `SupplyChainExecutor`，复用 `run_agent_loop` / `LLMToolAdapter` / `conversation_manager` / SSE 包装。
 - **工具集**：**复用问股 `get_tool_registry()` 的 18 个工具**（行情/基本面/新闻/技术）+ 3 个供应链专属工具（`score_supply_chain_bottleneck` 瓶颈打分 + `search_semianalysis` 半导体/AI 主题检索 semianalysis.com + `search_clue_hype` 线索多源炒作检索），装入独立 ToolRegistry 实例（复制问股工具，不污染全局单例；专属工具仅注册给供应链 executor，问股/郑希/排雷零影响）。
-- **线索炒作检索**：`search_clue_hype` 在用户提供「供应链线索」时，复用共享 `SearchService` provider（配置 `SERPAPI_API_KEYS` 等后可用），跨 5 个固定源——新浪财经（`site:finance.sina.com.cn`）/雪球（`site:xueqiu.com`）/同花顺（`site:10jqka.com.cn`）/巨潮公司公告（`site:cninfo.com.cn`）/全网 Google（不限）——用 `site:` 限定逐源检索线索（半年窗 180 天）。**单源异常/失败不拖垮整体**（逐源 try/except）。任一源提及即题材炒作加分项；按提及源数给信号强度（0=无/1-2=弱/3-4=中/≥5=强）。prompt 已加 standing 规则：线索非空必调，报告新增「题材炒作信号」小节列出提及媒体+原文链接，并把提及广度纳入 `hype_risk`（炒作风险）评分。
-- **SemiAnalysis 检索**：`search_semianalysis` 复用共享 `SearchService` 的 provider（配置 `SERPAPI_API_KEYS` 等后可用），query 前缀 `site:semianalysis.com` 站点限定（零改共享 `search_service`），时间窗 365 天（长青研究），返回带 `url` 的结果；无可用 provider 时 fail-open 返回 error，agent 标注「待核验」。prompt 已加 standing 规则：半导体/AI 主题（芯片/HBM/先进封装/光刻/GPU/数据中心 AI 硬件/硅光子 CPO 等）必调，证据强度按 `analysis`（一手调研升 `primary`），付费墙内容只引可见摘要。
+- **线索炒作检索**：`search_clue_hype` 在用户提供「供应链线索」时，复用共享 `SearchService` provider，跨新闻与公告源——新浪财经（`site:finance.sina.com.cn`）/同花顺（`site:10jqka.com.cn`）/巨潮公司公告（`site:cninfo.com.cn`）/全网（不限站点，但社区链接不计分）——用 `site:` 限定逐源检索线索（半年窗 180 天）。不查询社区，社区提及不计炒作分。**单源异常/失败不拖垮整体**（逐源 try/except）。新闻或公告提及即题材炒作加分项；按提及源数给信号强度（无/弱/中/强）。prompt 已加 standing 规则：线索非空必调，不要求社区讨论；报告新增「题材炒作信号」小节列出提及媒体+原文链接，并把提及广度纳入 `hype_risk`（炒作风险）评分。
+- **SemiAnalysis 检索**：`search_semianalysis` 复用共享 `SearchService` 的 provider（配置 MiniMax 或智谱 Coding Plan 套餐搜索后可用），query 前缀 `site:semianalysis.com` 站点限定（零改共享 `search_service`），时间窗 365 天（长青研究），返回带 `url` 的结果；无可用 provider 时 fail-open 返回 error，agent 标注「待核验」。prompt 已加 standing 规则：半导体/AI 主题（芯片/HBM/先进封装/光刻/GPU/数据中心 AI 硬件/硅光子 CPO 等）必调，证据强度按 `analysis`（一手调研升 `primary`），付费墙内容只引可见摘要。
 - **打分**：`src/services/supply_chain/scorecard.py` 通过 importlib 加载 `data/supply_chain_skill/scripts/serenity_scorecard.py`（纯函数，无需 subprocess）。
 - **system prompt**：运行时组装 SKILL.md + 核心 5 references（deep-research-workflow / evidence-ladder / market-source-playbook / serenity-dialogue-protocol / output-style-and-language）+ 合规红线 + **工具结果摘要约束**。
 - **API**：`api/v1/endpoints/supply_chain.py`（旧聊天，`POST /api/v1/supply-chain/chat/stream` + 会话 CRUD，保留）+ `api/v1/endpoints/supply_chain_reports.py`（新报告流，`POST /generate/stream` + `/reports` CRUD + `/reports/{id}/pdf`，与旧 chat 同前缀路径不冲突）。

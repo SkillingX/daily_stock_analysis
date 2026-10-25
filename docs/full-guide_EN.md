@@ -57,7 +57,7 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 | Secret Name | Description | Required |
 |------------|------|:----:|
-| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key, one key for popular LLMs and Chinese-optimized web search with free quota for this project | Recommended |
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key for the Anspire LLM gateway, with free quota for this project | Recommended |
 | `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API key, one key for multiple model families and a 10% top-up discount for this project | Recommended |
 | `GEMINI_API_KEY` | Get free key from [Google AI Studio](https://aistudio.google.com/) | Optional |
 | `ANTHROPIC_API_KEY` | Anthropic Claude API Key | Optional |
@@ -144,14 +144,9 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 | Secret Name | Description | Required |
 |------------|------|:----:|
 | `STOCK_LIST` | Watchlist codes, e.g., `600519,300750,002594` | ✅ |
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) optimized for Chinese content; the same key can also be used for Anspire LLM fallback scenarios (example model: `Doubao-Seed-2.0-lite`) | Recommended |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) search-engine results for realtime financial news | Recommended |
-| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. Tavily retired. [Setup](coding-plan-search.md). | Optional |
-| `BOCHA_API_KEYS` | [Bocha Search](https://open.bocha.cn/) Web Search API (Chinese search optimized, supports AI summaries, multiple keys comma-separated) | Optional |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API (privacy-first, US-stock news enrichment, comma-separated for multiple keys) | Optional |
+| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. [Setup](coding-plan-search.md). | Optional |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimax.io/) Coding Plan Web Search (structured search results) | Optional |
-| `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
+| `ANSPIRE_API_KEYS` / `SERPAPI_API_KEYS` / `BOCHA_API_KEYS` / `BRAVE_API_KEYS` / `SEARXNG_BASE_URLS` / `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Retired: search converged to the coding-plan entry; residual config is read for compatibility only and does not trigger requests | Retired |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638) Token | Optional |
 | `TICKFLOW_API_KEY` | [TickFlow](https://tickflow.org) API key for CN market review index enhancement; market breadth also uses TickFlow when the plan supports universe queries | Optional |
 
@@ -159,10 +154,10 @@ Go to your forked repo → `Settings` → `Secrets and variables` → `Actions` 
 
 To get started quickly, you need at minimum:
 
-1. **AI Model**: `ANSPIRE_API_KEYS` (one key for LLMs and search), `AIHUBMIX_KEY` (one key for multiple model families), `GEMINI_API_KEY`, or `OPENAI_API_KEY`
+1. **AI Model**: `ANSPIRE_API_KEYS` (Anspire LLM gateway), `AIHUBMIX_KEY` (one key for multiple model families), `GEMINI_API_KEY`, or `OPENAI_API_KEY`
 2. **Notification Channel**: At least one, e.g., `WECHAT_WEBHOOK_URL` or `EMAIL_SENDER` + `EMAIL_PASSWORD`
 3. **Stock List**: `STOCK_LIST` (required)
-4. **Search API**: `ANSPIRE_API_KEYS` or `SERPAPI_API_KEYS` (recommended for news and sentiment search)
+4. **Search API**: `MINIMAX_API_KEYS` or `CODING_PLAN_SEARCH_PROVIDER=zhipu` (see [coding-plan search](coding-plan-search.md); Anspire/SerpAPI/Bocha/Brave/SearXNG search retired)
 
 > Configure these 4 items and you're ready to go!
 
@@ -202,7 +197,7 @@ Default schedule: Every weekday at **18:00 (Beijing Time)** automatic execution.
 | `LITELLM_CONFIG` | Advanced model routing YAML path (expert use) | - | No |
 | `LLM_USAGE_HMAC_SECRET` | Secret for LLM usage telemetry message HMACs; leave empty to use a generated local data-dir secret file | - | No |
 | `LLM_USAGE_HMAC_KEY_VERSION` | Version label for the LLM usage HMAC key; update it when rotating the secret | `local-v1` | No |
-| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key, one key for the LLM gateway and search | - | Optional |
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API key for the Anspire LLM gateway (search entry retired) | - | Optional |
 | `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API key, one key for multiple model families | - | Optional |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | Optional |
 | `GEMINI_MODEL` | Primary model name (legacy, `LITELLM_MODEL` preferred) | `gemini-3.1-pro-preview` | No |
@@ -288,17 +283,12 @@ For the notification baseline, diagnostics, and deployment notes, see [Notificat
 
 | Variable | Description | Required |
 |--------|------|:----:|
-| `ANSPIRE_API_KEYS` | Anspire Open API Key (shared with search and LLM fallback examples; availability depends on account/model entitlement, and can effectively enhance A-share analysis) | Recommended |
-| `SERPAPI_API_KEYS` | SerpAPI search-engine results for realtime financial news | Recommended |
-| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. Tavily retired. [Setup](coding-plan-search.md). | Optional |
-| `BOCHA_API_KEYS` | Bocha Search API Key (Chinese optimized) | Optional |
-| `BRAVE_API_KEYS` | Brave Search API Key (US stocks optimized) | Optional |
+| `CODING_PLAN_SEARCH_PROVIDER` | `minimax` or `zhipu`; replaces the subscription-search slot only, reuses `LLM_ZHIPU_API_KEY`. [Setup](coding-plan-search.md). | Optional |
 | `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search (structured results) | Optional |
 | `SOCIAL_SENTIMENT_API_KEY` / `SOCIAL_SENTIMENT_API_URL` | Retired (community evaluation closed; residual config is read for compatibility only, no requests). | Retired |
-| `SEARXNG_BASE_URLS` | SearXNG self-hosted instances (quota-free fallback, enable format: json in settings.yml); when empty the app auto-discovers public instances | Optional |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Auto-discover public SearXNG instances from `searx.space` when `SEARXNG_BASE_URLS` is empty (default `true`) | Optional |
+| `ANSPIRE_API_KEYS` / `SERPAPI_API_KEYS` / `BOCHA_API_KEYS` / `BRAVE_API_KEYS` / `SEARXNG_BASE_URLS` / `SEARXNG_PUBLIC_INSTANCES_ENABLED` | Retired: search converged to the coding-plan entry; residual config is read for compatibility only and does not trigger requests | Retired |
 
-> Behavior note: Search and social sentiment are optional enhancement services. If either service fails to initialize, the system logs a warning and degrades gracefully by skipping that stage without blocking the core analysis flow.
+> Behavior note: Search is an optional enhancement service and only the coding-plan entry (MiniMax / Zhipu Coding Plan) is active; Anspire/SerpAPI/Bocha/Brave/SearXNG search is retired, residual config is read for compatibility only and does not trigger requests. If the search service fails to initialize, the system logs a warning and degrades gracefully by skipping that stage without blocking the core analysis flow.
 
 ### Data Source Configuration
 

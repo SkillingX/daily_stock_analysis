@@ -132,6 +132,14 @@ class TestSearchSemianalysisHandler:
         assert "error" in result and "不可用" in result["error"]
         assert result["keywords"] == "HBM3E supply"
 
+    def test_unavailable_error_names_retained_plan_search_only(self, monkeypatch):
+        # issue #47：不可用错误指向套餐搜索，不再指导配置退休的 SERPAPI 渠道
+        _patch_service(monkeypatch, _FakeProvider(available=False))
+        result = _handle_search_semianalysis("HBM")
+        assert "SERPAPI" not in result["error"]
+        assert "MiniMax" in result["error"]
+        assert "智谱" in result["error"]
+
     def test_returns_error_when_service_none(self, monkeypatch):
         monkeypatch.setattr(sct, "_get_search_service", lambda: None)
         result = _handle_search_semianalysis("HBM3E supply")
@@ -214,6 +222,11 @@ class TestSearchSemianalysisToolMetadata:
         param_names = {p.name: p for p in search_semianalysis_tool.parameters}
         assert param_names["max_results"].required is False
         assert param_names["max_results"].default == 5
+
+    def test_description_points_at_retained_plan_search(self):
+        desc = search_semianalysis_tool.description
+        assert "SERPAPI" not in desc
+        assert "MiniMax" in desc and "智谱" in desc
 
     def test_description_mentions_semianalysis_and_use_case(self):
         desc = search_semianalysis_tool.description

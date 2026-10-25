@@ -742,7 +742,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
     "ANSPIRE_API_KEYS": {
         "title": "Anspire API Keys",
-        "description": "Comma-separated Anspire Open API keys. Used by Anspire Search and, by default, the Anspire OpenAI-compatible LLM gateway.",
+        "description": "Comma-separated Anspire Open API keys. Used by the Anspire OpenAI-compatible LLM gateway; not used for news search.",
         "category": "data_source",
         "data_type": "string",
         "ui_control": "password",
@@ -753,7 +753,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "options": [],
         "validation": {"multi_value": True, "delimiter": ","},
         "display_order": 22,
-        "help_key": "settings.data_source.search_api_keys",
+        "help_key": "settings.ai_model.anspire_llm",
         "examples": [
             "ANSPIRE_API_KEYS=key1,key2",
         ],

@@ -284,3 +284,84 @@ class TestReportRenderer(unittest.TestCase):
         out = render("markdown", [], summary_only=True)
         self.assertIsNotNone(out)
         self.assertIn("0", out)
+
+
+class FreshChipStructureRetirementTest(unittest.TestCase):
+    """Issue #46：模型返回的 chip_structure 在解析采用边界丢弃，新报告不渲染筹码块。"""
+
+    @staticmethod
+    def _parse_with_model_chip() -> "AnalysisResult":
+        import json
+        from types import SimpleNamespace
+
+        from src.analyzer import GeminiAnalyzer
+
+        payload = {
+            "code": "300260",
+            "name": "新莱应材",
+            "sentiment_score": 72,
+            "trend_prediction": "看多",
+            "operation_advice": "持有",
+            "analysis_summary": "稳健",
+            "dashboard": {
+                "core_conclusion": {"one_sentence": "持有观望"},
+                "intelligence": {"risk_alerts": []},
+                "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+                "data_perspective": {
+                    "trend_status": {"ma_alignment": "多头排列"},
+                    "volume_analysis": {"volume_ratio": 1.2, "volume_status": "放量"},
+                    "chip_structure": {
+                        "profit_ratio": "80%",
+                        "avg_cost": 30,
+                        "concentration": "10%",
+                        "chip_health": "健康",
+                    },
+                },
+            },
+        }
+        analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
+        analyzer._config_override = SimpleNamespace(report_language="zh")
+        return analyzer._parse_response(
+            json.dumps(payload, ensure_ascii=False), "300260", "新莱应材"
+        )
+
+    def test_fresh_parser_result_drops_chip_structure_and_renders_no_chip_line(self):
+        result = self._parse_with_model_chip()
+        self.assertTrue(result.success)
+        data_perspective = result.dashboard.get("data_perspective", {})
+        self.assertNotIn("chip_structure", data_perspective)
+        # 同块其余数据照常保留，只丢退休字段
+        self.assertEqual(
+            data_perspective.get("trend_status", {}).get("ma_alignment"), "多头排列"
+        )
+        with patch(
+            "src.services.report_renderer.get_config",
+            return_value=_make_renderer_config(True),
+        ):
+            markdown = render("markdown", [result], summary_only=False)
+        self.assertIsNotNone(markdown)
+        self.assertNotIn("**筹码**", markdown)
+
+    def test_renderer_still_renders_chip_for_results_that_carry_it(self):
+        # 模板语义不变：结果若带 chip_structure（历史语义/兼容路径），筹码行照常渲染
+        dashboard = {
+            "core_conclusion": {"one_sentence": "持有观望"},
+            "intelligence": {"risk_alerts": []},
+            "battle_plan": {"sniper_points": {"stop_loss": "110"}},
+            "data_perspective": {
+                "chip_structure": {
+                    "profit_ratio": "80%",
+                    "avg_cost": 30,
+                    "concentration": "10%",
+                    "chip_health": "健康",
+                },
+            },
+        }
+        r = _make_result(dashboard=dashboard)
+        with patch(
+            "src.services.report_renderer.get_config",
+            return_value=_make_renderer_config(True),
+        ):
+            markdown = render("markdown", [r], summary_only=False)
+        self.assertIsNotNone(markdown)
+        self.assertIn("**筹码**: 80% | 30 | 10%", markdown)

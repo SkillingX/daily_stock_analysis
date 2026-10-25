@@ -40,6 +40,7 @@ from src.report_language import (
     localize_operation_advice,
     localize_trend_prediction,
     normalize_report_language,
+    strip_retired_chip_structure,
 )
 from src.search_service import SearchService
 from src.analysis_context_pack_prompt import format_analysis_context_pack_prompt_section
@@ -1800,7 +1801,11 @@ class StockAnalysisPipeline:
             # with core_conclusion / battle_plan / intelligence.  AnalysisResult's helper
             # methods (get_sniper_points, get_core_conclusion, etc.) expect that inner
             # structure, so we unwrap it here.
-            result.dashboard = nested_dashboard or dash
+            adopted_dashboard = nested_dashboard or dash
+            # 筹码结构已随 issue #46 退休：与 LLM 路径共用同一采用边界剥离，
+            # 新报告不再携带模型返回的 chip_structure；历史存档回放不受影响。
+            strip_retired_chip_structure(adopted_dashboard)
+            result.dashboard = adopted_dashboard
             self._backfill_agent_dashboard_fields(result, trend_result, report_language)
         else:
             self._apply_trend_fallback(result, trend_result, report_language)

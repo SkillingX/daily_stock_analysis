@@ -710,6 +710,20 @@ def is_chip_placeholder_value(value: Any) -> bool:
     return any(hint in lowered for hint in _CHIP_PLACEHOLDER_HINTS)
 
 
+def strip_retired_chip_structure(dashboard: Optional[Dict[str, Any]]) -> None:
+    """Drop the retired chip_structure block from a freshly adopted dashboard (issue #46).
+
+    Shared by the LLM and Agent adoption boundaries so new reports never carry
+    model-invented chip facts; historical stored reports replay their own data
+    unchanged.
+    """
+    if not isinstance(dashboard, dict):
+        return
+    data_perspective = dashboard.get("data_perspective")
+    if isinstance(data_perspective, dict):
+        data_perspective.pop("chip_structure", None)
+
+
 def is_chip_structure_unavailable(chip_data: Any) -> bool:
     """Detect chip_structure blocks that contain only unavailable placeholders."""
     if not isinstance(chip_data, dict) or not chip_data:

@@ -57,7 +57,7 @@ daily_stock_analysis/
 
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
-| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API Key，一 Key 同时启用大模型和中文优化联网搜索，含本项目免费额度 | 推荐 |
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API Key，作为 Anspire 大模型网关使用，含本项目免费额度 | 推荐 |
 | `AIHUBMIX_KEY` | [AIHubMix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，本项目可享 10% 优惠 | 推荐 |
 | `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) 获取免费 Key | 可选 |
 | `ANTHROPIC_API_KEY` | Anthropic Claude API Key | 可选 |
@@ -152,14 +152,9 @@ daily_stock_analysis/
 | Secret 名称 | 说明 | 必填 |
 |------------|------|:----:|
 | `STOCK_LIST` | 自选股代码，如 `600519,300750,002594` | ✅ |
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/) 针对中文内容特别优化；同一 Key 可用于搜索与 Anspire 大模型网关的兜底示例（是否可用以控制台与账号权限为准） | 推荐 |
-| `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis) 搜索引擎结果补强，适合实时金融新闻 | 推荐 |
 | `CODING_PLAN_SEARCH_PROVIDER` | `minimax`（默认）或 `zhipu`；仅替代套餐搜索位置，详见 [套餐搜索配置](coding-plan-search.md) | 可选 |
-| `BOCHA_API_KEYS` | [博查搜索](https://open.bocha.cn/) Web Search API（中文搜索优化，支持AI摘要，多个key用逗号分隔） | 可选 |
-| `BRAVE_API_KEYS` | [Brave Search](https://brave.com/search/api/) API（隐私优先，美股优化，多个key用逗号分隔） | 可选 |
 | `MINIMAX_API_KEYS` | [MiniMax](https://platform.minimax.io/) Coding Plan Web Search（结构化搜索结果） | 可选 |
-| `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） | 可选 |
+| `ANSPIRE_API_KEYS` / `SERPAPI_API_KEYS` / `BOCHA_API_KEYS` / `BRAVE_API_KEYS` / `SEARXNG_BASE_URLS` / `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 已停用：搜索渠道已收敛为套餐入口，残留配置仅兼容读取，不触发请求，不再按可用搜索渠道展示 | 已停用 |
 | `TUSHARE_TOKEN` | [Tushare Pro](https://tushare.pro/weborder/#/login?reg=834638 ) Token | 可选 |
 | `LONGBRIDGE_OAUTH_CLIENT_ID` | [Longbridge OpenAPI](https://open.longbridge.com/) OAuth client_id；留空且无 Legacy Access Token 时会兼容使用 `LONGBRIDGE_APP_KEY` | 可选 |
 | `LONGBRIDGE_OAUTH_TOKEN_CACHE_B64` | OAuth token 缓存文件的 base64 内容，供 GitHub Actions / Docker 等 headless 环境恢复 SDK token 缓存 | 可选 |
@@ -187,10 +182,10 @@ daily_stock_analysis/
 
 如果你想快速开始，最少需要配置以下项：
 
-1. **AI 模型**：`ANSPIRE_API_KEYS`（一 Key 同时启用大模型和搜索）、`AIHUBMIX_KEY`（[AIHubmix](https://aihubmix.com/?aff=CfMq)，一 Key 多模型）、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`
+1. **AI 模型**：`ANSPIRE_API_KEYS`（Anspire 大模型网关）、`AIHUBMIX_KEY`（[AIHubmix](https://aihubmix.com/?aff=CfMq)，一 Key 多模型）、`GEMINI_API_KEY` 或 `OPENAI_API_KEY`
 2. **通知渠道**：至少配置一个，如 `WECHAT_WEBHOOK_URL` 或 `EMAIL_SENDER` + `EMAIL_PASSWORD`
 3. **股票列表**：`STOCK_LIST`（必填）
-4. **搜索 API**：`ANSPIRE_API_KEYS` 或 `SERPAPI_API_KEYS`（推荐，用于新闻与舆情搜索）
+4. **搜索 API**：`MINIMAX_API_KEYS` 或 `CODING_PLAN_SEARCH_PROVIDER=zhipu`（详见 [套餐搜索配置](coding-plan-search.md)；Anspire/SerpAPI/Bocha/Brave/SearXNG 搜索已停用）
 
 > 💡 配置完以上 4 项即可开始使用！
 
@@ -236,7 +231,7 @@ daily_stock_analysis/
 | `LITELLM_CONFIG` | 高级模型路由 YAML 配置文件路径（高级） | - | 否 |
 | `LLM_USAGE_HMAC_SECRET` | LLM 用量遥测 message HMAC 密钥；留空时自动使用数据目录中的本地密钥文件 | - | 否 |
 | `LLM_USAGE_HMAC_KEY_VERSION` | LLM 用量遥测 HMAC 密钥版本标签，轮换密钥时同步更新 | `local-v1` | 否 |
-| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API Key，一 Key 同时启用大模型网关和搜索 | - | 可选 |
+| `ANSPIRE_API_KEYS` | [Anspire](https://open.anspire.cn/?share_code=QFBC0FYC) API Key，作为 Anspire 大模型网关使用（搜索入口已停用） | - | 可选 |
 | `AIHUBMIX_KEY` | [AIHubmix](https://aihubmix.com/?aff=CfMq) API Key，一 Key 切换使用全系模型，无需额外配置 Base URL | - | 可选 |
 | `GEMINI_API_KEY` | Google Gemini API Key | - | 可选 |
 | `GEMINI_MODEL` | 主模型名称（legacy，`LITELLM_MODEL` 优先） | `gemini-3.1-pro-preview` | 否 |
@@ -327,20 +322,15 @@ daily_stock_analysis/
 
 | 变量名 | 说明 | 必填 |
 |--------|------|:----:|
-| `ANSPIRE_API_KEYS` | Anspire Open API Key（可用于搜索与大模型网关共享场景的配置示例；是否可用取决于账号权限与网关可见性，可有效增强 A 股分析效果） | 推荐 |
-| `SERPAPI_API_KEYS` | SerpAPI 搜索引擎结果补强，适合实时金融新闻 | 推荐 |
 | `CODING_PLAN_SEARCH_PROVIDER` | `minimax`（默认）或 `zhipu`；仅替代套餐搜索位置，详见 [套餐搜索配置](coding-plan-search.md) | 可选 |
-| `BOCHA_API_KEYS` | 博查搜索 API Key（中文优化） | 可选 |
-| `BRAVE_API_KEYS` | Brave Search API Key（美股优化） | 可选 |
 | `MINIMAX_API_KEYS` | MiniMax Coding Plan Web Search（结构化搜索结果） | 可选 |
 | `SOCIAL_SENTIMENT_API_KEY` / `SOCIAL_SENTIMENT_API_URL` | 已停用（社区评价关闭，残留配置仅兼容读取，不触发请求） | 已停用 |
-| `SEARXNG_BASE_URLS` | SearXNG 自建实例（无配额兜底，需在 settings.yml 启用 format: json）；留空时默认自动发现公共实例 | 可选 |
-| `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 是否在 `SEARXNG_BASE_URLS` 为空时自动从 `searx.space` 获取公共实例（默认 `true`） | 可选 |
+| `ANSPIRE_API_KEYS` / `SERPAPI_API_KEYS` / `BOCHA_API_KEYS` / `BRAVE_API_KEYS` / `SEARXNG_BASE_URLS` / `SEARXNG_PUBLIC_INSTANCES_ENABLED` | 已停用：搜索渠道已收敛为套餐入口，残留配置仅兼容读取，不触发请求，不再按可用搜索渠道展示 | 已停用 |
 | `NEWS_STRATEGY_PROFILE` | 新闻策略窗口档位：`ultra_short`(1天)/`short`(3天)/`medium`(7天)/`long`(30天)；实际窗口取与 `NEWS_MAX_AGE_DAYS` 的最小值 | 默认 `short` |
 | `NEWS_MAX_AGE_DAYS` | 新闻最大时效（天），搜索时限制结果在近期内 | 默认 `3` |
 | `BIAS_THRESHOLD` | 乖离率阈值（%），超过提示不追高；强势趋势股自动放宽到 1.5 倍 | 默认 `5.0` |
 
-> 行为说明：搜索服务与社交舆情服务为可选增强链路。任一服务初始化失败时，系统会记录 warning 并降级为跳过该服务，仅影响对应环节，不会阻塞技术面主链路和主任务流。
+> 行为说明：搜索服务为可选增强链路，仅套餐搜索入口（MiniMax / 智谱 Coding Plan）生效；Anspire/SerpAPI/Bocha/Brave/SearXNG 搜索已停用，残留配置仅兼容读取，不触发请求。搜索服务初始化失败时，系统会记录 warning 并降级为跳过该服务，仅影响对应环节，不会阻塞技术面主链路和主任务流。
 
 ### 新闻检索可解释排序（Issue #1356）
 
