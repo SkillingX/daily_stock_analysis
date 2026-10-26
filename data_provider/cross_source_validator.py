@@ -52,7 +52,9 @@ QualityStatus = Literal["missing", "unverified", "single_source", "not_comparabl
 class SourceReadError(RuntimeError):
     """A supplier failure with a safe reason, isolated by the validator."""
     def __init__(self, source: str, reason_code: str) -> None:
-        known = {"invalid_configuration", "authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error", "sdk_unavailable", "permission_denied", "calendar_unavailable"}
+        known = {"invalid_configuration", "authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error", "sdk_unavailable", "permission_denied", "calendar_unavailable",
+                 # Choice 预算/阶段细分：预算耗尽未分派、等锁超时、SDK 登录/查询停留阶段超时
+                 "budget_exhausted", "lock_wait_timeout", "login_timeout", "query_timeout"}
         self.reason_code = reason_code if reason_code in known or re.fullmatch(r"http_[1-5][0-9]{2}", reason_code) else "source_error"
         super().__init__(f"{source}:{self.reason_code}")
 

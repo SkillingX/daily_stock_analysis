@@ -4202,11 +4202,17 @@ class DataFetcherManager:
                 pass
         verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
         omit = _qualified_ifind_choice_omissions(readings) if prefer_ifind else ()
+        # 必要 Choice 先执行；iFinD 主营/股东再决定可选 Choice 缺项。同一绝对截止时间不重置。
+        choice_deadline = deadline - verification_budget
+        adapter = ChoiceAdapter()
+        snapshot = adapter.snapshot(code, deadline=choice_deadline, omit_indicators=omit, include_optional=False)
         ifind_research: Dict[str, Any] = {}
+        research_omit: tuple[str, ...] = ()
         if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
             ifind_research = _ifind_research_omissions(code, readings, deadline, config)
-            omit = tuple(dict.fromkeys((*omit, *ifind_research.pop("omit", ()))))
-        snapshot = ChoiceAdapter().snapshot(code, deadline=deadline - verification_budget, omit_indicators=omit)
+            research_omit = tuple(ifind_research.pop("omit", ()))
+        if time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
+            adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
         if ifind_research:
             snapshot.setdefault("research", {}).update(ifind_research)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
