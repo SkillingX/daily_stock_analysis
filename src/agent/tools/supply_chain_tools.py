@@ -7,7 +7,6 @@ v2 旧工具（2 个）：
 
 v2 中间工具（3 个）：
 - ``search_clue_hype``（线索炒作信号）
-- ``verify_supply_chain_evidence``（双源校验）
 - ``search_supply_chain_kb``（知识库检索）
 
 v3 深度小节工具（5 个）：
@@ -25,6 +24,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, cast
+from urllib.parse import urlparse
 
 from src.agent.tools.registry import ToolDefinition, ToolParameter
 
@@ -287,14 +287,14 @@ def _handle_search_semianalysis(
 ) -> Dict[str, Any]:
     """检索 SemiAnalysis（semianalysis.com）半导体/AI 一级研究文章，返回带原文 url 的结果。
 
-    复用共享 ``SearchService`` 的 provider（配置 ``SERPAPI_API_KEYS`` 等后可用），query
+    复用共享 ``SearchService`` 的 provider（配置 MiniMax 或智谱 Coding Plan 套餐搜索后可用），query
     前缀 ``site:semianalysis.com`` 做站点限定；每条结果含 ``url``（可直接填入证据）。
     服务不可用 / 检索失败时返回 ``error``，agent 据此标注「待核验」而非编造。
     """
     provider = _pick_search_provider(_get_search_service())
     if provider is None:
         return {
-            "error": "搜索引擎不可用（未配置 SERPAPI_API_KEYS 等），无法检索 SemiAnalysis，请将相关判断标注「待核验」",
+            "error": "搜索引擎不可用（未配置 MiniMax 或智谱 Coding Plan 套餐搜索），无法检索 SemiAnalysis，请将相关判断标注「待核验」",
             "keywords": keywords,
         }
 
@@ -347,7 +347,7 @@ search_semianalysis_tool = ToolDefinition(
         "返回标题/摘要/**原文地址 url**/来源/日期。**半导体 / AI 主题必调**（芯片/SoC、HBM/存储、"
         "先进封装/CoWoS、光刻/设备/材料、晶圆代工、GPU/AI 加速卡、数据中心 AI 硬件、硅光子/CPO/"
         "薄膜铌酸锂、电源/散热等），按主题或卡点环节构造关键词（如『HBM3E supply』『CoWoS capacity』"
-        "『Blackwell GB200』『薄膜铌酸锂 CPO』）。配置 SERPAPI_API_KEYS 后可用。"
+        "『Blackwell GB200』『薄膜铌酸锂 CPO』）。配置 MiniMax 或智谱 Coding Plan 套餐搜索后可用。"
     ),
     parameters=[
         ToolParameter(
@@ -376,11 +376,10 @@ ALL_SUPPLY_CHAIN_TOOLS = [score_supply_chain_bottleneck_tool, search_semianalysi
 # 线索多源炒作检索（用户提供「线索」时，跨国内财经媒体查炒作信号）
 # ============================================================
 
-# 固定 5 源：点名的国内财经媒体 + 公司公告 + 全网（兜底东财/腾讯等其它媒体）。
+# 新闻与公告源。社区站点不查询，也不把社区提及计成炒作分。
 # 每项 (显示名, 站点限定)；站点为 None 表示不做 site: 限定（全网检索）。
 _CLUE_HYPE_SOURCES: tuple[tuple[str, Optional[str]], ...] = (
     ("新浪财经", "finance.sina.com.cn"),
-    ("雪球", "xueqiu.com"),
     ("同花顺", "10jqka.com.cn"),
     ("巨潮资讯/公司公告", "cninfo.com.cn"),
     ("全网/Google", None),
@@ -396,6 +395,15 @@ def _build_clue_hype_query(site: Optional[str], clue: Any) -> str:
     if site:
         return f"site:{site} {clue_text}".strip()
     return clue_text
+
+
+def _is_community_mention(url: str) -> bool:
+    """社区链接（雪球/股吧/论坛/微博等，含子域）不计炒作分；新闻与公告源正常计数。"""
+    host = urlparse(url or "").netloc.lower().split(":")[0].removeprefix("www.")
+    if any(host == domain or host.endswith(f".{domain}") for domain in ("x.com", "t.co", "t.10jqka.com.cn")):
+        return True
+    labels = host.split(".")
+    return any(label in labels for label in ("xueqiu", "reddit", "twitter", "weibo", "stocktwits", "guba", "zhihu", "tieba", "forum", "forums", "bbs"))
 
 
 def _hype_signal(mention_sources_count: Any) -> str:
@@ -416,7 +424,7 @@ def _handle_search_clue_hype(
 ) -> Dict[str, Any]:
     """跨国内财经媒体检索「供应链线索」，返回每源提及情况 + 题材炒作信号强度。
 
-    复用共享 ``SearchService`` provider（配置 ``SERPAPI_API_KEYS`` 等后可用）。逐源用
+    复用共享 ``SearchService`` provider（配置 MiniMax 或智谱 Coding Plan 套餐搜索后可用）。逐源用
     ``site:`` 限定（全网源不限）调用 ``provider.search()``；**单源异常/失败不拖垮整体**，
     该源计 0 提及、继续其它源。任一源提及线索即题材炒作加分项；提及源越多 hype_signal 越强。
     服务不可用时返回 ``error``，agent 据此标注「待核验」。
@@ -425,7 +433,7 @@ def _handle_search_clue_hype(
     provider = _pick_search_provider(_get_search_service())
     if provider is None:
         return {
-            "error": "搜索引擎不可用（未配置 SERPAPI_API_KEYS 等），无法跨源检索线索，请将炒作信号标注「待核验」",
+            "error": "搜索引擎不可用（未配置 MiniMax 或智谱 Coding Plan 套餐搜索），无法跨源检索线索，请将炒作信号标注「待核验」",
             "clue": clue_text,
         }
 
@@ -456,14 +464,18 @@ def _handle_search_clue_hype(
             queried.append(entry)
             continue
 
-        items = [
-            {
-                "title": getattr(r, "title", ""),
-                "url": getattr(r, "url", ""),
-                "source": getattr(r, "source", ""),
-            }
-            for r in (getattr(response, "results", None) or [])[:cap]
-        ]
+        items = []
+        for result in getattr(response, "results", None) or []:
+            url = getattr(result, "url", "")
+            if _is_community_mention(url):
+                continue
+            items.append({
+                "title": getattr(result, "title", ""),
+                "url": url,
+                "source": getattr(result, "source", ""),
+            })
+            if len(items) >= cap:
+                break
         entry["mention_count"] = len(items)
         entry["results"] = items
         if items:
@@ -487,9 +499,10 @@ def _handle_search_clue_hype(
 search_clue_hype_tool = ToolDefinition(
     name="search_clue_hype",
     description=(
-        "用户提供了「供应链线索」时必调：跨国内财经媒体（新浪财经/雪球/同花顺/巨潮公司公告/全网）"
+        "用户提供了「供应链线索」时必调：跨新闻与公告源（新浪财经/同花顺/巨潮公司公告/全网）"
         "检索该线索，返回每源提及情况、提及源列表与「题材炒作」信号强度（无/弱/中/强）。"
-        "任一媒体提及线索即题材炒作加分项（提及源越多炒作信号越强），用于报告『题材炒作信号』小节并纳入 hype_risk 评分。"
+        "社区讨论不是必填项，社区提及不计炒作分。新闻或公告提及才作为题材炒作加分项，"
+        "用于报告『题材炒作信号』小节并纳入 hype_risk 评分。"
     ),
     parameters=[
         ToolParameter(
@@ -607,92 +620,12 @@ search_supply_chain_kb_tool = ToolDefinition(
 
 
 # ============================================================
-# 供应链双源校验（公司 / 板块归属，东方财富 + 同花顺结构化核验）
-# ============================================================
-
-
-def _get_supply_chain_validator() -> Any:
-    """Lazy 默认双源校验器访问器（测试可 monkeypatch 替换为注入 fake 探针的实例）。"""
-    from data_provider.supply_chain.cross_source import get_default_validator
-
-    return get_default_validator()
-
-
-def _handle_verify_supply_chain_evidence(
-    stock_code: str,
-    stock_name: str,
-    claim: str,
-    board_hint: str = "",
-    topic: str = "",
-) -> Dict[str, Any]:
-    """对单条供应链事实做「东方财富 + 同花顺」双源结构化校验。
-
-    复用 ``data_provider.supply_chain.cross_source`` 的纯逻辑判定 + fail-open 探针：
-    非 A 股 → ``not_applicable``；A 股按决策表产出 ``confirmed / partial /
-    conflict / unverified`` 与 ``high / medium / low`` 置信度。校验失败不阻断
-    报告生成，agent 据状态文案标注「待核验」「单源支持」「双源冲突」。
-    """
-    validator = _get_supply_chain_validator()
-    result = validator.verify(
-        stock_code, stock_name, claim=claim, board_hint=board_hint, topic=topic
-    )
-    return cast(Dict[str, Any], result.to_dict())
-
-
-verify_supply_chain_evidence_tool = ToolDefinition(
-    name="verify_supply_chain_evidence",
-    description=(
-        "对供应链报告中的「公司 / 板块归属」事实做双源结构化校验（东方财富 + 同花顺），"
-        "返回 status(confirmed/partial/conflict/unverified/not_applicable) + "
-        "confidence(high/medium/low) + 东财/同花顺证据 + 成分股重合度。"
-        "**A 股候选标的进入最终候选表前必调**；未得到 confirmed 的结论不得写成已确认事实，"
-        "只能按状态写「双源确认 / 单源支持待核验 / 口径冲突 / 待核验」。仅支持 A 股，"
-        "港股/美股返回 not_applicable。"
-    ),
-    parameters=[
-        ToolParameter(
-            name="stock_code",
-            type="string",
-            description="A 股代码（如 300750，允许 SH/SZ/BJ 前缀或 .SH/.SZ/.BJ 后缀）",
-            required=True,
-        ),
-        ToolParameter(
-            name="stock_name",
-            type="string",
-            description="公司名称（用于名称匹配与报告展示）",
-            required=True,
-        ),
-        ToolParameter(
-            name="claim",
-            type="string",
-            description="需要校验的供应链事实陈述（如『宁德时代是动力电池产业链核心中游制造商』）",
-            required=True,
-        ),
-        ToolParameter(
-            name="board_hint",
-            type="string",
-            description="板块 / 主题提示（如『动力电池』），优先用于定位东财 / 同花顺板块或概念",
-            required=False,
-            default="",
-        ),
-        ToolParameter(
-            name="topic",
-            type="string",
-            description="主题（如『新能源车电池供应链』），无 board_hint 时用于构造检索关键词",
-            required=False,
-            default="",
-        ),
-    ],
-    handler=_handle_verify_supply_chain_evidence,
-    category="analysis",
-)
 
 
 ALL_SUPPLY_CHAIN_TOOLS = [
     score_supply_chain_bottleneck_tool,
     search_semianalysis_tool,
     search_clue_hype_tool,
-    verify_supply_chain_evidence_tool,
     search_supply_chain_kb_tool,
 ]
 
@@ -897,12 +830,9 @@ def _fetch_quote_v3(manager: Any, ticker: str) -> Any:
 
 
 def _fetch_boards_v3(manager: Any, ticker: str) -> List[Dict[str, Any]]:
-    """[v3] 拉取所属板块；失败返回空 list。"""
-    try:
-        return manager.get_belong_boards(ticker) or []
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("[SupplyChain v3] boards 失败 %s: %s", ticker, exc)
-        return []
+    """公开概念探针已退役（issue #45）。概念归属走 get_stock_info，不在这里取东财板块。"""
+    del manager, ticker
+    return []
 
 
 def _fetch_cross_validation_v3(ticker: str) -> Any:
@@ -1077,15 +1007,20 @@ def _format_fundamental_lines(info: Dict[str, Any], parts: List[str]) -> None:
 
 
 def _append_board_lines(info: Dict[str, Any], parts: List[str]) -> None:
-    """[拆分] 板块字段格式化到 parts。"""
+    """行业板块与最新概念归属分开写，概念不标成所属板块。"""
     boards = info.get("belong_boards") or []
-    if not boards:
-        return
-    board_names = [b.get("name") for b in boards[:10] if b.get("name")]
+    board_names = [b.get("name") for b in boards[:10] if isinstance(b, dict) and b.get("name")]
     if board_names:
+        parts.append("所属板块=" + ",".join([_safe_format_value(n) for n in board_names]))
+    membership = info.get("concept_membership") or {}
+    concepts = [item.get("name") for item in membership.get("concepts") or [] if isinstance(item, dict) and item.get("name")]
+    if concepts:
         parts.append(
-            "所属板块=" + ",".join([_safe_format_value(n) for n in board_names])
+            "最新概念归属=" + ",".join(concepts)
+            + f"（{membership.get('source') or 'ifind'}，{membership.get('as_of_nature') or 'latest'}）"
         )
+    elif membership.get("error"):
+        parts.append(f"最新概念归属未取得：{membership.get('error')}")
 
 
 def _append_valuation_lines(valuation: Dict[str, Any], parts: List[str]) -> None:
@@ -2326,10 +2261,13 @@ def _build_real_red_flags(quote: Dict[str, Any], info: Dict[str, Any]) -> List[s
         flags.append(f"当日涨幅={change_pct}%，触及涨停/跌停，短期波动剧烈")
     if mv is not None and mv > 0:
         flags.append(f"总市值={mv / 1e8:.2f}亿元")
-    boards = info.get("belong_boards") or []
-    board_names = [b.get("name", "") for b in boards[:10] if b.get("name")]
-    if any(n in {"半导体", "光伏", "新能源", "医药"} for n in board_names):
-        flags.append("所属板块含半导体/新能源/医药等热门概念，估值易受市场情绪影响")
+    concepts = [
+        item.get("name", "")
+        for item in ((info.get("concept_membership") or {}).get("concepts") or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    if any(n in {"半导体", "光伏", "新能源", "医药", "芯片概念"} for n in concepts):
+        flags.append("最新概念归属含半导体/新能源/医药等热门概念，估值易受市场情绪影响；概念标签不是客户事实")
     return flags
 
 
@@ -2908,7 +2846,6 @@ ALL_SUPPLY_CHAIN_TOOLS = [
     score_supply_chain_bottleneck_tool,
     search_semianalysis_tool,
     search_clue_hype_tool,
-    verify_supply_chain_evidence_tool,
     search_supply_chain_kb_tool,
     # [v3] 深度小节工具（产品·客户·竞争·前景 产能 五维补强）
     analyze_product_matrix_tool,

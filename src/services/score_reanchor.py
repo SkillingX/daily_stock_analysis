@@ -10,7 +10,7 @@ either — observed in batches 3-5 where the LLM ignored the table.
 
 The fix: do not let the LLM score. After parsing, re-compute the score
 deterministically from the factors the LLM *did* report (ma_alignment,
-bias_ma5, volume_status, risk_alerts count, chip_health, pe_ratio,
+bias_ma5, volume_status, risk_alerts count, pe_ratio,
 market_high_risk). The original LLM score is preserved in
 ``_reanchor_log.original_score`` for audit, and the recomputed value
 replaces ``sentiment_score``.
@@ -51,15 +51,6 @@ def _coerce_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _is_missing_chip(chip_health: Any) -> bool:
-    if chip_health is None:
-        return True
-    if isinstance(chip_health, str):
-        v = chip_health.strip().lower()
-        return v in ("", "missing", "unknown", "n/a", "数据缺失")
-    return False
 
 
 def _is_bullish_volume(volume_status: Any) -> Optional[bool]:
@@ -129,7 +120,6 @@ def extract_reanchor_inputs(
     is_bullish = _coerce_bool(_nested_dict(dp.get("trend_status") or {}, "is_bullish"))
     bias_ma5 = _coerce_float(_nested_dict(dp, "price_position").get("bias_ma5"))
     volume_status = _nested_dict(dp, "volume_analysis").get("volume_status")
-    chip_health = _nested_dict(dp, "chip_structure").get("chip_health")
     risk_alerts = intel.get("risk_alerts")
     risk_count = len(risk_alerts) if isinstance(risk_alerts, list) else 0
 
@@ -152,8 +142,6 @@ def extract_reanchor_inputs(
         "bias_ma5_safe": (bias_ma5 is not None and abs(bias_ma5) < 5.0),
         "volume_status": volume_status,
         "volume_supports_trend": _classify_volume(volume_status, is_bullish),
-        "chip_health": chip_health,
-        "chip_missing": _is_missing_chip(chip_health),
         "risk_alert_count": risk_count,
         "pe_ratio": pe_ratio,
         "market_high_risk": market_high_risk,
@@ -221,18 +209,6 @@ def reanchor_score(
                 "delta": -10,
             }
         )
-
-    # 筹码
-    if factors.get("chip_missing"):
-        # 数据缺失不扣分（设计：缺失不解释为利空）
-        pass
-    elif factors.get("chip_health") == "健康":
-        score += 10
-        adjustments.append({"factor": "chip", "value": "健康", "delta": 10})
-    elif factors.get("chip_health") == "警惕":
-        score -= 10
-        adjustments.append({"factor": "chip", "value": "警惕", "delta": -10})
-    # 一般: 不动
 
     # PE
     pe = factors.get("pe_ratio")

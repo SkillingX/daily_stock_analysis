@@ -317,8 +317,7 @@ class ExtractFirstJsonObjectTestCase(unittest.TestCase):
             '"moat_strength": "strong", "customer_concentration": null, '
             '"us_china_risk": "medium", "chokepoint_type": "capacity", '
             '"cognitive_difference": "market_fair", '
-            '"recent_catalysts": [], "news_sentiment": "neutral", '
-            '"chip_concentration": null}'
+            '"recent_catalysts": [], "news_sentiment": "neutral"}'
         )
         text = (
             "Some intro prose.\n"

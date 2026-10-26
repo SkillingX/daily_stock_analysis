@@ -58,7 +58,7 @@ def test_real_multi_table_response_reaches_snapshot_and_verification(ifind_trans
     assert calls
 
 
-def test_ifind_primary_reaches_report_with_choice_verification(ifind_transport, monkeypatch):
+def test_ifind_primary_reaches_report_without_single_source_verification(ifind_transport, monkeypatch):
     from src.agent.tools import data_tools
     from src.deep_research_dims.context import SharedContext, _safe_fundamental
     from src.deep_research_dims.fundamental_dim import build_fundamental_dim
@@ -74,17 +74,126 @@ def test_ifind_primary_reaches_report_with_choice_verification(ifind_transport, 
     snapshot = build_fundamental_dim(ctx).financial_snapshot
     assert snapshot['revenue'].reading.source == 'ifind'
     assert snapshot['revenue'].reading.value == 2997710000
-    assert snapshot['revenue'].quality.status == 'verified'
+    # 合格 iFinD 字段不再重查 Choice，单一 iFinD 来源不得写成 verified
+    assert snapshot['revenue'].quality.status != 'verified'
     assert snapshot['revenue'].rule_eligible
     assert '每个报告期' in calls[0][1]
 
 
+def test_qualified_ifind_fields_are_not_requeried_from_choice(ifind_transport, monkeypatch):
+    from data_provider.cross_source_validator import AnchorReading, SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    missing = "gross_margin"
+    qualified = ("revenue", "net_profit", "roe", "revenue_yoy", "net_profit_yoy")
+    readings = {
+        field: AnchorReading(
+            "ifind", 10.0, period="2025-12-31", period_basis="annual",
+            statement_scope="consolidated", adjustment="restated",
+            caliber="operating_revenue" if field == "revenue" else "weighted_roe" if field == "roe" else "operating_revenue_yoy" if field == "revenue_yoy" else "parent_net_profit_yoy" if field == "net_profit_yoy" else "parent_net_profit",
+            unit="currency_base" if field in {"revenue", "net_profit"} else "percentage_point",
+            currency="CNY" if field in {"revenue", "net_profit"} else None,
+        )
+        for field in qualified
+    }
+    monkeypatch.setattr(IfindFetcher, "financial_snapshot", lambda self, code, period, deadline: readings)
+
+    def _unavailable(*args, **kwargs):
+        raise SourceReadError("ifind", "invalid_response")
+
+    monkeypatch.setattr(IfindFetcher, "product_segments", _unavailable)
+    monkeypatch.setattr(IfindFetcher, "shareholders", _unavailable)
+    seen = []
+    native = ChoiceAdapter._native_request
+
+    def sdk(method, args, options, deadline):
+        raw = native(method, args, options, deadline)
+        if method == "css":
+            seen.append(args[1] if len(args) > 1 else "")
+            indicators = raw.get("indicators") or []
+            if "LATESTREPORTNEW" in indicators:
+                raw["data"][args[0]][indicators.index("LATESTREPORTNEW")] = "2026/06/30"
+        return raw
+
+    monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(sdk))
+    result = DataFetcherManager().get_fundamental_context("300260", budget_seconds=30)
+    requested = " ".join(seen)
+    for indicator in ("OPERATEREVENEW", "PARENTNETPROFITNEW", "ROEWA", "YOYOR", "YOYPNI"):
+        assert indicator not in requested
+    assert "GPMARGIN" in requested
+    assert "PETTM" in requested and "MV" in requested
+    assert "HISSW2021" in requested and "RATINGTARGETPRICE" in requested
+    assert result["growth"]["data"]["report_date"] == "2025-12-31"
+    assert result["growth"]["field_meta"]["revenue"]["source"] == "ifind"
+    assert result["growth"]["field_meta"]["revenue"]["period"] == "2025-12-31"
+    assert result["growth"]["data"][missing] is None
+    assert result["growth"]["field_meta"]["revenue"]["quality"]["status"] != "verified"
+
+
+def test_qualified_older_period_ifind_field_stays_adopted_and_unqueried(ifind_transport, monkeypatch):
+    from data_provider.cross_source_validator import AnchorReading, SourceReadError
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+
+    def _reading(field: str, period: str) -> AnchorReading:
+        return AnchorReading(
+            "ifind", 10.0, period=period, period_basis="annual",
+            statement_scope="consolidated", adjustment="restated",
+            caliber="operating_revenue" if field == "revenue" else "weighted_roe" if field == "roe" else "operating_revenue_yoy" if field == "revenue_yoy" else "parent_net_profit_yoy" if field == "net_profit_yoy" else "parent_net_profit",
+            unit="currency_base" if field in {"revenue", "net_profit"} else "percentage_point",
+            currency="CNY" if field in {"revenue", "net_profit"} else None,
+        )
+
+    # revenue 合格但财期早于其他合格字段：仍不重查 Choice，也不因快照财期更新丢成缺项
+    readings = {"revenue": _reading("revenue", "2025-12-31")}
+    readings.update({field: _reading(field, "2026-06-30") for field in ("net_profit", "roe", "revenue_yoy", "net_profit_yoy")})
+    monkeypatch.setattr(IfindFetcher, "financial_snapshot", lambda self, code, period, deadline: readings)
+
+    def _unavailable(*args, **kwargs):
+        raise SourceReadError("ifind", "invalid_response")
+
+    monkeypatch.setattr(IfindFetcher, "product_segments", _unavailable)
+    monkeypatch.setattr(IfindFetcher, "shareholders", _unavailable)
+    seen = []
+    native = ChoiceAdapter._native_request
+
+    def sdk(method, args, options, deadline):
+        raw = native(method, args, options, deadline)
+        if method == "css":
+            seen.append(args[1] if len(args) > 1 else "")
+            indicators = raw.get("indicators") or []
+            if "LATESTREPORTNEW" in indicators:
+                raw["data"][args[0]][indicators.index("LATESTREPORTNEW")] = "2026/06/30"
+        return raw
+
+    monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(sdk))
+    result = DataFetcherManager().get_fundamental_context("300260", budget_seconds=30)
+    requested = " ".join(seen)
+    assert "OPERATEREVENEW" not in requested
+    assert "GPMARGIN" in requested  # 缺口字段仍重查并按同期补位
+    assert result["growth"]["data"]["revenue"] == 10.0
+    assert result["growth"]["field_meta"]["revenue"]["period"] == "2025-12-31"
+    assert result["growth"]["field_meta"]["revenue"]["source"] == "ifind"
+    assert result["growth"]["data"]["report_date"] == "2026-06-30"
+    assert result["growth"]["field_meta"]["gross_margin"]["source"] == "choice"
+    assert result["growth"]["field_meta"]["revenue"]["quality"]["status"] != "verified"
+
+
 @pytest.mark.parametrize('ifind_period,choice_period,expected_source', [
     ('20260630', '20251231', 'ifind'),
-    ('20251231', '20260630', 'choice'),
+    ('20251231', '20260630', 'ifind'),
     ('20271231', '20251231', 'choice'),
 ])
 def test_primary_snapshot_uses_latest_real_period_not_supplier_order(ifind_transport, monkeypatch, ifind_period, choice_period, expected_source):
+    """合格的当前 iFinD 字段不再为了找更新的 Choice 财期而重查。
+
+    未来或不合格的 iFinD 行仍允许 Choice 补当前财期，且不倒退到更旧财期；
+    合格字段不会被另一字段更新的 Choice 财期挤掉。
+    """
     config, response, calls = ifind_transport
     config.financial_primary_source = 'ifind'
     response['data']['answer'] = response['data']['answer'].replace('20251231', ifind_period)
@@ -168,8 +277,9 @@ def test_ifind_primary_conflict_blocks_rules_without_replacing_main_value(ifind_
     snapshot = build_fundamental_dim(ctx).financial_snapshot
     assert snapshot['revenue'].reading.source == 'ifind'
     assert snapshot['revenue'].reading.value == 4997710000
-    assert snapshot['revenue'].quality.status == 'conflict'
-    assert not snapshot['revenue'].rule_eligible
+    # 合格 iFinD 值不再重查 Choice：无第二来源即无冲突，按单源披露且不标 verified
+    assert snapshot['revenue'].quality.status == 'single_source'
+    assert snapshot['revenue'].rule_eligible
 
 
 def test_changing_primary_strategy_does_not_reuse_old_field_sources(ifind_transport):
@@ -408,7 +518,7 @@ def test_financial_report_api_accepts_real_snapshot_and_roundtrip(ifind_transpor
         downloaded = client.get(f'/api/v1/financial-analysis/reports/{rid}/markdown?download=1')
         assert body['markdown'] == reread['data']['markdown'] == downloaded.text
         import re
-        assert re.search(r'2997710000|29\.9771\s*亿', body['markdown'])
+        assert re.search(r'2997710000|29\.9771\s*亿|29\.98\s*亿', body['markdown'])
 
 
 def test_agent_stock_info_reuses_current_snapshot_quality(ifind_transport, monkeypatch):
@@ -439,7 +549,6 @@ def test_deep_report_retries_failed_verification_instead_of_day_cache(ifind_tran
     monkeypatch.setattr(data_tools, '_fetcher_manager_singleton', DataFetcherManager())
     monkeypatch.setattr(context, '_safe_quote', lambda *a: {})
     monkeypatch.setattr(context, '_safe_history', lambda *a: [])
-    monkeypatch.setattr(context, '_safe_chip', lambda *a: {})
     monkeypatch.setattr(context, '_safe_history_reports', lambda *a: [])
     monkeypatch.setattr(service, '_get_dual_track_adapter', lambda: None)
     monkeypatch.setattr(orchestrator, '_write_reflection_journals', lambda *a: None)

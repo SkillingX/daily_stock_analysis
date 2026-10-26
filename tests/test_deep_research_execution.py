@@ -117,7 +117,6 @@ def test_report_budget_bounds_real_stage_zero_source_http(monkeypatch: pytest.Mo
     thread.start()
     monkeypatch.setattr(context, '_safe_quote', lambda *args: {})
     monkeypatch.setattr(context, '_safe_history', lambda *args: [])
-    monkeypatch.setattr(context, '_safe_chip', lambda *args: {})
     monkeypatch.setattr(context, '_safe_history_reports', lambda *args: [])
     def financial(*args: object) -> dict[str, object]:
         try:

@@ -1131,20 +1131,6 @@ def _enrich_raw_data_from_llm_output(
     _intel = dash.get("intelligence")
     data_perspective = _dp if isinstance(_dp, dict) else {}
     intelligence = _intel if isinstance(_intel, dict) else {}
-    _chip = data_perspective.get("chip_structure")
-    chip_struct = _chip if isinstance(_chip, dict) else {}
-
-    if "chip_concentration" not in raw_data:
-        _conc = chip_struct.get("concentration")
-        if isinstance(_conc, (int, float)):
-            v = float(_conc)
-            if v >= 30:
-                raw_data["chip_concentration"] = "high"
-            elif v >= 15:
-                raw_data["chip_concentration"] = "medium"
-            else:
-                raw_data["chip_concentration"] = "low"
-
     if "news_sentiment" not in raw_data:
         for key in (
             "sentiment_summary",
@@ -1333,22 +1319,6 @@ def _merge_six_dim(raw_data: Dict[str, Any], six: Dict[str, Any]) -> None:
         v = six.get(src_key)
         if isinstance(v, list) and v:
             raw_data[dst_key] = [str(x) for x in v if x is not None]
-
-    # chip_concentration（数值 0-100 → high/medium/low）
-    if "chip_concentration" not in raw_data:
-        v = six.get("chip_concentration")
-        try:
-            if v is not None and v != "" and v != "null":
-                f = float(v)
-                if f >= 30:
-                    raw_data["chip_concentration"] = "high"
-                elif f >= 15:
-                    raw_data["chip_concentration"] = "medium"
-                else:
-                    raw_data["chip_concentration"] = "low"
-        except (TypeError, ValueError):
-            pass
-
 
 def _fundament_merge(raw_data: Dict[str, Any], fund: Dict[str, Any]) -> None:
     """Merge top-level context['fundamental'] keys into raw_data."""

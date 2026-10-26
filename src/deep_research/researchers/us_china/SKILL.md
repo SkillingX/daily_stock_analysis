@@ -2,7 +2,7 @@
 name: researcher_us_china
 display_name: 中美竞争研究员
 category: research
-required_tools: ['search_comprehensive_intel', 'verify_supply_chain_evidence']
+required_tools: ['search_comprehensive_intel', 'get_stock_info']
 ---
 
 # 中美竞争研究员

@@ -29,7 +29,6 @@ _INTEL_TOOLS = {
 }
 _SUPPLY_CHAIN_TOOLS = {
     "search_comprehensive_intel",
-    "verify_supply_chain_evidence",
     "get_sector_rankings",
     "get_stock_info",
 }
@@ -41,10 +40,6 @@ def _build_registry(source_registry: Any, names: set[str]) -> Any:
     for tool in source_registry.list_tools():
         if tool.name in names:
             registry.register(tool)
-    if "verify_supply_chain_evidence" in names and registry.get("verify_supply_chain_evidence") is None:
-        # This verifier uses public Eastmoney/THS pages, not retired iFinD/MCP APIs.
-        from src.agent.tools.supply_chain_tools import verify_supply_chain_evidence_tool
-        registry.register(verify_supply_chain_evidence_tool)
     missing = names - set(registry.list_names())
     if missing:
         logger.warning("[DualTrack] 探索维度缺失工具: %s", sorted(missing))
@@ -214,11 +209,11 @@ def run_supply_chain_agent(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     max_steps: int = 8,
 ) -> Dict[str, Any]:
-    """L4 产业链探索：图谱/定位/瓶颈 + 双源校验。"""
+    """L4 产业链探索：图谱/定位/瓶颈；概念归属取 iFinD 最新（公开双源校验已退役）。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）执行产业链调研并直接输出 JSON：\n"
         "1) 用 search_comprehensive_intel 调研产业链位置与瓶颈，get_sector_rankings 看板块归属，"
-        "verify_supply_chain_evidence 做东财+同花顺双源校验，get_stock_info 取基本面佐证；\n"
+        "get_stock_info 取基本面与最新概念归属（iFinD，概念标签不是客户事实）；\n"
         "2) 输出 JSON 字段：company_position(字符串，必填：公司在产业链中的环节定位)、"
         "chain_map(数组，元素：{level(上/中/下游之一), companies(字符串数组), concentration(可选字符串)})、"
         "chokepoints(数组，元素：{type(取 patent/capacity/geo/tech/cert 之一), description(字符串), "
@@ -243,14 +238,14 @@ def run_supply_chain_agent(
 # ---------------------------------------------------------------------------
 
 _TECHNICAL_TOOLS = {"get_daily_history", "analyze_trend"}
-_CAPITAL_TOOLS = {"get_capital_flow", "get_chip_distribution", "get_stock_info"}
-_SENTIMENT_TOOLS = {"search_stock_news", "search_market_discussion"}
+_CAPITAL_TOOLS = {"get_capital_flow", "get_stock_info"}
+_SENTIMENT_TOOLS = {"search_stock_news"}
 _OWNERSHIP_TOOLS = {
     "search_comprehensive_intel",
     "search_stock_news",
     "search_knowledge_base",
 }
-_US_CHINA_TOOLS = {"search_comprehensive_intel", "verify_supply_chain_evidence"}
+_US_CHINA_TOOLS = {"search_comprehensive_intel", "get_stock_info"}
 
 
 def _chanlun_engine_facts(stock_code: str, history: Optional[list[dict[str, Any]]] = None) -> str:
@@ -354,16 +349,15 @@ def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=N
 
 
 def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8) -> Dict[str, Any]:
-    """资金研究员：资金流向 + 机构/大户持仓变动 + 筹码成本结构。"""
+    """资金研究员：资金流向 + 机构/大户持仓变动。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON：\n"
-        "1) get_capital_flow 取主力资金流（当日/5日/10日），get_chip_distribution 取筹码结构，"
+        "1) get_capital_flow 取主力资金流（当日/5日/10日），"
         "get_stock_info 取机构持仓与基本面佐证；\n"
         "2) 输出 JSON：flow_summary、flow_score(0-100)、institution_summary"
-        "（机构/大户持仓变动解读）、institution_score(0-100)、chip_summary"
-        "（筹码成本结构：获利盘/集中度/平均成本解读）、chip_score(0-100)、"
-        "score(三项加权总分)、每项说明含具体数字；取不到的项 score 填 null；"
-        "narrative(50-100 字结论：必须含至少 2 个硬数字——净流入金额/获利盘比例/成本价等，禁止只给分无论据)。"
+        "（机构/大户持仓变动解读）、institution_score(0-100)、"
+        "score(两项加权总分)、每项说明含具体数字；取不到的项 score 填 null；"
+        "narrative(50-100 字结论：必须含至少 2 个硬数字——净流入金额/持仓变动比例等，禁止只给分无论据)。"
     )
     tools = _CAPITAL_TOOLS
     flow = None
@@ -408,15 +402,13 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
 
 
 def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
-    """情绪研究员：机构评价 + 社区评价（雪球/微博/股吧，强制来源等级）。"""
+    """情绪研究员：机构评价（评级/目标价/分歧点，强制来源等级）。"""
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做情绪面深度分析并直接输出 JSON：\n"
-        "1) search_stock_news 查机构研报/评级观点，search_market_discussion 查雪球/微博/股吧讨论；\n"
+        "1) search_stock_news 查机构研报/评级观点；\n"
         "2) 输出 JSON：institute_view(机构评价分层：评级/目标价/分歧点)、institute_score(0-100)、"
-        "community_view(社区情绪：看多/看空比例与典型观点，带来源等级标签)、"
-        "community_score(0-100)、unverified_count(社区传闻条数)、"
-        "score(加权总分)、narrative(50-100 字结论：必须含至少 1 个硬数字——机构数/目标价家数/多空比例，"
-        "取不到数字就如实写「缺 XX 数据」，禁止只给分无论据)；社区信息只作分歧线索，不得写成确认。"
+        "score(总分)、narrative(50-100 字结论：必须含至少 1 个硬数字——机构数/目标价家数，"
+        "取不到数字就如实写「缺 XX 数据」，禁止只给分无论据)。"
     )
     return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
 
@@ -485,7 +477,7 @@ def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=No
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）做中美产业链竞争分析并直接输出 JSON：\n"
         "1) search_comprehensive_intel 调研出口管制/制裁/平行链影响，"
-        "verify_supply_chain_evidence 校验板块归属；\n"
+        "get_stock_info 取最新概念归属（只作标签，不作为供应链事实）；\n"
         "2) 输出 JSON：applicability(强相关/低相关/不适用+一句理由)、role_cn(中国链位置)、"
         "role_us(美国/全球链位置)、export_control(出口管制影响)、sanction_risk(制裁风险)、"
         "substitution(国产替代/平行替换进度与阶段标签)、"

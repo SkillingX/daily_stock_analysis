@@ -63,7 +63,6 @@ FULL_TOOLS = [
     {"tool": "get_sector_rankings"},
     {"tool": "get_stock_info"},
     {"tool": "analyze_trend"},
-    {"tool": "verify_supply_chain_evidence"},
 ]
 
 

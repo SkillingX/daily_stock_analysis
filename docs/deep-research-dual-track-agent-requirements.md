@@ -87,7 +87,7 @@ POST /api/v1/deep-research/generate/stream (SSE，现有端点保留)
 | # | 维度 | 类型 | 职责 | 后台深入分析代码（新建/复用） | 输出契约要点 |
 |---|------|------|------|------|------|
 | S1 | 信号 signal | 叙述型 | 评级、目标价、信号类型、置信度 | 新建信号合成器：输入 S2/S3/L3 输出，复用 `src/schemas/decision_action.py` 动作枚举 + S1↔L3 一致性映射表 | `signal_type`、`rating`、`target_price`、`confidence`、`one_sentence` |
-| S2 | 数据 data | 纯规则 | 趋势/价格位置/量能/筹码四类硬数据 | 复用 `data_provider/` + `analyze_trend`/`get_chip_distribution`；新建数据透视装配器（`report_schema.py` 的 `DataPerspective` 同构） | `trend_status`/`price_position`/`volume_analysis`/`chip_structure` + `as_of` |
+| S2 | 数据 data | 纯规则 | 趋势/价格位置/量能三类硬数据（筹码已退休，issue #46） | 复用 `data_provider/` + `analyze_trend`；新建数据透视装配器（`report_schema.py` 的 `DataPerspective` 同构） | `trend_status`/`price_position`/`volume_analysis` + `as_of`（`chip_structure` 字段保留兼容为空） |
 | S3 | 情报 intel | **探索型** | 新闻/公告/风险警报/催化剂/业绩展望/情绪 | 复用 `search_stock_news`/`search_comprehensive_intel`；新建来源等级标注器（旧 prompt §一.3 七级标签机器化） | `Intelligence` 同构 + **每条情报带来源等级标签** + `unverified` 计数 |
 | S4 | 计划 plan | 叙述型 | 狙击四点位、仓位策略、行动清单 | 新建：**ATR/波动率规则计算点位**（理想买=支撑+0.5×ATR 类规则）+ `src/schemas/risk_check.py` 风控 skill（已有 icontract 范式）算仓位；LLM 仅叙述 | `SniperPoints`/`PositionStrategy`/`action_checklist` + 点位计算参数 |
 | S5 | 阶段 phase | 纯规则 | 行动窗口/立即行动/观察条件/下次检查 | 新建：复用 `src/core/trading_calendar.py`（交易日历）+ 盘后/盘中时段判定（analyzer `_phase_aware_quote_labels` 思路） | `PhaseDecision` 同构 |

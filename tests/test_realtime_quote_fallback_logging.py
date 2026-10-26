@@ -60,7 +60,6 @@ def _make_pipeline(enable_realtime_quote: bool, realtime_quote=None) -> StockAna
     pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
     pipeline.config = SimpleNamespace(
         enable_realtime_quote=enable_realtime_quote,
-        enable_chip_distribution=True,
         agent_mode=False,
         agent_skills=[],
         fundamental_stage_timeout_seconds=1.5,
@@ -69,7 +68,6 @@ def _make_pipeline(enable_realtime_quote: bool, realtime_quote=None) -> StockAna
     pipeline.fetcher_manager = MagicMock()
     pipeline.fetcher_manager.get_stock_name.return_value = "贵州茅台"
     pipeline.fetcher_manager.get_realtime_quote.return_value = realtime_quote
-    pipeline.fetcher_manager.get_chip_distribution.return_value = None
     pipeline.fetcher_manager.get_fundamental_context.return_value = {
         "source_chain": [],
         "coverage": {},

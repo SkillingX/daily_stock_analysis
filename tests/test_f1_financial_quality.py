@@ -206,7 +206,6 @@ def test_direct_fuyao_slow_body_keeps_shared_stage_deadline(monkeypatch: pytest.
     monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", manager)
     monkeypatch.setattr(context_module, "_safe_quote", lambda *args: {})
     monkeypatch.setattr(context_module, "_safe_history", lambda *args: [])
-    monkeypatch.setattr(context_module, "_safe_chip", lambda *args: {})
     monkeypatch.setattr(context_module, "_safe_history_reports", lambda *args: [])
     try:
         start = monotonic()
@@ -351,7 +350,20 @@ def test_public_overview_passes_existing_quality_without_provider_io(financial_s
     raw = data_tools._get_fetcher_manager().get_fundamental_context("600519")
     raw["growth"]["field_meta"]["revenue_yoy"]["raw_value"] = "secret-supplier-body"
     raw["growth"]["field_meta"]["revenue_yoy"]["quality"] = {"status": status}
-    artifacts = PipelineAnalysisArtifacts("600519", "样本", "cn", None, {}, {}, None, None, None, raw, None, 0, {})
+    artifacts = PipelineAnalysisArtifacts(
+        code="600519",
+        stock_name="样本",
+        market="cn",
+        phase=None,
+        base_context={},
+        enhanced_context={},
+        realtime_quote=None,
+        trend_result=None,
+        fundamental_context=raw,
+        news_context=None,
+        news_result_count=0,
+        metadata={},
+    )
     pack = AnalysisContextBuilder.build(artifacts)
     overview = render_analysis_context_pack_overview(pack)
     assert "secret-supplier-body" not in json.dumps(overview)

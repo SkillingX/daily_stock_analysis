@@ -5,9 +5,8 @@ from typing import Any
 import pytest
 
 from src.deep_research.researchers.ownership import parse as parse_ownership
-from src.deep_research_dims.context import SharedContext, _safe_chip, _safe_fundamental
+from src.deep_research_dims.context import SharedContext, _safe_fundamental
 from src.deep_research_dims.render import build_view, render_markdown
-from src.deep_research_dims.six_dim import _chip_from_context
 from tests.test_deep_research_dims import _all_default_dims
 
 _CORE_PAYLOAD: dict[str, Any] = {
@@ -198,47 +197,3 @@ def test_partial_indicators_list_the_missing_fields(
     assert "已取得 6/7 项" in notice and "市盈率TTM" in notice and "pe_ttm" not in notice
     assert "部分补充查询未完成" not in notice  # 无来源错误时不冒充查询失败。
 
-
-def test_chip_states_disclose_adoption_and_gaps(monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.agent.tools import data_tools
-
-    real_chip = SimpleNamespace(
-        code="300260", date="2026-10-20", source="akshare", profit_ratio=0.6, avg_cost=50.0,
-        cost_90_low=40.0, cost_90_high=60.0, concentration_90=0.4,
-        cost_70_low=45.0, cost_70_high=55.0, concentration_70=0.2,
-        to_dict=lambda: {"code": "300260", "source": "akshare", "avg_cost": 50.0},
-    )
-    estimated = {"source": "estimated_from_history", "estimated": True, "avg_cost": 51.0, "profit_ratio": 0.5}
-
-    def manager(chip: Any):
-        return SimpleNamespace(get_chip_distribution=lambda code: chip)
-
-    monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: manager(real_chip))
-    ctx_real = SharedContext("300260", "新莱应材", "2026-10-20")
-    assert _safe_chip("300260", ctx_real) and not any("筹码" in item for item in ctx_real.limitations)
-
-    monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: manager(None))
-    monkeypatch.setattr(data_tools, "_estimate_chip_fallback", lambda code: dict(estimated))
-    ctx_estimated = SharedContext("300260", "新莱应材", "2026-10-20")
-    chip = _safe_chip("300260", ctx_estimated)
-    assert chip["source"] == "estimated_from_history" and chip["estimated"] is True
-    assert ctx_estimated.limitations == ["原始筹码分布数据未取得，资金面采用历史行情估算（精度有限）"]
-
-    monkeypatch.setattr(data_tools, "_estimate_chip_fallback", lambda code: None)
-    ctx_missing = SharedContext("300260", "新莱应材", "2026-10-20")
-    assert _safe_chip("300260", ctx_missing) == {}
-    assert ctx_missing.limitations == ["筹码分布数据缺失"]
-
-
-def test_estimated_chip_is_labelled_in_six_dim_and_report() -> None:
-    ctx = SharedContext("300260", "新莱应材", "2026-10-20")
-    ctx.quote = {"price": 52.0}
-    ctx.chip = {"source": "estimated_from_history", "estimated": True, "avg_cost": 50.0, "profit_ratio": 0.6}
-    entry = _chip_from_context(ctx)
-    assert entry is not None and entry["summary"].startswith("（历史行情估算，精度有限）")
-
-    ctx.limitations = ["原始筹码分布数据未取得，资金面采用历史行情估算（精度有限）"]
-    dims = _all_default_dims()
-    markdown = render_markdown(build_view(ctx.stock_name, ctx.stock_code, ctx.as_of, ctx.limitations, dims, []))
-    assert "原始筹码分布数据未取得，资金面采用历史行情估算" in markdown
-    assert "快照不缓存" not in markdown

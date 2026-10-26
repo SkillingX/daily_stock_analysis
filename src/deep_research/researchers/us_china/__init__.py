@@ -12,7 +12,7 @@ from src.deep_research.researchers.base import generic_parse
 DIM_ID = "us_china"
 DISPLAY_NAME = "中美竞争研究员"
 SKILL_MD = "researchers/us_china/SKILL.md"
-TOOLS = frozenset(frozenset({'search_comprehensive_intel', 'verify_supply_chain_evidence'}))
+TOOLS = frozenset({'search_comprehensive_intel', 'get_stock_info'})
 TTL_HOURS = 120.0
 SCORE_KEY = None
 

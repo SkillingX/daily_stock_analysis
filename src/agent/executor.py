@@ -70,9 +70,8 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 - `get_realtime_quote` 获取实时行情
 - `get_daily_history` 获取历史K线
 
-**第二阶段 · 技术与筹码**（等第一阶段结果返回后执行）
+**第二阶段 · 技术面**（等第一阶段结果返回后执行）
 - `analyze_trend` 获取技术指标
-- `get_chip_distribution` 获取筹码分布
 
 **第三阶段 · 情报搜索**（等前两阶段完成后执行）
 - `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
@@ -118,8 +117,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
         "data_perspective": {{
             "trend_status": {{"ma_alignment": "", "is_bullish": true, "trend_score": 0}},
             "price_position": {{"current_price": 0, "ma5": 0, "ma10": 0, "ma20": 0, "bias_ma5": 0, "bias_status": "", "support_level": 0, "resistance_level": 0}},
-            "volume_analysis": {{"volume_ratio": 0, "volume_status": "", "turnover_rate": 0, "volume_meaning": ""}},
-            "chip_structure": {{"profit_ratio": 0, "avg_cost": 0, "concentration": 0, "chip_health": ""}}
+            "volume_analysis": {{"volume_ratio": 0, "volume_status": "", "turnover_rate": 0, "volume_meaning": ""}}
         }},
         "intelligence": {{
             "latest_news": "",
@@ -169,7 +167,6 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 - ✅ 多头排列：MA5 > MA10 > MA20
 - ✅ 低乖离率：<2%，最佳买点
 - ✅ 缩量回调或放量突破
-- ✅ 筹码集中健康
 - ✅ 消息面有利好催化
 
 ### 买入（60-79分）：
@@ -200,7 +197,7 @@ LEGACY_DEFAULT_AGENT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mar
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
@@ -220,9 +217,8 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 - `get_realtime_quote` 获取实时行情
 - `get_daily_history` 获取历史K线
 
-**第二阶段 · 技术与筹码**（等第一阶段结果返回后执行）
+**第二阶段 · 技术面**（等第一阶段结果返回后执行）
 - `analyze_trend` 获取技术指标
-- `get_chip_distribution` 获取筹码分布
 
 **第三阶段 · 情报搜索**（等前两阶段完成后执行）
 - `search_stock_news` 搜索最新资讯、减持、业绩预告等风险信号
@@ -268,8 +264,7 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
         "data_perspective": {{
             "trend_status": {{"ma_alignment": "", "is_bullish": true, "trend_score": 0}},
             "price_position": {{"current_price": 0, "ma5": 0, "ma10": 0, "ma20": 0, "bias_ma5": 0, "bias_status": "", "support_level": 0, "resistance_level": 0}},
-            "volume_analysis": {{"volume_ratio": 0, "volume_status": "", "turnover_rate": 0, "volume_meaning": ""}},
-            "chip_structure": {{"profit_ratio": 0, "avg_cost": 0, "concentration": 0, "chip_health": ""}}
+            "volume_analysis": {{"volume_ratio": 0, "volume_status": "", "turnover_rate": 0, "volume_meaning": ""}}
         }},
         "intelligence": {{
             "latest_news": "",
@@ -347,7 +342,7 @@ AGENT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数
 ## 可操作性与稳定性约束
 
 - 不得仅因为单日涨跌或评分跨线就在“买入/卖出”之间剧烈切换。
-- 操作建议必须同时参考价格位置（支撑/压力位）、量能/筹码、主力资金流向和风险事件。
+- 操作建议必须同时参考价格位置（支撑/压力位）、量能、主力资金流向和风险事件。
 - 股价位于支撑与压力之间、资金流不明确时，优先输出“持有/震荡/观望/洗盘观察”等可执行的中性建议；`decision_type` 仍保持 `hold`。
 - 只有在接近支撑确认或有效突破压力，且资金流/量价配合时，才能给出买入；接近压力且资金流出时不得追买。
 - 只有在跌破关键支撑、主力资金持续流出或风险显著放大时，才能给出卖出/减仓。
@@ -369,9 +364,8 @@ LEGACY_DEFAULT_CHAT_SYSTEM_PROMPT = """你是一位专注于趋势交易的{mark
 - 调用 `get_realtime_quote` 获取实时行情和当前价格
 - 调用 `get_daily_history` 获取近期历史K线数据
 
-**第二阶段 · 技术与筹码**（等第一阶段结果返回后再执行）
+**第二阶段 · 技术面**（等第一阶段结果返回后再执行）
 - 调用 `analyze_trend` 获取 MA/MACD/RSI 等技术指标
-- 调用 `get_chip_distribution` 获取筹码分布结构
 
 **第三阶段 · 情报搜索**（等前两阶段完成后再执行）
 - 调用 `search_stock_news` 搜索最新新闻公告、减持、业绩预告等风险信号
@@ -406,9 +400,8 @@ CHAT_SYSTEM_PROMPT = """你是一位{market_role}投资分析 Agent，拥有数�
 - 调用 `get_realtime_quote` 获取实时行情和当前价格
 - 调用 `get_daily_history` 获取近期历史K线数据
 
-**第二阶段 · 技术与筹码**（等第一阶段结果返回后再执行）
+**第二阶段 · 技术面**（等第一阶段结果返回后再执行）
 - 调用 `analyze_trend` 获取 MA/MACD/RSI 等技术指标
-- 调用 `get_chip_distribution` 获取筹码分布结构
 
 **第三阶段 · 情报搜索**（等前两阶段完成后再执行）
 - 调用 `search_stock_news` 搜索最新新闻公告、减持、业绩预告等风险信号
@@ -827,8 +820,6 @@ class AgentExecutor:
             # Inject pre-fetched context data to avoid redundant fetches
             if context.get("realtime_quote"):
                 parts.append(f"\n[系统已获取的实时行情]\n{json.dumps(context['realtime_quote'], ensure_ascii=False)}")
-            if context.get("chip_distribution"):
-                parts.append(f"\n[系统已获取的筹码分布]\n{json.dumps(context['chip_distribution'], ensure_ascii=False)}")
             if context.get("news_context"):
                 parts.append(f"\n[系统已获取的新闻与舆情情报]\n{context['news_context']}")
 

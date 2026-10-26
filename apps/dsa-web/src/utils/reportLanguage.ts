@@ -74,7 +74,7 @@ const REPORT_TEXT = {
     // Dimension sub-captions (locale-aware, displayed beneath the dimension title)
     dimCaptionSupplyChain: '上下游链路与卡点评估',
     dimCaptionFundamental: '估值、盈利与成长性',
-    dimCaptionCapital: '资金流向与筹码集中度',
+    dimCaptionCapital: '资金流向与机构持仓变动',
     dimCaptionTechnical: '趋势、量能、波动',
     dimCaptionSentiment: '分析师共识与新闻情绪',
     dimCaptionMacro: '货币与地缘宏观环境',
@@ -156,7 +156,7 @@ const REPORT_TEXT = {
     weightShort: 'W',
     dimCaptionSupplyChain: 'Upstream/downstream positioning & chokepoints',
     dimCaptionFundamental: 'Valuation, profitability & growth',
-    dimCaptionCapital: 'Capital flow & chip concentration',
+    dimCaptionCapital: 'Capital flow & institutional holdings',
     dimCaptionTechnical: 'Trend, volume & volatility',
     dimCaptionSentiment: 'Analyst consensus & news sentiment',
     dimCaptionMacro: 'Monetary policy & geopolitical backdrop',
@@ -190,8 +190,6 @@ export type SixDimensionEnumKey =
   | 'rising' | 'falling' | 'oscillating'
   // volume_trend
   | 'increasing' | 'stable' | 'decreasing'
-  // chip_concentration
-  | 'chip_high' | 'chip_medium' | 'chip_low'
   // regulatory_risk
   | 'risk_low' | 'risk_medium' | 'risk_high'
   // chain_position
@@ -219,7 +217,6 @@ export const SIX_DIMENSION_ENUM_LABELS: { [lang in ReportLanguage]: { [K in SixD
     bullish: '多头', bearish: '空头', ma_neutral: '中性走势',
     rising: '上升', falling: '下降', oscillating: '震荡',
     increasing: '放大', stable: '平稳', decreasing: '缩小',
-    chip_high: '高', chip_medium: '中', chip_low: '低',
     risk_high: '高', risk_medium: '中', risk_low: '低',
     upstream: '上游', bottleneck: '卡点', midstream: '中游', downstream: '下游', commodity: '大宗',
     patent: '专利', technology: '技术', brand: '品牌', network: '网络效应',
@@ -239,7 +236,6 @@ export const SIX_DIMENSION_ENUM_LABELS: { [lang in ReportLanguage]: { [K in SixD
     bullish: 'Bullish', bearish: 'Bearish', ma_neutral: 'Neutral trend',
     rising: 'Rising', falling: 'Falling', oscillating: 'Oscillating',
     increasing: 'Up', stable: 'Stable', decreasing: 'Down',
-    chip_high: 'High', chip_medium: 'Medium', chip_low: 'Low',
     risk_high: 'High', risk_medium: 'Medium', risk_low: 'Low',
     upstream: 'Upstream', bottleneck: 'Bottleneck', midstream: 'Midstream', downstream: 'Downstream', commodity: 'Commodity',
     patent: 'Patent', technology: 'Technology', brand: 'Brand', network: 'Network',
@@ -268,12 +264,10 @@ export const translateSixDimensionEnum = (
   const labels = SIX_DIMENSION_ENUM_LABELS[normalizeReportLanguage(language)];
   const key = value.toLowerCase();
   // Try the canonical lookup first; for ambiguous tokens
-  // (high/medium/low) try the chip_/risk_ variants in turn.
+  // (high/medium/low) try the risk_ variants.
   let translated: string | undefined = (labels as Record<string, string>)[key];
   if (!translated && (key === 'high' || key === 'low' || key === 'medium')) {
-    translated =
-      (labels as Record<string, string>)[`chip_${key}`] ??
-      (labels as Record<string, string>)[`risk_${key}`];
+    translated = (labels as Record<string, string>)[`risk_${key}`];
   }
   return translated ?? value;
 };
@@ -335,9 +329,7 @@ export const localizeEnumInSummary = (
       translated = (dict as Record<string, string>)['ma_neutral'];
     }
     if (!translated && (key === 'high' || key === 'low' || key === 'medium')) {
-      translated =
-        (dict as Record<string, string>)[`chip_${key}`] ??
-        (dict as Record<string, string>)[`risk_${key}`];
+      translated = (dict as Record<string, string>)[`risk_${key}`];
     }
     return translated;
   };

@@ -45,9 +45,6 @@ from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
     get_signal_level,
-    get_chip_unavailable_reason,
-    is_chip_structure_unavailable,
-    localize_chip_health,
     localize_operation_advice,
     localize_trend_prediction,
     normalize_report_language,
@@ -1299,7 +1296,6 @@ class NotificationService(
                     trend_data = data_persp.get("trend_status", {})
                     price_data = data_persp.get("price_position", {})
                     vol_data = data_persp.get("volume_analysis", {})
-                    chip_data = data_persp.get("chip_structure", {})
 
                     report_lines.extend(
                         [
@@ -1349,38 +1345,6 @@ class NotificationService(
                                 "",
                             ]
                         )
-                    # 筹码结构
-                    if chip_data:
-                        if is_chip_structure_unavailable(chip_data):
-                            report_lines.extend(
-                                [
-                                    f"**{labels['chip_label']}**: {get_chip_unavailable_reason(chip_data, report_language)}",
-                                    "",
-                                ]
-                            )
-                        else:
-                            chip_health = localize_chip_health(
-                                chip_data.get("chip_health", "N/A"), report_language
-                            )
-                            report_lines.extend(
-                                [
-                                    f"**{labels['chip_label']}**: {chip_data.get('profit_ratio', 'N/A')} | {chip_data.get('avg_cost', 'N/A')} | "
-                                    f"{chip_data.get('concentration', 'N/A')} {chip_health}",
-                                    "",
-                                ]
-                            )
-                    else:
-                        chip_unavailable_reason = get_chip_unavailable_reason(
-                            data_persp, report_language
-                        )
-                        if chip_unavailable_reason:
-                            report_lines.extend(
-                                [
-                                    f"**{labels['chip_label']}**: {chip_unavailable_reason}",
-                                    "",
-                                ]
-                            )
-
                 # ========== 作战计划 ==========
                 battle = dashboard.get("battle_plan", {}) if dashboard else {}
                 if battle:
@@ -2179,6 +2143,7 @@ class NotificationService(
         self._append_financial_summary(lines, blocks, labels)
         self._append_shareholder_return(lines, blocks, labels)
         self._append_related_boards(lines, blocks, labels)
+        self._append_concept_membership(lines, result)
 
     def _append_financial_summary(
         self,
@@ -2369,6 +2334,31 @@ class NotificationService(
             lines.append("|:-----|:----:|")
             for name, board_type, _, _ in prepared:
                 lines.append(f"| {name} | {board_type} |")
+        lines.append("")
+
+    def _append_concept_membership(self, lines: List[str], result: AnalysisResult) -> None:
+        """最新概念归属单独成段，不写进所属板块，也不把缺失说成双源校验失败。"""
+        ctx = getattr(result, "fundamental_context", None)
+        membership = ctx.get("concept_membership") if isinstance(ctx, dict) else None
+        if not isinstance(membership, dict):
+            return
+        names = [
+            str(item.get("name")).strip()
+            for item in membership.get("concepts") or []
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        error = str(membership.get("error") or "").strip()
+        if not names and not error:
+            return
+        lines.append("### 最新概念归属")
+        lines.append("")
+        if names:
+            lines.append(
+                f"来源：{membership.get('source') or 'ifind'}（{membership.get('as_of_nature') or 'latest'}）"
+            )
+            lines.append("、".join(names))
+        else:
+            lines.append(f"未取得：{error}")
         lines.append("")
 
     def _should_use_image_for_channel(

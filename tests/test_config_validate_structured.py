@@ -560,27 +560,50 @@ class TestValidateStructuredNotification:
             for issue in issues
         )
 
-    def test_no_search_engine_is_info(self):
-        cfg = _make_config(searxng_public_instances_enabled=False)
+    def test_no_plan_search_is_info(self):
+        cfg = _make_config(
+            coding_plan_search_provider="minimax",
+            minimax_api_keys=[],
+            zhipu_api_key=None,
+            searxng_public_instances_enabled=False,
+        )
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
-        assert any("搜索引擎" in i.message for i in info)
-        search_issue = next(i for i in info if "搜索引擎" in i.message)
-        assert search_issue.field == "BOCHA_API_KEYS"
+        search_issue = next(i for i in info if "套餐搜索能力" in i.message)
+        assert search_issue.field == "CODING_PLAN_SEARCH_PROVIDER"
 
-    def test_searxng_configured_no_search_info(self):
-        """When searxng_base_urls is configured, no 'unconfigured search engine' info."""
-        cfg = _make_config(searxng_base_urls=["https://searx.example.org"])
+    def test_searxng_configuration_does_not_enable_search(self):
+        """Retired SearXNG configuration must not count as a search capability."""
+        cfg = _make_config(
+            coding_plan_search_provider="minimax",
+            minimax_api_keys=[],
+            zhipu_api_key=None,
+            searxng_base_urls=["https://searx.example.org"],
+        )
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
-        assert not any("搜索引擎" in i.message and "未配置" in i.message for i in info)
+        assert any("套餐搜索能力" in i.message for i in info)
 
-    def test_public_searxng_enabled_no_search_info(self):
-        """Public SearXNG mode also counts as search capability."""
-        cfg = _make_config(searxng_public_instances_enabled=True)
+    def test_retired_public_searxng_does_not_enable_search(self):
+        cfg = _make_config(
+            coding_plan_search_provider="minimax",
+            minimax_api_keys=[],
+            zhipu_api_key=None,
+            searxng_public_instances_enabled=True,
+        )
         issues = cfg.validate_structured()
         info = [i for i in issues if i.severity == "info"]
-        assert not any("搜索引擎" in i.message and "未配置" in i.message for i in info)
+        assert any("套餐搜索能力" in i.message for i in info)
+
+    def test_configured_plan_search_suppresses_search_info(self):
+        cfg = _make_config(
+            coding_plan_search_provider="minimax",
+            minimax_api_keys=["fixture"],
+            zhipu_api_key=None,
+        )
+        issues = cfg.validate_structured()
+        info = [i for i in issues if i.severity == "info"]
+        assert not any("套餐搜索能力" in i.message for i in info)
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,6 @@ class SupplyChainAgent(BaseAgent):
     max_steps = 5
     tool_names = [
         "get_stock_info",
-        "get_concept_boards",
         "get_institutional_holdings",
         "get_northbound_flow",
     ]
@@ -42,7 +41,7 @@ competitive moat, and identify key risks.
 
 ## Workflow
 1. Call get_stock_info to get basic company information (industry, main business)
-2. Call get_concept_boards to understand which concept/sector themes the stock belongs to
+2. Read concept membership from get_stock_info (iFinD latest concepts; labels are not customer facts)
 3. Call get_institutional_holdings to check major institutional holders and their changes
 4. Call get_northbound_flow to check foreign capital flow trends
 5. Analyze supply chain positioning and produce a structured JSON opinion
@@ -120,7 +119,7 @@ Return **only** a JSON object:
         parts.append(
             "Steps:\n"
             "1. Call get_stock_info to get industry and main business info.\n"
-            "2. Call get_concept_boards to understand sector themes.\n"
+            "2. Read concept membership from get_stock_info (iFinD latest concepts).\n"
             "3. Call get_institutional_holdings to check major holders.\n"
             "4. Call get_northbound_flow to check foreign capital flow.\n"
             "5. Output the JSON opinion including supply chain positioning analysis."

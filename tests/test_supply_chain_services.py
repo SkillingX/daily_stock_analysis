@@ -181,13 +181,13 @@ class TestScoreTool:
 class TestToolMetadata:
     def test_supply_chain_tools(self):
         # v3 增 6 个深度小节工具 → 共 11 个工具
-        assert len(ALL_SUPPLY_CHAIN_TOOLS) == 11
+        # issue #45 退役 verify_supply_chain_evidence 后为 10 个
+        assert len(ALL_SUPPLY_CHAIN_TOOLS) == 10
         names = {t.name for t in ALL_SUPPLY_CHAIN_TOOLS}
         assert names == {
             "score_supply_chain_bottleneck",
             "search_semianalysis",
             "search_clue_hype",
-            "verify_supply_chain_evidence",
             "search_supply_chain_kb",
             # [v3] 深度小节工具
             "analyze_product_matrix",

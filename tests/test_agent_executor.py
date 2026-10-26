@@ -133,7 +133,6 @@ def _build_analysis_context_pack_summary(
         if realtime_quote is not None
         else {"price": 1880.0, "source": "mock_quote"},
         trend_result={"trend_status": "available"},
-        chip_data={"source": "mock_chip", "date": "2026-03-26"},
         fundamental_context=fundamental_context
         if fundamental_context is not None
         else {

@@ -126,34 +126,6 @@ class TestTushareFetcherFollowUps(unittest.TestCase):
         self.assertEqual(bottom, [{"name": "消费", "change_pct": -0.6}])
         self.assertEqual(rate_limit_mock.call_count, 2)
 
-    def test_get_chip_distribution_rate_limits_all_tushare_calls(self) -> None:
-        fetcher = self._make_fetcher()
-        fetcher._api.trade_cal.return_value = pd.DataFrame(
-            {"cal_date": ["20260317", "20260314"], "is_open": [1, 1]}
-        )
-        fetcher._api.cyq_chips.return_value = pd.DataFrame(
-            {
-                "price": [9.0, 10.0, 11.0],
-                "percent": [20.0, 50.0, 30.0],
-            }
-        )
-        fetcher._api.daily.return_value = pd.DataFrame({"close": [10.5]})
-
-        with patch.object(fetcher, "_get_china_now", return_value=datetime(2026, 3, 17, 20, 0)), patch.object(
-            fetcher, "_check_rate_limit"
-        ) as rate_limit_mock:
-            chip = fetcher.get_chip_distribution("600519")
-
-        self.assertIsNotNone(chip)
-        if chip is None:
-            self.fail("expected chip distribution data")
-        self.assertEqual(chip.date, "2026-03-17")
-        self.assertAlmostEqual(chip.profit_ratio, 0.7)
-        self.assertAlmostEqual(chip.avg_cost, 10.1)
-        self.assertAlmostEqual(chip.concentration_90, 0.1)
-        self.assertAlmostEqual(chip.concentration_70, 0.1)
-        self.assertEqual(rate_limit_mock.call_count, 3)
-
     def test_convert_stock_code_accepts_exchange_prefixed_a_share(self) -> None:
         fetcher = self._make_fetcher()
 

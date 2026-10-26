@@ -584,7 +584,6 @@ class TestAgentResultConversion(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -650,6 +649,70 @@ class TestAgentResultConversion(unittest.TestCase):
         self.assertEqual(result.decision_type, "hold")
         self.assertIn("agent:gemini", result.data_sources)
         self.assertIsNotNone(result.dashboard)
+
+    def test_agent_chip_structure_stripped_through_parse_adopt_render(self):
+        """Issue #46：Agent 路径完整链路（parse → adopt → render）不携带退休的筹码块。"""
+        pipeline = self._make_pipeline()
+
+        from src.agent.executor import AgentResult
+        from src.agent.runner import parse_dashboard_json
+        from src.enums import ReportType
+        from src.services.report_renderer import render
+
+        content = json.dumps(
+            {
+                "sentiment_score": 60,
+                "operation_advice": "持有",
+                "dashboard": {
+                    "core_conclusion": {"one_sentence": "观察"},
+                    "data_perspective": {
+                        "chip_structure": {
+                            "profit_ratio": "80%",
+                            "avg_cost": 30,
+                            "concentration": "10%",
+                            "chip_health": "健康",
+                        }
+                    },
+                },
+            },
+            ensure_ascii=False,
+        )
+        dashboard = parse_dashboard_json(content)
+        self.assertIsNotNone(dashboard)
+
+        agent_result = AgentResult(
+            success=True,
+            content=content,
+            dashboard=dashboard,
+            tool_calls_log=[],
+            total_steps=3,
+            total_tokens=500,
+            provider="gemini",
+        )
+
+        result = pipeline._agent_result_to_analysis_result(
+            agent_result, "600519", "贵州茅台", ReportType.FULL, "q-chip"
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.sentiment_score, 60)
+        self.assertNotIn(
+            "chip_structure", result.dashboard.get("data_perspective", {})
+        )
+        # 同级其余 dashboard 事实保留
+        self.assertEqual(
+            result.dashboard.get("core_conclusion", {}).get("one_sentence"), "观察"
+        )
+
+        renderer_config = MagicMock()
+        renderer_config.report_templates_dir = "templates"
+        renderer_config.report_language = "zh"
+        renderer_config.report_show_llm_model = True
+        with patch(
+            "src.services.report_renderer.get_config", return_value=renderer_config
+        ):
+            markdown = render("markdown", [result], summary_only=False)
+        self.assertIsNotNone(markdown)
+        self.assertNotIn("**筹码**", markdown)
 
     def test_convert_preserves_top_level_phase_decision_with_nested_dashboard(self):
         """Agent top-level phase_decision should survive nested dashboard unwrapping."""
@@ -1523,7 +1586,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1569,7 +1631,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1580,7 +1641,6 @@ class TestPipelineRouting(unittest.TestCase):
 
             # Mock the fetcher_manager to return None for realtime
             pipeline.fetcher_manager.get_realtime_quote.return_value = None
-            pipeline.fetcher_manager.get_chip_distribution.return_value = None
             # Mock search service
             pipeline.search_service.is_available = False
             # Mock DB context
@@ -1616,7 +1676,6 @@ class TestPipelineRouting(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1662,7 +1721,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -1739,7 +1797,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -1831,7 +1888,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -1936,7 +1992,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_cfg.report_language = "zh"
@@ -2015,7 +2070,6 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = True
             mock_cfg.report_language = "zh"
@@ -2786,7 +2840,6 @@ class TestSafeInt(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg
@@ -2929,7 +2982,6 @@ class TestSkillActivation(unittest.TestCase):
             mock_cfg.searxng_public_instances_enabled = False
             mock_cfg.news_max_age_days = 7
             mock_cfg.enable_realtime_quote = True
-            mock_cfg.enable_chip_distribution = True
             mock_cfg.realtime_source_priority = []
             mock_cfg.save_context_snapshot = False
             mock_config.return_value = mock_cfg

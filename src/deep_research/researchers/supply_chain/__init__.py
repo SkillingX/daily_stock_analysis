@@ -12,7 +12,7 @@ from src.deep_research.researchers.base import generic_parse
 DIM_ID = "supply_chain"
 DISPLAY_NAME = "产业链研究员"
 SKILL_MD = "researchers/supply_chain/SKILL.md"
-TOOLS = frozenset(frozenset({'get_sector_rankings', 'search_comprehensive_intel', 'get_stock_info', 'verify_supply_chain_evidence'}))
+TOOLS = frozenset({'get_sector_rankings', 'search_comprehensive_intel', 'get_stock_info'})
 TTL_HOURS = 120.0
 SCORE_KEY = None
 
@@ -79,6 +79,6 @@ def _parse_existing(existing):
         verification_status=f"existing_report:{existing.get('report_id')}",
         narrative=(
             f"本维度直接复用供应链模块专项报告（{existing.get('created_at')}）："
-            f"{existing.get('link')} —— 含产业链图谱/瓶颈/议价力与双源校验差异。"
+            f"{existing.get('link')} —— 含产业链图谱/瓶颈/议价力；概念归属以报告自身记录为准。"
         ),
     )

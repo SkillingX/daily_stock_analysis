@@ -1,5 +1,8 @@
 # x.com（Twitter/X）海外媒体消息源接入方案 · v3（查证定稿）
 
+> **状态更新（2026-10，issue #46）**：x.com 消息源与社区评价能力已退役，`XSearchProvider` 已删除；本文保留为历史方案说明。
+
+
 - 日期：2026-06-30
 - 状态：**已实现**（Phase 0–6 完成；查证复用 adanos，零新依赖/零新 env；39 用例 + 2 opt-in 真 API 集成测试全绿）
 - 相关代码：`src/search_service.py`、`src/services/social_sentiment_service.py`、`src/core/pipeline.py`、`src/config.py`

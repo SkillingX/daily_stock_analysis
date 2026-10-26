@@ -903,10 +903,6 @@ class Config:
         True  # Auto-discover public SearXNG instances when base URLs are absent
     )
 
-    # === Social Sentiment (US stocks only, api.adanos.org) ===
-    social_sentiment_api_key: Optional[str] = None
-    social_sentiment_api_url: str = "https://api.adanos.org"
-
     # === 新闻与分析筛选配置 ===
     news_max_age_days: int = 3  # 新闻最大时效（天）
     news_strategy_profile: str = (
@@ -1176,8 +1172,6 @@ class Config:
     enable_realtime_quote: bool = True
     # 盘中实时技术面：启用时用实时价计算 MA/多头排列（Issue #234）；关闭则用昨日收盘
     enable_realtime_technical_indicators: bool = True
-    # 筹码分布开关（该接口不稳定，云端部署建议关闭）
-    enable_chip_distribution: bool = True
     # 东财接口补丁开关
     enable_eastmoney_patch: bool = False
     # 实时行情数据源优先级（逗号分隔）
@@ -1970,10 +1964,6 @@ class Config:
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
-            social_sentiment_api_key=os.getenv("SOCIAL_SENTIMENT_API_KEY") or None,
-            social_sentiment_api_url=os.getenv(
-                "SOCIAL_SENTIMENT_API_URL", "https://api.adanos.org"
-            ).rstrip("/"),
             news_max_age_days=parse_env_int(
                 os.getenv("NEWS_MAX_AGE_DAYS"),
                 3,
@@ -2400,10 +2390,6 @@ class Config:
             == "true",
             enable_realtime_technical_indicators=os.getenv(
                 "ENABLE_REALTIME_TECHNICAL_INDICATORS", "true"
-            ).lower()
-            == "true",
-            enable_chip_distribution=os.getenv(
-                "ENABLE_CHIP_DISTRIBUTION", "true"
             ).lower()
             == "true",
             # 东财接口补丁开关
@@ -3141,22 +3127,15 @@ class Config:
         cls._BOOTSTRAP_RUNTIME_ENV_OVERRIDES = frozenset()
         cls._BOOTSTRAP_RUNTIME_ENV_PRESENT_KEYS = frozenset()
 
-    def has_searxng_enabled(self) -> bool:
-        """Whether SearXNG fallback is enabled via self-hosted or public mode."""
-        return bool(self.searxng_base_urls) or bool(
-            self.searxng_public_instances_enabled
-        )
-
     def has_search_capability_enabled(self) -> bool:
-        """Whether any search provider is configured or SearXNG fallback is enabled."""
-        return bool(
-            self.anspire_api_keys
-            or self.bocha_api_keys
-            or (self.minimax_api_keys if self.coding_plan_search_provider == "minimax" else self.zhipu_api_key)
-            or self.brave_api_keys
-            or self.serpapi_keys
-            or self.has_searxng_enabled()
-        )
+        """Whether the retained plan search slot is configured.
+
+        issue #47：只认 MiniMax 或本机智谱套餐。残留的 Bocha/Brave/SerpAPI/
+        Anspire/Tavily/SearXNG 配置不构成搜索能力，也不能抑制缺搜索告警。
+        """
+        if self.coding_plan_search_provider == "zhipu":
+            return bool(self.zhipu_api_key)
+        return bool(self.minimax_api_keys)
 
     def is_agent_available(self) -> bool:
         """Check whether agent capabilities are usable.
@@ -3449,8 +3428,8 @@ class Config:
             issues.append(
                 ConfigIssue(
                     severity="info",
-                    message="未配置搜索引擎能力 (Bocha/套餐搜索/Brave/SerpAPI/SearXNG)，新闻搜索功能将不可用",
-                    field="BOCHA_API_KEYS",
+                    message="未配置套餐搜索能力（MiniMax 或智谱 Coding Plan），新闻搜索功能将不可用",
+                    field="CODING_PLAN_SEARCH_PROVIDER",
                 )
             )
 
