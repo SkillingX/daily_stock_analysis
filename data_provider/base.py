@@ -644,7 +644,11 @@ def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ..
 
 
 def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any) -> Dict[str, Any]:
-    """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。"""
+    """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。
+
+    失败不再静默：供应商、操作与原因记入 errors，随 research 一路保留
+    （issue #51），且不影响已取得的财务或概念结果。
+    """
     from data_provider.cross_source_validator import SourceReadError
     from data_provider.ifind_fundamental_adapter import IfindFetcher
 
@@ -652,6 +656,7 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
     omitted: list[str] = []
     payload: Dict[str, Any] = {}
+    errors: list[str] = []
     if time.monotonic() >= deadline:
         return {"omit": ()}
     try:
@@ -659,19 +664,27 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
         if products.items and not products.errors:
             omitted.extend(["MAINBUSINESS", "MAINPRODUCT"])
             payload["product_segments"] = products.model_dump(mode="json")
-    except SourceReadError:
-        pass
+        elif products.errors:
+            errors.append(f"ifind:products:{','.join(products.errors)}")
+    except SourceReadError as exc:
+        errors.append(f"ifind:products:{exc.reason_code}")
     if time.monotonic() >= deadline:
         payload["omit"] = tuple(omitted)
+        if errors:
+            payload["errors"] = errors
         return payload
     try:
         holders = fetcher.shareholders(code, period, deadline=deadline)
         if holders.items and not holders.errors:
             omitted.extend(["AHOLDER", "AHOLDERTYPE", "HOLDNAMER", "HOLDPCTR"])
             payload["shareholder_details"] = holders.model_dump(mode="json")
-    except SourceReadError:
-        pass
+        elif holders.errors:
+            errors.append(f"ifind:holders:{','.join(holders.errors)}")
+    except SourceReadError as exc:
+        errors.append(f"ifind:holders:{exc.reason_code}")
     payload["omit"] = tuple(omitted)
+    if errors:
+        payload["errors"] = errors
     return payload
 
 
@@ -4169,13 +4182,11 @@ class DataFetcherManager:
 
     def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float]) -> Dict[str, Any]:
         from src.config import get_config
-        from data_provider.choice_adapter import ChoiceAdapter
         from data_provider.mx_data_adapter import financial_refresh
-        from src.core.research_run import current_research, ResearchStopped
+        from src.core.research_run import current_research, supplier_need_key
         run = current_research.get()
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
-        deadline = time.monotonic() + budget
         key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
@@ -4186,6 +4197,25 @@ class DataFetcherManager:
                     return cast(Dict[str, Any], cached["context"])
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
+        if run is not None:
+            # Issue #51: one financial round-trip per report. The first caller
+            # (stage zero) owns the outbound; concurrent researchers share its
+            # outcome — success or known failure — instead of re-running the
+            # whole aggregation. Run-scoped: nothing is revived across runs.
+            run_key = supplier_need_key("choice", config.data_source_contract, "fundamental_full", code, refresh[1] if refresh else "")
+            return run.single_fetch(run_key, lambda: self._build_choice_fundamental_context_uncached(code, budget_seconds, run), timeout=max(0.0, budget))
+        return self._build_choice_fundamental_context_uncached(code, budget_seconds, run)
+
+    def _build_choice_fundamental_context_uncached(self, code: str, budget_seconds: Optional[float], run: Any) -> Dict[str, Any]:
+        from src.config import get_config
+        from data_provider.choice_adapter import ChoiceAdapter
+        from src.core.research_run import current_research, ResearchStopped
+        if run is None:
+            run = current_research.get()
+        config = get_config()
+        budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
+        deadline = time.monotonic() + budget
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
         from data_provider.cross_source_validator import AnchorReading, SourceReadError
         prefer_ifind = config.financial_primary_source == "ifind"
         readings: dict[str, AnchorReading] = {}
@@ -4214,7 +4244,14 @@ class DataFetcherManager:
         if time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
             adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
         if ifind_research:
-            snapshot.setdefault("research", {}).update(ifind_research)
+            # Merge, never overwrite: optional iFinD research failures are kept
+            # as evidence next to Choice's own research errors.
+            research_block = snapshot.setdefault("research", {})
+            research_errors = research_block.setdefault("errors", [])
+            for research_error in ifind_research.pop("errors", ()):
+                if research_error not in research_errors:
+                    research_errors.append(research_error)
+            research_block.update(ifind_research)
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         if source_error:
             errors.append(f"ifind:{source_error}")
@@ -4379,13 +4416,19 @@ class DataFetcherManager:
             if cached is not None and not (refresh and refresh[0] == stock_code):
                 return cast(Dict[str, Any], cached["context"])
         deadline = min(deadline, time.monotonic() + config.ifind_mcp_timeout_seconds) if deadline is not None else time.monotonic() + config.ifind_mcp_timeout_seconds
-        try:
+
+        def _fetch() -> Dict[str, Any]:
             fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
             dataset = fetcher.product_segments(stock_code, period, deadline=deadline) if section == "products" else fetcher.shareholders(stock_code, period, deadline=deadline)
-            result = dataset.model_dump(mode="json")
+            return dataset.model_dump(mode="json")
+
+        run = current_research.get()
+        # Issue #51: the supplier outbound is shared inside IfindFetcher.query,
+        # including the known failure. This cache stores only a qualified success.
+        try:
+            result = _fetch()
         except SourceReadError as exc:
             return {"source": "ifind", "coverage": "partial", "items": [], "errors": [str(exc)]}
-        run = current_research.get()
         if not (run and (run.stop_reason or run.finalized or run.remaining() <= 0)) and result["items"] and not result["errors"]:
             with self._fundamental_cache_lock:
                 self._fundamental_cache[key] = {"ts": time.time(), "context": result}

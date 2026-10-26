@@ -782,7 +782,7 @@ class ChoiceAdapter:
                 break
             except SourceReadError as error:
                 out["errors"].append(f"choice:{report_date}:{error.reason_code}")
-                if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "timeout", "login_timeout", "query_timeout"}:
+                if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "rate_limited", "timeout", "login_timeout", "query_timeout"}:
                     break
         from src.core.research_run import current_research
         run = current_research.get()

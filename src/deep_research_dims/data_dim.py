@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
+
+from data_provider.ifind_fundamental_adapter import ConceptMembership
 from src.deep_research_dims.context import SharedContext
 from src.schemas.deep_research_dims import DataDim
 from src.schemas.report_schema import (
@@ -61,13 +64,44 @@ def _support_resistance(history: List[Dict[str, Any]], window: int = 60) -> tupl
     return (round(min(lows), 2) if lows else None, round(max(highs), 2) if highs else None)
 
 
+def adopt_concept_membership(ctx: SharedContext) -> Optional[ConceptMembership]:
+    """阶段 0 概念归属快照（issue #51）→ 可持久化维度字段，纯还原不再出站。
+
+    SharedContext 存的是工具公开载荷 {concepts: [{name, source, as_of_nature}],
+    source, as_of_nature, error}；这里确定性地还原成已验证供应商结果并标明
+    证券代码。快照为空（阶段 0 未运行/取消/超时）返回 None，原因已在
+    limitations 中，不伪造空概念、不补造日期。
+    """
+    payload = ctx.concept_membership
+    if not isinstance(payload, dict) or not payload:
+        return None
+    try:
+        return ConceptMembership(
+            code=ctx.stock_code,
+            concepts=[
+                str(entry["name"]).strip()
+                for entry in payload.get("concepts") or []
+                if isinstance(entry, dict) and str(entry.get("name") or "").strip()
+            ],
+            source=payload["source"],
+            as_of_nature=payload["as_of_nature"],
+            errors=[str(payload["error"])] if payload.get("error") else [],
+        )
+    except (ValidationError, KeyError):
+        # 畸形载荷不阻塞报告装配；未采纳原因以阶段 0 limitations 为准。
+        return None
+
+
 def build_data_dim(ctx: SharedContext) -> DataDim:
     """S2：从快照装配数据透视。history 不足时维度降级。"""
+    # 概念归属是独立的已验证事实（issue #51），不随历史不足降级丢失。
+    concept = adopt_concept_membership(ctx)
     closes = _closes(ctx.history)
     if len(closes) < 20:
         return DataDim(
             status="degraded",
             degraded_reason="日线历史不足 20 条，无法计算均线与点位",
+            concept_membership=concept,
         )
 
     current = ctx.quote.get("price") or closes[-1]
@@ -116,6 +150,7 @@ def build_data_dim(ctx: SharedContext) -> DataDim:
         perspective=perspective,
         ma250_deviation_pct=ma250_dev,
         distance_from_52w_high_pct=dist_high,
+        concept_membership=concept,
         narrative=(
             f"均线{alignment}；{price_order}。偏离 MA5 {bias}%，"
             f"距 52 周高点 {dist_high}%。" if dist_high is not None else f"均线{alignment}。"

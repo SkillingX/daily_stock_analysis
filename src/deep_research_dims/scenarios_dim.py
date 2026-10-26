@@ -104,6 +104,7 @@ def build_scenarios_dim(
                 "authentication_failed": "Choice登录验证暂未通过",
                 "permission_denied": "当前Choice权限未覆盖此项数据",
                 "quota_exhausted": "Choice调用额度受限",
+                "rate_limited": "Choice接口临时限流",
                 "timeout": "Choice查询超时",
                 "query_timeout": "Choice查询超时",
                 "login_timeout": "Choice登录超时",

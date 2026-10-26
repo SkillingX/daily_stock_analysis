@@ -52,7 +52,7 @@ QualityStatus = Literal["missing", "unverified", "single_source", "not_comparabl
 class SourceReadError(RuntimeError):
     """A supplier failure with a safe reason, isolated by the validator."""
     def __init__(self, source: str, reason_code: str) -> None:
-        known = {"invalid_configuration", "authentication_failed", "quota_exhausted", "business_error", "invalid_response", "period_unknown", "timeout", "source_error", "sdk_unavailable", "permission_denied", "calendar_unavailable",
+        known = {"invalid_configuration", "authentication_failed", "quota_exhausted", "rate_limited", "business_error", "invalid_response", "period_unknown", "timeout", "source_error", "sdk_unavailable", "permission_denied", "calendar_unavailable",
                  # Choice 预算/阶段细分：预算耗尽未分派、等锁超时、SDK 登录/查询停留阶段超时
                  "budget_exhausted", "lock_wait_timeout", "login_timeout", "query_timeout"}
         self.reason_code = reason_code if reason_code in known or re.fullmatch(r"http_[1-5][0-9]{2}", reason_code) else "source_error"
@@ -67,9 +67,22 @@ def source_failure_reason(exc: BaseException) -> str:
         return source_failure_reason(nested[0])
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
+    # HTTP 429 only proves transport-level throttling; a quota conclusion needs
+    # explicit supplier evidence (business message), classified by the adapter.
     if status is not None:
-        return "authentication_failed" if status in (401, 403) else "quota_exhausted" if status == 429 else f"http_{status}"
+        return "authentication_failed" if status in (401, 403) else "rate_limited" if status == 429 else f"http_{status}"
     return "timeout" if "timeout" in type(exc).__name__.lower() else "source_error"
+
+
+def source_failure_text(reason_code: str) -> str:
+    """User-facing phrase. Unknown codes stay unchanged so classes remain distinct."""
+    return {
+        "authentication_failed": "登录验证未通过",
+        "permission_denied": "当前权限未覆盖此项数据",
+        "quota_exhausted": "数据调用额度受限",
+        "rate_limited": "数据接口临时限流",
+        "timeout": "数据查询超时",
+    }.get(reason_code, reason_code)
 
 
 class AnchorQuality(BaseModel):

@@ -419,16 +419,37 @@ def test_ifind_query_preserves_research_stop_instead_of_supplier_error(monkeypat
 
 
 def test_ifind_does_not_dispatch_after_cancellation(monkeypatch):
+    """取消后仍进入共享边界记录零分派证据，但不得创建任何真实 MCP 客户端/会话。"""
+    import mcp
+    from mcp.client import streamable_http
+    from mcp.shared import _httpx_utils
     from src.core.research_run import ResearchRun, ResearchStopped
+    from src.services import mcp_client
+    from tests.test_mcp_evidence import _payloads, _records
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Cancelled research must not create a real MCP client/session/transport")
+
+    monkeypatch.setattr(_httpx_utils, "create_mcp_http_client", forbidden)
+    monkeypatch.setattr(streamable_http, "streamable_http_client", forbidden, raising=False)
+    monkeypatch.setattr(streamable_http, "streamablehttp_client", forbidden, raising=False)
+    monkeypatch.setattr(mcp, "ClientSession", forbidden)
+
     run = ResearchRun(5)
     run.stop("cancelled")
-
-    async def forbidden(*args, **kwargs):
-        pytest.fail("Cancelled research must not start a fresh MCP session")
-
-    monkeypatch.setattr(IfindFetcher, "_async_query", forbidden)
-    with run.bind(), pytest.raises(ResearchStopped):
-        IfindFetcher("https://fixture.invalid/mcp", "test-only").query("get_stock_financials", "fixture")
+    lines, handler = _records()
+    try:
+        with run.bind(), pytest.raises(ResearchStopped):
+            IfindFetcher("https://fixture.invalid/mcp", "test-only").query("get_stock_financials", "fixture")
+    finally:
+        mcp_client.logger.removeHandler(handler)
+    payloads = _payloads(lines)
+    assert len(payloads) == 2
+    assert {item["phase"] for item in payloads} == {"start", "end"}
+    assert len({item["call_id"] for item in payloads}) == 1
+    end = next(item for item in payloads if item["phase"] == "end")
+    assert end["dispatched"] is False and end["status"] == "error"
+    assert end["error_kind"] == "ResearchStopped"
 
 
 @pytest.mark.parametrize("requested,expected", [(None, "2026-06-30"), ("2025-12-31", "2025-12-31")])

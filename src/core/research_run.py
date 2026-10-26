@@ -9,8 +9,23 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, TypeVar, cast
 from uuid import uuid4
+
+_T = TypeVar("_T")
+
+
+def supplier_need_key(supplier: str, contract: str, need: str, qualifier: str, refresh: str = "") -> str:
+    """In-report identity for one supplier need. Not a cache key and not persisted."""
+    return f"{supplier}|{contract}|{need}|{qualifier}|{refresh}"
+
+
+def _isolated_copy(result: _T) -> _T:
+    import copy
+
+    if isinstance(result, dict):
+        return cast(_T, copy.deepcopy(result))
+    return result
 
 current_research: ContextVar[ResearchRun | None] = ContextVar("current_research", default=None)
 research_dimension: ContextVar[str] = ContextVar("research_dimension", default="")
@@ -37,6 +52,9 @@ class ResearchRun:
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _pending: set[Future[Any]] = field(default_factory=set, repr=False)
     _on_clean: Callable[[], None] | None = field(default=None, repr=False)
+    # Same-report single-flight results (issue #51): key -> completed-or-running
+    # future. Failures are retained too; nothing here outlives this run.
+    _fetches: dict[str, Future[Any]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.deadline = monotonic() + self.timeout_seconds
@@ -94,7 +112,13 @@ class ResearchRun:
             callback()
 
     def wait_for(self, future: Future[Any], timeout: float | None = None) -> Any:
-        deadline = min(self.deadline, monotonic() + timeout) if timeout is not None else self.deadline
+        from src.patches.eastmoney_patch import request_deadline
+        caps = [self.deadline]
+        if timeout is not None:
+            caps.append(monotonic() + timeout)
+        if (outer := request_deadline.get()) is not None:
+            caps.append(outer)
+        deadline = min(caps)
         while True:
             if future.done():
                 return future.result()
@@ -144,6 +168,39 @@ class ResearchRun:
             if self.finalized or self.stop_reason or self.remaining() <= 0:
                 return None
             return self.daily_history
+
+    def single_fetch(self, key: str, fetch: Callable[[], _T], *, timeout: float | None = None) -> _T:
+        """One outbound per report for the same need; failures are shared too.
+
+        The first caller executes ``fetch`` in its own thread; concurrent
+        callers wait on the same future. A waiter passes its own remaining
+        stage budget as ``timeout`` so a short-budget consumer is not held
+        until a longer owner finishes — it raises ``FutureTimeout`` instead,
+        while the owner keeps running for the other consumers. Dict results
+        are deep-copied per consumer so downstream edits cannot leak.
+        """
+        with self._lock:
+            self.check()
+            existing = self._fetches.get(key)
+            future: Future[Any]
+            if existing is not None:
+                future = existing
+                owner = False
+            else:
+                future = Future()
+                self._fetches[key] = future
+                owner = True
+        if not owner:
+            # The future was stored for this key's fetch; wait_for only knows Any.
+            return _isolated_copy(cast(_T, self.wait_for(future, timeout=timeout)))
+        try:
+            result = fetch()
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        else:
+            future.set_result(result)
+            return _isolated_copy(result)
 
     def retain_vendor(self, dim: str, research: dict[str, Any]) -> None:
         with self._lock:

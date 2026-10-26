@@ -32,6 +32,8 @@ class SharedContext:
     fundamental: Dict[str, Any] = field(default_factory=dict)
     history_reports: List[Dict[str, Any]] = field(default_factory=list)
     limitations: List[str] = field(default_factory=list)
+    # 最新概念归属（issue #51）：独立轻量取数，与财务聚合并行，不排在聚合链末尾。
+    concept_membership: Dict[str, Any] = field(default_factory=dict)
 
     def limitation(self, msg: str) -> None:
         if msg not in self.limitations:
@@ -191,7 +193,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
                 if error:
                     ctx.limitation(f"Fuyao补值未完成: {error}")
                     result["errors"].append(error)
-                    if "quota" in error or "authentication" in error or "http_" in error:
+                    if "quota" in error or "rate_limited" in error or "authentication" in error or "http_" in error:
                         break
                     continue
                 if reading is not None:
@@ -237,6 +239,37 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         return {}
 
 
+def _safe_concepts(code: str, deadline: float, ctx: SharedContext) -> Dict[str, Any]:
+    """独立轻量概念归属（issue #51）：与财务聚合并行，不重跑整套财务。
+
+    取消/预算耗尽不发起请求；失败只记原因，不占用后续研究预算。
+    """
+    from src.core.research_run import current_research, ResearchStopped
+
+    run = current_research.get()
+    if run is not None and (run.stop_reason or run.finalized or run.remaining() <= 0):
+        ctx.limitation("概念归属: 报告预算已用完，本次未查询")
+        return {}
+    if deadline <= monotonic():
+        ctx.limitation("概念归属: 阶段预算已用完，本次未查询")
+        return {}
+    try:
+        from src.agent.tools.data_tools import _concept_membership
+
+        membership = _concept_membership(code, deadline)
+    except ResearchStopped:
+        ctx.limitation("概念归属: 研究已停止，本次未查询")
+        return {}
+    except Exception as exc:  # noqa: BLE001 - 阶段0装配失败只降级
+        logger.warning("[DualTrack] 概念归属装配失败 %s: %s", code, exc)
+        ctx.limitation(f"概念归属装配失败: {exc}")
+        return {}
+    if membership.get("error"):
+        from data_provider.cross_source_validator import source_failure_text
+        ctx.limitation(f"概念归属: {source_failure_text(str(membership['error']))}")
+    return membership
+
+
 def _safe_history_reports(code: str, ctx: SharedContext) -> List[Dict[str, Any]]:
     try:
         from src.storage import get_db
@@ -256,6 +289,7 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
 
     行情和日线在线程池运行，与本身已限时的财务装配并行。
     各路共用阶段截止时间；超时保留可用数据及失败证据，不占用后续研究预算。
+    概念归属（issue #51）与行情/日线同属轻量路，与财务聚合并行，不排在其末尾。
     筹码分布已随 issue #46 退休，不再装配。
     """
     from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -276,9 +310,9 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
     stage_deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     if deadline is not None:
         stage_deadline = min(stage_deadline, deadline)
-    pool = ThreadPoolExecutor(max_workers=2)
+    pool = ThreadPoolExecutor(max_workers=3)
     # Each worker owns its limitations so late IO cannot mutate a returned context.
-    workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history")}
+    workers = {key: SharedContext(stock_code, stock_name, ctx.as_of) for key in ("quote", "history", "concept_membership")}
     from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
     eastmoney_patch(budget_only=True)
     if outer := request_deadline.get():
@@ -289,6 +323,7 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
         futures = {
             "quote": pool.submit(copy_context().run, _safe_quote, stock_code, workers["quote"]),
             "history": pool.submit(copy_context().run, _safe_history, stock_code, 260, workers["history"]),
+            "concept_membership": pool.submit(copy_context().run, _safe_concepts, stock_code, stage_deadline, workers["concept_membership"]),
         }
         if run is not None:
             for future in futures.values():

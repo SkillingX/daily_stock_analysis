@@ -1191,6 +1191,7 @@ class ZhipuSearchProvider(BaseSearchProvider):
         super().__init__(api_keys, "Zhipu")
 
     def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        from uuid import uuid4
         from src.services import mcp_client
         from src.patches.eastmoney_patch import request_deadline
         from data_provider.cross_source_validator import SourceReadError, source_failure_reason
@@ -1198,6 +1199,9 @@ class ZhipuSearchProvider(BaseSearchProvider):
         deadline = request_deadline.get()
         timeout = min(15.0, deadline - time.monotonic()) if deadline is not None else 15.0
         recency = "oneDay" if days <= 1 else "oneWeek" if days <= 7 else "oneMonth" if days <= 31 else "oneYear" if days <= 366 else "noLimit"
+        # Issue #51: Zhipu search shares the MCP failure-evidence boundary, so
+        # its start/end lines join the transport evidence by call_id.
+        call_token = mcp_client.current_call_id.set(uuid4().hex[:12])
 
         async def request() -> object:
             result = await mcp_client.call_mcp_tool(self.API_ENDPOINT, f"Bearer {api_key}", "web_search_prime", {"search_query": query, "search_recency_filter": recency, "content_size": "medium"}, timeout_seconds=timeout, deadline=deadline)
@@ -1217,7 +1221,10 @@ class ZhipuSearchProvider(BaseSearchProvider):
             return payload
 
         try:
-            raw = asyncio.run(asyncio.wait_for(request(), max(0.0, timeout)))
+            # wait_for(0) cancels before call_mcp_tool, so an expired deadline
+            # would leave no start/end. Enter the existing boundary instead.
+            coro = request() if timeout <= 0 else asyncio.wait_for(request(), timeout)
+            raw = asyncio.run(coro)
             items = TypeAdapter(list[_ZhipuSearchItem]).validate_python(raw, strict=True)
             results = [SearchResult(title=item.title, snippet=item.content[:1500], url=item.link, source=urlparse(item.link).netloc, published_date=item.published_date) for item in items[:max_results]]
             return SearchResponse(query=query, results=results, provider=self.name, success=bool(results), error_message=None if results else "empty_result")
@@ -1227,6 +1234,8 @@ class ZhipuSearchProvider(BaseSearchProvider):
             reason = "invalid_response" if isinstance(exc, ValueError) else source_failure_reason(exc)
             # MCP errors can contain supplier text/headers; never expose them.
             return SearchResponse(query=query, results=[], provider=self.name, success=False, error_message=f"zhipu:{reason}")
+        finally:
+            mcp_client.current_call_id.reset(call_token)
 
 
 class MiniMaxSearchProvider(BaseSearchProvider):
@@ -1339,10 +1348,47 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _bounded(value: object, *secrets: str) -> str:
+        """Keep a useful refusal word; never a credential, object dump, or whole body."""
+        from src.utils.sanitize import sanitize_diagnostic_text
+        if value is None:
+            text = ""
+        elif isinstance(value, (str, int, float, bool)):
+            text = str(value)
+        else:
+            text = type(value).__name__
+        for secret in secrets:
+            if secret and secret in text:
+                text = text.replace(secret, "[REDACTED]")
+        return sanitize_diagnostic_text(text, max_length=300)
+
+    @staticmethod
+    def _evidence(call_id: str, *secrets: str, **fields: object) -> None:
+        """Bounded correlation. A failing handler must not change the search result."""
+        try:
+            detail = " ".join(f"{key}={MiniMaxSearchProvider._bounded(value, *secrets)}" for key, value in fields.items())
+            logger.info("[MiniMax] evidence call_id=%s %s", call_id, detail[:500])
+        except Exception:
+            return
+
+    @staticmethod
+    def _log(level: str, template: str, *args: object) -> None:
+        try:
+            getattr(logger, level)(template, *args)
+        except Exception:
+            return
+
     def _do_search(
         self, query: str, api_key: str, max_results: int, days: int = 7
     ) -> SearchResponse:
         """Execute MiniMax web search."""
+        # Issue #51: correlation only. Channel, billing endpoint and native
+        # error text stay as they were; the query never enters the log.
+        from uuid import uuid4
+        call_id = uuid4().hex[:12]
+        started = time.monotonic()
+        self._evidence(call_id, phase="start")
         try:
             # Detect language hint from query (simple heuristic)
             has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in query)
@@ -1362,8 +1408,9 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
             # HTTP error handling
             if response.status_code != 200:
-                error_msg = self._parse_http_error(response)
-                logger.warning(f"[MiniMax] Search failed: {error_msg}")
+                error_msg = self._parse_http_error(response, api_key)
+                self._evidence(call_id, api_key, phase="end", http_status=response.status_code, duration_ms=int((time.monotonic() - started) * 1000))
+                self._log("warning", "[MiniMax] Search failed: %s", error_msg)
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1377,7 +1424,13 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             # Check base_resp status
             base_resp = data.get("base_resp", {})
             if base_resp.get("status_code", 0) != 0:
-                error_msg = base_resp.get("status_msg", "Unknown API error")
+                error_msg = self._bounded(base_resp.get("status_msg", "Unknown API error"), api_key)
+                self._evidence(
+                    call_id, api_key, phase="end", http_status=200,
+                    business_code=base_resp.get("status_code"),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                self._log("warning", "[MiniMax] Search failed: %s", error_msg)
                 return SearchResponse(
                     query=query,
                     results=[],
@@ -1386,8 +1439,8 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                     error_message=error_msg,
                 )
 
-            logger.info(f"[MiniMax] Search done, query='{query}'")
-            logger.debug(f"[MiniMax] Raw response keys: {list(data.keys())}")
+            self._log("info", "[MiniMax] Search done call_id=%s", call_id)
+            self._log("debug", "[MiniMax] Raw response keys: %s", list(data.keys()))
 
             # Parse organic results
             results: List[SearchResult] = []
@@ -1411,7 +1464,11 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                 if len(results) >= max_results:
                     break
 
-            logger.info(f"[MiniMax] Parsed {len(results)} results (after time filter)")
+            self._log("info", "[MiniMax] Parsed %s results (after time filter)", len(results))
+            self._evidence(
+                call_id, phase="end", status="ok" if results else "empty",
+                result_count=len(results), duration_ms=int((time.monotonic() - started) * 1000),
+            )
 
             return SearchResponse(
                 query=query,
@@ -1422,7 +1479,8 @@ class MiniMaxSearchProvider(BaseSearchProvider):
 
         except requests.exceptions.Timeout:
             error_msg = "Request timeout"
-            logger.error(f"[MiniMax] {error_msg}")
+            self._evidence(call_id, phase="end", status="timeout", duration_ms=int((time.monotonic() - started) * 1000))
+            self._log("error", "[MiniMax] %s", error_msg)
             return SearchResponse(
                 query=query,
                 results=[],
@@ -1431,8 +1489,9 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                 error_message=error_msg,
             )
         except requests.exceptions.RequestException as e:
-            error_msg = f"Network error: {e}"
-            logger.error(f"[MiniMax] {error_msg}")
+            error_msg = self._bounded(f"Network error: {e}", api_key)
+            self._evidence(call_id, phase="end", status="request_error", duration_ms=int((time.monotonic() - started) * 1000))
+            self._log("error", "[MiniMax] %s", error_msg)
             return SearchResponse(
                 query=query,
                 results=[],
@@ -1441,8 +1500,9 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                 error_message=error_msg,
             )
         except Exception as e:
-            error_msg = f"Unexpected error: {e}"
-            logger.error(f"[MiniMax] {error_msg}")
+            error_msg = self._bounded(f"Unexpected error: {e}", api_key)
+            self._evidence(call_id, phase="end", status="error", duration_ms=int((time.monotonic() - started) * 1000))
+            self._log("error", "[MiniMax] %s", error_msg)
             return SearchResponse(
                 query=query,
                 results=[],
@@ -1452,18 +1512,22 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             )
 
     @staticmethod
-    def _parse_http_error(response) -> str:
-        """Parse HTTP error response from MiniMax API."""
+    def _parse_http_error(response, secret: str = "") -> str:
+        """Native HTTP refusal text, redacted and bounded. Never the whole body."""
         try:
             ct = response.headers.get("content-type", "")
             if "json" in ct:
                 err = response.json()
-                base_resp = err.get("base_resp", {})
-                msg = base_resp.get("status_msg") or err.get("message") or str(err)
-                return cast(str, msg)
-            return cast(str, response.text[:200])
+                base_resp = err.get("base_resp", {}) if isinstance(err, dict) else {}
+                msg = base_resp.get("status_msg") if isinstance(base_resp, dict) else None
+                if not msg and isinstance(err, dict):
+                    msg = err.get("message")
+                if not isinstance(msg, str) or not msg:
+                    msg = f"HTTP {getattr(response, 'status_code', '')}"
+                return MiniMaxSearchProvider._bounded(msg, secret)
+            return MiniMaxSearchProvider._bounded(getattr(response, "text", ""), secret)
         except Exception:
-            return f"HTTP {response.status_code}: {response.text[:200]}"
+            return MiniMaxSearchProvider._bounded(f"HTTP {getattr(response, 'status_code', '')}", secret)
 
     @staticmethod
     def _extract_domain(url: str) -> str:
