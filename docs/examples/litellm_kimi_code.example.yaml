@@ -3,11 +3,11 @@
 # .env: LLM_KIMI_API_KEY=<Kimi Code 控制台创建的套餐 Key>
 # 按账号地域/权益修改 api_base 和 model；不要改成 Moonshot 按量计费入口。
 model_list:
-  - model_name: openai/kimi-for-coding
+  - model_name: openai/k3.1-pro
     litellm_params:
-      model: openai/kimi-for-coding
+      model: openai/k3.1-pro
       api_base: https://api.kimi.com/coding/v1
       api_key: os.environ/LLM_KIMI_API_KEY
-      reasoning_effort: high
+      reasoning_effort: low
       # openai provider 默认丢弃未声明参数；Kimi Code 需要显式放行 reasoning_effort
       allowed_openai_params: ["reasoning_effort"]
