@@ -195,7 +195,7 @@ def run_intel_agent(
         "不确定日期写\"未知\"。\n"
         "事件预案编号联动：plans 每条预案开头引用操作编号——T1-L 左侧买入 ｜ T1-R 右侧确认买入 ｜ "
         "T1-S1 减仓/止盈 ｜ T1-SL 止损。会导致无论价格无条件离场的事件，在预案末尾标注「一票否决」。\n"
-        "来源等级标注（primary/news/industry/community_*/inferred/unverified）写在字符串内容里。"
+        "来源等级只使用 primary/news/industry/inferred/unverified，写在字符串内容里；F10 聚合页和二手引用不得标 primary，推断必须写明依据。不要求社区评价，也不要写固定品牌双源验证字样。"
     )
     return _run_explore(
         "intel", _INTEL_TOOLS, task, llm_adapter, progress_callback, max_steps

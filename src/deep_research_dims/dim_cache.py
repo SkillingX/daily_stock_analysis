@@ -49,6 +49,12 @@ DIM_TTL_HOURS: Dict[str, float] = {
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
 SCHEMA_VERSION = 13  # issue #46：筹码/社区指标退休，六维与资金/情绪契约变更
+# 本次来源提示已变、且编排器会读入新报告的维度。缺版本即 miss，不改 payload 正文。
+# 不 bump 全局 SCHEMA_VERSION / 基本面 mapping，context 维度本就不走这段缓存。
+SOURCE_LABEL_VERSION = 1
+_SOURCE_LABEL_DIMS = frozenset({
+    "business", "intel", "supply_chain", "sentiment", "ownership", "us_china",
+})
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 FUNDAMENTAL_MAPPING_VERSION = 18  # Choice latest-period balance sheet and research evidence
@@ -60,6 +66,7 @@ def _cache_path(stock_code: str, dim: str) -> str:
     contract = get_config().data_source_contract
     suffix = "" if contract == "legacy" else f"_{contract}"
     return os.path.join(_CACHE_DIR, f"{stock_code}{suffix}_{dim}.json")
+
 
 
 def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
@@ -75,6 +82,8 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         return None
     if record.get("schema_version") != SCHEMA_VERSION:
         return None  # 旧契约 payload 不兼容（C4）：视为 miss，重算并覆盖
+    if dim in _SOURCE_LABEL_DIMS and record.get("source_label_version") != SOURCE_LABEL_VERSION:
+        return None  # 旧来源等级契约可能把 F10/社区标签带回新报告
     if dim in _FUNDAMENTAL_MAPPING_DIMS and record.get("mapping_version") != FUNDAMENTAL_MAPPING_VERSION:
         return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
     if dim in _FUNDAMENTAL_MAPPING_DIMS:
@@ -110,13 +119,19 @@ def save_cached_dim(stock_code: str, dim: str, payload: Dict[str, Any]) -> None:
         return
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
+        stored = payload
+        if dim in _SOURCE_LABEL_DIMS:
+            from src.report_language import adopt_structured_source_grades
+            stored = adopt_structured_source_grades(payload)
         record = {
             "schema_version": SCHEMA_VERSION,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "stock_code": stock_code,
             "dim": dim,
-            "payload": payload,
+            "payload": stored,
         }
+        if dim in _SOURCE_LABEL_DIMS:
+            record["source_label_version"] = SOURCE_LABEL_VERSION
         if dim in _FUNDAMENTAL_MAPPING_DIMS:
             record["mapping_version"] = FUNDAMENTAL_MAPPING_VERSION
             from src.config import get_config

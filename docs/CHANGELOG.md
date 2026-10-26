@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 新报告来源等级只使用 primary/news/industry/inferred/unverified：共享提示、研究员/经理要求和旧总提示不再要求社区来源标签或固定 MX+iFinD 验证字样；F10 聚合页和二手引用不能升为 primary，未知出处保持 unverified。模型残留的社区/筹码评分字段在采用边界丢弃且不补缺失占位；只失效业务维度的旧来源缓存契约，历史报告和历史来源字段保持可读。
+
 - [改进] 独立 Scheduler 的 Kimi Code 示例明确指定 K3.1 Pro 与 low 推理强度；Kimi 将第三方请求中的 medium 映射为 high。
 - [修复] 合格 iFinD 财务字段按字段省略 Choice 重查：单项缺项不再迫使其他合格字段重查；Choice 缺口只允许在同财期内补位，不因另一字段财期更新而丢掉已合格的 iFinD 字段；估值/目标价/行业 Choice 查询保留，单一 iFinD 来源不标记为已核验。
 - [修复] 社区评价不再作为必填或计分来源：深研提示词删除必填社区讨论章节与社区工具调用要求（保留社区传闻不能确认事实的分级规则）；search_clue_hype 不再查询雪球，社区链接不计入炒作分；报告不再要求 Xueqiu/X/Reddit 取数。
