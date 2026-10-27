@@ -120,6 +120,31 @@ class _FakeDualTrackResult:
         self.success = status != "failed"
 
 
+def _isolate_offline_suppliers(monkeypatch) -> None:
+    """技术/资金试点备料的离线隔离：无关供应商不触网（issue #56）。
+
+    固定资料准备走既有有界入口；本文件只测长线桥接映射/缓存语义，
+    将日线与资金/基本面供应商缝替换为立即失败的桩，真实取数边界由
+    试点自身测试与根反例覆盖。
+    """
+    from src.agent.tools import data_tools
+    from src.services import history_loader
+
+    class _OfflineManager:
+        def get_daily_data(self, code, days=60, **kwargs):
+            return None, "offline"
+
+        def get_capital_flow_context(self, code, **kwargs):
+            return {"status": "failed", "data": {}, "errors": ["offline"]}
+
+        def get_fundamental_context(self, code, **kwargs):
+            return {}
+
+    offline = _OfflineManager()
+    monkeypatch.setattr(history_loader, "_fetcher_singleton", offline)
+    monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", offline)
+
+
 class TestLongtrackBridge:
     def test_happy_path_maps_five_sections(self, monkeypatch):
         from src.services import longtrack_bridge
@@ -291,6 +316,7 @@ class TestCacheHygieneRegressions:
     def _run_offline(self, monkeypatch, tmp_path, **run_kwargs):
         from datetime import date, timedelta
 
+        _isolate_offline_suppliers(monkeypatch)
         from src.agent.deep_research import orchestrator as orch
         from src.deep_research_dims import dim_cache
         from src.deep_research_dims.context import SharedContext
@@ -306,8 +332,8 @@ class TestCacheHygieneRegressions:
         ]
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
         events: List[Dict[str, Any]] = []
-        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
-        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        monkeypatch.setattr(orch, "run_intel_agent", lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1})
+        monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
         result = orch.run_dual_track(
             "600519", "贵州茅台", llm_adapter=None,
             progress_callback=lambda e: events.append(e),
@@ -368,9 +394,10 @@ class TestFinalConclusion:
              "high": 10.3 + i * 0.1, "low": 9.7 + i * 0.1, "close": 10 + i * 0.1, "volume": 10000}
             for i in range(40)
         ]
+        _isolate_offline_suppliers(monkeypatch)
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
-        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
-        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        monkeypatch.setattr(orch, "run_intel_agent", lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1})
+        monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
 
         captured: dict = {}
 
@@ -409,9 +436,10 @@ class TestFinalConclusion:
              "low": 9, "close": 10, "volume": 100}
             for i in range(40)
         ]
+        _isolate_offline_suppliers(monkeypatch)
         monkeypatch.setattr(orch, "build_shared_context", lambda code, name: ctx)
-        orch.run_intel_agent = lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1}
-        orch.run_supply_chain_agent = lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1}
+        monkeypatch.setattr(orch, "run_intel_agent", lambda *a, **k: {"ok": True, "data": {"sentiment_summary": "中", "risk_alerts": [], "positive_catalysts": [], "unverified_count": 0, "evidence_items": []}, "steps": 1})
+        monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
         result = orch.run_dual_track("600519", "贵州茅台", llm_adapter=None, force_refresh=True)
         assert result.final_conclusion == ""
         # 模板回退：无 LLM 时第一节仍渲染（信号一句话兜底）
@@ -496,6 +524,7 @@ class TestSkipNarrationsPropagation:
             raise AssertionError("skip_narrations=True 时不应调用 narrate")
 
         monkeypatch.setattr(orch, "narrate", _forbidden_narrate)
+        _isolate_offline_suppliers(monkeypatch)
 
         result = orch.run_dual_track(
             "600519", "贵州茅台", llm_adapter=None,

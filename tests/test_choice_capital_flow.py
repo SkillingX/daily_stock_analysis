@@ -56,22 +56,45 @@ def test_real_flow_tool_uses_yuan_and_requires_complete_trading_windows(native_f
     assert fresh["main_net_inflow"] is fresh["inflow_5d"] is fresh["inflow_10d"] is None
 
 
-def test_actual_researcher_consumer_removes_unsupported_scores(native_flow, monkeypatch):
+def test_no_valid_capital_material_skips_model(native_flow, monkeypatch):
+    """issue #56：两侧均无可解释资料时不启动模型，缺口如实保留。"""
     native_flow[1].remove(DATES[0])
     monkeypatch.setattr(data_tools, "_handle_get_stock_info", lambda *a, **k: {"fundamental_context": {"institution": {"data": {"top10_holder_change": -1323}, "field_meta": {}}}})
+    def fundamental(code, **kwargs):
+        return {"institution": {"status": "ok", "data": {}, "field_meta": {"institution_holding_change": {"rule_eligible": False}}}}
+    monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", fundamental)
+    called = []
     def generate(**kwargs):
-        return SimpleNamespace(success=True, content='{"flow_score": 95, "score": 90, "institution_score": 95, "institution_summary": "机构减持", "flow_summary": "主力买入", "narrative": "可加仓", "chip_score": 60}', total_steps=1, error=None)
+        called.append(kwargs)
+        return SimpleNamespace(success=True, content='{"flow_score": 95, "score": 90}', total_steps=1, error=None)
     monkeypatch.setattr(explore_agents, "run_agent_loop", generate)
     result = explore_agents.run_capital_agent("300260", "新莱应材", object())
+    assert called == []
+    assert result["ok"] is False
+    assert "窗口不完整" in result["error"] or "资金流" in result["error"]
+    assert "机构" in result["error"]
+    assert "未启动模型" in result["error"]
+
+
+def test_single_pass_capital_consumes_scores_and_drops_chip(native_flow, monkeypatch):
+    """issue #56：单轮无工具分析；#46 筹码分仍在解析层丢弃。"""
+    monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", lambda code, **k: {
+        "institution": {"status": "ok", "data": {"institution_holding_change": -1.25},
+                         "field_meta": {"institution_holding_change": {"rule_eligible": True, "period": "2026中报"}}}})
+    def generate(**kwargs):
+        assert "资金面深度分析" in kwargs["messages"][-1]["content"]
+        return SimpleNamespace(success=True, content='{"flow_score": 95, "score": 90, "institution_score": 55, "institution_summary": "机构小幅减持", "flow_summary": "主力买入", "narrative": "当日主力净流入 0.00 万元，机构持仓变动 -1.25%。", "chip_score": 60}', total_steps=1, error=None)
+    monkeypatch.setattr(explore_agents, "run_agent_loop", generate)
+    result = explore_agents.run_capital_agent("300260", "新莱应材", object())
+    assert result["ok"] is True
     dim, _ = parse(result["data"], 1)
-    assert dim.status == "degraded"
-    assert dim.flow_score is None and dim.score is None
+    assert dim.status == "ok"
+    assert dim.flow_score == 95 and dim.institution_score == 55 and dim.score == 90
     # issue #46：模型返回的筹码分在解析层丢弃，不能形成分数。
     assert not hasattr(dim, "chip_score")
-    assert dim.institution_score is None
-    assert "机构减持" not in dim.institution_summary
-    assert "窗口" in dim.narrative
-    assert "加仓" not in dim.narrative
+    assert "机构小幅减持" in dim.institution_summary
+    assert "Choice 主力净流入" in dim.flow_summary and "万元" in dim.flow_summary
+    assert "未独立核验" in dim.flow_summary
 
 
 def test_failed_calendar_never_falls_back_to_weekdays_or_legacy(native_flow, monkeypatch):

@@ -346,15 +346,18 @@ def _score_llm_indicators(
         f"可选 id 限定为 {missing}。"
     )
     results: Dict[str, Dict[str, Any]] = {}
+    from src.llm.attempt import ENTRY_SCORING, attempt_scope
+
     try:
-        response = llm_adapter.call_text(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.2,
-            timeout=timeout,
-        )
+        with attempt_scope(ENTRY_SCORING, "supplement_missing_indicators"):
+            response = llm_adapter.call_text(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.2,
+                timeout=timeout,
+            )
         if getattr(response, "provider", "") == "error":
             return {
                 ind_id: gap_indicator(ind_id, "补充评分模型返回错误") for ind_id in missing
@@ -380,17 +383,31 @@ def _score_llm_indicators(
             match = re.search(r"\{.*\}", text, flags=re.DOTALL)
             text = match.group(0) if match else ""
         if not text:
+            from src.llm.attempt import refine_attempt_parse_error
+
+            refine_attempt_parse_error()
             return {
                 ind_id: gap_indicator(ind_id, "补充评分响应结构无效") for ind_id in missing
             }
         try:
             parsed = json.loads(text)
         except ValueError:
+            from src.llm.attempt import refine_attempt_parse_error
+
+            refine_attempt_parse_error()
             return {
                 ind_id: gap_indicator(ind_id, "补充评分响应结构无效") for ind_id in missing
             }
         valid_ids = set(missing)
-        for item in parsed.get("indicators") or []:
+        indicators = parsed.get("indicators") or []
+        if indicators and not all(isinstance(item, dict) for item in indicators):
+            # Malformed indicator shape: attribute the parse failure, keeping
+            # the scoring policy (no scores) and transport terminal priority.
+            from src.llm.attempt import refine_attempt_parse_error
+
+            refine_attempt_parse_error()
+            return {ind_id: gap_indicator(ind_id, "补充评分响应结构无效") for ind_id in missing}
+        for item in indicators:
             ind_id = str(item.get("id") or "")
             if ind_id not in valid_ids:
                 continue

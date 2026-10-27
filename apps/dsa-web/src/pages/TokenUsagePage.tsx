@@ -147,7 +147,7 @@ const TokenUsagePage: React.FC = () => {
         <PageHeader
           eyebrow={t('usage.eyebrow')}
           title={t('usage.title')}
-          description={t('usage.description')}
+          description={`${t('usage.description')} ${t('usage.confirmedScope')}`}
           actions={(
             <div className="flex flex-wrap items-center gap-2">
               <div className="inline-flex rounded-xl border border-border/70 bg-card/70 p-1">
@@ -275,9 +275,9 @@ const TokenUsagePage: React.FC = () => {
                             <div className="max-w-[18rem] truncate font-medium text-foreground">{item.model}</div>
                             {item.stockCode ? <div className="text-xs text-secondary-text">{item.stockCode}</div> : null}
                           </td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right text-secondary-text">{formatNumber(item.promptTokens, language)}</td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right text-secondary-text">{formatNumber(item.completionTokens, language)}</td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right font-medium text-foreground">{formatNumber(item.totalTokens, language)}</td>
+                          <td className="whitespace-nowrap px-4 py-3 text-right text-secondary-text">{item.unknownFields?.includes('prompt_tokens') ? t('usage.unknownField') : formatNumber(item.promptTokens, language)}</td>
+                          <td className="whitespace-nowrap px-4 py-3 text-right text-secondary-text">{item.unknownFields?.includes('completion_tokens') ? t('usage.unknownField') : formatNumber(item.completionTokens, language)}</td>
+                          <td className="whitespace-nowrap px-4 py-3 text-right font-medium text-foreground">{item.unknownFields?.includes('total_tokens') ? t('usage.unknownField') : formatNumber(item.totalTokens, language)}</td>
                         </tr>
                       )) : (
                         <tr>

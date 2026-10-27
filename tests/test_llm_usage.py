@@ -1252,7 +1252,6 @@ class TestGetLLMUsageSummary(unittest.TestCase):
         self.assertEqual(by_model["gemini/gemini-2.5-flash"]["calls"], 3)
         self.assertEqual(by_model["openai/gpt-4o"]["calls"], 2)
 
-
     def test_token_totals_include_prompt_completion_and_model_peak(self):
         from_dt, to_dt = self._today_range()
         result = self.db.get_llm_usage_summary(from_dt, to_dt)
@@ -1333,9 +1332,12 @@ class TestPersistUsageHelper(unittest.TestCase):
             self.assertEqual(row.prompt_tokens, 0)
             self.assertEqual(row.completion_tokens, 0)
             self.assertEqual(row.total_tokens, 0)
-            self.assertEqual(row.normalized_prompt_tokens, 0)
-            self.assertEqual(row.normalized_completion_tokens, 0)
-            self.assertEqual(row.normalized_total_tokens, 0)
+            # Provider-absent normalized fields stay NULL since #55: padding
+            # them with the legacy numeric zero would turn unknown into
+            # confirmed zero consumption.
+            self.assertIsNone(row.normalized_prompt_tokens)
+            self.assertIsNone(row.normalized_completion_tokens)
+            self.assertIsNone(row.normalized_total_tokens)
             self.assertEqual(row.cache_observation, "invalid_provider_usage")
 
     def test_persist_usage_writes_new_telemetry_fields(self):

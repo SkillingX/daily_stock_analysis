@@ -109,9 +109,9 @@ export const LLM_PROVIDER_TEMPLATES: LLMProviderTemplate[] = [
     label: 'Moonshot（月之暗面）',
     protocol: 'openai',
     baseUrl: 'https://api.moonshot.cn/v1',
-    placeholderModels: 'kimi-k2.6,kimi-k2.5',
+    placeholderModels: 'kimi-k3.1-pro',
     capabilities: ['openai-compatible'],
-    officialSources: [{ label: 'Kimi Platform Docs', url: 'https://platform.kimi.com/docs/models' }],
+    officialSources: [{ label: 'Kimi Platform Docs', url: 'https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart' }],
   },
   {
     channelId: 'minimax',

@@ -349,19 +349,27 @@ def _clean_dim_verdicts(value: Any) -> Dict[str, str]:
 
 
 def _call_wave(
-    llm_adapter: Any, system: str, facts: Dict[str, Any], timeout: float = 150.0
+    llm_adapter: Any, system: str, facts: Dict[str, Any], timeout: float = 150.0, *, wave: str = ""
 ) -> Dict[str, Any]:
-    resp = llm_adapter.call_text(
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": _dump(facts)},
-        ],
-        temperature=0.4,
-        timeout=timeout,
-    )
+    from src.llm.attempt import ENTRY_MANAGER_WRITEUP, attempt_scope
+
+    with attempt_scope(ENTRY_MANAGER_WRITEUP, wave):
+        resp = llm_adapter.call_text(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": _dump(facts)},
+            ],
+            temperature=0.4,
+            timeout=timeout,
+        )
     if getattr(resp, "provider", "") == "error" or getattr(resp, "finish_reason", None) in {"length", "content_filter"}:
         return {}
-    return _extract_json((resp.content or "").strip())
+    parsed = _extract_json((resp.content or "").strip())
+    if not parsed:
+        from src.llm.attempt import refine_attempt_parse_error
+
+        refine_attempt_parse_error()
+    return parsed
 
 
 def _wave_a_facts(
@@ -467,6 +475,7 @@ def generate_manager_writeup(
             + "}, \"dim_verdicts\": {"
             "\"基本面\": \"…(≤30字小计定性)\", \"消息面\": \"…\", \"资金面\": \"…\", \"情绪面\": \"…\", \"技术面\": \"…\", \"宏观\": \"…\"}}",
             _wave_a_facts(stock_name, stock_code, dims, guardrail_events),
+            wave="wave_a_title_summary",
         )
         out["title_angle"] = _clean_title(parsed.get("title_angle"))[:25]
         out["executive_summary"] = _clean_narrative(parsed.get("executive_summary"))[:600]
@@ -496,6 +505,7 @@ def generate_manager_writeup(
             " × ≤3 条，按确定性降序], \"scenario_triggers\": {"
             "\"optimistic\": \"…(可验证触发条件)\", \"neutral\": \"…\", \"pessimistic\": \"…\"}}",
             _wave_b_facts(stock_name, stock_code, dims),
+            wave="wave_b_main_sections",
         )
         narratives = parsed.get("section_narratives")
         if isinstance(narratives, dict):
@@ -519,6 +529,7 @@ def generate_manager_writeup(
             + ", ".join(f'\"{k}\": \"…(150-300字四段式论述)\"' for k in DIM_SECTION_KEYS)
             + "}}",
             _wave_c_facts(stock_name, stock_code, dims),
+            wave="wave_c_dim_sections",
         )
         narratives = parsed.get("section_narratives")
         if isinstance(narratives, dict):

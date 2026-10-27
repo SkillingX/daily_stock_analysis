@@ -520,6 +520,70 @@ class LLMChannelConfigTestCase(unittest.TestCase):
         self.assertTrue(directive.omit_temperature)
         self.assertNotIn("temperature", call_kwargs)
 
+    def test_kimi_k31_pro_temperature_is_omitted_at_request_build_time(self) -> None:
+        self.assertIsNone(get_fixed_litellm_temperature("openai/kimi-k3.1-pro"))
+
+        directive = resolve_litellm_temperature_directive("openai/kimi-k3.1-pro")
+        self.assertTrue(directive.omit_temperature)
+
+        call_kwargs = apply_litellm_generation_params(
+            {"model": "openai/kimi-k3.1-pro", "messages": [], "temperature": 0.3},
+            "openai/kimi-k3.1-pro",
+            0.3,
+        )
+
+        self.assertNotIn("temperature", call_kwargs)
+
+    def test_kimi_k31_pro_does_not_inherit_k26_fixed_temperatures(self) -> None:
+        self.assertIsNone(
+            get_fixed_litellm_temperature(
+                "openai/kimi-k3.1-pro",
+                request_overrides={"extra_body": {"thinking": {"type": "disabled"}}},
+            )
+        )
+        call_kwargs = apply_litellm_generation_params(
+            {"model": "openai/kimi-k3.1-pro", "messages": [], "temperature": 0.3},
+            "openai/kimi-k3.1-pro",
+            0.3,
+            request_overrides={"extra_body": {"thinking": {"type": "disabled"}}},
+        )
+
+        self.assertNotIn("temperature", call_kwargs)
+
+    def test_kimi_k31_pro_temperature_directive_resolves_litellm_yaml_alias(self) -> None:
+        model_list = [
+            {
+                "model_name": "kimi_router",
+                "litellm_params": {"model": "openai/kimi-k3.1-pro"},
+            }
+        ]
+
+        directive = resolve_litellm_temperature_directive("kimi_router", model_list=model_list)
+        call_kwargs = apply_litellm_generation_params(
+            {"model": "kimi_router", "messages": []},
+            "kimi_router",
+            0.3,
+            model_list=model_list,
+        )
+
+        self.assertTrue(directive.omit_temperature)
+        self.assertNotIn("temperature", call_kwargs)
+
+    def test_non_kimi_fallback_models_keep_user_temperature(self) -> None:
+        cold_kwargs = apply_litellm_generation_params(
+            {"model": "openai/glm-5.1", "messages": [], "temperature": 0.3},
+            "openai/glm-5.1",
+            0.3,
+        )
+        warm_kwargs = apply_litellm_generation_params(
+            {"model": "openai/glm-5.1", "messages": [], "temperature": 1.0},
+            "openai/glm-5.1",
+            1.0,
+        )
+
+        self.assertAlmostEqual(cold_kwargs["temperature"], 0.3)
+        self.assertAlmostEqual(warm_kwargs["temperature"], 1.0)
+
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_local_openai_compatible_channel_defaults_to_openai_protocol(self, _mock_parse_yaml, _mock_setup_env) -> None:

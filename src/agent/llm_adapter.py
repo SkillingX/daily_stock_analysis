@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 import litellm
 from litellm.router import Router
 
+from src.llm.attempt import STATUS_OK, STATUS_PARSE_ERROR, attempt_entry, last_attempt
 from src.llm.concurrency import limited_completion
 from src.config import (
     extra_litellm_params,
@@ -351,6 +352,13 @@ def resolve_fallback_litellm_wire_models(
 # ============================================================
 # LLM Tool Adapter
 # ============================================================
+
+
+def _refine_parse_error(error: BaseException) -> None:
+    """A response returned fine but did not parse; keep the outbound fact."""
+    attempt = last_attempt.get()
+    if attempt is not None and attempt.status == STATUS_OK:
+        attempt.refine_status(STATUS_PARSE_ERROR)
 
 
 class LLMToolAdapter:
@@ -709,12 +717,18 @@ class LLMToolAdapter:
                 logger=logger,
             )
 
-        return self._parse_litellm_response(
-            response,
-            model,
-            openai_messages,
-            model_list=recovery_model_list,
-        )
+        try:
+            return self._parse_litellm_response(
+                response,
+                model,
+                openai_messages,
+                model_list=recovery_model_list,
+            )
+        except Exception as e:
+            # Transport succeeded (last_attempt is this attempt with its
+            # usage already adopted); a parse failure is its terminal state.
+            _refine_parse_error(e)
+            raise
 
     def _get_temperature(self) -> float:
         """Return the raw configured temperature before per-model normalization."""

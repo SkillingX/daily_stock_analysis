@@ -340,103 +340,80 @@ class TestAgentExecutor(unittest.TestCase):
         self.assertEqual(result.effective_context["stock_code"], "600519")
         self.assertEqual(result.stock_scope.allowed_stock_codes, {"600519"})
 
-    def test_run_agent_loop_does_not_persist_agent_usage_without_provider_usage(self):
-        registry = _make_registry_with_echo()
-        adapter = _make_mock_adapter()
-        adapter.call_with_tools.return_value = LLMResponse(
-            content="Done.",
-            tool_calls=[],
-            usage={},
-            provider="openai",
-            model="openai/gpt-test",
-        )
+    def _audit_for(self, attempt):
+        """Drive the transport-layer audit decision (its new home).
 
-        with patch("src.agent.runner._persist_usage") as persist_usage:
-            result = run_agent_loop(
-                messages=[{"role": "user", "content": "Analyze"}],
-                tool_registry=registry,
-                llm_adapter=adapter,
-                max_steps=1,
-            )
+        Persistence moved from call_completion into the admission attempt
+        lifecycle; the decision is exercised there with the same usage shapes.
+        """
+        from src.llm import concurrency
+        from src.llm.attempt import ENTRY_AGENT, attempt_scope
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.total_tokens, 0)
+        with patch("src.storage.persist_llm_usage") as persist_usage:
+            with attempt_scope(ENTRY_AGENT, "step1"):
+                concurrency._persist_attempt_audit(attempt)
+        return persist_usage
+
+    def test_audit_persists_agent_usage_with_provider_usage(self):
+        from src.llm.attempt import ENTRY_AGENT, ModelAttempt
+
+        attempt = ModelAttempt(run_id="r", entry=ENTRY_AGENT, target_model="openai/gpt-test",
+                               wire_model="openai/gpt-test", outbound=True,
+                               usage_presence="provided",
+                               usage_provided={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        persist_usage = self._audit_for(attempt)
+        persist_usage.assert_called_once()
+        args = persist_usage.call_args[0]
+        assert args[1] == "openai/gpt-test" and persist_usage.call_args[1] == {"call_type": "agent"}
+        assert args[0]["total_tokens"] == 15
+        # A committed row id is linked exactly once onto the attempt.
+        with patch("src.storage.persist_llm_usage", return_value=7) as persist_usage2:
+            from src.llm import concurrency
+            from src.llm.attempt import attempt_scope
+
+            attempt2 = ModelAttempt(run_id="r", entry=ENTRY_AGENT, target_model="openai/gpt-test",
+                                    outbound=True, usage_presence="provided",
+                                    usage_provided={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+            with attempt_scope(ENTRY_AGENT, "step1"):
+                concurrency._persist_attempt_audit(attempt2)
+        assert attempt2.usage_record_id == 7
+        persist_usage2.assert_called_once()
+
+    def test_audit_does_not_persist_without_presence(self):
+        from src.llm.attempt import ENTRY_AGENT, ModelAttempt
+
+        attempt = ModelAttempt(run_id="r", entry=ENTRY_AGENT, target_model="openai/gpt-test",
+                               outbound=True, usage_presence="unset")
+        persist_usage = self._audit_for(attempt)
         persist_usage.assert_not_called()
 
-    def test_run_agent_loop_does_not_persist_metadata_only_provider_usage(self):
-        registry = _make_registry_with_echo()
-        adapter = _make_mock_adapter()
-        adapter.call_with_tools.return_value = LLMResponse(
-            content="Done.",
-            tool_calls=[],
-            usage=normalize_litellm_usage(
-                {"estimated_prefix_tokens": 123},
-                model="openai/gpt-4o",
-            ),
-            provider="openai",
-            model="openai/gpt-test",
-        )
+    def test_audit_does_not_persist_absent_usage(self):
+        from src.llm.attempt import ENTRY_AGENT, ModelAttempt
 
-        with patch("src.agent.runner._persist_usage") as persist_usage:
-            result = run_agent_loop(
-                messages=[{"role": "user", "content": "Analyze"}],
-                tool_registry=registry,
-                llm_adapter=adapter,
-                max_steps=1,
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.total_tokens, 0)
+        attempt = ModelAttempt(run_id="r", entry=ENTRY_AGENT, target_model="openai/gpt-test",
+                               outbound=True, usage_presence="absent")
+        persist_usage = self._audit_for(attempt)
         persist_usage.assert_not_called()
 
-    def test_run_agent_loop_persists_invalid_provider_usage_diagnostics(self):
-        registry = _make_registry_with_echo()
-        adapter = _make_mock_adapter()
-        usage = normalize_litellm_usage({"prompt_tokens": -1}, model="openai/gpt-4o")
-        adapter.call_with_tools.return_value = LLMResponse(
-            content="Done.",
-            tool_calls=[],
-            usage=usage,
-            provider="openai",
-            model="openai/gpt-test",
-        )
+    def test_audit_persists_invalid_provider_usage_diagnostics(self):
+        from src.llm.attempt import ENTRY_AGENT, ModelAttempt
 
-        with patch("src.agent.runner._persist_usage") as persist_usage:
-            result = run_agent_loop(
-                messages=[{"role": "user", "content": "Analyze"}],
-                tool_registry=registry,
-                llm_adapter=adapter,
-                max_steps=1,
-            )
+        attempt = ModelAttempt(run_id="r", entry=ENTRY_AGENT, target_model="openai/gpt-test",
+                               outbound=True, usage_presence="provided",
+                               usage_provided={"prompt_tokens": -1, "completion_tokens": 5, "total_tokens": 15})
+        persist_usage = self._audit_for(attempt)
+        persist_usage.assert_called_once()
+        persisted = persist_usage.call_args[0][0]
+        assert persisted["cache_observation"] == "invalid_provider_usage"
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.total_tokens, 0)
-        self.assertEqual(usage["cache_observation"], "invalid_provider_usage")
-        persist_usage.assert_called_once_with(usage, "openai/gpt-test", call_type="agent")
+    def test_audit_skips_unattributed_entries(self):
+        from src.llm.attempt import ModelAttempt
 
-    def test_run_agent_loop_persists_agent_usage_with_provider_usage(self):
-        registry = _make_registry_with_echo()
-        adapter = _make_mock_adapter()
-        usage = {"total_tokens": 5}
-        adapter.call_with_tools.return_value = LLMResponse(
-            content="Done.",
-            tool_calls=[],
-            usage=usage,
-            provider="openai",
-            model="openai/gpt-test",
-        )
-
-        with patch("src.agent.runner._persist_usage") as persist_usage:
-            result = run_agent_loop(
-                messages=[{"role": "user", "content": "Analyze"}],
-                tool_registry=registry,
-                llm_adapter=adapter,
-                max_steps=1,
-            )
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.total_tokens, 5)
-        persist_usage.assert_called_once_with(usage, "openai/gpt-test", call_type="agent")
+        attempt = ModelAttempt(run_id="r", entry="", target_model="openai/gpt-test",
+                               outbound=True, usage_presence="provided",
+                               usage_provided={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15})
+        persist_usage = self._audit_for(attempt)
+        persist_usage.assert_not_called()
 
     def test_run_agent_loop_blocks_conflicting_stock_scoped_tool_and_keeps_tool_result(self):
         executed_calls = []

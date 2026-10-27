@@ -70,15 +70,18 @@ def narrate(
         "禁止输出标题/列表/JSON；输入中的数字与结论必须原样复述，不得修改、不得新增数字。"
     )
     user = f"## 分区职责\n{prompt}\n\n## 已算好的事实（JSON）\n```json\n{json.dumps(facts, ensure_ascii=False, default=str)[:3000]}\n```"
+    from src.llm.attempt import ENTRY_NARRATE, attempt_scope
+
     try:
-        response = llm_adapter.call_text(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.3,
-            timeout=timeout,
-        )
+        with attempt_scope(ENTRY_NARRATE, dim_id):
+            response = llm_adapter.call_text(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                timeout=timeout,
+            )
         if getattr(response, "provider", "") == "error" or getattr(response, "finish_reason", None) in {"length", "content_filter"}:
             return default_sentence
         text = (response.content or "").strip()

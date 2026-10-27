@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import date
 from functools import partial
 from time import monotonic
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from src.agent.runner import run_agent_loop
 from src.agent.tools.registry import ToolRegistry
@@ -32,6 +32,36 @@ _SUPPLY_CHAIN_TOOLS = {
     "get_sector_rankings",
     "get_stock_info",
 }
+
+# 两试点（技术/资金）在共享宪法之上的分区职责边界（issue #56 阶段一）：
+# 宪法的 PM 七问、评级+目标价+时间维度与免责声明属于规则/聚合层职责，
+# 不作为单轮固定资料解读的输出义务；来源等级、缺口披露与禁止编造等
+# 既有纪律原样有效，仅收敛与本轮 schema 冲突的报告级义务与取数前时点确认职责。
+_PILOT_DIMS = frozenset({"technical", "capital"})
+_PILOT_SCOPE = (
+    "【本轮职责边界（分区研究员，优先于上文通用要求中与本边界冲突的部分）】\n"
+    "你是投研报告众多分区中的一位固定资料解读员：分析所需资料已由代码全部注入，"
+    "你没有工具、不重新研究公司；你的 JSON 是既有规则与聚合层的分区输入，不是完整研究报告。\n"
+    "职责分工：投资评级（买入/增持/中性/减持等）、目标价、时间维度、交易行动词表"
+    "（加仓/持有/减仓等）与 PM 七问投资决策由报告的既有规则与聚合层负责，不在本轮输出义务内；"
+    "score 字段仍按下方 schema 照常输出。报告末尾免责声明由聚合层统一附，"
+    "你在 JSON 之外不得再输出任何文字。\n"
+    "仍然有效的纪律：来源等级标签、数据日期/财期/单位、资格拒绝记录、单源未独立核验的标注、"
+    "真实缺口披露与禁止编造数字，全部按上文通用要求执行。\n"
+    "数字纪律：资料中的原统计值与代码给定展示是引用依据——已有统计展示（如金额窗口）直接引用，"
+    "不重复求和或重算；其他数字只做保留原值含义与币种的等值单位展示（如 2050000000000 CNY 写作 2.05 万亿元），"
+    "不新增资料未支持的推导。\n"
+    "未知纪律：资料未给出的比较基期、统计范围或子集一律按「未给出」如实说明，不得推定为事实，"
+    "也不得把由其推导的金额或结论当成事实。\n"
+    "时点纪律：上文中「先确认此刻最新一期财报再取数」的要求在本轮不适用——资料已由代码注入、"
+    "你没有取数动作，改为以资料已给定的时点与财期作解读。资料未给出更新核验结果时，"
+    "不得断言某记录是全局最新或「当前最新可得披露」，只能说「资料中最晚已给的时点/财期」。"
+    "讨论时效或陈旧性时写明所依据的时钟——财期截止日、观测/披露时间与会话日是不同的时点，"
+    "不得把财期截止日当作观测或披露时间；不同时钟得出不同结论时如实并陈，"
+    "依据不足以判定就说明该限制。\n"
+    "本边界不降低分析深度：围绕已注入资料的核心证据、理由与真实缺口充分解读，不略过已给证据，"
+    "也不加大全报告成文义务。"
+)
 
 
 def _build_registry(source_registry: Any, names: set[str]) -> Any:
@@ -76,6 +106,7 @@ def _run_explore(
         ("" if dim_id == "business" else load_constitution())
         + "\n\n"
         + prompt
+        + ("\n\n" + _PILOT_SCOPE if dim_id in _PILOT_DIMS else "")
         + "\n\n最终回答必须是且仅是一个 JSON 对象（不要 Markdown 代码围栏外的任何文字）。"
     )
     if dim_id == "business":
@@ -134,6 +165,11 @@ def _run_explore(
         parsed = _extract_json(loop.content)
         if parsed:
             return {"ok": True, "data": parsed, "steps": loop.total_steps}
+        # The transport succeeded but the structured answer is unusable:
+        # attribute the parse failure to the attempt that just returned.
+        from src.llm.attempt import refine_attempt_parse_error
+
+        refine_attempt_parse_error()
         last_error = loop.error or "LLM 未输出可解析 JSON"
         messages.append(
             {
@@ -237,8 +273,6 @@ def run_supply_chain_agent(
 # 八大研究员 · 新增 5 员（方案 v3：基金经理-研究员架构）
 # ---------------------------------------------------------------------------
 
-_TECHNICAL_TOOLS = {"get_daily_history", "analyze_trend"}
-_CAPITAL_TOOLS = {"get_capital_flow", "get_stock_info"}
 _SENTIMENT_TOOLS = {"search_stock_news"}
 _OWNERSHIP_TOOLS = {
     "search_comprehensive_intel",
@@ -248,51 +282,57 @@ _OWNERSHIP_TOOLS = {
 _US_CHINA_TOOLS = {"search_comprehensive_intel", "get_stock_info"}
 
 
-def _chanlun_engine_facts(stock_code: str, history: Optional[list[dict[str, Any]]] = None) -> str:
-    """P0-1：缠论引擎真实结构。优先复用共享快照日线，缺时才按需取数（issue #42）。"""
-    if run := current_research.get():
-        run.check()
+def _chanlun_structure_facts(history: list[dict[str, Any]]) -> str:
+    """缠论引擎结构（issue #42/#56）：只消费已准备的同一份日线，不自行取数。
+
+    空/不足 60 根或引擎失败返回空串，作为真实缺项披露；取数统一走
+    ``_prepared_history`` 的同报告单飞，避免失败样本重复出站。
+    """
+    if len(history) < 60:
+        return ""
     try:
         import pandas as pd
 
         from chanlun.chanlun_engine import ChanLunEngine
 
-        df = None
-        if history is not None and len(history) >= 60:
-            df = pd.DataFrame(history)
-        else:
-            from src.services.history_loader import load_history_df
-
-            df, _src = load_history_df(stock_code, days=250)
-            if df is None or df.empty or len(df) < 60:
-                return ""
-        df = df.copy()
+        df = pd.DataFrame(history)
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
         out = ChanLunEngine(df).analyze()
-        return (
-            f"【缠论引擎结构（权威，禁止矛盾）】趋势={out.get('current_trend')}"
-            f"，中枢位置={out.get('position')}，背驰={out.get('divergence') or '无'}；"
-            f"笔数={len(out.get('strokes') or [])}，中枢数={len(out.get('zhongshus') or [])}。"
-        )
     except Exception:  # noqa: BLE001 - 引擎失败不阻断研究员
         return ""
+    # 引擎结构结论沿既有标量抽取留存（issue #56 A2）：模型失败/取消后退化
+    # 报告仍保留已算好的趋势/位置/背驰，文本结论不算评分依据。
+    if run := current_research.get():
+        run.retain_facts("chanlun_engine", {"source": "缠论引擎计算", "date": history[-1].get("date") or "",
+                                            "current_trend": out.get("current_trend"),
+                                            "position": out.get("position"),
+                                            "divergence": out.get("divergence")})
+    return (
+        f"【缠论引擎结构（权威，禁止矛盾）】趋势={out.get('current_trend')}"
+        f"，中枢位置={out.get('position')}，背驰={out.get('divergence') or '无'}；"
+        f"笔数={len(out.get('strokes') or [])}，中枢数={len(out.get('zhongshus') or [])}。"
+    )
 
 
-def _shared_market_facts(ctx: Any) -> str:
+def _shared_market_facts(ctx: Any, history: Optional[List[Dict[str, Any]]] = None, history_source: str = "") -> str:
     """共享快照中已取得的技术事实摘要（同次研究、同分析时点，issue #42）。
 
     现价、最新收盘（含真实数据日期）、MA20、支撑阻力与数据来源均来自
-    阶段 0 共享快照；指标复用既有计算入口（data_dim._support_resistance）。
+    阶段 0 共享快照；技术研究传入同报告单飞补取的日线时，以同一份结果
+    注入（history/history_source 覆盖），指标复用既有计算入口。
     """
     if ctx is None:
         return ""
+    if history is None:
+        history = getattr(ctx, "history", None) or []
+    if not history_source:
+        history_source = str(getattr(ctx, "history_source", "") or "")
     parts: list[str] = []
     if ctx.quote and ctx.quote.get("price") is not None:
         parts.append(f"现价 {ctx.quote['price']}")
-    history = getattr(ctx, "history", None) or []
     if history:
-        closes = [r.get("close") for r in history if r.get("close") is not None]
+        closes = [c for r in history if (c := r.get("close")) is not None]
         latest = history[-1]
         if closes and latest.get("date"):
             parts.append(
@@ -307,97 +347,477 @@ def _shared_market_facts(ctx: Any) -> str:
             from src.deep_research_dims.data_dim import _support_resistance
 
             support, resistance = _support_resistance(list(history))
+            # 已算支撑/阻力沿既有标量抽取留存（issue #56 A2）：模型失败/取消
+            # 后退化报告仍保留；None 项由抽取层跳过，不补造。
+            if run := current_research.get():
+                run.retain_facts("support_resistance", {"source": f"代码计算，日线来源 {history_source or '未记录'}",
+                                                        "date": latest.get("date") or "",
+                                                        "support": support, "resistance": resistance})
             if support is not None:
                 parts.append(f"支撑 {support}")
             if resistance is not None:
                 parts.append(f"阻力 {resistance}")
         except Exception:  # noqa: BLE001 - 指标失败不阻断事实注入
             pass
-    source = str(getattr(ctx, "history_source", "") or "")
+    source = history_source
     parts.append(f"来源：本次研究共享快照（日线实际来源 {source or '未记录'}）")
     return "；".join(parts)
 
 
+def _prepared_history(stock_code: str) -> tuple[list[dict[str, Any]], str]:
+    """技术研究固定日线：共享快照优先，不足时走既有有界入口一次（issue #56）。
+
+    同报告去重身份：run + 证券 + 技术日线需求 + 刷新标记；失败/空结果如实
+    保留，不交给模型规划取数，也不在同一研究员内二次加载。返回 (records, source)。
+    """
+    if run := current_research.get():
+        run.check()
+    shared_ctx = getattr(run, "context", None)
+    shared_history = list(shared_ctx.history) if getattr(shared_ctx, "history", None) else None
+    if shared_history is not None and len(shared_history) >= 60:
+        return shared_history, str(getattr(shared_ctx, "history_source", "") or "")
+
+    def _load() -> tuple[list[dict[str, Any]], str]:
+        from src.services.history_loader import load_history_df
+
+        df, source = load_history_df(stock_code, days=250)
+        if df is None or df.empty:
+            return [], str(source or "")
+        records: list[dict[str, Any]] = df.to_dict(orient="records")  # type: ignore[assignment]
+        for row in records:
+            if "date" in row:
+                row["date"] = str(row["date"])
+        return records, str(source or "")
+
+    if run is None:
+        records, source = _load()
+    else:
+        from src.config import get_config
+        from src.core.research_run import supplier_need_key
+        from data_provider.mx_data_adapter import financial_refresh
+
+        config = get_config()
+        refresh = financial_refresh.get()
+        key = supplier_need_key("history", config.data_source_contract, "technical_daily", stock_code, refresh[1] if refresh else "")
+        records, source = run.single_fetch(key, _load)
+    if not records and shared_history:
+        # 补取失败/为空时保留阶段 0 已取得的部分日线：局部有效资料
+        # 不因一次有界补取失败被整套丢弃（issue #56 反例契约）。
+        return shared_history, str(getattr(shared_ctx, "history_source", "") or "")
+    return records, source
+
+
+def _computed_indicator_facts(history: list[dict[str, Any]], stock_code: str, history_source: str = "") -> tuple[str, bool]:
+    """既有趋势分析入口产出 MACD/RSI/均线状态（代码计算，不新增取数）。
+
+    返回 (事实文本, 是否可用)；样本不足或引擎失败返回空串，由任务文本披露缺口。
+    """
+    if len(history) < 20:
+        return "", False
+    try:
+        import pandas as pd
+
+        from src.stock_analyzer import StockTrendAnalyzer
+
+        result = StockTrendAnalyzer().analyze(pd.DataFrame(history), stock_code)
+    except Exception:  # noqa: BLE001 - 指标失败只作缺口披露
+        return "", False
+
+    def _fmt(value: Any, digits: int = 2) -> str:
+        return f"{value:.{digits}f}" if isinstance(value, (int, float)) else str(value)
+
+    # 已算指标沿既有 analyze_trend 标量抽取留存（issue #56 A2）：模型失败/
+    # 取消后退化报告仍保留真实算得的指标；样本不足的 0 默认值不留存。来源
+    # 区分计算者与上游日线来源（补取结果可不同于共享快照来源），末日如实。
+    if run := current_research.get():
+        scalars: Dict[str, Any] = {
+            "ma5": result.ma5, "ma10": result.ma10, "ma20": result.ma20,
+            "current_price": result.current_price,
+        }
+        if result.macd_signal != "数据不足":
+            scalars["macd_dif"] = result.macd_dif
+        if result.rsi_signal != "数据不足":
+            scalars["rsi_6"] = result.rsi_6
+        run.retain_facts("analyze_trend", {"source": f"代码指标计算，日线来源 {history_source or '未记录'}",
+                                           "date": history[-1].get("date") or "", **scalars})
+
+    # 样本不足时分析器保留 0 默认值并以信号文案标注；默认值不是权威事实，
+    # 只披露实际算得的指标，其余按名列为真实缺口（issue #56 根反例）。
+    parts: list[str] = [
+        f"趋势={result.trend_status.value}",
+        f"均线排列={result.ma_alignment}",
+        f"MA5={_fmt(result.ma5)}，MA10={_fmt(result.ma10)}，MA20={_fmt(result.ma20)}",
+    ]
+    if result.macd_signal == "数据不足":
+        parts.append("MACD 未取得（样本不足）")
+    else:
+        parts.append(
+            f"MACD DIF={_fmt(result.macd_dif, 4)}/DEA={_fmt(result.macd_dea, 4)}/{result.macd_status.value}（{result.macd_signal}）"
+        )
+    if result.rsi_signal == "数据不足":
+        parts.append("RSI 未取得（样本不足）")
+    else:
+        parts.append(f"RSI6={_fmt(result.rsi_6)}/RSI12={_fmt(result.rsi_12)}/{result.rsi_status.value}")
+    parts.append(f"量能={result.volume_status.value}")
+    text = "【已计算指标（代码产出，权威）】" + "；".join(parts)
+    return text, True
+
+
+def _technical_valid_parts(
+    shared_ctx: Any, history: list[dict[str, Any]], indicator_facts: str, engine_facts: str
+) -> dict[str, bool]:
+    """可解释技术资料的组成标记；仅来源文字不算有效资料（issue #56）。"""
+    quote_price = (getattr(shared_ctx, "quote", None) or {}).get("price")
+    return {
+        "quote": quote_price is not None,
+        "daily": bool(history),
+        "indicators": bool(indicator_facts),
+        "structure": bool(engine_facts),
+    }
+
+
+def _technical_gaps(valid: dict[str, bool]) -> str:
+    labels = {"quote": "实时行情", "daily": "日线历史", "indicators": "MACD/RSI/均线指标", "structure": "缠论结构"}
+    missing = [label for name, label in labels.items() if not valid.get(name)]
+    return "、".join(missing) if missing else "无"
+
+
 def _technical_task(
-    stock_code: str, stock_name: str, market_facts: str, engine_facts: str
+    stock_code: str,
+    stock_name: str,
+    market_facts: str,
+    engine_facts: str,
+    indicator_facts: str = "",
+    gaps: str = "无",
 ) -> str:
-    """技术研究员任务文本：共享事实优先注入，工具仅作补充（issue #42）。"""
+    """技术研究员任务文本：代码准备的固定事实注入，单轮无工具分析（issue #56）。"""
     return (
-        f"请对 A 股 {stock_name}（{stock_code}）做技术面深度分析并直接输出 JSON：\n"
-        f"0) 共享快照事实（本次研究已取得，权威，禁止声称这些行情缺失）：{market_facts or '共享快照无行情，用工具取数'}\n"
-        f"0.1) 缠论结构事实（引擎已算好，你的解读必须与之一致，禁止矛盾）：{engine_facts or '引擎不可用，用工具取数后自行判定'}\n"
-        "1) 第 0) 项事实够用时直接使用，确需补充才调 get_daily_history / analyze_trend；"
-        "工具调用失败时基于第 0) 项已有事实作答，只说明真实缺项（如仅 MACD 未取得），"
-        "禁止把局部缺项说成整套行情缺失；\n"
-        "2) 输出 JSON：chanlun_summary(字符串：基于引擎结构的解读——为什么是这个趋势/位置/背驰)、"
-        "support(数值)、resistance(数值)、indicator_summary(字符串：MACD/RSI/均线状态)、"
+        f"请对 A 股 {stock_name}（{stock_code}）做技术面深度分析并直接输出 JSON。\n"
+        "本次所需的固定资料已由代码全部准备完毕；你没有可用工具，也不要请求任何工具，"
+        "仅基于以下事实完成分析：\n"
+        f"0) 共享快照事实（本次研究已取得，权威，禁止声称这些行情缺失）：{market_facts or '共享快照无行情（缺口如实说明）'}\n"
+        f"0.1) 已计算指标（代码产出，权威，你的解读必须与之一致）：{indicator_facts or '未取得（缺口如实说明）'}\n"
+        f"0.2) 缠论结构事实（引擎已算好，你的解读必须与引擎一致，禁止矛盾）：{engine_facts or '引擎结构不可用（缺口如实说明）'}\n"
+        f"0.3) 已确认缺项：{gaps}。缺项只作为真实限制说明，"
+        "禁止把局部缺项说成整套行情缺失，禁止编造未提供的数字或指标；\n"
+        "1) 输出 JSON：chanlun_summary(字符串：基于引擎结构的解读——为什么是这个趋势/位置/背驰)、"
+        "support(数值或 null)、resistance(数值或 null)：只引用上面实际存在的价位依据，无依据的点位保持 null；"
+        "indicator_summary(字符串：MACD/RSI/均线状态，未取得的项如实说明)、"
         "wave_note(字符串：波浪理论视角的一句判断，不适用则写不适用)、"
-        "score(0-100 综合技术分，须与引擎结构方向一致)、basis(打分依据一句话，含具体数字)、"
-        "narrative(50-100 字结论：必须含至少 2 个硬数字——价位/百分比/指标值，禁止只给分无论据)。"
+        "score(0-100 综合技术分或 null：依据不足时保持 null，有分时须与引擎结构方向一致)、"
+        "basis(打分依据一句话，只引用实际存在的数字)、"
+        "narrative(50-100 字结论：引用实际存在的硬数字——价位/百分比/指标值；"
+        "可引用的数字不足时写足实际存在的并明确其余缺口，禁止为凑数量编造)。"
     )
 
 
-def run_technical_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
-    """技术研究员：共享快照 + 缠论引擎结构注入（LLM 只解读），+ 支撑压力 + MACD/RSI/波浪。"""
+def run_technical_agent(
+    stock_code: str,
+    stock_name: str,
+    llm_adapter: Any,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    max_steps: int = 8,
+) -> Dict[str, Any]:
+    """技术研究员：代码准备行情/日线/指标/结构事实，单轮无工具结构化分析（issue #56）。"""
+    history, history_source = _prepared_history(stock_code)
+    engine_facts = _chanlun_structure_facts(history)
+    indicator_facts, _indicators_ok = _computed_indicator_facts(history, stock_code, history_source)
     run = current_research.get()
     shared_ctx = getattr(run, "context", None)
-    shared_history = list(shared_ctx.history) if getattr(shared_ctx, "history", None) else None
-    engine_facts = _chanlun_engine_facts(stock_code, history=shared_history)
-    market_facts = _shared_market_facts(shared_ctx)
-    task = _technical_task(stock_code, stock_name, market_facts, engine_facts)
-    return _run_explore("technical", _TECHNICAL_TOOLS, task, llm_adapter, progress_callback, max_steps)
+    # 备料标量沿既有 retained_tool_facts 抽取留存（issue #56 A2）：模型失败/
+    # 取消/预算中断后退化报告仍保留阶段 0 已取得的行情与日线，不重新取数。
+    if run is not None:
+        quote = getattr(shared_ctx, "quote", None) or {}
+        if quote.get("price") is not None:
+            run.retain_facts("get_realtime_quote", quote)
+        if history:
+            run.retain_facts("get_daily_history", {"data": [history[-1]], "source": history_source})
+    market_facts = _shared_market_facts(shared_ctx, history=history, history_source=history_source)
+    valid = _technical_valid_parts(shared_ctx, history, indicator_facts, engine_facts)
+    if not any(valid.values()):
+        return {"ok": False, "error": "无可解释的有效技术资料（行情、日线、指标、结构均缺失），未启动模型"}
+    task = _technical_task(
+        stock_code, stock_name, market_facts, engine_facts,
+        indicator_facts=indicator_facts, gaps=_technical_gaps(valid),
+    )
+    return _run_explore("technical", set(), task, llm_adapter, progress_callback, max_steps=1)
+
+
+def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
+    """资金流固定输入：既有有界入口 + 同报告去重（issue #56，#51 single_fetch 模式）。"""
+    from src.agent.tools.data_tools import _handle_get_capital_flow
+
+    if run := current_research.get():
+        run.check()
+
+    def _fetch() -> Dict[str, Any]:
+        return _handle_get_capital_flow(stock_code)
+
+    run = current_research.get()
+    if run is None:
+        return _fetch()
+    from src.config import get_config
+    from src.core.research_run import supplier_need_key
+    from data_provider.mx_data_adapter import financial_refresh
+
+    config = get_config()
+    refresh = financial_refresh.get()
+    key = supplier_need_key(config.data_source_profile, config.data_source_contract, "capital_flow", stock_code, refresh[1] if refresh else "")
+    result = run.single_fetch(key, _fetch)
+    run.retain("get_capital_flow", result)
+    return result
+
+
+def _retain_institution_block(run: Any, block: Dict[str, Any]) -> None:
+    """机构标量沿既有 get_fundamental_context 抽取留存（issue #56 A2）。
+
+    值经既有抽取器的资格投影进 run.facts：来源/单位（percentage_point）/
+    财期/口径（caliber，如 top10_shareholders 统计对象）/质量与拒绝原因
+    等既有 RetainedFact 字段保留，非整条原始 field_meta 归档；股东户数不
+    等于持仓，已知限制原样随投影保留。
+    """
+    data = block.get("data") or {}
+    meta = block.get("field_meta") or {}
+    payload = {key: data.get(key) for key in ("institution_holding_change", "top10_holder_change")
+               if data.get(key) is not None or isinstance(meta.get(key), dict)}
+    if run is not None and payload:
+        run.retain_facts("get_fundamental_context", {**payload, "field_meta": meta})
+
+
+def _institution_materials(stock_code: str) -> Dict[str, Any]:
+    """机构/股东固定输入：优先消费本报告已取得的 institution 块（issue #56）。
+
+    阶段 0 快照（同报告、同证券）自本票起保留 institution 块，命中时零新增
+    出站；仅当该块整体未保留（旧日缓存/装配异常）才走既有有界入口
+    ``manager.get_fundamental_context``（choice 下经 #51 single_fetch 与阶段 0
+    同飞）。块内失败/空值如实保留，不整装配 stock_info，不因缺项重复出站。
+    """
+    run = current_research.get()
+    if run is not None:
+        run.check()
+    ctx = getattr(run, "context", None)
+    fundamental = getattr(ctx, "fundamental", None) or {}
+    block = fundamental.get("institution")
+    if isinstance(block, dict):
+        _retain_institution_block(run, block)
+        return block
+    from src.agent.tools.data_tools import _get_fetcher_manager
+
+    if run is None:
+        run = current_research.get()
+    if run is not None:
+        run.check()
+    from src.config import get_config
+
+    budget = max(0.0, get_config().fundamental_stage_timeout_seconds)
+    try:
+        context = _get_fetcher_manager().get_fundamental_context(stock_code, budget_seconds=budget)
+    except Exception as exc:  # noqa: BLE001 - 机构资料失败如实降级
+        return {"status": "failed", "data": {}, "field_meta": {}, "errors": [str(exc)]}
+    fetched = context.get("institution")
+    if not isinstance(fetched, dict):
+        return {"status": "failed", "data": {}, "field_meta": {}, "errors": ["机构资料块缺失"]}
+    _retain_institution_block(run, fetched)
+    return fetched
+
+
+def _flow_unit_known(flow: Dict[str, Any]) -> bool:
+    """金额量纲只认既有资格层的字段级记录（issue #56 根反例契约）。
+
+    完整消费契约：``field_meta.main_inflow`` 带 ``normalization_error``
+    （unit_conflict/unit_unknown/metadata_invalid 等资格层明确拒绝）一票
+    否决，任何源级标注（currency/source_unit）都不能推翻或升级；无拒绝时
+    仅当该记录 ``rule_eligible`` 且带规范 ``unit`` 才算量纲已知。仅有
+    ``currency``/``source_unit`` 字段不构成量纲依据，拒绝记录原样保留。
+    """
+    record = (flow.get("field_meta") or {}).get("main_inflow") or {}
+    if record.get("normalization_error"):
+        return False
+    return bool(record.get("rule_eligible") and record.get("unit"))
+
+
+def _flow_amount_text(flow: Dict[str, Any], key: str, label: str, unit: str) -> str:
+    value = flow.get(key)
+    if value is None:
+        return f"{label}窗口不完整"
+    if unit in {"currency_base", "CNY"}:
+        return f"{label} {value / 10000:,.2f} 万元"
+    return f"{label} {value}（单位 {unit or '未确认'}）"
+
+
+# 三个固定金额窗口：任务内展示与失败兜底 flow_summary 同一来源（issue #56）。
+_FLOW_WINDOWS: tuple[tuple[str, str], ...] = (
+    ("main_net_inflow", "当日"),
+    ("inflow_5d", "5交易日"),
+    ("inflow_10d", "10交易日"),
+)
+
+
+def _flow_display_text(flow: Optional[Dict[str, Any]]) -> str:
+    """字段级资格合格金额的既有展示文本，供任务直接引用、避免模型自行换算。"""
+    if flow is None or flow.get("main_net_inflow") is None or not _flow_unit_known(flow):
+        return ""
+    record = (flow.get("field_meta") or {}).get("main_inflow") or {}
+    unit = str(record.get("unit") or "")
+    amounts = "；".join(_flow_amount_text(flow, key, label, unit) for key, label in _FLOW_WINDOWS)
+    return f"主力净流入金额展示（代码按合格单位换算，直接引用，不自行换算）：{amounts}。\n"
+
+
+def _flow_gap_text(flow: Dict[str, Any]) -> str:
+    errors = "; ".join(flow.get("errors") or [])
+    if errors:
+        return errors
+    note = str(flow.get("note") or "")
+    if note:
+        return note
+    if flow.get("main_net_inflow") is not None:
+        return "主力净流入金额单位未确认，不推断资金金额与方向"
+    return "资金流数据不可用"
+
+
+def _capital_gap_reason(flow_ready: bool, institution_eligible: bool, flow: Dict[str, Any], institution: Dict[str, Any]) -> str:
+    parts: list[str] = []
+    if not flow_ready:
+        parts.append(f"资金流不可用：{_flow_gap_text(flow)}")
+    if not institution_eligible:
+        status = institution.get("status")
+        parts.append("机构/股东资料无合格字段" + (f"（{status}）" if status else ""))
+    return "；".join(parts)
+
+
+def _market_cap_materials() -> Dict[str, Any]:
+    """市值锚点固定输入：只读同报告阶段 0 已装配的 ``ctx.fundamental``（issue #56）。
+
+    总市值/流通市值分开标识，整条复用既有字段级资格记录（含来源/单位/币种/
+    时点/财期/质量与拒绝原因），零新增出站。锚点资格沿用既有字段级口径（与
+    ``_flow_unit_known`` 同一语义）：带字段级拒绝（``normalization_error``）
+    一票否决，仅 ``rule_eligible`` 且带规范 ``unit`` 与值的记录可作量级锚点，
+    源级标注不补造资格；不合格与缺失记录原样保留真实原因。总市值入口与
+    ``_safe_fundamental`` 标量装配同键名序列（total_mv/market_cap/
+    total_market_cap），总/流通不混用。两个固定入口必各自产出锚点或缺口
+    （无记录按 ``record: null`` 如实标缺），不会没有可报告项。
+    """
+    run = current_research.get()
+    if run is not None:
+        run.check()
+    ctx = getattr(run, "context", None)
+    fundamental = getattr(ctx, "fundamental", None) or {}
+    records = fundamental.get("field_meta") or {}
+    anchors: Dict[str, Any] = {}
+    gaps: list[Dict[str, Any]] = []
+    entries: list[tuple[str, str, tuple[str, ...]]] = [
+        ("total", "总市值", ("total_mv", "market_cap", "total_market_cap")),
+        ("circ", "流通市值", ("circ_mv",)),
+    ]
+    for key, label, names in entries:
+        existing = [(name, records[name]) for name in names if isinstance(records.get(name), dict)]
+        qualified = [
+            (name, record) for name, record in existing
+            if not record.get("normalization_error")
+            and record.get("rule_eligible") and record.get("unit") and record.get("value") is not None
+        ]
+        if qualified:
+            name, record = qualified[0]
+            anchors[key] = {"label": label, "field": name, "record": record}
+            continue
+        # 既有资格记录（含拒绝原因）原样保留，不折成泛称缺失；无记录才如实标缺。
+        for name, record in existing:
+            gaps.append({"label": label, "field": name, "record": record})
+        if not existing:
+            gaps.append({"label": label, "field": list(names), "record": None})
+    material: Dict[str, Any] = {"anchors": anchors}
+    if gaps:
+        material["gaps"] = gaps
+    # 市值标量沿既有 get_stock_info 抽取留存（issue #56 A2）：合格锚点与拒绝
+    # 记录都带既有资格投影进 run.facts（含口径），模型失败/取消后退化报告仍
+    # 保留；无记录的缺口没有标量可留，不补造。
+    if run is not None:
+        payload: Dict[str, Any] = {}
+        meta: Dict[str, Any] = {}
+        for entry in (*anchors.values(), *gaps):
+            record = entry.get("record")
+            if not isinstance(record, dict) or record.get("value") is None:
+                continue
+            fixed = "total_mv" if entry["label"] == "总市值" else "circ_mv"
+            payload[fixed] = record.get("value")
+            meta[fixed] = record
+        if payload:
+            run.retain_facts("get_stock_info", {**payload, "field_meta": meta})
+    return material
+
+
+def _capital_task(stock_code: str, stock_name: str, flow: Optional[Dict[str, Any]], institution: Dict[str, Any], market_cap: Optional[Dict[str, Any]] = None) -> str:
+    """资金研究员任务文本：代码准备的固定资料注入，单轮无工具分析（issue #56）。"""
+    import json
+
+    if market_cap is not None:
+        market_cap_text = (
+            "\n3) 市值锚点（同报告估值资料，整条复用既有字段级资格记录，含来源/单位/币种/时点/"
+            "财期/质量与拒绝原因；单源数据未独立核验，不当作跨源核验结论；资金量级判断可对照此"
+            "分母，禁止把已取得的市值说成缺失；gaps 中的原资格记录按其拒绝原因如实保留，"
+            "record 为 null 即无记录，不虚构市值数字）："
+            + json.dumps(market_cap, ensure_ascii=False)
+        )
+    else:
+        market_cap_text = "\n3) 市值锚点：本报告未取得合格市值资料（按真实缺口说明，不虚构市值数字）。"
+    return (
+        f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON。\n"
+        "解读方向：结合市值锚点说明资金流的相对量级含义；机构/股东部分说明既有口径"
+        "（field_meta 的 caliber/period/period_basis）实际能支持的结论范围。\n"
+        "本次所需的固定资料已由代码全部准备完毕；你没有可用工具，也不要请求任何工具，仅基于以下事实完成分析：\n"
+        "1) 资金流资料（已取得，权威；金额缺失、窗口不完整或单位未确认按缺口处理）："
+        + json.dumps(flow, ensure_ascii=False)
+        + ("\n" + flow_display if (flow_display := _flow_display_text(flow)) else "")
+        + "\n2) 机构/股东资料（institution 块，含来源与资格标注；股东户数不等于持仓量）："
+        + json.dumps(institution, ensure_ascii=False)
+        + market_cap_text
+        + "\n4) 输出 JSON：flow_summary、flow_score(0-100 或 null)、institution_summary"
+        "（机构/大户持仓变动解读）、institution_score(0-100 或 null)、score(两项加权总分或 null，任一侧缺失不给合成总分)、"
+        "narrative(50-100 字结论：只引用资料中实际存在的硬数字——净流入金额/持仓变动比例/市值锚点等；"
+        "可引用的数字不足时写足实际存在的并明确其余缺口，禁止为凑数量编造)。\n"
+        "金额缺失、窗口不完整或单位未确认时，flow_score、资金总分填 null，不推断资金金额、方向或交易行动；"
+        "narrative 只说明已验证内容与真实缺口，不要求凑齐数字。"
+        "机构与股东资料按各自 field_meta/source_chain 引用；缺统计对象、日期或单位时只作线索，不给机构分数或方向结论；"
+        "某一侧缺失时保留另一侧的解释，禁止把局部缺项说成整套资料无效。"
+    )
 
 
 def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8) -> Dict[str, Any]:
-    """资金研究员：资金流向 + 机构/大户持仓变动。"""
-    task = (
-        f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON：\n"
-        "1) get_capital_flow 取主力资金流（当日/5日/10日），"
-        "get_stock_info 取机构持仓与基本面佐证；\n"
-        "2) 输出 JSON：flow_summary、flow_score(0-100)、institution_summary"
-        "（机构/大户持仓变动解读）、institution_score(0-100)、"
-        "score(两项加权总分)、每项说明含具体数字；取不到的项 score 填 null；"
-        "narrative(50-100 字结论：必须含至少 2 个硬数字——净流入金额/持仓变动比例等，禁止只给分无论据)。"
-    )
-    tools = _CAPITAL_TOOLS
-    flow = None
-    institution_eligible = True
-    if get_config().data_source_profile == "choice":
-        import json
-        from src.agent.tools.data_tools import _handle_get_capital_flow, _handle_get_stock_info
-        deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
-        if run := current_research.get():
-            run.check()
-        flow = _handle_get_capital_flow(stock_code)
-        if run := current_research.get():
-            run.retain("get_capital_flow", flow)
-        if run := current_research.get():
-            run.check()
-        info = _handle_get_stock_info(stock_code, deadline=deadline)
-        if run := current_research.get():
-            run.retain("get_stock_info", info)
-        institution = (info.get("fundamental_context") or {}).get("institution") or {}
-        institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
-        tools = tools - {"get_capital_flow", "get_stock_info"}
-        task += "\n资金流工具已执行，结果：" + json.dumps(flow, ensure_ascii=False)
-        task += "\n基本面工具已执行，结果：" + json.dumps(info, ensure_ascii=False)
-        task += "\n金额缺失或单位未确认时，flow_score、资金总分填 null，不推断资金金额、方向或交易行动。narrative 只说明已验证内容与缺口，不要求凑齐数字。"
-        task += "\n机构与股东资料按各自 source_chain 引用；股东户数不等于持仓量，缺统计对象、日期或单位时只作线索，不给机构分数或方向结论。"
-    out = _run_explore("capital", tools, task, llm_adapter, progress_callback, max_steps)
-    if out.get("ok") and not institution_eligible:
-        out["data"]["institution_score"] = None
-        out["data"]["score"] = None
-        out["data"]["institution_summary"] = "公开机构/股东资料仅作线索；统计对象、日期或单位未核实，不能据此判定持仓方向。"
-    if flow is not None and out.get("ok") and flow.get("main_net_inflow") is not None:
-        amounts = [f"{label} {flow[key] / 10000:,.2f} 万元" if flow.get(key) is not None else f"{label}窗口不完整" for key, label in (("main_net_inflow", "当日"), ("inflow_5d", "5交易日"), ("inflow_10d", "10交易日"))]
-        out["data"]["flow_summary"] = f"Choice 主力净流入，截至{flow.get('expected_date')}已收盘交易日：" + "；".join(amounts) + "。单源数据，未独立核验。"
-    if flow is not None and out.get("ok") and flow.get("main_net_inflow") is None:
-        data = out["data"]
-        data["flow_score"] = data["score"] = None
-        data["flow_summary"] = flow.get("note") or "资金流数据不可用"
-        data["narrative"] = data["flow_summary"]
+    """资金研究员：代码准备资金流与机构资料，单轮无工具结构化分析（issue #56）。"""
+    flow = _capital_flow_material(stock_code)
+    institution = _institution_materials(stock_code)
+    # 市值材料是同报告共享上下文的纯读取/留存（零新增出站），必须在门控早退
+    # 前执行：两侧无效不启动模型时，已知市值仍进 run.facts 供失败/取消留存。
+    market_cap = _market_cap_materials()
+    institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
+    flow_ready = flow is not None and flow.get("main_net_inflow") is not None and _flow_unit_known(flow)
+    if not flow_ready and not institution_eligible:
+        flow_reason = _flow_gap_text(flow or {})
+        return {"ok": False, "error": f"无可解释的有效资金资料：资金流——{flow_reason}；机构/股东资料无合格字段，未启动模型"}
+    task = _capital_task(stock_code, stock_name, flow, institution, market_cap)
+    out = _run_explore("capital", set(), task, llm_adapter, progress_callback, max_steps=1)
+    if not out.get("ok"):
+        return out
+    data = out["data"]
+    if not institution_eligible:
+        data["institution_score"] = None
+        data["institution_summary"] = "公开机构/股东资料仅作线索；统计对象、日期或单位未核实，不能据此判定持仓方向。"
+    if not flow_ready:
+        data["flow_score"] = None
+        data["flow_summary"] = _flow_gap_text(flow or {})
+    if not flow_ready or not institution_eligible:
+        # 单腿缺失时不给合成总分；另一侧已取得的解释保留在 narrative 与对应 summary。
+        data["score"] = None
         data["status"] = "degraded"
-        data["degraded_reason"] = "; ".join(flow.get("errors") or [])
+        data["degraded_reason"] = _capital_gap_reason(flow_ready, institution_eligible, flow or {}, institution)
+    if flow_ready:
+        assert flow is not None
+        record = (flow.get("field_meta") or {}).get("main_inflow") or {}
+        unit = str(record.get("unit") or "")
+        amounts = "；".join(_flow_amount_text(flow, key, label, unit) for key, label in _FLOW_WINDOWS)
+        source_label = "Choice 主力净流入" if flow.get("source") == "choice" else "主力净流入"
+        as_of_text = f"，截至{flow.get('expected_date')}已收盘交易日" if flow.get("expected_date") else ""
+        data["flow_summary"] = f"{source_label}{as_of_text}：{amounts}。单源数据，未独立核验。"
     return out
 
 

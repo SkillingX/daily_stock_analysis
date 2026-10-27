@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+
 logger = logging.getLogger(__name__)
 
 PROVIDER_USAGE_SCHEMA_NAME = "provider_usage_v1"
@@ -53,6 +54,9 @@ _ALLOWED_RAW_USAGE_DETAIL_KEYS = {
     "completion_tokens_details",
     "input_tokens_details",
     "output_tokens_details",
+    "input_token_detail",
+    "output_token_detail",
+    # Kept from the previously supported provider forms.
     "input_token_details",
     "output_token_details",
 }
@@ -120,6 +124,12 @@ _PROVIDER_USAGE_JSON_DETAIL_SIGNAL_KEYS = (
 )
 _USAGE_COUNT_SCALAR_KEYS = frozenset(_ALLOWED_RAW_USAGE_SCALAR_KEYS)
 _USAGE_COUNT_DETAIL_KEYS = frozenset(_ALLOWED_RAW_USAGE_DETAIL_SCALAR_KEYS)
+
+
+def sanitized_provider_usage(usage: Mapping[str, Any]) -> Dict[str, Any]:
+    """Public allow-listed view of a provider-reported usage payload."""
+    sanitized = _sanitize_raw_usage(dict(usage))
+    return sanitized if isinstance(sanitized, dict) else {}
 
 
 def extract_usage_payload(response: Any) -> Any:
@@ -670,8 +680,24 @@ def _sanitize_raw_usage_detail(value: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _sanitize_raw_usage_count(value: Any) -> Any:
-    parsed = _as_non_negative_int(value)
+    # Negative integers are kept: the normalizer must still see them to flag
+    # invalid_provider_usage; only non-numeric values are dropped here.
+    parsed = _as_int(value)
     return parsed if parsed is not None else _DROP_RAW_USAGE_VALUE
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
+            return int(text)
+    return None
 
 
 def _has_deepseek_hit_miss_shape(usage: Mapping[str, Any]) -> bool:

@@ -31,8 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 from src.agent.llm_adapter import LLMToolAdapter
 from src.agent.tools.registry import ToolRegistry
 from src.agent.stock_scope import StockScope
-from src.llm.usage import should_persist_usage_telemetry
-from src.storage import persist_llm_usage as _persist_usage
+from src.llm.attempt import ENTRY_AGENT, attempt_scope
 
 logger = logging.getLogger(__name__)
 
@@ -637,24 +636,20 @@ def run_agent_loop(
             call_timeout = min(call_timeout, research_remaining) if call_timeout is not None else research_remaining
         llm_started = time.monotonic()
         logger.info("Agent LLM step %d started, remaining=%.2fs", step + 1, remaining_timeout if remaining_timeout is not None else -1.0)
-        response = llm_adapter.call_with_tools(
-            messages,
-            [] if finalizing else tool_decls,
-            timeout=call_timeout,
-        )
+        # Per-call usage persistence for attributed entries happens inside the
+        # adapter now, so runner and text entries cannot double-record.
+        with attempt_scope(ENTRY_AGENT, f"step{step + 1}"):
+            response = llm_adapter.call_with_tools(
+                messages,
+                [] if finalizing else tool_decls,
+                timeout=call_timeout,
+            )
         logger.info("Agent LLM step %d finished in %.2fs, provider=%s", step + 1, time.monotonic() - llm_started, response.provider)
         provider_used = response.provider
         total_tokens += (response.usage or {}).get("total_tokens", 0)
         m = getattr(response, "model", "") or response.provider
         if m and m != "error":
             models_used.append(m)
-        model_for_usage = m or response.provider
-        if (
-            model_for_usage
-            and model_for_usage != "error"
-            and should_persist_usage_telemetry(response.usage)
-        ):
-            _persist_usage(response.usage, model_for_usage, call_type="agent")
 
         if research_run is not None and research_run.stop_reason:
             return RunLoopResult(success=False, error=research_run.reason_text, messages=messages,

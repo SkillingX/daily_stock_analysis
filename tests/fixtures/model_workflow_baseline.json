@@ -1,0 +1,3804 @@
+{
+ "schema": "model_workflow_baseline_fixture_v2",
+ "fixture_notice": "全部数字与证据为本地冻结控制样本（fixture），非任何真实供应商在线结果，不得用作线上证明。",
+ "stock": {
+  "code": "600519",
+  "name": "冻结样本股份",
+  "market": "cn"
+ },
+ "as_of": "2026-10-15T16:00:00",
+ "dims": [
+  "fundamental",
+  "business",
+  "technical",
+  "capital",
+  "ownership"
+ ],
+ "history": {
+  "source_family": "frozen-local-fixture",
+  "derived": {
+   "ma20": 74.95,
+   "support": 67.0,
+   "resistance": 77.4,
+   "last_close": 75.9
+  },
+  "rows": [
+   {
+    "date": "2025-10-17",
+    "open": 48.0,
+    "high": 51.5,
+    "low": 47.0,
+    "close": 50.0,
+    "volume": 10000
+   },
+   {
+    "date": "2025-10-20",
+    "open": 48.1,
+    "high": 51.6,
+    "low": 47.1,
+    "close": 50.1,
+    "volume": 10007
+   },
+   {
+    "date": "2025-10-21",
+    "open": 48.2,
+    "high": 51.7,
+    "low": 47.2,
+    "close": 50.2,
+    "volume": 10014
+   },
+   {
+    "date": "2025-10-22",
+    "open": 48.3,
+    "high": 51.8,
+    "low": 47.3,
+    "close": 50.3,
+    "volume": 10021
+   },
+   {
+    "date": "2025-10-23",
+    "open": 48.4,
+    "high": 51.9,
+    "low": 47.4,
+    "close": 50.4,
+    "volume": 10028
+   },
+   {
+    "date": "2025-10-24",
+    "open": 48.5,
+    "high": 52.0,
+    "low": 47.5,
+    "close": 50.5,
+    "volume": 10035
+   },
+   {
+    "date": "2025-10-27",
+    "open": 48.6,
+    "high": 52.1,
+    "low": 47.6,
+    "close": 50.6,
+    "volume": 10042
+   },
+   {
+    "date": "2025-10-28",
+    "open": 48.7,
+    "high": 52.2,
+    "low": 47.7,
+    "close": 50.7,
+    "volume": 10049
+   },
+   {
+    "date": "2025-10-29",
+    "open": 48.8,
+    "high": 52.3,
+    "low": 47.8,
+    "close": 50.8,
+    "volume": 10056
+   },
+   {
+    "date": "2025-10-30",
+    "open": 48.9,
+    "high": 52.4,
+    "low": 47.9,
+    "close": 50.9,
+    "volume": 10063
+   },
+   {
+    "date": "2025-10-31",
+    "open": 49.0,
+    "high": 52.5,
+    "low": 48.0,
+    "close": 51.0,
+    "volume": 10070
+   },
+   {
+    "date": "2025-11-03",
+    "open": 49.1,
+    "high": 52.6,
+    "low": 48.1,
+    "close": 51.1,
+    "volume": 10077
+   },
+   {
+    "date": "2025-11-04",
+    "open": 49.2,
+    "high": 52.7,
+    "low": 48.2,
+    "close": 51.2,
+    "volume": 10084
+   },
+   {
+    "date": "2025-11-05",
+    "open": 49.3,
+    "high": 52.8,
+    "low": 48.3,
+    "close": 51.3,
+    "volume": 10091
+   },
+   {
+    "date": "2025-11-06",
+    "open": 49.4,
+    "high": 52.9,
+    "low": 48.4,
+    "close": 51.4,
+    "volume": 10098
+   },
+   {
+    "date": "2025-11-07",
+    "open": 49.5,
+    "high": 53.0,
+    "low": 48.5,
+    "close": 51.5,
+    "volume": 10105
+   },
+   {
+    "date": "2025-11-10",
+    "open": 49.6,
+    "high": 53.1,
+    "low": 48.6,
+    "close": 51.6,
+    "volume": 10112
+   },
+   {
+    "date": "2025-11-11",
+    "open": 49.7,
+    "high": 53.2,
+    "low": 48.7,
+    "close": 51.7,
+    "volume": 10119
+   },
+   {
+    "date": "2025-11-12",
+    "open": 49.8,
+    "high": 53.3,
+    "low": 48.8,
+    "close": 51.8,
+    "volume": 10126
+   },
+   {
+    "date": "2025-11-13",
+    "open": 49.9,
+    "high": 53.4,
+    "low": 48.9,
+    "close": 51.9,
+    "volume": 10133
+   },
+   {
+    "date": "2025-11-14",
+    "open": 50.0,
+    "high": 53.5,
+    "low": 49.0,
+    "close": 52.0,
+    "volume": 10140
+   },
+   {
+    "date": "2025-11-17",
+    "open": 50.1,
+    "high": 53.6,
+    "low": 49.1,
+    "close": 52.1,
+    "volume": 10147
+   },
+   {
+    "date": "2025-11-18",
+    "open": 50.2,
+    "high": 53.7,
+    "low": 49.2,
+    "close": 52.2,
+    "volume": 10154
+   },
+   {
+    "date": "2025-11-19",
+    "open": 50.3,
+    "high": 53.8,
+    "low": 49.3,
+    "close": 52.3,
+    "volume": 10161
+   },
+   {
+    "date": "2025-11-20",
+    "open": 50.4,
+    "high": 53.9,
+    "low": 49.4,
+    "close": 52.4,
+    "volume": 10168
+   },
+   {
+    "date": "2025-11-21",
+    "open": 50.5,
+    "high": 54.0,
+    "low": 49.5,
+    "close": 52.5,
+    "volume": 10175
+   },
+   {
+    "date": "2025-11-24",
+    "open": 50.6,
+    "high": 54.1,
+    "low": 49.6,
+    "close": 52.6,
+    "volume": 10182
+   },
+   {
+    "date": "2025-11-25",
+    "open": 50.7,
+    "high": 54.2,
+    "low": 49.7,
+    "close": 52.7,
+    "volume": 10189
+   },
+   {
+    "date": "2025-11-26",
+    "open": 50.8,
+    "high": 54.3,
+    "low": 49.8,
+    "close": 52.8,
+    "volume": 10196
+   },
+   {
+    "date": "2025-11-27",
+    "open": 50.9,
+    "high": 54.4,
+    "low": 49.9,
+    "close": 52.9,
+    "volume": 10203
+   },
+   {
+    "date": "2025-11-28",
+    "open": 51.0,
+    "high": 54.5,
+    "low": 50.0,
+    "close": 53.0,
+    "volume": 10210
+   },
+   {
+    "date": "2025-12-01",
+    "open": 51.1,
+    "high": 54.6,
+    "low": 50.1,
+    "close": 53.1,
+    "volume": 10217
+   },
+   {
+    "date": "2025-12-02",
+    "open": 51.2,
+    "high": 54.7,
+    "low": 50.2,
+    "close": 53.2,
+    "volume": 10224
+   },
+   {
+    "date": "2025-12-03",
+    "open": 51.3,
+    "high": 54.8,
+    "low": 50.3,
+    "close": 53.3,
+    "volume": 10231
+   },
+   {
+    "date": "2025-12-04",
+    "open": 51.4,
+    "high": 54.9,
+    "low": 50.4,
+    "close": 53.4,
+    "volume": 10238
+   },
+   {
+    "date": "2025-12-05",
+    "open": 51.5,
+    "high": 55.0,
+    "low": 50.5,
+    "close": 53.5,
+    "volume": 10245
+   },
+   {
+    "date": "2025-12-08",
+    "open": 51.6,
+    "high": 55.1,
+    "low": 50.6,
+    "close": 53.6,
+    "volume": 10252
+   },
+   {
+    "date": "2025-12-09",
+    "open": 51.7,
+    "high": 55.2,
+    "low": 50.7,
+    "close": 53.7,
+    "volume": 10259
+   },
+   {
+    "date": "2025-12-10",
+    "open": 51.8,
+    "high": 55.3,
+    "low": 50.8,
+    "close": 53.8,
+    "volume": 10266
+   },
+   {
+    "date": "2025-12-11",
+    "open": 51.9,
+    "high": 55.4,
+    "low": 50.9,
+    "close": 53.9,
+    "volume": 10273
+   },
+   {
+    "date": "2025-12-12",
+    "open": 52.0,
+    "high": 55.5,
+    "low": 51.0,
+    "close": 54.0,
+    "volume": 10280
+   },
+   {
+    "date": "2025-12-15",
+    "open": 52.1,
+    "high": 55.6,
+    "low": 51.1,
+    "close": 54.1,
+    "volume": 10287
+   },
+   {
+    "date": "2025-12-16",
+    "open": 52.2,
+    "high": 55.7,
+    "low": 51.2,
+    "close": 54.2,
+    "volume": 10294
+   },
+   {
+    "date": "2025-12-17",
+    "open": 52.3,
+    "high": 55.8,
+    "low": 51.3,
+    "close": 54.3,
+    "volume": 10301
+   },
+   {
+    "date": "2025-12-18",
+    "open": 52.4,
+    "high": 55.9,
+    "low": 51.4,
+    "close": 54.4,
+    "volume": 10308
+   },
+   {
+    "date": "2025-12-19",
+    "open": 52.5,
+    "high": 56.0,
+    "low": 51.5,
+    "close": 54.5,
+    "volume": 10315
+   },
+   {
+    "date": "2025-12-22",
+    "open": 52.6,
+    "high": 56.1,
+    "low": 51.6,
+    "close": 54.6,
+    "volume": 10322
+   },
+   {
+    "date": "2025-12-23",
+    "open": 52.7,
+    "high": 56.2,
+    "low": 51.7,
+    "close": 54.7,
+    "volume": 10329
+   },
+   {
+    "date": "2025-12-24",
+    "open": 52.8,
+    "high": 56.3,
+    "low": 51.8,
+    "close": 54.8,
+    "volume": 10336
+   },
+   {
+    "date": "2025-12-25",
+    "open": 52.9,
+    "high": 56.4,
+    "low": 51.9,
+    "close": 54.9,
+    "volume": 10343
+   },
+   {
+    "date": "2025-12-26",
+    "open": 53.0,
+    "high": 56.5,
+    "low": 52.0,
+    "close": 55.0,
+    "volume": 10350
+   },
+   {
+    "date": "2025-12-29",
+    "open": 53.1,
+    "high": 56.6,
+    "low": 52.1,
+    "close": 55.1,
+    "volume": 10357
+   },
+   {
+    "date": "2025-12-30",
+    "open": 53.2,
+    "high": 56.7,
+    "low": 52.2,
+    "close": 55.2,
+    "volume": 10364
+   },
+   {
+    "date": "2025-12-31",
+    "open": 53.3,
+    "high": 56.8,
+    "low": 52.3,
+    "close": 55.3,
+    "volume": 10371
+   },
+   {
+    "date": "2026-01-01",
+    "open": 53.4,
+    "high": 56.9,
+    "low": 52.4,
+    "close": 55.4,
+    "volume": 10378
+   },
+   {
+    "date": "2026-01-02",
+    "open": 53.5,
+    "high": 57.0,
+    "low": 52.5,
+    "close": 55.5,
+    "volume": 10385
+   },
+   {
+    "date": "2026-01-05",
+    "open": 53.6,
+    "high": 57.1,
+    "low": 52.6,
+    "close": 55.6,
+    "volume": 10392
+   },
+   {
+    "date": "2026-01-06",
+    "open": 53.7,
+    "high": 57.2,
+    "low": 52.7,
+    "close": 55.7,
+    "volume": 10399
+   },
+   {
+    "date": "2026-01-07",
+    "open": 53.8,
+    "high": 57.3,
+    "low": 52.8,
+    "close": 55.8,
+    "volume": 10406
+   },
+   {
+    "date": "2026-01-08",
+    "open": 53.9,
+    "high": 57.4,
+    "low": 52.9,
+    "close": 55.9,
+    "volume": 10413
+   },
+   {
+    "date": "2026-01-09",
+    "open": 54.0,
+    "high": 57.5,
+    "low": 53.0,
+    "close": 56.0,
+    "volume": 10420
+   },
+   {
+    "date": "2026-01-12",
+    "open": 54.1,
+    "high": 57.6,
+    "low": 53.1,
+    "close": 56.1,
+    "volume": 10427
+   },
+   {
+    "date": "2026-01-13",
+    "open": 54.2,
+    "high": 57.7,
+    "low": 53.2,
+    "close": 56.2,
+    "volume": 10434
+   },
+   {
+    "date": "2026-01-14",
+    "open": 54.3,
+    "high": 57.8,
+    "low": 53.3,
+    "close": 56.3,
+    "volume": 10441
+   },
+   {
+    "date": "2026-01-15",
+    "open": 54.4,
+    "high": 57.9,
+    "low": 53.4,
+    "close": 56.4,
+    "volume": 10448
+   },
+   {
+    "date": "2026-01-16",
+    "open": 54.5,
+    "high": 58.0,
+    "low": 53.5,
+    "close": 56.5,
+    "volume": 10455
+   },
+   {
+    "date": "2026-01-19",
+    "open": 54.6,
+    "high": 58.1,
+    "low": 53.6,
+    "close": 56.6,
+    "volume": 10462
+   },
+   {
+    "date": "2026-01-20",
+    "open": 54.7,
+    "high": 58.2,
+    "low": 53.7,
+    "close": 56.7,
+    "volume": 10469
+   },
+   {
+    "date": "2026-01-21",
+    "open": 54.8,
+    "high": 58.3,
+    "low": 53.8,
+    "close": 56.8,
+    "volume": 10476
+   },
+   {
+    "date": "2026-01-22",
+    "open": 54.9,
+    "high": 58.4,
+    "low": 53.9,
+    "close": 56.9,
+    "volume": 10483
+   },
+   {
+    "date": "2026-01-23",
+    "open": 55.0,
+    "high": 58.5,
+    "low": 54.0,
+    "close": 57.0,
+    "volume": 10490
+   },
+   {
+    "date": "2026-01-26",
+    "open": 55.1,
+    "high": 58.6,
+    "low": 54.1,
+    "close": 57.1,
+    "volume": 10497
+   },
+   {
+    "date": "2026-01-27",
+    "open": 55.2,
+    "high": 58.7,
+    "low": 54.2,
+    "close": 57.2,
+    "volume": 10504
+   },
+   {
+    "date": "2026-01-28",
+    "open": 55.3,
+    "high": 58.8,
+    "low": 54.3,
+    "close": 57.3,
+    "volume": 10511
+   },
+   {
+    "date": "2026-01-29",
+    "open": 55.4,
+    "high": 58.9,
+    "low": 54.4,
+    "close": 57.4,
+    "volume": 10518
+   },
+   {
+    "date": "2026-01-30",
+    "open": 55.5,
+    "high": 59.0,
+    "low": 54.5,
+    "close": 57.5,
+    "volume": 10525
+   },
+   {
+    "date": "2026-02-02",
+    "open": 55.6,
+    "high": 59.1,
+    "low": 54.6,
+    "close": 57.6,
+    "volume": 10532
+   },
+   {
+    "date": "2026-02-03",
+    "open": 55.7,
+    "high": 59.2,
+    "low": 54.7,
+    "close": 57.7,
+    "volume": 10539
+   },
+   {
+    "date": "2026-02-04",
+    "open": 55.8,
+    "high": 59.3,
+    "low": 54.8,
+    "close": 57.8,
+    "volume": 10546
+   },
+   {
+    "date": "2026-02-05",
+    "open": 55.9,
+    "high": 59.4,
+    "low": 54.9,
+    "close": 57.9,
+    "volume": 10553
+   },
+   {
+    "date": "2026-02-06",
+    "open": 56.0,
+    "high": 59.5,
+    "low": 55.0,
+    "close": 58.0,
+    "volume": 10560
+   },
+   {
+    "date": "2026-02-09",
+    "open": 56.1,
+    "high": 59.6,
+    "low": 55.1,
+    "close": 58.1,
+    "volume": 10567
+   },
+   {
+    "date": "2026-02-10",
+    "open": 56.2,
+    "high": 59.7,
+    "low": 55.2,
+    "close": 58.2,
+    "volume": 10574
+   },
+   {
+    "date": "2026-02-11",
+    "open": 56.3,
+    "high": 59.8,
+    "low": 55.3,
+    "close": 58.3,
+    "volume": 10581
+   },
+   {
+    "date": "2026-02-12",
+    "open": 56.4,
+    "high": 59.9,
+    "low": 55.4,
+    "close": 58.4,
+    "volume": 10588
+   },
+   {
+    "date": "2026-02-13",
+    "open": 56.5,
+    "high": 60.0,
+    "low": 55.5,
+    "close": 58.5,
+    "volume": 10595
+   },
+   {
+    "date": "2026-02-16",
+    "open": 56.6,
+    "high": 60.1,
+    "low": 55.6,
+    "close": 58.6,
+    "volume": 10602
+   },
+   {
+    "date": "2026-02-17",
+    "open": 56.7,
+    "high": 60.2,
+    "low": 55.7,
+    "close": 58.7,
+    "volume": 10609
+   },
+   {
+    "date": "2026-02-18",
+    "open": 56.8,
+    "high": 60.3,
+    "low": 55.8,
+    "close": 58.8,
+    "volume": 10616
+   },
+   {
+    "date": "2026-02-19",
+    "open": 56.9,
+    "high": 60.4,
+    "low": 55.9,
+    "close": 58.9,
+    "volume": 10623
+   },
+   {
+    "date": "2026-02-20",
+    "open": 57.0,
+    "high": 60.5,
+    "low": 56.0,
+    "close": 59.0,
+    "volume": 10630
+   },
+   {
+    "date": "2026-02-23",
+    "open": 57.1,
+    "high": 60.6,
+    "low": 56.1,
+    "close": 59.1,
+    "volume": 10637
+   },
+   {
+    "date": "2026-02-24",
+    "open": 57.2,
+    "high": 60.7,
+    "low": 56.2,
+    "close": 59.2,
+    "volume": 10644
+   },
+   {
+    "date": "2026-02-25",
+    "open": 57.3,
+    "high": 60.8,
+    "low": 56.3,
+    "close": 59.3,
+    "volume": 10651
+   },
+   {
+    "date": "2026-02-26",
+    "open": 57.4,
+    "high": 60.9,
+    "low": 56.4,
+    "close": 59.4,
+    "volume": 10658
+   },
+   {
+    "date": "2026-02-27",
+    "open": 57.5,
+    "high": 61.0,
+    "low": 56.5,
+    "close": 59.5,
+    "volume": 10665
+   },
+   {
+    "date": "2026-03-02",
+    "open": 57.6,
+    "high": 61.1,
+    "low": 56.6,
+    "close": 59.6,
+    "volume": 10672
+   },
+   {
+    "date": "2026-03-03",
+    "open": 57.7,
+    "high": 61.2,
+    "low": 56.7,
+    "close": 59.7,
+    "volume": 10679
+   },
+   {
+    "date": "2026-03-04",
+    "open": 57.8,
+    "high": 61.3,
+    "low": 56.8,
+    "close": 59.8,
+    "volume": 10686
+   },
+   {
+    "date": "2026-03-05",
+    "open": 57.9,
+    "high": 61.4,
+    "low": 56.9,
+    "close": 59.9,
+    "volume": 10693
+   },
+   {
+    "date": "2026-03-06",
+    "open": 58.0,
+    "high": 61.5,
+    "low": 57.0,
+    "close": 60.0,
+    "volume": 10700
+   },
+   {
+    "date": "2026-03-09",
+    "open": 58.1,
+    "high": 61.6,
+    "low": 57.1,
+    "close": 60.1,
+    "volume": 10707
+   },
+   {
+    "date": "2026-03-10",
+    "open": 58.2,
+    "high": 61.7,
+    "low": 57.2,
+    "close": 60.2,
+    "volume": 10714
+   },
+   {
+    "date": "2026-03-11",
+    "open": 58.3,
+    "high": 61.8,
+    "low": 57.3,
+    "close": 60.3,
+    "volume": 10721
+   },
+   {
+    "date": "2026-03-12",
+    "open": 58.4,
+    "high": 61.9,
+    "low": 57.4,
+    "close": 60.4,
+    "volume": 10728
+   },
+   {
+    "date": "2026-03-13",
+    "open": 58.5,
+    "high": 62.0,
+    "low": 57.5,
+    "close": 60.5,
+    "volume": 10735
+   },
+   {
+    "date": "2026-03-16",
+    "open": 58.6,
+    "high": 62.1,
+    "low": 57.6,
+    "close": 60.6,
+    "volume": 10742
+   },
+   {
+    "date": "2026-03-17",
+    "open": 58.7,
+    "high": 62.2,
+    "low": 57.7,
+    "close": 60.7,
+    "volume": 10749
+   },
+   {
+    "date": "2026-03-18",
+    "open": 58.8,
+    "high": 62.3,
+    "low": 57.8,
+    "close": 60.8,
+    "volume": 10756
+   },
+   {
+    "date": "2026-03-19",
+    "open": 58.9,
+    "high": 62.4,
+    "low": 57.9,
+    "close": 60.9,
+    "volume": 10763
+   },
+   {
+    "date": "2026-03-20",
+    "open": 59.0,
+    "high": 62.5,
+    "low": 58.0,
+    "close": 61.0,
+    "volume": 10770
+   },
+   {
+    "date": "2026-03-23",
+    "open": 59.1,
+    "high": 62.6,
+    "low": 58.1,
+    "close": 61.1,
+    "volume": 10777
+   },
+   {
+    "date": "2026-03-24",
+    "open": 59.2,
+    "high": 62.7,
+    "low": 58.2,
+    "close": 61.2,
+    "volume": 10784
+   },
+   {
+    "date": "2026-03-25",
+    "open": 59.3,
+    "high": 62.8,
+    "low": 58.3,
+    "close": 61.3,
+    "volume": 10791
+   },
+   {
+    "date": "2026-03-26",
+    "open": 59.4,
+    "high": 62.9,
+    "low": 58.4,
+    "close": 61.4,
+    "volume": 10798
+   },
+   {
+    "date": "2026-03-27",
+    "open": 59.5,
+    "high": 63.0,
+    "low": 58.5,
+    "close": 61.5,
+    "volume": 10805
+   },
+   {
+    "date": "2026-03-30",
+    "open": 59.6,
+    "high": 63.1,
+    "low": 58.6,
+    "close": 61.6,
+    "volume": 10812
+   },
+   {
+    "date": "2026-03-31",
+    "open": 59.7,
+    "high": 63.2,
+    "low": 58.7,
+    "close": 61.7,
+    "volume": 10819
+   },
+   {
+    "date": "2026-04-01",
+    "open": 59.8,
+    "high": 63.3,
+    "low": 58.8,
+    "close": 61.8,
+    "volume": 10826
+   },
+   {
+    "date": "2026-04-02",
+    "open": 59.9,
+    "high": 63.4,
+    "low": 58.9,
+    "close": 61.9,
+    "volume": 10833
+   },
+   {
+    "date": "2026-04-03",
+    "open": 60.0,
+    "high": 63.5,
+    "low": 59.0,
+    "close": 62.0,
+    "volume": 10840
+   },
+   {
+    "date": "2026-04-06",
+    "open": 60.1,
+    "high": 63.6,
+    "low": 59.1,
+    "close": 62.1,
+    "volume": 10847
+   },
+   {
+    "date": "2026-04-07",
+    "open": 60.2,
+    "high": 63.7,
+    "low": 59.2,
+    "close": 62.2,
+    "volume": 10854
+   },
+   {
+    "date": "2026-04-08",
+    "open": 60.3,
+    "high": 63.8,
+    "low": 59.3,
+    "close": 62.3,
+    "volume": 10861
+   },
+   {
+    "date": "2026-04-09",
+    "open": 60.4,
+    "high": 63.9,
+    "low": 59.4,
+    "close": 62.4,
+    "volume": 10868
+   },
+   {
+    "date": "2026-04-10",
+    "open": 60.5,
+    "high": 64.0,
+    "low": 59.5,
+    "close": 62.5,
+    "volume": 10875
+   },
+   {
+    "date": "2026-04-13",
+    "open": 60.6,
+    "high": 64.1,
+    "low": 59.6,
+    "close": 62.6,
+    "volume": 10882
+   },
+   {
+    "date": "2026-04-14",
+    "open": 60.7,
+    "high": 64.2,
+    "low": 59.7,
+    "close": 62.7,
+    "volume": 10889
+   },
+   {
+    "date": "2026-04-15",
+    "open": 60.8,
+    "high": 64.3,
+    "low": 59.8,
+    "close": 62.8,
+    "volume": 10896
+   },
+   {
+    "date": "2026-04-16",
+    "open": 60.9,
+    "high": 64.4,
+    "low": 59.9,
+    "close": 62.9,
+    "volume": 10903
+   },
+   {
+    "date": "2026-04-17",
+    "open": 61.0,
+    "high": 64.5,
+    "low": 60.0,
+    "close": 63.0,
+    "volume": 10910
+   },
+   {
+    "date": "2026-04-20",
+    "open": 61.1,
+    "high": 64.6,
+    "low": 60.1,
+    "close": 63.1,
+    "volume": 10917
+   },
+   {
+    "date": "2026-04-21",
+    "open": 61.2,
+    "high": 64.7,
+    "low": 60.2,
+    "close": 63.2,
+    "volume": 10924
+   },
+   {
+    "date": "2026-04-22",
+    "open": 61.3,
+    "high": 64.8,
+    "low": 60.3,
+    "close": 63.3,
+    "volume": 10931
+   },
+   {
+    "date": "2026-04-23",
+    "open": 61.4,
+    "high": 64.9,
+    "low": 60.4,
+    "close": 63.4,
+    "volume": 10938
+   },
+   {
+    "date": "2026-04-24",
+    "open": 61.5,
+    "high": 65.0,
+    "low": 60.5,
+    "close": 63.5,
+    "volume": 10945
+   },
+   {
+    "date": "2026-04-27",
+    "open": 61.6,
+    "high": 65.1,
+    "low": 60.6,
+    "close": 63.6,
+    "volume": 10952
+   },
+   {
+    "date": "2026-04-28",
+    "open": 61.7,
+    "high": 65.2,
+    "low": 60.7,
+    "close": 63.7,
+    "volume": 10959
+   },
+   {
+    "date": "2026-04-29",
+    "open": 61.8,
+    "high": 65.3,
+    "low": 60.8,
+    "close": 63.8,
+    "volume": 10966
+   },
+   {
+    "date": "2026-04-30",
+    "open": 61.9,
+    "high": 65.4,
+    "low": 60.9,
+    "close": 63.9,
+    "volume": 10973
+   },
+   {
+    "date": "2026-05-01",
+    "open": 62.0,
+    "high": 65.5,
+    "low": 61.0,
+    "close": 64.0,
+    "volume": 10980
+   },
+   {
+    "date": "2026-05-04",
+    "open": 62.1,
+    "high": 65.6,
+    "low": 61.1,
+    "close": 64.1,
+    "volume": 10987
+   },
+   {
+    "date": "2026-05-05",
+    "open": 62.2,
+    "high": 65.7,
+    "low": 61.2,
+    "close": 64.2,
+    "volume": 10994
+   },
+   {
+    "date": "2026-05-06",
+    "open": 62.3,
+    "high": 65.8,
+    "low": 61.3,
+    "close": 64.3,
+    "volume": 11001
+   },
+   {
+    "date": "2026-05-07",
+    "open": 62.4,
+    "high": 65.9,
+    "low": 61.4,
+    "close": 64.4,
+    "volume": 11008
+   },
+   {
+    "date": "2026-05-08",
+    "open": 62.5,
+    "high": 66.0,
+    "low": 61.5,
+    "close": 64.5,
+    "volume": 11015
+   },
+   {
+    "date": "2026-05-11",
+    "open": 62.6,
+    "high": 66.1,
+    "low": 61.6,
+    "close": 64.6,
+    "volume": 11022
+   },
+   {
+    "date": "2026-05-12",
+    "open": 62.7,
+    "high": 66.2,
+    "low": 61.7,
+    "close": 64.7,
+    "volume": 11029
+   },
+   {
+    "date": "2026-05-13",
+    "open": 62.8,
+    "high": 66.3,
+    "low": 61.8,
+    "close": 64.8,
+    "volume": 11036
+   },
+   {
+    "date": "2026-05-14",
+    "open": 62.9,
+    "high": 66.4,
+    "low": 61.9,
+    "close": 64.9,
+    "volume": 11043
+   },
+   {
+    "date": "2026-05-15",
+    "open": 63.0,
+    "high": 66.5,
+    "low": 62.0,
+    "close": 65.0,
+    "volume": 11050
+   },
+   {
+    "date": "2026-05-18",
+    "open": 63.1,
+    "high": 66.6,
+    "low": 62.1,
+    "close": 65.1,
+    "volume": 11057
+   },
+   {
+    "date": "2026-05-19",
+    "open": 63.2,
+    "high": 66.7,
+    "low": 62.2,
+    "close": 65.2,
+    "volume": 11064
+   },
+   {
+    "date": "2026-05-20",
+    "open": 63.3,
+    "high": 66.8,
+    "low": 62.3,
+    "close": 65.3,
+    "volume": 11071
+   },
+   {
+    "date": "2026-05-21",
+    "open": 63.4,
+    "high": 66.9,
+    "low": 62.4,
+    "close": 65.4,
+    "volume": 11078
+   },
+   {
+    "date": "2026-05-22",
+    "open": 63.5,
+    "high": 67.0,
+    "low": 62.5,
+    "close": 65.5,
+    "volume": 11085
+   },
+   {
+    "date": "2026-05-25",
+    "open": 63.6,
+    "high": 67.1,
+    "low": 62.6,
+    "close": 65.6,
+    "volume": 11092
+   },
+   {
+    "date": "2026-05-26",
+    "open": 63.7,
+    "high": 67.2,
+    "low": 62.7,
+    "close": 65.7,
+    "volume": 11099
+   },
+   {
+    "date": "2026-05-27",
+    "open": 63.8,
+    "high": 67.3,
+    "low": 62.8,
+    "close": 65.8,
+    "volume": 11106
+   },
+   {
+    "date": "2026-05-28",
+    "open": 63.9,
+    "high": 67.4,
+    "low": 62.9,
+    "close": 65.9,
+    "volume": 11113
+   },
+   {
+    "date": "2026-05-29",
+    "open": 64.0,
+    "high": 67.5,
+    "low": 63.0,
+    "close": 66.0,
+    "volume": 11120
+   },
+   {
+    "date": "2026-06-01",
+    "open": 64.1,
+    "high": 67.6,
+    "low": 63.1,
+    "close": 66.1,
+    "volume": 11127
+   },
+   {
+    "date": "2026-06-02",
+    "open": 64.2,
+    "high": 67.7,
+    "low": 63.2,
+    "close": 66.2,
+    "volume": 11134
+   },
+   {
+    "date": "2026-06-03",
+    "open": 64.3,
+    "high": 67.8,
+    "low": 63.3,
+    "close": 66.3,
+    "volume": 11141
+   },
+   {
+    "date": "2026-06-04",
+    "open": 64.4,
+    "high": 67.9,
+    "low": 63.4,
+    "close": 66.4,
+    "volume": 11148
+   },
+   {
+    "date": "2026-06-05",
+    "open": 64.5,
+    "high": 68.0,
+    "low": 63.5,
+    "close": 66.5,
+    "volume": 11155
+   },
+   {
+    "date": "2026-06-08",
+    "open": 64.6,
+    "high": 68.1,
+    "low": 63.6,
+    "close": 66.6,
+    "volume": 11162
+   },
+   {
+    "date": "2026-06-09",
+    "open": 64.7,
+    "high": 68.2,
+    "low": 63.7,
+    "close": 66.7,
+    "volume": 11169
+   },
+   {
+    "date": "2026-06-10",
+    "open": 64.8,
+    "high": 68.3,
+    "low": 63.8,
+    "close": 66.8,
+    "volume": 11176
+   },
+   {
+    "date": "2026-06-11",
+    "open": 64.9,
+    "high": 68.4,
+    "low": 63.9,
+    "close": 66.9,
+    "volume": 11183
+   },
+   {
+    "date": "2026-06-12",
+    "open": 65.0,
+    "high": 68.5,
+    "low": 64.0,
+    "close": 67.0,
+    "volume": 11190
+   },
+   {
+    "date": "2026-06-15",
+    "open": 65.1,
+    "high": 68.6,
+    "low": 64.1,
+    "close": 67.1,
+    "volume": 11197
+   },
+   {
+    "date": "2026-06-16",
+    "open": 65.2,
+    "high": 68.7,
+    "low": 64.2,
+    "close": 67.2,
+    "volume": 11204
+   },
+   {
+    "date": "2026-06-17",
+    "open": 65.3,
+    "high": 68.8,
+    "low": 64.3,
+    "close": 67.3,
+    "volume": 11211
+   },
+   {
+    "date": "2026-06-18",
+    "open": 65.4,
+    "high": 68.9,
+    "low": 64.4,
+    "close": 67.4,
+    "volume": 11218
+   },
+   {
+    "date": "2026-06-19",
+    "open": 65.5,
+    "high": 69.0,
+    "low": 64.5,
+    "close": 67.5,
+    "volume": 11225
+   },
+   {
+    "date": "2026-06-22",
+    "open": 65.6,
+    "high": 69.1,
+    "low": 64.6,
+    "close": 67.6,
+    "volume": 11232
+   },
+   {
+    "date": "2026-06-23",
+    "open": 65.7,
+    "high": 69.2,
+    "low": 64.7,
+    "close": 67.7,
+    "volume": 11239
+   },
+   {
+    "date": "2026-06-24",
+    "open": 65.8,
+    "high": 69.3,
+    "low": 64.8,
+    "close": 67.8,
+    "volume": 11246
+   },
+   {
+    "date": "2026-06-25",
+    "open": 65.9,
+    "high": 69.4,
+    "low": 64.9,
+    "close": 67.9,
+    "volume": 11253
+   },
+   {
+    "date": "2026-06-26",
+    "open": 66.0,
+    "high": 69.5,
+    "low": 65.0,
+    "close": 68.0,
+    "volume": 11260
+   },
+   {
+    "date": "2026-06-29",
+    "open": 66.1,
+    "high": 69.6,
+    "low": 65.1,
+    "close": 68.1,
+    "volume": 11267
+   },
+   {
+    "date": "2026-06-30",
+    "open": 66.2,
+    "high": 69.7,
+    "low": 65.2,
+    "close": 68.2,
+    "volume": 11274
+   },
+   {
+    "date": "2026-07-01",
+    "open": 66.3,
+    "high": 69.8,
+    "low": 65.3,
+    "close": 68.3,
+    "volume": 11281
+   },
+   {
+    "date": "2026-07-02",
+    "open": 66.4,
+    "high": 69.9,
+    "low": 65.4,
+    "close": 68.4,
+    "volume": 11288
+   },
+   {
+    "date": "2026-07-03",
+    "open": 66.5,
+    "high": 70.0,
+    "low": 65.5,
+    "close": 68.5,
+    "volume": 11295
+   },
+   {
+    "date": "2026-07-06",
+    "open": 66.6,
+    "high": 70.1,
+    "low": 65.6,
+    "close": 68.6,
+    "volume": 11302
+   },
+   {
+    "date": "2026-07-07",
+    "open": 66.7,
+    "high": 70.2,
+    "low": 65.7,
+    "close": 68.7,
+    "volume": 11309
+   },
+   {
+    "date": "2026-07-08",
+    "open": 66.8,
+    "high": 70.3,
+    "low": 65.8,
+    "close": 68.8,
+    "volume": 11316
+   },
+   {
+    "date": "2026-07-09",
+    "open": 66.9,
+    "high": 70.4,
+    "low": 65.9,
+    "close": 68.9,
+    "volume": 11323
+   },
+   {
+    "date": "2026-07-10",
+    "open": 67.0,
+    "high": 70.5,
+    "low": 66.0,
+    "close": 69.0,
+    "volume": 11330
+   },
+   {
+    "date": "2026-07-13",
+    "open": 67.1,
+    "high": 70.6,
+    "low": 66.1,
+    "close": 69.1,
+    "volume": 11337
+   },
+   {
+    "date": "2026-07-14",
+    "open": 67.2,
+    "high": 70.7,
+    "low": 66.2,
+    "close": 69.2,
+    "volume": 11344
+   },
+   {
+    "date": "2026-07-15",
+    "open": 67.3,
+    "high": 70.8,
+    "low": 66.3,
+    "close": 69.3,
+    "volume": 11351
+   },
+   {
+    "date": "2026-07-16",
+    "open": 67.4,
+    "high": 70.9,
+    "low": 66.4,
+    "close": 69.4,
+    "volume": 11358
+   },
+   {
+    "date": "2026-07-17",
+    "open": 67.5,
+    "high": 71.0,
+    "low": 66.5,
+    "close": 69.5,
+    "volume": 11365
+   },
+   {
+    "date": "2026-07-20",
+    "open": 67.6,
+    "high": 71.1,
+    "low": 66.6,
+    "close": 69.6,
+    "volume": 11372
+   },
+   {
+    "date": "2026-07-21",
+    "open": 67.7,
+    "high": 71.2,
+    "low": 66.7,
+    "close": 69.7,
+    "volume": 11379
+   },
+   {
+    "date": "2026-07-22",
+    "open": 67.8,
+    "high": 71.3,
+    "low": 66.8,
+    "close": 69.8,
+    "volume": 11386
+   },
+   {
+    "date": "2026-07-23",
+    "open": 67.9,
+    "high": 71.4,
+    "low": 66.9,
+    "close": 69.9,
+    "volume": 11393
+   },
+   {
+    "date": "2026-07-24",
+    "open": 68.0,
+    "high": 71.5,
+    "low": 67.0,
+    "close": 70.0,
+    "volume": 11400
+   },
+   {
+    "date": "2026-07-27",
+    "open": 68.1,
+    "high": 71.6,
+    "low": 67.1,
+    "close": 70.1,
+    "volume": 11407
+   },
+   {
+    "date": "2026-07-28",
+    "open": 68.2,
+    "high": 71.7,
+    "low": 67.2,
+    "close": 70.2,
+    "volume": 11414
+   },
+   {
+    "date": "2026-07-29",
+    "open": 68.3,
+    "high": 71.8,
+    "low": 67.3,
+    "close": 70.3,
+    "volume": 11421
+   },
+   {
+    "date": "2026-07-30",
+    "open": 68.4,
+    "high": 71.9,
+    "low": 67.4,
+    "close": 70.4,
+    "volume": 11428
+   },
+   {
+    "date": "2026-07-31",
+    "open": 68.5,
+    "high": 72.0,
+    "low": 67.5,
+    "close": 70.5,
+    "volume": 11435
+   },
+   {
+    "date": "2026-08-03",
+    "open": 68.6,
+    "high": 72.1,
+    "low": 67.6,
+    "close": 70.6,
+    "volume": 11442
+   },
+   {
+    "date": "2026-08-04",
+    "open": 68.7,
+    "high": 72.2,
+    "low": 67.7,
+    "close": 70.7,
+    "volume": 11449
+   },
+   {
+    "date": "2026-08-05",
+    "open": 68.8,
+    "high": 72.3,
+    "low": 67.8,
+    "close": 70.8,
+    "volume": 11456
+   },
+   {
+    "date": "2026-08-06",
+    "open": 68.9,
+    "high": 72.4,
+    "low": 67.9,
+    "close": 70.9,
+    "volume": 11463
+   },
+   {
+    "date": "2026-08-07",
+    "open": 69.0,
+    "high": 72.5,
+    "low": 68.0,
+    "close": 71.0,
+    "volume": 11470
+   },
+   {
+    "date": "2026-08-10",
+    "open": 69.1,
+    "high": 72.6,
+    "low": 68.1,
+    "close": 71.1,
+    "volume": 11477
+   },
+   {
+    "date": "2026-08-11",
+    "open": 69.2,
+    "high": 72.7,
+    "low": 68.2,
+    "close": 71.2,
+    "volume": 11484
+   },
+   {
+    "date": "2026-08-12",
+    "open": 69.3,
+    "high": 72.8,
+    "low": 68.3,
+    "close": 71.3,
+    "volume": 11491
+   },
+   {
+    "date": "2026-08-13",
+    "open": 69.4,
+    "high": 72.9,
+    "low": 68.4,
+    "close": 71.4,
+    "volume": 11498
+   },
+   {
+    "date": "2026-08-14",
+    "open": 69.5,
+    "high": 73.0,
+    "low": 68.5,
+    "close": 71.5,
+    "volume": 11505
+   },
+   {
+    "date": "2026-08-17",
+    "open": 69.6,
+    "high": 73.1,
+    "low": 68.6,
+    "close": 71.6,
+    "volume": 11512
+   },
+   {
+    "date": "2026-08-18",
+    "open": 69.7,
+    "high": 73.2,
+    "low": 68.7,
+    "close": 71.7,
+    "volume": 11519
+   },
+   {
+    "date": "2026-08-19",
+    "open": 69.8,
+    "high": 73.3,
+    "low": 68.8,
+    "close": 71.8,
+    "volume": 11526
+   },
+   {
+    "date": "2026-08-20",
+    "open": 69.9,
+    "high": 73.4,
+    "low": 68.9,
+    "close": 71.9,
+    "volume": 11533
+   },
+   {
+    "date": "2026-08-21",
+    "open": 70.0,
+    "high": 73.5,
+    "low": 69.0,
+    "close": 72.0,
+    "volume": 11540
+   },
+   {
+    "date": "2026-08-24",
+    "open": 70.1,
+    "high": 73.6,
+    "low": 69.1,
+    "close": 72.1,
+    "volume": 11547
+   },
+   {
+    "date": "2026-08-25",
+    "open": 70.2,
+    "high": 73.7,
+    "low": 69.2,
+    "close": 72.2,
+    "volume": 11554
+   },
+   {
+    "date": "2026-08-26",
+    "open": 70.3,
+    "high": 73.8,
+    "low": 69.3,
+    "close": 72.3,
+    "volume": 11561
+   },
+   {
+    "date": "2026-08-27",
+    "open": 70.4,
+    "high": 73.9,
+    "low": 69.4,
+    "close": 72.4,
+    "volume": 11568
+   },
+   {
+    "date": "2026-08-28",
+    "open": 70.5,
+    "high": 74.0,
+    "low": 69.5,
+    "close": 72.5,
+    "volume": 11575
+   },
+   {
+    "date": "2026-08-31",
+    "open": 70.6,
+    "high": 74.1,
+    "low": 69.6,
+    "close": 72.6,
+    "volume": 11582
+   },
+   {
+    "date": "2026-09-01",
+    "open": 70.7,
+    "high": 74.2,
+    "low": 69.7,
+    "close": 72.7,
+    "volume": 11589
+   },
+   {
+    "date": "2026-09-02",
+    "open": 70.8,
+    "high": 74.3,
+    "low": 69.8,
+    "close": 72.8,
+    "volume": 11596
+   },
+   {
+    "date": "2026-09-03",
+    "open": 70.9,
+    "high": 74.4,
+    "low": 69.9,
+    "close": 72.9,
+    "volume": 11603
+   },
+   {
+    "date": "2026-09-04",
+    "open": 71.0,
+    "high": 74.5,
+    "low": 70.0,
+    "close": 73.0,
+    "volume": 11610
+   },
+   {
+    "date": "2026-09-07",
+    "open": 71.1,
+    "high": 74.6,
+    "low": 70.1,
+    "close": 73.1,
+    "volume": 11617
+   },
+   {
+    "date": "2026-09-08",
+    "open": 71.2,
+    "high": 74.7,
+    "low": 70.2,
+    "close": 73.2,
+    "volume": 11624
+   },
+   {
+    "date": "2026-09-09",
+    "open": 71.3,
+    "high": 74.8,
+    "low": 70.3,
+    "close": 73.3,
+    "volume": 11631
+   },
+   {
+    "date": "2026-09-10",
+    "open": 71.4,
+    "high": 74.9,
+    "low": 70.4,
+    "close": 73.4,
+    "volume": 11638
+   },
+   {
+    "date": "2026-09-11",
+    "open": 71.5,
+    "high": 75.0,
+    "low": 70.5,
+    "close": 73.5,
+    "volume": 11645
+   },
+   {
+    "date": "2026-09-14",
+    "open": 71.6,
+    "high": 75.1,
+    "low": 70.6,
+    "close": 73.6,
+    "volume": 11652
+   },
+   {
+    "date": "2026-09-15",
+    "open": 71.7,
+    "high": 75.2,
+    "low": 70.7,
+    "close": 73.7,
+    "volume": 11659
+   },
+   {
+    "date": "2026-09-16",
+    "open": 71.8,
+    "high": 75.3,
+    "low": 70.8,
+    "close": 73.8,
+    "volume": 11666
+   },
+   {
+    "date": "2026-09-17",
+    "open": 71.9,
+    "high": 75.4,
+    "low": 70.9,
+    "close": 73.9,
+    "volume": 11673
+   },
+   {
+    "date": "2026-09-18",
+    "open": 72.0,
+    "high": 75.5,
+    "low": 71.0,
+    "close": 74.0,
+    "volume": 11680
+   },
+   {
+    "date": "2026-09-21",
+    "open": 72.1,
+    "high": 75.6,
+    "low": 71.1,
+    "close": 74.1,
+    "volume": 11687
+   },
+   {
+    "date": "2026-09-22",
+    "open": 72.2,
+    "high": 75.7,
+    "low": 71.2,
+    "close": 74.2,
+    "volume": 11694
+   },
+   {
+    "date": "2026-09-23",
+    "open": 72.3,
+    "high": 75.8,
+    "low": 71.3,
+    "close": 74.3,
+    "volume": 11701
+   },
+   {
+    "date": "2026-09-24",
+    "open": 72.4,
+    "high": 75.9,
+    "low": 71.4,
+    "close": 74.4,
+    "volume": 11708
+   },
+   {
+    "date": "2026-09-25",
+    "open": 72.5,
+    "high": 76.0,
+    "low": 71.5,
+    "close": 74.5,
+    "volume": 11715
+   },
+   {
+    "date": "2026-09-28",
+    "open": 72.6,
+    "high": 76.1,
+    "low": 71.6,
+    "close": 74.6,
+    "volume": 11722
+   },
+   {
+    "date": "2026-09-29",
+    "open": 72.7,
+    "high": 76.2,
+    "low": 71.7,
+    "close": 74.7,
+    "volume": 11729
+   },
+   {
+    "date": "2026-09-30",
+    "open": 72.8,
+    "high": 76.3,
+    "low": 71.8,
+    "close": 74.8,
+    "volume": 11736
+   },
+   {
+    "date": "2026-10-01",
+    "open": 72.9,
+    "high": 76.4,
+    "low": 71.9,
+    "close": 74.9,
+    "volume": 11743
+   },
+   {
+    "date": "2026-10-02",
+    "open": 73.0,
+    "high": 76.5,
+    "low": 72.0,
+    "close": 75.0,
+    "volume": 11750
+   },
+   {
+    "date": "2026-10-05",
+    "open": 73.1,
+    "high": 76.6,
+    "low": 72.1,
+    "close": 75.1,
+    "volume": 11757
+   },
+   {
+    "date": "2026-10-06",
+    "open": 73.2,
+    "high": 76.7,
+    "low": 72.2,
+    "close": 75.2,
+    "volume": 11764
+   },
+   {
+    "date": "2026-10-07",
+    "open": 73.3,
+    "high": 76.8,
+    "low": 72.3,
+    "close": 75.3,
+    "volume": 11771
+   },
+   {
+    "date": "2026-10-08",
+    "open": 73.4,
+    "high": 76.9,
+    "low": 72.4,
+    "close": 75.4,
+    "volume": 11778
+   },
+   {
+    "date": "2026-10-09",
+    "open": 73.5,
+    "high": 77.0,
+    "low": 72.5,
+    "close": 75.5,
+    "volume": 11785
+   },
+   {
+    "date": "2026-10-12",
+    "open": 73.6,
+    "high": 77.1,
+    "low": 72.6,
+    "close": 75.6,
+    "volume": 11792
+   },
+   {
+    "date": "2026-10-13",
+    "open": 73.7,
+    "high": 77.2,
+    "low": 72.7,
+    "close": 75.7,
+    "volume": 11799
+   },
+   {
+    "date": "2026-10-14",
+    "open": 73.8,
+    "high": 77.3,
+    "low": 72.8,
+    "close": 75.8,
+    "volume": 11806
+   },
+   {
+    "date": "2026-10-15",
+    "open": 73.9,
+    "high": 77.4,
+    "low": 72.9,
+    "close": 75.9,
+    "volume": 11813
+   }
+  ]
+ },
+ "quote": {
+  "price": 75.9,
+  "change_pct": 1.2,
+  "volume": 1234560,
+  "turnover": 631000000.0,
+  "name": "冻结样本股份",
+  "currency": "CNY",
+  "source": "frozen-local-fixture"
+ },
+ "concept_membership": {
+  "concepts": [
+   {
+    "name": "冻结概念样本A",
+    "source": "ifind",
+    "as_of_nature": "latest"
+   }
+  ],
+  "source": "ifind",
+  "as_of_nature": "latest",
+  "error": null
+ },
+ "sector_capital": {
+  "sector_rankings": {
+   "top": [
+    {
+     "name": "冻结板块甲",
+     "main_net_inflow": 1230000000.0
+    },
+    {
+     "name": "冻结板块乙",
+     "main_net_inflow": 980000000.0
+    }
+   ],
+   "bottom": [
+    {
+     "name": "冻结板块丙",
+     "main_net_inflow": -870000000.0
+    }
+   ]
+  },
+  "errors": []
+ },
+ "samples": {
+  "sufficient": {
+   "fact_note": "充分：六项财务锚点单位/口径/报告期齐备且合格，资金流三个窗口完整，机构字段合格，业务与股权资料齐备。",
+   "fundamental_bundle": {
+    "market": "cn",
+    "status": "ok",
+    "coverage": {},
+    "research": {
+     "as_of": "2026-10-15",
+     "company": {
+      "MAINBUSINESS": "冻结样本主营业务：高端消费品制造与销售（fixture）",
+      "MAINPRODUCT": "冻结样本主导产品系列 A/B（fixture）",
+      "AHOLDER": "冻结样本控股集团（fixture）"
+     },
+     "holders": {
+      "HOLDNAMER": "冻结样本控股集团;冻结样本公募基金一号;冻结样本资管二号",
+      "period": "2026中报"
+     },
+     "industry": {
+      "HISSW2021": "白酒"
+     },
+     "product_segments": {
+      "source": "ifind",
+      "coverage": "partial",
+      "items": [
+       {
+        "name": "冻结样本主导产品系列 A",
+        "rank": 1,
+        "report_date": "2026-06-30",
+        "revenue": null,
+        "cost": null,
+        "gross_profit": null,
+        "gross_margin": null
+       }
+      ],
+      "errors": [],
+      "disclosed_at": "2026-08-28",
+      "original_url": null
+     },
+     "shareholder_details": {
+      "source": "ifind",
+      "coverage": "complete",
+      "items": [
+       {
+        "name": "冻结样本控股集团",
+        "rank": 1,
+        "report_date": "2026-06-30",
+        "shares": null,
+        "ratio": null
+       },
+       {
+        "name": "冻结样本公募基金一号",
+        "rank": 2,
+        "report_date": "2026-06-30",
+        "shares": null,
+        "ratio": null
+       }
+      ],
+      "errors": [],
+      "disclosed_at": "2026-08-28",
+      "original_url": null
+     },
+     "governance_evidence": []
+    },
+    "cross_validation": null,
+    "errors": [],
+    "valuation": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "pe_ratio": 28.5,
+      "pb_ratio": 7.2,
+      "total_mv": 2050000000000.0,
+      "circ_mv": 2050000000000.0
+     },
+     "field_meta": {
+      "pe_ratio": {
+       "field": "pe_ratio",
+       "source": "frozen-choice",
+       "value": 28.5,
+       "unit": "multiple",
+       "currency": null,
+       "caliber": "TTM",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "pb_ratio": {
+       "field": "pb_ratio",
+       "source": "frozen-choice",
+       "value": 7.2,
+       "unit": "multiple",
+       "currency": null,
+       "caliber": "MRQ",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "total_mv": {
+       "field": "total_mv",
+       "source": "frozen-choice",
+       "value": 2050000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "snapshot",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "circ_mv": {
+       "field": "circ_mv",
+       "source": "frozen-choice",
+       "value": 2050000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "snapshot",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "growth": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "revenue": 89000000000.0,
+      "net_profit": 41000000000.0,
+      "roe": 28.4,
+      "revenue_yoy": 12.5,
+      "net_profit_yoy": 10.8,
+      "gross_margin": 91.5,
+      "report_date": "2026-06-30",
+      "balance_sheet": {
+       "source": "choice",
+       "currency": "CNY",
+       "unit": "currency_base",
+       "period": "2026中报",
+       "disclosed_at": "2026-08-28",
+       "assets": 280000000000.0,
+       "liabilities": 56000000000.0
+      }
+     },
+     "field_meta": {
+      "revenue": {
+       "field": "revenue",
+       "source": "frozen-choice",
+       "value": 89000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "consolidated",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "net_profit": {
+       "field": "net_profit",
+       "source": "frozen-choice",
+       "value": 41000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "parent_consolidated",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "roe": {
+       "field": "roe",
+       "source": "frozen-choice",
+       "value": 28.4,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "weighted_roe",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "revenue_yoy": {
+       "field": "revenue_yoy",
+       "source": "frozen-choice",
+       "value": 12.5,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "operating_revenue_yoy",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "net_profit_yoy": {
+       "field": "net_profit_yoy",
+       "source": "frozen-choice",
+       "value": 10.8,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "parent_net_profit_yoy",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "gross_margin": {
+       "field": "gross_margin",
+       "source": "frozen-choice",
+       "value": 91.5,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "sales_gross_margin",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "earnings": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "institution": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "institution_holding_change": -1.25
+     },
+     "field_meta": {
+      "institution_holding_change": {
+       "field": "institution_holding_change",
+       "source": "frozen-choice",
+       "value": -1.25,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "top10_shareholders",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": "2026-08-28",
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "capital_flow": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "dragon_tiger": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "boards": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "industry": "白酒"
+     },
+     "field_meta": {}
+    }
+   },
+   "capital_flow": {
+    "status": "ok",
+    "source": "choice",
+    "currency": "CNY",
+    "source_unit": "CNY",
+    "main_net_inflow": 100000.0,
+    "inflow_5d": 623450.0,
+    "inflow_10d": 1555525.0,
+    "errors": [],
+    "daily_series": [
+     {
+      "date": "2026-10-15",
+      "value": 100000.0
+     },
+     {
+      "date": "2026-10-14",
+      "value": 112345.0
+     },
+     {
+      "date": "2026-10-13",
+      "value": 124690.0
+     },
+     {
+      "date": "2026-10-12",
+      "value": 137035.0
+     },
+     {
+      "date": "2026-10-09",
+      "value": 149380.0
+     },
+     {
+      "date": "2026-10-08",
+      "value": 161725.0
+     },
+     {
+      "date": "2026-10-07",
+      "value": 174070.0
+     },
+     {
+      "date": "2026-10-06",
+      "value": 186415.0
+     },
+     {
+      "date": "2026-10-05",
+      "value": 198760.0
+     },
+     {
+      "date": "2026-10-02",
+      "value": 211105.0
+     }
+    ],
+    "coverage": {
+     "1": {
+      "expected_dates": [
+       "2026-10-15"
+      ],
+      "missing_dates": [],
+      "complete": true
+     },
+     "5": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09"
+      ],
+      "missing_dates": [],
+      "complete": true
+     },
+     "10": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09",
+       "2026-10-08",
+       "2026-10-07",
+       "2026-10-06",
+       "2026-10-05",
+       "2026-10-02"
+      ],
+      "missing_dates": [],
+      "complete": true
+     }
+    },
+    "expected_date": "2026-10-15",
+    "latest_date": "2026-10-15",
+    "field_meta": {
+     "main_inflow": {
+      "field": "main_inflow",
+      "source": "choice",
+      "value": 100000.0,
+      "unit": "currency_base",
+      "currency": "CNY",
+      "caliber": "daily_main_net_inflow",
+      "observed_at": "2026-10-15",
+      "fetched_at": null,
+      "period": null,
+      "period_basis": "unknown",
+      "source_family": "choice",
+      "quality": {
+       "status": "single_source",
+       "reason_codes": [
+        "single_family"
+       ]
+      },
+      "input_reasons": [],
+      "rule_eligible": true,
+      "selection_reason": "primary"
+     }
+    }
+   },
+   "model_responses": {
+    "technical": {
+     "content": {
+      "chanlun_summary": "共享快照冻结日线呈缓慢上行结构（2025-10-17 至 2026-10-15 共 260 根），中枢逐步抬升，无顶背驰信号（冻结样本解读）。",
+      "support": 67.0,
+      "resistance": 77.4,
+      "indicator_summary": "MA20=74.95，现价 75.9 位于其上方；MACD 零轴上方钝化，RSI 中性（共享快照冻结数据）。",
+      "wave_note": "日线级别第三上行段，斜率放缓（冻结样本解读）。",
+      "score": 68,
+      "basis": "现价 75.9 高于 MA20 74.95，支撑 67.0、阻力 77.4（共享快照冻结日线）。",
+      "narrative": "现价 75.9 元站上 MA20 74.95 元，支撑 67.0 元、阻力 77.4 元，趋势结构偏多但动能放缓（冻结样本）。"
+     },
+     "usage": {
+      "prompt_tokens": 950,
+      "completion_tokens": 210,
+      "total_tokens": 1160
+     }
+    },
+    "capital": {
+     "content": {
+      "flow_summary": "（由规则覆写：Choice 主力净流入窗口完整）",
+      "flow_score": 72,
+      "institution_summary": "机构持仓变动 -1.25%（2026中报，Choice 单源，统计对象与前十大股东一致）。",
+      "institution_score": 55,
+      "score": 64,
+      "narrative": "当日主力净流入 10.00 万元、5 日累计 62.34 万元（Choice，截至 2026-10-15 已收盘交易日）；机构持仓变动 -1.25%（2026中报）。单源数据，未独立核验。"
+     },
+     "usage": {
+      "prompt_tokens": 1050,
+      "completion_tokens": 190,
+      "total_tokens": 1240
+     }
+    },
+    "business": {
+     "content": {
+      "business_model": {
+       "value": "高端消费品制造与销售，品牌溢价驱动（冻结样本）",
+       "source": "Choice MAINBUSINESS，截至 2026-10-15"
+      },
+      "main_products": {
+       "value": "主导产品系列 A/B，A 系列收入占比第一（冻结样本）",
+       "source": "Choice MAINPRODUCT，截至 2026-10-15"
+      },
+      "competitive_position": "行业龙头地位稳固，护城河来自品牌与渠道（冻结样本解读，未取得定期报告原文）",
+      "vs_market_leader": "相对板块指数估值溢价偏高，来源等级 inferred（冻结样本解读）",
+      "score": 74,
+      "data_gaps": [],
+      "narrative": "主营与产品结构来自 Choice 供应商资料（截至 2026-10-15），竞争地位为推断，未取得定期报告原文佐证。"
+     },
+     "usage": {
+      "prompt_tokens": 1100,
+      "completion_tokens": 200,
+      "total_tokens": 1300
+     }
+    },
+    "ownership": {
+     "content": {
+      "controller": "（由规则覆写：Choice AHOLDER）",
+      "top_holders": [
+       {
+        "name": "冻结样本公募基金一号",
+        "source": "模型输出，报告期 2026中报"
+       }
+      ],
+      "executives": [
+       {
+        "name": "冻结样本董事长",
+        "source": "模型输出（fixture）"
+       }
+      ],
+      "recent_changes": [],
+      "data_gaps": [],
+      "score": 70,
+      "narrative": "控股股东与主要股东名单来自 Choice 供应商资料（2026中报），高管背景仅线索级，未独立核验。"
+     },
+     "usage": {
+      "prompt_tokens": 1150,
+      "completion_tokens": 180,
+      "total_tokens": 1330
+     }
+    }
+   }
+  },
+  "missing_key_facts": {
+   "fact_note": "关键资料真实缺失：全部财务锚点与机构字段缺失（来源失败记录保留），资金流窗口不完整，公司研究资料查询失败；行情与日线仍在。",
+   "fundamental_bundle": {
+    "market": "cn",
+    "status": "partial",
+    "coverage": {},
+    "research": {
+     "as_of": "2026-10-15",
+     "company": {},
+     "holders": {},
+     "industry": {},
+     "product_segments": {
+      "source": "ifind",
+      "coverage": "partial",
+      "items": [],
+      "errors": [
+       "frozen-fixture: choice_query_failed"
+      ],
+      "disclosed_at": null,
+      "original_url": null
+     },
+     "shareholder_details": {
+      "source": "ifind",
+      "coverage": "partial",
+      "items": [],
+      "errors": [
+       "frozen-fixture: choice_query_failed"
+      ],
+      "disclosed_at": null,
+      "original_url": null
+     },
+     "governance_evidence": []
+    },
+    "cross_validation": null,
+    "errors": [
+     "frozen-fixture: choice_financial_query_failed"
+    ],
+    "valuation": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "pe_ratio": null,
+      "pb_ratio": null,
+      "total_mv": null,
+      "circ_mv": null
+     },
+     "field_meta": {
+      "pe_ratio": {
+       "field": "pe_ratio",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "pb_ratio": {
+       "field": "pb_ratio",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "total_mv": {
+       "field": "total_mv",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "circ_mv": {
+       "field": "circ_mv",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      }
+     }
+    },
+    "growth": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "revenue": null,
+      "net_profit": null,
+      "roe": null,
+      "revenue_yoy": null,
+      "net_profit_yoy": null,
+      "gross_margin": null,
+      "report_date": null,
+      "balance_sheet": {}
+     },
+     "field_meta": {
+      "revenue": {
+       "field": "revenue",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "net_profit": {
+       "field": "net_profit",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "roe": {
+       "field": "roe",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "revenue_yoy": {
+       "field": "revenue_yoy",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "net_profit_yoy": {
+       "field": "net_profit_yoy",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      },
+      "gross_margin": {
+       "field": "gross_margin",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      }
+     }
+    },
+    "earnings": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "institution": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {
+      "institution_holding_change": {
+       "field": "institution_holding_change",
+       "source": "frozen-choice",
+       "value": null,
+       "quality": {
+        "status": "missing",
+        "reason_codes": [
+         "source_missing"
+        ]
+       },
+       "input_reasons": [
+        "source_missing"
+       ],
+       "rule_eligible": false,
+       "selection_reason": "primary",
+       "source_family": "frozen-local-fixture"
+      }
+     }
+    },
+    "capital_flow": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "dragon_tiger": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "boards": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "industry": "白酒"
+     },
+     "field_meta": {}
+    }
+   },
+   "capital_flow": {
+    "status": "partial",
+    "source": "choice",
+    "currency": "CNY",
+    "source_unit": "CNY",
+    "main_net_inflow": null,
+    "inflow_5d": null,
+    "inflow_10d": null,
+    "errors": [
+     "choice:window_1_incomplete",
+     "choice:window_5_incomplete",
+     "choice:window_10_incomplete"
+    ],
+    "daily_series": [
+     {
+      "date": "2026-10-14",
+      "value": 112345.0
+     },
+     {
+      "date": "2026-10-13",
+      "value": 124690.0
+     },
+     {
+      "date": "2026-10-12",
+      "value": 137035.0
+     },
+     {
+      "date": "2026-10-09",
+      "value": 149380.0
+     },
+     {
+      "date": "2026-10-08",
+      "value": 161725.0
+     },
+     {
+      "date": "2026-10-07",
+      "value": 174070.0
+     },
+     {
+      "date": "2026-10-06",
+      "value": 186415.0
+     },
+     {
+      "date": "2026-10-05",
+      "value": 198760.0
+     },
+     {
+      "date": "2026-10-02",
+      "value": 211105.0
+     }
+    ],
+    "expected_date": "2026-10-15",
+    "latest_date": "2026-10-14",
+    "coverage": {
+     "1": {
+      "expected_dates": [
+       "2026-10-15"
+      ],
+      "missing_dates": [
+       "2026-10-15"
+      ],
+      "complete": false
+     },
+     "5": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09"
+      ],
+      "missing_dates": [
+       "2026-10-15"
+      ],
+      "complete": false
+     },
+     "10": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09",
+       "2026-10-08",
+       "2026-10-07",
+       "2026-10-06",
+       "2026-10-05",
+       "2026-10-02"
+      ],
+      "missing_dates": [
+       "2026-10-15"
+      ],
+      "complete": false
+     }
+    },
+    "field_meta": {
+     "main_inflow": {
+      "value": null,
+      "rule_eligible": false,
+      "quality": {
+       "status": "missing",
+       "reason_codes": [
+        "window_incomplete"
+       ]
+      }
+     }
+    }
+   },
+   "model_responses": {
+    "technical": {
+     "content": {
+      "chanlun_summary": "共享快照冻结日线呈缓慢上行结构（2025-10-17 至 2026-10-15 共 260 根），中枢逐步抬升，无顶背驰信号（冻结样本解读）。",
+      "support": 67.0,
+      "resistance": 77.4,
+      "indicator_summary": "MA20=74.95，现价 75.9 位于其上方；MACD 零轴上方钝化，RSI 中性（共享快照冻结数据）。",
+      "wave_note": "日线级别第三上行段，斜率放缓（冻结样本解读）。",
+      "score": 68,
+      "basis": "现价 75.9 高于 MA20 74.95，支撑 67.0、阻力 77.4（共享快照冻结日线）。",
+      "narrative": "现价 75.9 元站上 MA20 74.95 元，支撑 67.0 元、阻力 77.4 元，趋势结构偏多但动能放缓（冻结样本）。"
+     },
+     "usage": {
+      "prompt_tokens": 950,
+      "completion_tokens": 210,
+      "total_tokens": 1160
+     }
+    },
+    "capital": {
+     "content": {
+      "flow_summary": "（由规则覆写：窗口不完整）",
+      "flow_score": null,
+      "institution_summary": "机构持仓资料未取得合格字段（统计对象或日期未确认），不判定方向。",
+      "institution_score": null,
+      "score": null,
+      "narrative": "资金流窗口不完整、机构字段缺失；未取得可验证金额与比例，不作方向判断。"
+     },
+     "usage": {
+      "prompt_tokens": 980,
+      "completion_tokens": 120,
+      "total_tokens": 1100
+     }
+    },
+    "business": {
+     "content": {
+      "business_model": {},
+      "main_products": {},
+      "competitive_position": "未取得供应商主营与产品资料，无法描述竞争地位。",
+      "vs_market_leader": {},
+      "score": null,
+      "data_gaps": [
+       "主营与产品资料未取得",
+       "定期报告原文未取得"
+      ],
+      "narrative": "供应商财务与公司资料缺失（真实缺口），本维度无可解释的合格资料，不编造业务画像。"
+     },
+     "usage": {
+      "prompt_tokens": 900,
+      "completion_tokens": 110,
+      "total_tokens": 1010
+     }
+    },
+    "ownership": {
+     "content": {
+      "controller": "",
+      "top_holders": [],
+      "executives": [],
+      "recent_changes": [],
+      "data_gaps": [
+       "股东名单未取得",
+       "高管背景未取得",
+       "近一年变动未取得"
+      ],
+      "score": null,
+      "narrative": "股权与治理资料未取得合格字段，仅保留缺口，不生成治理评分。"
+     },
+     "usage": {
+      "prompt_tokens": 870,
+      "completion_tokens": 100,
+      "total_tokens": 970
+     }
+    }
+   }
+  },
+  "conflicting_news_governance": {
+   "fact_note": "新闻/治理证据矛盾：财务与资金资料同充分样本，另注入两条有身份/来源/时间/相反主张的质押比例证据，未经核验。",
+   "fundamental_bundle": {
+    "market": "cn",
+    "status": "ok",
+    "coverage": {},
+    "research": {
+     "as_of": "2026-10-15",
+     "company": {
+      "MAINBUSINESS": "冻结样本主营业务：高端消费品制造与销售（fixture）",
+      "MAINPRODUCT": "冻结样本主导产品系列 A/B（fixture）",
+      "AHOLDER": "冻结样本控股集团（fixture）"
+     },
+     "holders": {
+      "HOLDNAMER": "冻结样本控股集团;冻结样本公募基金一号;冻结样本资管二号",
+      "period": "2026中报"
+     },
+     "industry": {
+      "HISSW2021": "白酒"
+     },
+     "product_segments": {
+      "source": "ifind",
+      "coverage": "partial",
+      "items": [
+       {
+        "name": "冻结样本主导产品系列 A",
+        "rank": 1,
+        "report_date": "2026-06-30",
+        "revenue": null,
+        "cost": null,
+        "gross_profit": null,
+        "gross_margin": null
+       }
+      ],
+      "errors": [],
+      "disclosed_at": "2026-08-28",
+      "original_url": null
+     },
+     "shareholder_details": {
+      "source": "ifind",
+      "coverage": "complete",
+      "items": [
+       {
+        "name": "冻结样本控股集团",
+        "rank": 1,
+        "report_date": "2026-06-30",
+        "shares": null,
+        "ratio": null
+       },
+       {
+        "name": "冻结样本公募基金一号",
+        "rank": 2,
+        "report_date": "2026-06-30",
+        "shares": null,
+        "ratio": null
+       }
+      ],
+      "errors": [],
+      "disclosed_at": "2026-08-28",
+      "original_url": null
+     },
+     "governance_evidence": [
+      {
+       "id": "ann-2026-09-12-001",
+       "subject": "控股股东质押比例",
+       "source_family": "exchange_announcement",
+       "source": "交易所公告（冻结样本，fixture）",
+       "published_at": "2026-09-12",
+       "claim": "控股股东质押股份占其所持股份 12.3%（截至 2026-09-10），风险可控，无平仓风险"
+      },
+      {
+       "id": "news-2026-09-13-002",
+       "subject": "控股股东质押比例",
+       "source_family": "news_media",
+       "source": "财经媒体报道（冻结样本，fixture）",
+       "published_at": "2026-09-13",
+       "claim": "控股股东质押比例已超过其所持股份 30%，接近警戒线"
+      }
+     ]
+    },
+    "cross_validation": null,
+    "errors": [],
+    "valuation": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "pe_ratio": 28.5,
+      "pb_ratio": 7.2,
+      "total_mv": 2050000000000.0,
+      "circ_mv": 2050000000000.0
+     },
+     "field_meta": {
+      "pe_ratio": {
+       "field": "pe_ratio",
+       "source": "frozen-choice",
+       "value": 28.5,
+       "unit": "multiple",
+       "currency": null,
+       "caliber": "TTM",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "pb_ratio": {
+       "field": "pb_ratio",
+       "source": "frozen-choice",
+       "value": 7.2,
+       "unit": "multiple",
+       "currency": null,
+       "caliber": "MRQ",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "total_mv": {
+       "field": "total_mv",
+       "source": "frozen-choice",
+       "value": 2050000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "snapshot",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "circ_mv": {
+       "field": "circ_mv",
+       "source": "frozen-choice",
+       "value": 2050000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "snapshot",
+       "period": null,
+       "period_basis": "unknown",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "growth": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "revenue": 89000000000.0,
+      "net_profit": 41000000000.0,
+      "roe": 28.4,
+      "revenue_yoy": 12.5,
+      "net_profit_yoy": 10.8,
+      "gross_margin": 91.5,
+      "report_date": "2026-06-30",
+      "balance_sheet": {
+       "source": "choice",
+       "currency": "CNY",
+       "unit": "currency_base",
+       "period": "2026中报",
+       "disclosed_at": "2026-08-28",
+       "assets": 280000000000.0,
+       "liabilities": 56000000000.0
+      }
+     },
+     "field_meta": {
+      "revenue": {
+       "field": "revenue",
+       "source": "frozen-choice",
+       "value": 89000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "consolidated",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "net_profit": {
+       "field": "net_profit",
+       "source": "frozen-choice",
+       "value": 41000000000.0,
+       "unit": "currency_base",
+       "currency": "CNY",
+       "caliber": "parent_consolidated",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "roe": {
+       "field": "roe",
+       "source": "frozen-choice",
+       "value": 28.4,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "weighted_roe",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "revenue_yoy": {
+       "field": "revenue_yoy",
+       "source": "frozen-choice",
+       "value": 12.5,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "operating_revenue_yoy",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "net_profit_yoy": {
+       "field": "net_profit_yoy",
+       "source": "frozen-choice",
+       "value": 10.8,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "parent_net_profit_yoy",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      },
+      "gross_margin": {
+       "field": "gross_margin",
+       "source": "frozen-choice",
+       "value": 91.5,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "sales_gross_margin",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": null,
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "earnings": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "institution": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "institution_holding_change": -1.25
+     },
+     "field_meta": {
+      "institution_holding_change": {
+       "field": "institution_holding_change",
+       "source": "frozen-choice",
+       "value": -1.25,
+       "unit": "percentage_point",
+       "currency": null,
+       "caliber": "top10_shareholders",
+       "period": "2026中报",
+       "period_basis": "YTD",
+       "observed_at": "2026-08-28",
+       "fetched_at": null,
+       "source_family": "frozen-local-fixture",
+       "quality": {
+        "status": "single_source",
+        "reason_codes": [
+         "single_family"
+        ]
+       },
+       "input_reasons": [],
+       "rule_eligible": true,
+       "selection_reason": "primary"
+      }
+     }
+    },
+    "capital_flow": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "dragon_tiger": {
+     "status": "ok",
+     "errors": [],
+     "data": {},
+     "field_meta": {}
+    },
+    "boards": {
+     "status": "ok",
+     "errors": [],
+     "data": {
+      "industry": "白酒"
+     },
+     "field_meta": {}
+    }
+   },
+   "capital_flow": {
+    "status": "ok",
+    "source": "choice",
+    "currency": "CNY",
+    "source_unit": "CNY",
+    "main_net_inflow": 100000.0,
+    "inflow_5d": 623450.0,
+    "inflow_10d": 1555525.0,
+    "errors": [],
+    "daily_series": [
+     {
+      "date": "2026-10-15",
+      "value": 100000.0
+     },
+     {
+      "date": "2026-10-14",
+      "value": 112345.0
+     },
+     {
+      "date": "2026-10-13",
+      "value": 124690.0
+     },
+     {
+      "date": "2026-10-12",
+      "value": 137035.0
+     },
+     {
+      "date": "2026-10-09",
+      "value": 149380.0
+     },
+     {
+      "date": "2026-10-08",
+      "value": 161725.0
+     },
+     {
+      "date": "2026-10-07",
+      "value": 174070.0
+     },
+     {
+      "date": "2026-10-06",
+      "value": 186415.0
+     },
+     {
+      "date": "2026-10-05",
+      "value": 198760.0
+     },
+     {
+      "date": "2026-10-02",
+      "value": 211105.0
+     }
+    ],
+    "coverage": {
+     "1": {
+      "expected_dates": [
+       "2026-10-15"
+      ],
+      "missing_dates": [],
+      "complete": true
+     },
+     "5": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09"
+      ],
+      "missing_dates": [],
+      "complete": true
+     },
+     "10": {
+      "expected_dates": [
+       "2026-10-15",
+       "2026-10-14",
+       "2026-10-13",
+       "2026-10-12",
+       "2026-10-09",
+       "2026-10-08",
+       "2026-10-07",
+       "2026-10-06",
+       "2026-10-05",
+       "2026-10-02"
+      ],
+      "missing_dates": [],
+      "complete": true
+     }
+    },
+    "expected_date": "2026-10-15",
+    "latest_date": "2026-10-15",
+    "field_meta": {
+     "main_inflow": {
+      "field": "main_inflow",
+      "source": "choice",
+      "value": 100000.0,
+      "unit": "currency_base",
+      "currency": "CNY",
+      "caliber": "daily_main_net_inflow",
+      "observed_at": "2026-10-15",
+      "fetched_at": null,
+      "period": null,
+      "period_basis": "unknown",
+      "source_family": "choice",
+      "quality": {
+       "status": "single_source",
+       "reason_codes": [
+        "single_family"
+       ]
+      },
+      "input_reasons": [],
+      "rule_eligible": true,
+      "selection_reason": "primary"
+     }
+    }
+   },
+   "model_responses": {
+    "technical": {
+     "content": {
+      "chanlun_summary": "共享快照冻结日线呈缓慢上行结构（2025-10-17 至 2026-10-15 共 260 根），中枢逐步抬升，无顶背驰信号（冻结样本解读）。",
+      "support": 67.0,
+      "resistance": 77.4,
+      "indicator_summary": "MA20=74.95，现价 75.9 位于其上方；MACD 零轴上方钝化，RSI 中性（共享快照冻结数据）。",
+      "wave_note": "日线级别第三上行段，斜率放缓（冻结样本解读）。",
+      "score": 68,
+      "basis": "现价 75.9 高于 MA20 74.95，支撑 67.0、阻力 77.4（共享快照冻结日线）。",
+      "narrative": "现价 75.9 元站上 MA20 74.95 元，支撑 67.0 元、阻力 77.4 元，趋势结构偏多但动能放缓（冻结样本）。"
+     },
+     "usage": {
+      "prompt_tokens": 950,
+      "completion_tokens": 210,
+      "total_tokens": 1160
+     }
+    },
+    "capital": {
+     "content": {
+      "flow_summary": "（由规则覆写：Choice 主力净流入窗口完整）",
+      "flow_score": 72,
+      "institution_summary": "机构持仓变动 -1.25%（2026中报，Choice 单源，统计对象与前十大股东一致）。",
+      "institution_score": 55,
+      "score": 64,
+      "narrative": "当日主力净流入 10.00 万元、5 日累计 62.34 万元（Choice，截至 2026-10-15 已收盘交易日）；机构持仓变动 -1.25%（2026中报）。单源数据，未独立核验。"
+     },
+     "usage": {
+      "prompt_tokens": 1050,
+      "completion_tokens": 190,
+      "total_tokens": 1240
+     }
+    },
+    "business": {
+     "content": {
+      "business_model": {
+       "value": "高端消费品制造与销售，品牌溢价驱动（冻结样本）",
+       "source": "Choice MAINBUSINESS，截至 2026-10-15"
+      },
+      "main_products": {
+       "value": "主导产品系列 A/B，A 系列收入占比第一（冻结样本）",
+       "source": "Choice MAINPRODUCT，截至 2026-10-15"
+      },
+      "competitive_position": "行业龙头地位稳固，护城河来自品牌与渠道（冻结样本解读，未取得定期报告原文）",
+      "vs_market_leader": "相对板块指数估值溢价偏高，来源等级 inferred（冻结样本解读）",
+      "score": 74,
+      "data_gaps": [],
+      "narrative": "主营与产品结构来自 Choice 供应商资料（截至 2026-10-15），竞争地位为推断，未取得定期报告原文佐证。"
+     },
+     "usage": {
+      "prompt_tokens": 1100,
+      "completion_tokens": 200,
+      "total_tokens": 1300
+     }
+    },
+    "ownership": {
+     "content": {
+      "controller": "（由规则覆写：Choice AHOLDER）",
+      "top_holders": [
+       {
+        "name": "冻结样本公募基金一号",
+        "source": "模型输出，报告期 2026中报"
+       }
+      ],
+      "executives": [
+       {
+        "name": "冻结样本董事长",
+        "source": "模型输出（fixture）"
+       }
+      ],
+      "recent_changes": [
+       {
+        "name": "控股股东质押比例：公告口径 12.3%（截至 2026-09-10）",
+        "source": "exchange_announcement ann-2026-09-12-001",
+        "date": "2026-09-12",
+        "detail": "公告称质押占其所持 12.3%，无平仓风险"
+       },
+       {
+        "name": "控股股东质押比例：报道口径超 30%",
+        "source": "news_media news-2026-09-13-002",
+        "date": "2026-09-13",
+        "detail": "报道称质押超 30%、接近警戒线，未署名来源"
+       }
+      ],
+      "data_gaps": [
+       "控股股东质押比例存在公告与新闻矛盾（ann-2026-09-12-001 vs news-2026-09-13-002），未经独立核验，不采信任一方"
+      ],
+      "score": null,
+      "narrative": "两条证据对同一质押事项给出 12.3% 与超 30% 的相反主张（公告 2026-09-12 / 新闻 2026-09-13）；未取得独立核验渠道，本报告同时保留两说，不给治理分数。"
+     },
+     "usage": {
+      "prompt_tokens": 1250,
+      "completion_tokens": 230,
+      "total_tokens": 1480
+     }
+    }
+   }
+  }
+ }
+}

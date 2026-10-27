@@ -67,7 +67,7 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 | DeepSeek | `deepseek` | `deepseek` | `https://api.deepseek.com` | `deepseek-v4-flash,deepseek-v4-pro` |
 | Gemini | `gemini` | `gemini` | 留空 | `gemini-3.1-pro-preview,gemini-3-flash-preview` |
 | Anthropic Claude | `anthropic` | `anthropic` | 留空 | `claude-sonnet-4-6,claude-opus-4-7` |
-| Kimi / Moonshot | `moonshot` | `openai` | `https://api.moonshot.cn/v1` | `kimi-k2.6,kimi-k2.5` |
+| Kimi / Moonshot | `moonshot` | `openai` | `https://api.moonshot.cn/v1` | `kimi-k3.1-pro` |
 | 通义千问 / DashScope | `dashscope` | `openai` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen3.6-plus,qwen3.6-flash` |
 | 智谱 GLM | `zhipu` | `openai` | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.1,glm-4.7-flash` |
 | MiniMax | `minimax` | `openai` | `https://api.minimax.io/v1` | `MiniMax-M3.1-Flash,MiniMax-M3,MiniMax-M2.7,MiniMax-M2.7-highspeed` |
@@ -86,7 +86,7 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 | DeepSeek | [快速开始](https://api-docs.deepseek.com/) | 官方 OpenAI Base URL 为 `https://api.deepseek.com`；`deepseek-chat` / `deepseek-reasoner` 将于 2026-07-24 弃用，当前模板直接使用 `deepseek-v4-flash` / `deepseek-v4-pro`。 |
 | Gemini | [模型列表](https://ai.google.dev/gemini-api/docs/models) | Gemini 3.1 Pro / Gemini 3 Flash 仍为 preview；如需生产稳定性，可在控制台改回 2.5 稳定模型。 |
 | Anthropic Claude | [模型概览](https://docs.anthropic.com/en/docs/about-claude/models/all-models) | Claude 当前 API ID 包含 `claude-sonnet-4-6`、`claude-opus-4-7`；Sonnet 更适合作为默认性价比入口。 |
-| Kimi / Moonshot | [Kimi K2.6 快速开始](https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart)、[模型列表](https://platform.kimi.com/docs/models) | 官方推荐 `kimi-k2.6`；`kimi-k2` 系列将在 2026-05-25 下线，旧 `moonshot-v1-*` 仅保留为稳定旧工作负载选择。 |
+| Kimi / Moonshot | [Kimi K3.1 Pro 快速开始](https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart)、[模型列表](https://platform.kimi.ai/docs/models) | 官方推荐 `kimi-k3.1-pro`（K3.1 Pro 固定 `temperature=1.0`/`top_p=0.95` 等采样参数并要求请求中省略，本项目会自动省略 `temperature`）；`kimi-k2.6` 保留为旧工作负载兼容选择（thinking 固定 `temperature=1.0`、non-thinking 固定 `0.6`，仓库自动适配）。 |
 | 通义千问 / DashScope | [文本生成](https://help.aliyun.com/zh/model-studio/text-generation-model/) | 百炼推荐 `qwen3.6-plus`，确认效果后可用 `qwen3.6-flash` 降低成本。 |
 | 智谱 GLM | [模型概览](https://docs.bigmodel.cn/cn/guide/start/model-overview)、[GLM-5.1](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1) | `glm-5.1` 是当前旗舰；`glm-4.7-flash` 作为轻量/免费模型示例。 |
 | MiniMax | [OpenAI API 兼容与参数](https://platform.minimax.io/docs/api-reference/text-openai-api)、[获取模型列表](https://platform.minimax.io/docs/api-reference/models/openai/list-models)、[Pricing](https://platform.minimax.io/docs/pricing/overview) | Web 新建渠道默认使用 `MiniMax-M3.1-Flash`；thinking 保持开启，`.env` 中的 `MINIMAX_REASONING_EFFORT` 可选 `low`、`medium`、`high`、`xhigh`、`max`，仅该模型会按档位调节推理深度。`MiniMax-M3` 仍为现有配置的兼容选项，但不再作为默认。M3.1-Flash 用量按官方按量 API 标价估算，不代表套餐实际扣费。Base URL 示例为 `https://api.minimax.io/v1`；实际权限、套餐路由与计费以账户控制台为准。 |

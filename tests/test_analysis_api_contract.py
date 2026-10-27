@@ -2927,12 +2927,16 @@ class ImageStockExtractorContractTestCase(unittest.TestCase):
             openai_model="gpt-4o-mini",
             openai_base_url=None,
         )
-        msg = MagicMock()
-        msg.content = '["600519"]'
-        choice = MagicMock()
-        choice.message = msg
-        response = MagicMock()
-        response.choices = [choice]
+        # LiteLLM chat.completion shape with explicit no-usage contract; a
+        # spec-less MagicMock would auto-synthesize usage/model_dump and break
+        # limited_completion's usage adoption.
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='["600519"]'), finish_reason="stop")],
+            model="gemini/gemini-2.0-flash",
+            usage=None,
+            usage_metadata=None,
+            _hidden_params=None,
+        )
 
         with patch("src.services.image_stock_extractor.get_config", return_value=cfg), \
              patch("src.services.image_stock_extractor.litellm.completion", return_value=response) as mock_completion:

@@ -9,8 +9,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any, Callable, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from src.llm.attempt import ModelAttempt
 
 _T = TypeVar("_T")
 
@@ -49,6 +52,9 @@ class ResearchRun:
     facts: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     vendor_research: dict[str, dict[str, Any]] = field(default_factory=dict)
     daily_history: dict[str, Any] | None = None
+    # Model attempt ledger (issue #55): one entry per admission attempt.
+    # Appends survive finish/cancel so a late in-flight usage stays recorded.
+    attempts: list[ModelAttempt] = field(default_factory=list, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _pending: set[Future[Any]] = field(default_factory=set, repr=False)
     _on_clean: Callable[[], None] | None = field(default=None, repr=False)
@@ -150,6 +156,11 @@ class ResearchRun:
             except Exception:
                 # A detached progress listener cannot stop accepted research.
                 pass
+
+    def record_attempt(self, attempt: ModelAttempt) -> None:
+        """Attach one model attempt to this run; finalization does not drop it."""
+        with self._lock:
+            self.attempts.append(attempt)
 
     def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
         """Share one completed session inside this run. Does not touch a returned context."""
@@ -279,6 +290,9 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
         "get_stock_info": {"name": "公司名称", "pe_ratio": "PE", "pb_ratio": "PB", "total_mv": "总市值", "circ_mv": "流通市值", "revenue": "营业收入", "net_profit": "归母净利润", "roe": "加权ROE", "gross_margin": "毛利率", "revenue_yoy": "营收同比", "net_profit_yoy": "归母净利同比"},
         "get_daily_history": {"open": "最近交易日开盘", "high": "最近交易日最高", "low": "最近交易日最低", "close": "最近交易日收盘", "volume": "最近交易日成交量"},
         "analyze_trend": {"ma5": "5日均线", "ma10": "10日均线", "ma20": "20日均线", "current_price": "价格", "macd_dif": "MACD DIF", "rsi_6": "6日RSI"},
+        "get_fundamental_context": {"institution_holding_change": "机构持仓变化", "top10_holder_change": "十大股东持股变化"},
+        "support_resistance": {"support": "支撑", "resistance": "阻力"},
+        "chanlun_engine": {"current_trend": "缠论趋势", "position": "缠论位置", "divergence": "缠论背驰"},
     }.get(tool, {})
     values = dict(result)
     metadata = dict(result.get("field_meta") or {})
@@ -311,7 +325,7 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
                 source=str(meta.get("source") or result.get("source") or "工具未标注来源")[:160],
                 period=str(meta.get("period") or meta.get("observed_at") or values.get("date") or result.get("latest_date") or result.get("date") or "")[:80],
                 unit=" / ".join(str(part) for part in (meta.get("unit") or result.get("source_unit"), meta.get("currency") or result.get("currency")) if part)[:80],
-                qualification="；".join([str(quality.get("status") or "未独立核验"), *[str(code) for code in quality.get("reason_codes", [])], *[str(code) for code in meta.get("input_reasons", [])], *[str(meta[key]) for key in ("period_basis", "statement_scope", "adjustment") if meta.get(key)], *(["历史估算"] if result.get("estimated") else [])])[:300],
+                qualification="；".join([str(quality.get("status") or "未独立核验"), *[str(code) for code in quality.get("reason_codes", [])], *[str(code) for code in meta.get("input_reasons", [])], *[str(meta[key]) for key in ("caliber", "period_basis", "statement_scope", "adjustment") if meta.get(key)], *([str(meta["normalization_error"])] if meta.get("normalization_error") else []), *(["资格不合格"] if meta.get("rule_eligible") is False else []), *(["历史估算"] if result.get("estimated") else [])])[:300],
             )
             records.append(record.model_dump())
         except ValidationError:

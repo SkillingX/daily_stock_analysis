@@ -243,7 +243,7 @@ class DeepResearchService:
                         "cache_hit": True,
                     }
                     # 透传双轨增量字段（engine/dimensions/guardrail_events/dims_degraded）
-                    for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded", "final_conclusion"):
+                    for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded", "final_conclusion", "model_usage"):
                         if _k in cached_result:
                             done_event[_k] = cached_result[_k]
                     progress_callback(done_event)
@@ -289,6 +289,7 @@ class DeepResearchService:
                 provider=dt_result.provider,
                 error=dt_result.error,
                 final_conclusion=dt_result.final_conclusion,
+                usage=dt_result.usage,
             )
             dims_payload = dt_result.dims_payload
             guardrail_events = [
@@ -302,6 +303,16 @@ class DeepResearchService:
                 report_type=report_type,
                 progress_callback=progress_callback,
             )
+
+        # 在途尝试可能在编排返回后才 release；落盘与 done 前用运行账本
+        # 重刷用量（同一批 attempt 对象，迟到 usage 反映在最终快照里）。
+        if run is not None and getattr(result, "usage", None):
+            from src.llm.attempt import attempts_detail, known_total_tokens, summarize_attempts
+
+            refreshed = summarize_attempts(run.attempts, origin_run_id=run.run_id, origin_report_id=report_id)
+            refreshed["attempt_records"] = attempts_detail(run.attempts)
+            result.usage = refreshed
+            result.total_tokens = known_total_tokens(refreshed)
 
         # 写 Markdown 文件（即使 partial 也写，保证有产物）
         markdown = result.markdown or ""
@@ -332,6 +343,9 @@ class DeepResearchService:
                             "engine": "dual_track",
                             "run_id": run.run_id if run is not None else None,
                             "end_reason": run.stop_reason if run is not None else None,
+                            # 生成用量的唯一归属快照：读取（历史/日缓存）引用此处，
+                            # 不复制记录也不新增出站（issue #55）。
+                            "model_usage": getattr(result, "usage", None),
                             "guardrail_events": guardrail_events,
                             "dimensions": dims_payload,
                         },
@@ -382,6 +396,9 @@ class DeepResearchService:
             done_event["guardrail_events"] = guardrail_events
             done_event["dims_degraded"] = list(result.missing_layers)
             done_event["final_conclusion"] = getattr(result, "final_conclusion", "") or ""
+            # 追加用量元数据：本次 run_id 是传输身份，model_usage.origin_run_id
+            # 是生成归属；数值接口（total_tokens）只含可确认合计。
+            done_event["model_usage"] = getattr(result, "usage", None)
         if progress_callback:
             progress_callback(done_event)
 
@@ -409,6 +426,7 @@ class DeepResearchService:
             return_dict["final_conclusion"] = (
                 getattr(result, "final_conclusion", "") or ""
             )
+            return_dict["model_usage"] = getattr(result, "usage", None)
 
         # ── 写入报告日缓存（成功时，同一自然日内复用）────────────────────────
         if write_ok and return_dict.get("markdown") and _cacheable_report(return_dict):
@@ -419,6 +437,49 @@ class DeepResearchService:
             logger.info("[DeepResearch] 日缓存已写入 %s → %s", cache_key, report_id)
 
         return return_dict
+
+    def refresh_report_usage(self, run: "ResearchRun", report_id: str, code: str, dims: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Re-derive usage after in-flight attempts finished (cleanup point).
+
+        Late responses arriving between the render and the run cleanup keep
+        their outbound facts and usage in the run ledger; this refresh rewrites
+        the saved sidecar/DB/cache so the final done, history reads and the
+        per-call audit agree. Idempotent on the normal path.
+        """
+        if run is None or report_id is None:
+            return None
+        try:
+            from src.llm.attempt import attempts_detail, known_total_tokens, summarize_attempts
+
+            usage = summarize_attempts(run.attempts, origin_run_id=run.run_id, origin_report_id=report_id)
+            usage["attempt_records"] = attempts_detail(run.attempts)
+            total = known_total_tokens(usage)
+            report_dir = get_deep_research_dir()
+            dims_path = report_dir / f"{report_id}_dims.json"
+            if dims_path.exists():
+                import json as _json
+
+                try:
+                    payload = _json.loads(dims_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    payload = None
+                if isinstance(payload, dict):
+                    payload["model_usage"] = usage
+                    try:
+                        dims_path.write_text(_json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning("[DeepResearch] 刷新用量产物失败 %s: %s", report_id, exc)
+            get_db().update_deep_research_total_tokens(report_id, total)
+            cache_key = _date_key(code, dims)
+            with _cache_lock:
+                cached = _report_cache.get(cache_key)
+                if cached and cached[0] == report_id:
+                    cached[2]["model_usage"] = usage
+                    cached[2]["total_tokens"] = total
+            return usage
+        except Exception as exc:  # noqa: BLE001 - 收尾刷新失败不改变终态语义
+            logger.warning("[DeepResearch] 迟到用量刷新失败 %s: %s", report_id, exc)
+            return None
 
     # ------------------------------------------------------------------
     # 查询
@@ -450,7 +511,7 @@ class DeepResearchService:
         data["markdown"] = normalize_saved_markdown(markdown)
         payload = self.get_dims_payload(report_id)
         if payload is not None:
-            for key in ("engine", "dimensions", "guardrail_events", "run_id", "end_reason"):
+            for key in ("engine", "dimensions", "guardrail_events", "run_id", "end_reason", "model_usage"):
                 if key in payload:
                     data[key] = payload[key]
         return data

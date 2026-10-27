@@ -124,7 +124,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             ctx.limitation(f"基本面取数: {error}")
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
-        institution = (compact.get("institution") or {}).get("data") or {}
+        institution_block = compact.get("institution") or {}
+        institution = institution_block.get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
         industry_hint = ""
         research = compact.get("research") or {}
@@ -156,6 +157,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
             "research": research,
+            # issue #56：保留机构块（含 field_meta 资格标注），资金研究员直接消费，
+            # 不再为单一机构字段重跑整套基本面装配。
+            "institution": institution_block,
             "balance_sheet": financial.get("balance_sheet") or {},
             "sector_rankings": (((compact.get("capital_flow") or {}).get("data") or {}).get("sector_rankings") or {}),
             "stock_name": raw.get("stock_name"),
