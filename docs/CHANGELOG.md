@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 共享同步流式调用（limited_completion）的供应商用量现在递归保留嵌套明细（prompt_tokens_details 缓存命中、completion_tokens_details 推理），与异步 Agent 路径同口径；嵌套 Pydantic 对象不再因被当作不透明对象而丢失，缺失/显式全零/部分字段的未知纪律不变。
 - [测试] 流生命周期测试的 choice 级用量用例改为真实渲染 choices[0].usage（Kimi 把用量尾包放在 choice 上）：choice-only 用例与顶层优先（两值不同）用例分开断言，并新增共享同步流嵌套用量明细回归。
 - [测试] 修复 tests/test_agent_pipeline.py 在先装 litellm stub 的全新子进程中的导入顺序：stub 移除提前到全部真实 SDK 导入之前，消除 ModuleNotFoundError（模块级 xfail 保持不变）。
+- [文档] AGENTS.md 新增 LLM provider 支持范围治理：Gemini 当前无用户、暂不受支持，维护者明确启用前 Gemini 专属问题只记录为 deferred，不展开当前实现 / 修复 / 验收工作、不阻塞发布、不声称已修复或已支持；影响在用 provider 的共享路径问题照常修复，通用测试与共享正确性检查不豁免，正式启用请求时重新评估。
 - [文档] 服务商文档、机器人命令文档（中英）、AlphaSift 集成与完整指南（中英）的当前运行时依赖描述同步为精确锁定 `litellm==1.106.4`（带日期的历史线上复核记录保留原约束）；服务商文档注明 Gemini 渠道暂不支持，Gemini 专项发现不作为发布门禁。
 - [文档] 深研文档与 `.env.example` 补充流式生命周期与护栏语义；服务商文档与中英文配置指南补充 MiniMax 固定 `temperature=1` 口径、统一温度偏好边界及配置生效/重建边界。
 - [改进] Kimi 公开 API 预设与示例默认模型更新为 `kimi-k3.1-pro`：Web 新建 Moonshot 渠道默认收敛为单个当前模型（不把旧 K2.6 混入新建列表），`.env.example` 与服务商文档示例同步；已有自定义渠道模型不迁移。请求层对 `kimi-k3.1-pro`（含 `kimi-k3.1-pro-highspeed` 变体）省略 `temperature`——官方固定 `temperature=1.0`/`top_p=0.95` 等采样参数并要求请求中省略，已保存的 `LLM_TEMPERATURE` 不改写；`kimi-k2.6` 固定温度（thinking 1.0 / non-thinking 0.6）兼容代码与测试原样保留，仅存在于旧配置兼容说明。独立 Scheduler 的 Kimi Code 套餐路由（`openai/k3.1-pro`）不受影响。
