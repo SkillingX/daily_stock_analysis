@@ -90,8 +90,8 @@ primary 支撑事实；新闻线索不升级为已确认订单。
 ### 2.2 瓶颈与利润分配
 中游设计是利润集中点，公司处于关键环节。
 
-### 2.3 板块归属双源校验（东财 + 同花顺，confirmed / partial / conflict / unverified / not_applicable）
-东方财富 + 同花顺双源 confirmed（high confidence），板块归属明确。
+### 2.3 最新概念归属
+概念归属取 iFinD 最新时点，概念标签不是客户事实；无数据按原因披露，不写双源确认。板块归属只作标签。
 
 ---
 

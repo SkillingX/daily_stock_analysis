@@ -94,7 +94,7 @@ def test_expired_deadline_skips_wire_request(zhipu_wire):
     assert not zhipu_wire[1]
 
 
-@pytest.mark.parametrize('status,reason', [(401, 'authentication_failed'), (403, 'authentication_failed'), (429, 'quota_exhausted')])
+@pytest.mark.parametrize('status,reason', [(401, 'authentication_failed'), (403, 'authentication_failed'), (429, 'rate_limited')])
 def test_wire_failures_are_classified_and_do_not_leak_key(monkeypatch, status, reason):
     from src.services import mcp_client
 
@@ -232,3 +232,112 @@ def test_readonly_provider_credentials_are_masked_before_reaching_settings(tmp_p
     assert item['value'] == '******' and item['is_masked']
     for name in ('FINANCIAL_PRIMARY_SOURCE', 'CODING_PLAN_SEARCH_PROVIDER'):
         assert all(option['label'] != option['value'] for option in get_field_definition(name)['options'])
+
+
+def test_minimax_log_failure_preserves_native_result(monkeypatch):
+    """A throwing log handler must not replace MiniMax HTTP or business results."""
+    import logging
+    from src.search_service import MiniMaxSearchProvider
+
+    class Boom(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError("log failed")
+
+    calls = {"count": 0}
+
+    def post(url, *, headers, json, timeout):
+        calls["count"] += 1
+        assert "coding_plan/search" in url
+        assert "fixture-secret" not in url
+        class Response:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = ""
+
+            def json(self):
+                return {"base_resp": {"status_code": 7, "status_msg": "余额不足"}, "organic": []}
+
+        return Response()
+
+    monkeypatch.setattr("src.search_service._post_with_retry", post)
+    handler = Boom()
+    logging.getLogger("src.search_service").addHandler(handler)
+    try:
+        result = MiniMaxSearchProvider(["fixture-secret"])._do_search("不应落日志的查询", "fixture-secret", 3)
+    finally:
+        logging.getLogger("src.search_service").removeHandler(handler)
+    assert calls["count"] == 1
+    assert result.success is False
+    assert result.error_message == "余额不足"
+    assert "fixture-secret" not in (result.error_message or "")
+
+
+def test_minimax_error_echo_is_bounded_and_redacted(monkeypatch):
+    """HTTP, business and request echoes keep the refusal word, not the key or body."""
+    import logging
+    import requests
+    from src.search_service import MiniMaxSearchProvider
+
+    secret = "fixture-minimax-key"
+    blob = "B" * 6500
+
+    class Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines: list[str] = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    def run(post):
+        monkeypatch.setattr("src.search_service._post_with_retry", post)
+        handler = Capture()
+        handler.setLevel(logging.INFO)
+        logger = logging.getLogger("src.search_service")
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        try:
+            result = MiniMaxSearchProvider([secret])._do_search("查询正文不应出现", secret, 3)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        logged = "\n".join(handler.lines)
+        assert secret not in logged and secret not in (result.error_message or "")
+        assert "查询正文不应出现" not in logged
+        assert max(len(line) for line in handler.lines) <= 500
+        assert len(result.error_message or "") <= 300
+        assert blob not in logged and blob not in (result.error_message or "")
+        return result, logged
+
+    class Response:
+        status_code = 429
+        headers = {"content-type": "application/json"}
+        text = blob
+
+        def json(self):
+            return {"base_resp": {"status_code": 429, "status_msg": f"权限不足 {secret} {blob}"}}
+
+    http_result, http_log = run(lambda *args, **kwargs: Response())
+    assert http_result.error_message.startswith("权限不足")
+    assert "权限不足" in http_log
+
+    class Business:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        text = ""
+
+        def json(self):
+            return {"base_resp": {"status_code": {"key": secret, "blob": blob}, "status_msg": f"额度耗尽 {secret} {blob}"}, "organic": []}
+
+    business, business_log = run(lambda *args, **kwargs: Business())
+    assert business.error_message.startswith("额度耗尽")
+    assert "dict" in business_log
+    assert "'key'" not in business_log
+
+    def explode(*args, **kwargs):
+        raise requests.exceptions.RequestException(f"connection failed {secret} {blob}")
+
+    request_result, request_log = run(explode)
+    assert request_result.error_message.startswith("Network error:")
+    assert blob not in request_log

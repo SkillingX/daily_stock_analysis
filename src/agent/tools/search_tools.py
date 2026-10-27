@@ -48,10 +48,10 @@ def _persist_news_response(
 ) -> None:
     """Best-effort news persistence for Agent search tools.
 
-    P3 信息源分层（按 docs/deep-research-chain-news-logic-plan.md §信息源策略）：
-    调用方可在 ``source_type`` 传入 ``official / news / industry / community_cn /
-    community_global``，``reliability_hint`` 传入 ``high / medium / low / unverified``。
-    老调用方不传 → 写 NULL（与历史 primary/news 隐式语义一致）。
+    新报告来源等级只用 ``primary / news / industry / inferred / unverified``。
+    ``reliability_hint`` 可传 ``high / medium / low / unverified``。
+    已存行保持原值可读，本函数不改写历史行，也不把未知等级替换成 primary。
+    老调用方不传 → 写 NULL。
     """
     if (
         not response

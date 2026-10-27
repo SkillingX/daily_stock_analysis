@@ -135,7 +135,7 @@ AlphaSift 侧已在 `ZhuLinsen/alphasift@14e74fc0819267f7c04c3117a0dd0fe3f9b1940
 ## 配置兼容边界（LLM / LiteLLM / Base URL）
 
 - 兼容语义与版本证据（可追溯）：
-  - 运行依赖约束：`requirements.txt` 中将 LiteLLM 固定到 `litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0`，并通过 `git+https://github.com/ZhuLinsen/alphasift.git@14e74fc0819267f7c04c3117a0dd0fe3f9b19404` 安装 AlphaSift 适配层。
+  - 运行依赖约束：`requirements.txt` 中将 LiteLLM 精确锁定为 `litellm==1.106.4`，并通过 `git+https://github.com/ZhuLinsen/alphasift.git@14e74fc0819267f7c04c3117a0dd0fe3f9b19404` 安装 AlphaSift 适配层。
   - 文档依据：
     - LiteLLM Providers: https://docs.litellm.ai/docs/providers
     - LiteLLM OpenAI-compatible: https://docs.litellm.ai/docs/providers/openai_compatible
@@ -153,7 +153,7 @@ AlphaSift 侧已在 `ZhuLinsen/alphasift@14e74fc0819267f7c04c3117a0dd0fe3f9b1940
   - 回退到旧模型名：直接修改 `LITELLM_MODEL`、`LITELLM_FALLBACK_MODELS`，或清空自定义 `LLM_CHANNELS`。
   - 恢复旧渠道：保留历史 `LLM_<NAME>_API_KEYS/BASE_URL` 并重启配置生效，不需执行额外迁移脚本。
 - 兼容校验依据（运维核验）：
-  - 依赖版本依据：当前服务端约束为 `litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0`（见 `requirements.txt`），AlphaSift 只复用该依赖的 provider/model 解析、`model_list` 与调用参数语义。
+  - 依赖版本依据：当前服务端为精确锁定 `litellm==1.106.4`（见 `requirements.txt`），AlphaSift 只复用该依赖的 provider/model 解析、`model_list` 与调用参数语义。
   - 官方 provider/model 依据：LiteLLM Providers 文档（[https://docs.litellm.ai/docs/providers](https://docs.litellm.ai/docs/providers)）定义 provider 前缀；OpenAI-compatible 文档（[https://docs.litellm.ai/docs/providers/openai_compatible](https://docs.litellm.ai/docs/providers/openai_compatible)）说明 `openai/<model>`、`api_base`、`api_key` 的兼容语义。
   - 官方 `model_list`/额外头依据：LiteLLM config 文档（[https://docs.litellm.ai/docs/proxy/configs](https://docs.litellm.ai/docs/proxy/configs)）说明 `litellm_params` 支持 `model`、`api_base`、`api_key` 与 `extra_headers`。DSA 只把已声明渠道转换为同类结构传给 AlphaSift，不新增模型路由映射，不做 provider 模式迁移。
   - 兼容头部语义依据：OpenAI 调用约定（[https://platform.openai.com/docs/api-reference/making-requests](https://platform.openai.com/docs/api-reference/making-requests)）与鉴权约定（[https://platform.openai.com/docs/api-reference/authentication](https://platform.openai.com/docs/api-reference/authentication)）对应 `Authorization` 与自定义 header 传递行为，`extra_headers` 仅用于补充会话头，不改写模型路由。

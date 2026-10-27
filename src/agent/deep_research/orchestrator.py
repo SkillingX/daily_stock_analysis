@@ -33,7 +33,7 @@ from src.agent.deep_research.explore_agents import (  # noqa: F401
 from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import SharedContext, build_shared_context
-from src.deep_research_dims.data_dim import build_data_dim
+from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
@@ -59,6 +59,7 @@ from src.schemas.report_schema import Intelligence
 from src.schemas.supply_chain import SupplyChain
 
 from src.core.research_run import ResearchRun, ResearchStopped, current_research, research_dimension
+from src.llm.attempt import attempts_detail, known_total_tokens, summarize_attempts
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ class DualTrackResult:
     total_tokens: int = 0
     provider: str = ""
     error: Optional[str] = None
+    # 模型尝试账本汇总（issue #55）：total_tokens 只含可确认合计；
+    # usage.completeness 区分 complete/partial/unknown/no_outbound，
+    # 未知用量不得冒充确认零消耗。
+    usage: Dict[str, Any] = field(default_factory=dict)
     # 终读结论（需求 3）：LLM 通读结构化事实写报告级总结；空 = 回退信号一句话
     final_conclusion: str = ""
     # 经理终稿（研报体 v2）：观点式标题/内容概括/分节叙事；空 dict = 模板全降级
@@ -311,15 +316,18 @@ def _generate_final_conclusion(
         "（从维度总结中选）；然后一个最大风险；最后一句下一步关注点。只允许使用输入中的数字，"
         "禁止新增或修改任何数字；禁止 markdown 格式与项目符号。"
     )
+    from src.llm.attempt import ENTRY_FINAL_CONCLUSION, attempt_scope
+
     try:
-        resp = llm_adapter.call_text(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
-            ],
-            temperature=0.3,
-            timeout=120.0,
-        )
+        with attempt_scope(ENTRY_FINAL_CONCLUSION, "final_read_summary"):
+            resp = llm_adapter.call_text(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
+                ],
+                temperature=0.3,
+                timeout=120.0,
+            )
         if getattr(resp, "provider", "") == "error" or getattr(resp, "finish_reason", None) in {"length", "content_filter"}:
             return ""
         text = (resp.content or "").strip()
@@ -942,6 +950,13 @@ def _run_dual_track(
     result.total_steps = steps_total
     result.provider = ""
     result.error = None if result.success else "维度降级过多，报告不可用"
+    result.usage = summarize_attempts(
+        run.attempts,
+        origin_run_id=run.run_id if run is not None else None,
+        origin_report_id=report_id,
+    )
+    result.usage["attempt_records"] = attempts_detail(run.attempts)
+    result.total_tokens = known_total_tokens(result.usage)
     _write_reflection_journals(
         stock_code, stock_name, dims, report_id, write_cache
     )
@@ -983,6 +998,10 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
         if dim.status == "skipped":
             continue
         if dim.status == "ok" or dim.retained_evidence or dim.retained_facts:
+            return True
+        # 已验证供应商概念名（issue #51）是已取得事实：足以让部分报告成文留存，
+        # 不抬升任何评分或投资结论；仅有错误码、无概念名不算可用数据。
+        if getattr(getattr(dim, "concept_membership", None), "concepts", None):
             return True
         if any(getattr(dim, field, None) for field in ("business_model", "main_products", "controller", "top_holders")):
             return True
@@ -1040,7 +1059,13 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         from src.core.research_run import retained_tool_facts
         facts = retained_tool_facts("get_realtime_quote", ctx.quote)
         facts += retained_tool_facts("get_daily_history", {"data": ctx.history})
-        dims["data"] = DIM_MODELS["data"](status="degraded", degraded_reason=run.reason_text, retained_facts=facts)
+        # 中断报告同样保留阶段 0 已取得的概念归属（issue #51）。
+        dims["data"] = DIM_MODELS["data"](
+            status="degraded",
+            degraded_reason=run.reason_text,
+            retained_facts=facts,
+            concept_membership=adopt_concept_membership(ctx),
+        )
     for dim_id in DIM_IDS:
         if dim_id not in dims:
             dims[dim_id] = DIM_MODELS[dim_id](
@@ -1066,9 +1091,12 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")
     markdown = render_markdown(view)
     valid = _has_useful_data(dims)
+    interrupted_usage = summarize_attempts(run.attempts, origin_run_id=run.run_id, origin_report_id=report_id)
+    interrupted_usage["attempt_records"] = attempts_detail(run.attempts)
     return DualTrackResult(success=bool(valid), status="partial" if valid else "failed", markdown=markdown if valid else "",
                            dims=dims, dims_payload={key: value.model_dump(mode="json") for key, value in dims.items()},
-                           guardrail_events=events, error=run.reason_text)
+                           guardrail_events=events, error=run.reason_text,
+                           usage=interrupted_usage, total_tokens=known_total_tokens(interrupted_usage))
 
 
 def run_dual_track(

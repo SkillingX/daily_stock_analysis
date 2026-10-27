@@ -21,32 +21,24 @@ def _history(days: int = 100, price: float = 10.0) -> list[dict]:
     ]
 
 
-class TestChanlunEngineFactsReuse:
-    def test_shared_history_skips_loader(self):
-        """共享快照 ≥60 根时不再调用 load_history_df。"""
+class TestChanlunStructureFacts:
+    def test_sufficient_history_yields_structure_without_loader(self):
+        """结构计算只消费传入日线，自身不取数（issue #56 预审修正）。"""
         with patch("src.services.history_loader.load_history_df") as mock_load:
-            facts = explore_agents._chanlun_engine_facts(
-                "600519", history=_history(100)
-            )
+            facts = explore_agents._chanlun_structure_facts(_history(100))
         mock_load.assert_not_called()
         # 引擎结果或空串都可接受，关键是取数路径未触发
         assert isinstance(facts, str)
 
-    def test_no_shared_history_falls_back_to_loader(self):
-        with patch(
-            "src.services.history_loader.load_history_df",
-            return_value=(None, "none"),
-        ):
-            facts = explore_agents._chanlun_engine_facts("600519", history=None)
+    def test_short_history_is_gap_without_refetch(self):
+        """不足 60 根按缺项披露，不再回退加载入口重复出站。"""
+        with patch("src.services.history_loader.load_history_df") as mock_load:
+            facts = explore_agents._chanlun_structure_facts(_history(30))
+        mock_load.assert_not_called()
         assert facts == ""
 
-    def test_short_shared_history_falls_back_to_loader(self):
-        with patch(
-            "src.services.history_loader.load_history_df",
-            return_value=(None, "none"),
-        ) as mock_load:
-            explore_agents._chanlun_engine_facts("600519", history=_history(30))
-        mock_load.assert_called_once()
+    def test_empty_history_is_gap(self):
+        assert explore_agents._chanlun_structure_facts([]) == ""
 
 
 class TestSharedMarketFacts:

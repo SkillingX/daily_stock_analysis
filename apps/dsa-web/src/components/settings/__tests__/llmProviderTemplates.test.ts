@@ -77,6 +77,19 @@ describe('llmProviderTemplates', () => {
     expect(LLM_PROVIDER_TEMPLATE_BY_ID.ark).toBeUndefined();
   });
 
+  it('defaults new Moonshot channels to the current public Kimi model only', () => {
+    expect(LLM_PROVIDER_TEMPLATE_BY_ID.moonshot).toMatchObject({
+      label: 'Moonshot（月之暗面）',
+      protocol: 'openai',
+      baseUrl: 'https://api.moonshot.cn/v1',
+      placeholderModels: 'kimi-k3.1-pro',
+      officialSources: [
+        { label: 'Kimi Platform Docs', url: 'https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart' },
+      ],
+    });
+    expect(LLM_PROVIDER_TEMPLATE_BY_ID.moonshot.placeholderModels).not.toContain('kimi-k2.6');
+  });
+
   it('keeps focused config hints on providers with common setup pitfalls', () => {
     expect(LLM_PROVIDER_TEMPLATE_BY_ID.ollama.configHint).toContain('Ollama 服务');
     expect(LLM_PROVIDER_TEMPLATE_BY_ID.siliconflow.configHint).toContain('API Key');

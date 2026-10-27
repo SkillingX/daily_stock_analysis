@@ -30,7 +30,11 @@ from src.schemas.report_schema import (
     SniperPoints,
 )
 from src.schemas.research_framework import ResearchFramework
-from data_provider.ifind_fundamental_adapter import IfindShareholders, ProductSegments
+from data_provider.ifind_fundamental_adapter import (
+    ConceptMembership,
+    IfindShareholders,
+    ProductSegments,
+)
 from src.schemas.supply_chain import SupplyChain
 from src.schemas.value_scenarios import AnalystTarget, ValueScenarios
 
@@ -171,6 +175,9 @@ class DataDim(DimEnvelope):
     perspective: Optional[DataPerspective] = None
     ma250_deviation_pct: Optional[float] = None
     distance_from_52w_high_pct: Optional[float] = None
+    # 个股最新概念归属（issue #51）：阶段 0 已验证供应商结果的确定性采纳，
+    # 不依赖模型复述；历史载荷缺该字段解析为 None，不触发任何补查。
+    concept_membership: Optional[ConceptMembership] = None
     narrative: str = ""
 
 

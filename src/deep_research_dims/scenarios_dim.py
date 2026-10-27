@@ -104,10 +104,16 @@ def build_scenarios_dim(
                 "authentication_failed": "Choice登录验证暂未通过",
                 "permission_denied": "当前Choice权限未覆盖此项数据",
                 "quota_exhausted": "Choice调用额度受限",
+                "rate_limited": "Choice接口临时限流",
                 "timeout": "Choice查询超时",
+                "query_timeout": "Choice查询超时",
+                "login_timeout": "Choice登录超时",
+                "lock_wait_timeout": "Choice连接排队等待超时",
+                "budget_exhausted": "本次取数预算已用尽，目标价查询未发出",
                 "sdk_unavailable": "Choice数据连接尚未就绪",
             }.get(target_errors[0].rsplit(":", 1)[-1], "Choice查询未完成")
-            reason = f"机构目标价尚未取得：{cause}，暂时无法提供估值参考。恢复数据连接后可重新生成。"
+            suffix = "" if target_errors[0].rsplit(":", 1)[-1] in {"budget_exhausted", "lock_wait_timeout"} else "恢复数据连接后可重新生成。"
+            reason = f"机构目标价尚未取得：{cause}，暂时无法提供估值参考。{suffix}".rstrip("。") + "。"
         elif targets.get("RATINGTARGETPRICE") is not None:
             try:
                 reference = AnalystTarget.model_validate_json(json.dumps({"source": research["source"], "as_of": research.get("as_of"), "window_days": research.get("target_window_days"), "price": targets["RATINGTARGETPRICE"], "low": targets.get("RATINGTARGETPRICEMIN"), "high": targets.get("RATINGTARGETPRICEMAX")}))

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,11 @@ class UsageCallRecord(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Appended honesty fields (legacy numerics unchanged): which token fields
+    # the provider did not report. A displayed 0 with unknown_fields naming it
+    # is not confirmed zero consumption.
+    completeness: Literal["known", "partial", "unknown"] = "known"
+    unknown_fields: List[str] = Field(default_factory=list)
 
 
 class UsageSummaryResponse(BaseModel):

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
+
 logger = logging.getLogger(__name__)
 
 PROVIDER_USAGE_SCHEMA_NAME = "provider_usage_v1"
@@ -53,6 +54,9 @@ _ALLOWED_RAW_USAGE_DETAIL_KEYS = {
     "completion_tokens_details",
     "input_tokens_details",
     "output_tokens_details",
+    "input_token_detail",
+    "output_token_detail",
+    # Kept from the previously supported provider forms.
     "input_token_details",
     "output_token_details",
 }
@@ -120,6 +124,12 @@ _PROVIDER_USAGE_JSON_DETAIL_SIGNAL_KEYS = (
 )
 _USAGE_COUNT_SCALAR_KEYS = frozenset(_ALLOWED_RAW_USAGE_SCALAR_KEYS)
 _USAGE_COUNT_DETAIL_KEYS = frozenset(_ALLOWED_RAW_USAGE_DETAIL_SCALAR_KEYS)
+
+
+def sanitized_provider_usage(usage: Mapping[str, Any]) -> Dict[str, Any]:
+    """Public allow-listed view of a provider-reported usage payload."""
+    sanitized = _sanitize_raw_usage(dict(usage))
+    return sanitized if isinstance(sanitized, dict) else {}
 
 
 def extract_usage_payload(response: Any) -> Any:
@@ -381,6 +391,24 @@ def normalize_litellm_usage(
             cache_read = cached
             cache_field_observed = True
             capability = "supported"
+
+    if provider_name in {"gemini", "vertex_ai"} and completion_tokens is not None:
+        # Gemini reports thinking tokens separately from the visible
+        # candidates while both belong to the completion side of its
+        # accounting. Add the separate thinking count only when the
+        # completion number came from the raw visible-candidates key: an
+        # already normalized completion/output value includes reasoning, and
+        # adding it again would double-count and trip the impossible-total
+        # guard.
+        thinking_tokens = _nested_int(
+            usage, ("completion_tokens_details", "reasoning_tokens")
+        )
+        completion_from_visible_candidates = (
+            "candidates_token_count" in usage
+            and _first_int(usage, "completion_tokens", "output_tokens") is None
+        )
+        if thinking_tokens is not None and completion_from_visible_candidates:
+            completion_tokens = completion_tokens + thinking_tokens
 
     if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + completion_tokens
@@ -670,8 +698,24 @@ def _sanitize_raw_usage_detail(value: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _sanitize_raw_usage_count(value: Any) -> Any:
-    parsed = _as_non_negative_int(value)
+    # Negative integers are kept: the normalizer must still see them to flag
+    # invalid_provider_usage; only non-numeric values are dropped here.
+    parsed = _as_int(value)
     return parsed if parsed is not None else _DROP_RAW_USAGE_VALUE
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text and (text.isdigit() or (text.startswith("-") and text[1:].isdigit())):
+            return int(text)
+    return None
 
 
 def _has_deepseek_hit_miss_shape(usage: Mapping[str, Any]) -> bool:

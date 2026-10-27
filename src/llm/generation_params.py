@@ -15,6 +15,12 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 # - https://platform.moonshot.ai/docs/guide/compatibility#parameters-differences-in-request-body
 # - https://huggingface.co/moonshotai/Kimi-K2.6
 # - https://docs.litellm.ai/docs/providers/openai_compatible
+# Kimi K3.1 Pro (the current public Moonshot API model) always runs with
+# thinking enabled and fixes temperature=1.0 / top_p=0.95 / n=1 / penalties=0,
+# so its quickstart asks callers to omit these fixed sampling params; this
+# repository therefore omits temperature for that family instead of extending
+# the K2.6 fixed-temperature mapping:
+# - https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart
 _FIXED_TEMPERATURE_LITELLM_MODELS: Dict[str, Dict[str, float]] = {
     "kimi-k2.6": {
         "thinking": 1.0,
@@ -191,6 +197,7 @@ def _should_omit_litellm_temperature(model: str) -> bool:
         part.startswith(("gpt-5", "gpt5"))
         or part in {"o1", "o3", "o4"}
         or part.startswith(("o1-", "o3-", "o4-"))
+        or part.startswith("kimi-k3.1-pro")
         for part in _model_parts(model)
     )
 

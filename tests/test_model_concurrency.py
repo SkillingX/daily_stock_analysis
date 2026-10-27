@@ -27,6 +27,17 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _business_payload(self) -> tuple[dict[str, Any], str, dict[str, int]]:
+            """The same business payload for stream and non-stream rendering."""
+            message: dict[str, Any] = {"role": "assistant", "content": '{"status":"ok"}'}
+            if state.get("legacy_text"):
+                message["content"] = "# 样本研究\n\n本次资料不足，尚不能形成完整结论。"
+            finish = "stop"
+            if state.get("research_mode") == 1:
+                message = {"role": "assistant", "content": None, "tool_calls": [{"id": "search-1", "type": "function", "function": {"name": "search_comprehensive_intel", "arguments": '{"stock_code":"600519","stock_name":"样本"}'}}]}
+                finish = "tool_calls"
+            return message, finish, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
         def do_POST(self) -> None:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             with lock:
@@ -34,27 +45,6 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                 state["count"] += 1
                 state["peak"] = max(state["peak"], state["active"])
             try:
-                if request.get("stream"):
-                    with lock:
-                        state["streams"] += 1
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    chunk = {"id": "fixture", "object": "chat.completion.chunk", "created": 0,
-                             "model": "fixture", "choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": None}]}
-                    self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
-                    self.wfile.flush()
-                    # Observe actual peer close; a first chunk alone is not end-of-stream.
-                    self.connection.settimeout(0.05)
-                    deadline = time.monotonic() + 3
-                    while time.monotonic() < deadline:
-                        try:
-                            if not self.connection.recv(1, socket.MSG_PEEK):
-                                break
-                        except TimeoutError:
-                            continue
-                    return
                 time.sleep(0.2)
                 hold_deadline = time.monotonic() + state.get("hold_seconds", 8)
                 while state.get("hold_models") and time.monotonic() < hold_deadline:
@@ -68,18 +58,52 @@ def provider() -> Iterator[tuple[str, dict[str, int]]]:
                     return
                 if state.get("research_mode") == 2:
                     time.sleep(0.6)
-                message: dict[str, Any] = {"role": "assistant", "content": '{"status":"ok"}'}
-                if state.get("legacy_text"):
-                    message["content"] = "# 样本研究\n\n本次资料不足，尚不能形成完整结论。"
-                finish = "stop"
-                if state.get("research_mode") == 1:
-                    message = {"role": "assistant", "content": None, "tool_calls": [{"id": "search-1", "type": "function", "function": {"name": "search_comprehensive_intel", "arguments": '{"stock_code":"600519","stock_name":"样本"}'}}]}
-                    finish = "tool_calls"
+                message, finish, usage = self._business_payload()
+                if request.get("stream"):
+                    # A legal stream carrying the same business payload.
+                    with lock:
+                        state["streams"] += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                    def sse(payload: dict[str, Any]) -> None:
+                        self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                        self.wfile.flush()
+
+                    if message.get("tool_calls"):
+                        tool_call = message["tool_calls"][0]["function"]
+                        sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                             "model": "fixture", "choices": [{"index": 0, "delta": {
+                                 "role": "assistant",
+                                 "tool_calls": [{"index": 0, "id": message["tool_calls"][0]["id"], "type": "function",
+                                                 "function": {"name": tool_call["name"], "arguments": tool_call["arguments"]}}],
+                             }, "finish_reason": None}]})
+                    else:
+                        sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                             "model": "fixture", "choices": [{"index": 0, "delta": {"role": "assistant", "content": message["content"]}, "finish_reason": None}]})
+                    sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+                    sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture", "choices": [], "usage": usage})
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    # Observe actual peer close; a first chunk alone is not end-of-stream.
+                    self.connection.settimeout(0.05)
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        try:
+                            if not self.connection.recv(1, socket.MSG_PEEK):
+                                break
+                        except TimeoutError:
+                            continue
+                    return
                 body = json.dumps({
                     "id": "fixture", "object": "chat.completion", "created": 0,
                     "model": "fixture", "choices": [{"index": 0, "finish_reason": finish,
                     "message": message}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    "usage": usage,
                 }).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -164,7 +188,8 @@ assert result["success"], result
 assert agent().provider != "error"
 ''')
     assert result.returncode == 0, result.stdout + result.stderr
-    assert observed["streams"] == 1
+    # Both the capability probe and the regular agent entry now stream.
+    assert observed["streams"] == 2
     assert observed["count"] == 3
     assert observed["peak"] == 1
 

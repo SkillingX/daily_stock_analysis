@@ -6,17 +6,27 @@ Normalizes function-calling / tool-use across all providers into a unified
 interface consumed by the AgentExecutor, via LiteLLM.
 """
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 import litellm
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.router import Router
 
-from src.llm.concurrency import limited_completion
+from src.llm.attempt import (
+    STATUS_OK,
+    STATUS_PARSE_ERROR,
+    attempt_entry,
+    current_attempt,
+    last_attempt,
+)
+from src.llm.concurrency import limited_acompletion
 from src.config import (
     extra_litellm_params,
     get_api_keys_for_model,
@@ -32,10 +42,13 @@ from src.agent.provider_trace import (
     resolved_provider_namespace,
     trace_model_matches,
 )
-from src.llm.errors import call_litellm_with_param_recovery
+from src.core.research_run import ResearchStopped, current_research
+from src.llm.errors import classify_litellm_generation_param_error
 from src.llm.generation_params import (
     apply_litellm_generation_params,
+    apply_litellm_param_recovery,
     apply_minimax_reasoning_params,
+    remember_litellm_generation_param_recovery,
     resolve_litellm_wire_model,
 )
 from src.llm.usage import (
@@ -45,6 +58,33 @@ from src.llm.usage import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamAttemptRouter(Router):
+    """Router that exposes the inner stream wrapper to the current attempt.
+
+    ``Router._acompletion_streaming_iterator`` receives the real litellm
+    ``CustomStreamWrapper`` and unconditionally wraps it in a fallback
+    iterator whose ``completion_stream`` is an opaque async generator. This
+    override records the wrapper on the current attempt (a mutable object
+    visible across the Router's context) before deferring to the original
+    implementation, so the stream consumer can attach its provider-usage
+    observer at the raw SDK boundary. No routing, fallback or SDK parsing is
+    replaced; on an SDK without this method the observation degrades to
+    unknown usage.
+    """
+
+    async def _acompletion_streaming_iterator(self, model_response: Any, **kwargs: Any) -> Any:
+        attempt = current_attempt.get()
+        if attempt is not None and attempt.stream_transport is None:
+            attempt.stream_transport = model_response
+        return await super()._acompletion_streaming_iterator(model_response=model_response, **kwargs)
+
+# Sentinel for ``_parse_litellm_response(stream_raw_usage=...)``: the default
+# keeps the non-stream path reading usage off the full response object, while
+# a streamed call always passes an explicit value (provider-actual dict or
+# None) so LiteLLM's synthesized stream estimates can never be promoted.
+_NON_STREAM_USAGE = object()
 
 
 def _resolve_litellm_exception(name: str) -> type[BaseException]:
@@ -353,6 +393,181 @@ def resolve_fallback_litellm_wire_models(
 # ============================================================
 
 
+def _refine_parse_error(error: BaseException) -> None:
+    """A response returned fine but did not parse; keep the outbound fact."""
+    attempt = last_attempt.get()
+    if attempt is not None and attempt.status == STATUS_OK:
+        attempt.refine_status(STATUS_PARSE_ERROR)
+
+
+# How often the cancellation watcher polls the run while a streamed model
+# response is being consumed in the local event loop.
+_STREAM_CANCEL_POLL_SECONDS = 0.05
+
+
+def _provider_stream_usage_keys(usage: Any) -> Optional[Dict[str, Any]]:
+    """The usage fields the provider actually sent, if any.
+
+    Providers deliver usage either as a pydantic payload (top level) or a
+    plain dict (current Kimi puts it on the choice); only explicitly sent
+    keys count, never library defaults.
+    """
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return dict(usage)
+    fields = getattr(usage, "model_fields_set", None)
+    if fields:
+        # exclude_unset recurses into nested Pydantic details (cache and
+        # reasoning breakdowns): hand-picking top-level fields would keep
+        # those details as opaque objects the Mapping-only sanitizer drops.
+        dumped = usage.model_dump(exclude_unset=True)
+        return {key: dumped[key] for key in fields if key in dumped}
+    return None
+
+
+_GEMINI_USAGE_KEY_MAP = {
+    "promptTokenCount": "prompt_token_count",
+    "candidatesTokenCount": "candidates_token_count",
+    "totalTokenCount": "total_token_count",
+    "cachedContentTokenCount": "cached_content_token_count",
+}
+
+
+def _observe_native_chunk(chunk: Any, sink: Dict[str, Any]) -> None:
+    """Read raw native (non-openai) SSE payloads for usage and finish.
+
+    Anthropic and Gemini deliver usage and stop reasons inside their SSE
+    events long before LiteLLM normalizes them (and LiteLLM synthesizes a
+    stop when the stream ends without one, so the normalized chunk is never
+    evidence). Payloads are dicts at the ``chunk_parser`` boundary; usage
+    keys overwrite per event (never summed, never frozen at start).
+    """
+    if not isinstance(chunk, dict):
+        return
+    event_type = chunk.get("type") or ""
+    if event_type == "message_start":
+        usage = _provider_stream_usage_keys((chunk.get("message") or {}).get("usage"))
+        if usage:
+            sink["usage"] = {**(sink.get("usage") or {}), **usage}
+        return
+    if event_type == "message_delta":
+        usage = _provider_stream_usage_keys(chunk.get("usage"))
+        if usage:
+            sink["usage"] = {**(sink.get("usage") or {}), **usage}
+        stop_reason = (chunk.get("delta") or {}).get("stop_reason")
+        if stop_reason:
+            sink["finish"] = stop_reason
+        return
+    if event_type == "message_stop":
+        # The terminal event is itself finish evidence.
+        sink["finish"] = sink.get("finish") or "stop"
+        return
+    # Gemini: usageMetadata plus candidates[].finishReason, camelCase keys.
+    # Thinking tokens are reported separately from visible candidates; they
+    # are preserved as a completion-side reasoning detail so the provider's
+    # own breakdown survives sanitization and normalization reads the
+    # complete output (candidates + thoughts) without inventing zeros.
+    usage_metadata = chunk.get("usageMetadata")
+    if isinstance(usage_metadata, dict):
+        gemini_usage: Dict[str, Any] = {}
+        for key, value in usage_metadata.items():
+            mapped = _GEMINI_USAGE_KEY_MAP.get(key)
+            if mapped is not None:
+                gemini_usage[mapped] = value
+        if "thoughtsTokenCount" in usage_metadata:
+            # Raw actual count straight into the nested detail: the existing
+            # usage sanitizer owns the range/type boundary at adoption time.
+            gemini_usage["completion_tokens_details"] = {
+                "reasoning_tokens": usage_metadata["thoughtsTokenCount"]
+            }
+        sink["usage"] = {**(sink.get("usage") or {}), **gemini_usage}
+    for candidate in chunk.get("candidates") or []:
+        finish_reason = candidate.get("finishReason")
+        if finish_reason:
+            sink["finish"] = finish_reason
+
+
+async def _observe_raw_stream(wrapper: Any, attempt: Any, sink: Dict[str, Any]) -> None:
+    """Observe provider usage at the raw SDK stream boundary.
+
+    Attaches to whatever the attempt captured at the transport boundary:
+    the openai ``AsyncStream`` iterator (``_iterator``) for openai-compatible
+    providers, or a single-shot read-only hook around the native
+    ``chunk_parser`` for Anthropic/Gemini. Lazy litellm wrappers have their
+    stream fetched inside this same constrained coroutine first. Without a
+    captured wrapper (e.g. an unknown Router layout) the observation is
+    skipped and provider usage stays honestly unknown.
+    """
+    if wrapper is None or not isinstance(wrapper, CustomStreamWrapper):
+        return
+    inner = getattr(wrapper, "completion_stream", None)
+    if inner is None and getattr(wrapper, "make_call", None) is not None:
+        inner = await wrapper.fetch_stream()
+    if inner is None:
+        return
+    sink["observed"] = True
+
+    if hasattr(inner, "_iterator"):
+        source = inner._iterator
+        owner = sink
+
+        class _ObservingAsyncIter:
+            def __init__(self) -> None:
+                self._source = source
+
+            def __aiter__(self) -> "_ObservingAsyncIter":
+                return self
+
+            async def __anext__(self) -> Any:
+                chunk = await self._source.__anext__()
+                top_level = _provider_stream_usage_keys(getattr(chunk, "usage", None))
+                if top_level is not None:
+                    owner["usage"] = top_level
+                else:
+                    # Some providers deliver the usage tail on the choice; the
+                    # top level keeps priority when both exist.
+                    choices = getattr(chunk, "choices", None) or []
+                    if choices:
+                        choice_usage = _provider_stream_usage_keys(getattr(choices[0], "usage", None))
+                        if choice_usage is not None:
+                            owner["usage"] = choice_usage
+                # Stream finish lives on the chunk, not the response object.
+                choices = getattr(chunk, "choices", None)
+                finish = getattr(choices[0], "finish_reason", None) if choices else None
+                if finish:
+                    owner["finish"] = finish
+                return chunk
+
+        inner._iterator = _ObservingAsyncIter()
+        return
+
+    original_parser = getattr(inner, "chunk_parser", None)
+    if callable(original_parser):
+        owner = sink
+
+        def _observing_parser(chunk: Any) -> Any:
+            try:
+                _observe_native_chunk(chunk, owner)
+            except Exception:  # noqa: BLE001 - observation must not alter the stream
+                pass
+            result = original_parser(chunk)
+            # LiteLLM synthesizes finish_reason "stop" for an Anthropic
+            # message_delta whose stop_reason is null, and the streaming
+            # wrapper stops iterating once it sees a finish reason. The
+            # official protocol allows several message_delta events with
+            # cumulative usage, so a null stop_reason is not a finish: clear
+            # the synthesized reason so the SDK keeps reading to the real
+            # terminal event. Nothing else in the parsed chunk is touched.
+            if isinstance(chunk, dict) and chunk.get("type") == "message_delta":
+                if not (chunk.get("delta") or {}).get("stop_reason"):
+                    for choice in getattr(result, "choices", None) or []:
+                        choice.finish_reason = None
+            return result
+
+        inner.chunk_parser = _observing_parser
+
+
 class LLMToolAdapter:
     """Unified adapter for tool-calling via LiteLLM.
 
@@ -406,7 +621,7 @@ class LLMToolAdapter:
         # --- Channel / YAML path ---
         if self._has_channel_config():
             model_list = config.llm_model_list
-            self._router = Router(
+            self._router = _StreamAttemptRouter(
                 model_list=model_list,
                 routing_strategy="simple-shuffle",
                 num_retries=2,
@@ -443,7 +658,7 @@ class LLMToolAdapter:
                 for k in keys
             ]
             self._legacy_router_model_list = legacy_model_list
-            self._router = Router(
+            self._router = _StreamAttemptRouter(
                 model_list=legacy_model_list,
                 routing_strategy="simple-shuffle",
                 num_retries=2,
@@ -589,12 +804,19 @@ class LLMToolAdapter:
                     )
                     last_error = e
                     continue
-                logger.warning("Agent LLM call failed with %s: %s", model, e)
+                logger.warning(
+                    "Agent LLM call failed with %s: %s",
+                    model, str(e) or type(e).__name__,
+                )
                 last_error = e
                 continue
 
         suffix = " (rate-limit encountered during fallback)" if hit_rate_limit else ""
-        error_msg = f"All LLM models failed{suffix}. Last error: {last_error}"
+        # A bare asyncio.wait_for expiry raises TimeoutError whose str() is
+        # empty; keep the type name visible so timeout stays recognisable at
+        # every downstream text boundary. Non-empty messages pass unchanged.
+        last_error_text = str(last_error) or type(last_error).__name__
+        error_msg = f"All LLM models failed{suffix}. Last error: {last_error_text}"
         logger.error(error_msg)
         return LLMResponse(content=error_msg, provider="error")
 
@@ -625,6 +847,11 @@ class LLMToolAdapter:
         call_kwargs: Dict[str, Any] = {
             "model": model,
             "messages": openai_messages,
+            # One streamed upstream response for Router, direct and fallback
+            # calls alike; aggregated below into the original full-response
+            # contract before the existing parser runs.
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if max_tokens is not None:
             call_kwargs["max_tokens"] = max_tokens
@@ -679,46 +906,264 @@ class LLMToolAdapter:
         )
         if use_channel_router and self._router and model in _router_model_names:
             # Channel / YAML path: Router manages all models in its model_list
-            router = cast(Router, self._router)
-            response = call_litellm_with_param_recovery(
-                lambda kwargs: limited_completion(router.completion, **kwargs),
-                model=model,
-                call_kwargs=call_kwargs,
-                model_list=recovery_model_list,
-                logger=logger,
-            )
+            acompletion_fn = cast(Router, self._router).acompletion
         elif self._router and model == agent_primary_model and not use_channel_router:
             # Legacy path: Router for primary model multi-key
-            router = cast(Router, self._router)
-            response = call_litellm_with_param_recovery(
-                lambda kwargs: limited_completion(router.completion, **kwargs),
-                model=model,
-                call_kwargs=call_kwargs,
-                model_list=recovery_model_list,
-                logger=logger,
-            )
+            acompletion_fn = cast(Router, self._router).acompletion
         else:
             # Legacy/direct-env path: direct call (also handles direct-env
             # providers like groq/ or bedrock/ that are not in the Router
             # model_list even when channel mode is active)
-            response = call_litellm_with_param_recovery(
-                lambda kwargs: limited_completion(litellm.completion, **kwargs),
-                model=model,
-                call_kwargs=call_kwargs,
-                model_list=self._config.llm_model_list,
-                logger=logger,
-            )
+            acompletion_fn = litellm.acompletion
 
-        return self._parse_litellm_response(
-            response,
-            model,
+        # One async admission opens, fully consumes and aggregates the stream
+        # so the original parser below sees one complete response.
+        response, stream_raw_usage = self._streamed_completion(
+            acompletion_fn,
+            call_kwargs,
             openai_messages,
+            model=model,
             model_list=recovery_model_list,
+            timeout=timeout,
         )
+
+        try:
+            return self._parse_litellm_response(
+                response,
+                model,
+                openai_messages,
+                model_list=recovery_model_list,
+                stream_raw_usage=stream_raw_usage,
+            )
+        except Exception as e:
+            # Transport succeeded (last_attempt is this attempt with its
+            # usage already adopted); a parse failure is its terminal state.
+            _refine_parse_error(e)
+            raise
 
     def _get_temperature(self) -> float:
         """Return the raw configured temperature before per-model normalization."""
         return float(self._config.llm_temperature)
+
+    def _streamed_completion(
+        self,
+        acompletion_fn: Any,
+        call_kwargs: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        *,
+        model: str,
+        model_list: Optional[List[Dict[str, Any]]],
+        timeout: Optional[float],
+    ) -> Tuple[Any, Optional[Dict[str, Any]]]:
+        """Open, fully consume and aggregate one streamed model response.
+
+        One existing async admission (:func:`limited_acompletion`) owns the
+        whole coroutine — awaiting the response, streaming every chunk and
+        aggregating it — so the permit is held until an aggregated response
+        exists, and the response-level adoption sees the real result. A
+        local ``asyncio.wait_for`` scope (Python 3.10 compatible) covers
+        header latency, first chunk, reasoning, body and end together with
+        the caller's and the report's remaining budget; new chunks never
+        extend it. A run cancellation propagates through the same scope: the
+        read task actually exits, the transport is closed, and only then is
+        the permit released. The sync-facing ContextVars are restored
+        explicitly because asyncio Tasks copy but do not write back context.
+
+        Returns the aggregated full response plus the usage keys the provider
+        actually sent (``None`` when it sent none — LiteLLM's synthesized
+        stream estimates must never pass as provider actuals).
+        """
+        run = current_research.get()
+        # The single-response cap starts only once admitted (queue waiting
+        # consumes the caller/report budget, never this cap).
+        response_cap: Optional[float] = None
+        if run is not None:
+            from src.config import get_config
+
+            response_cap = float(get_config().llm_stream_response_timeout)
+
+        raw: Dict[str, Any] = {"usage": None, "finish": None, "observed": False}
+        attempt_box: Dict[str, Any] = {}
+
+        async def _admitted_call(**kwargs: Any) -> Any:
+            """Open, consume and aggregate one streamed response.
+
+            ``kwargs`` are the full SDK call parameters as handed back by the
+            admission (``logger_fn`` observer attached, ``timeout`` reduced
+            to the remaining caller/report budget) and go to the SDK as-is:
+            the reduced timeout keeps serving as the first-chunk/idle read
+            cap. The response wall clock starts here — admitted, past the
+            queue — as the smaller of the configured response cap and that
+            remaining budget, covering header latency, first chunk,
+            reasoning, body and finish; new chunks never extend it. The
+            permit is held until aggregation and transport close are done.
+            """
+            scope: Optional[float] = None
+            remaining = kwargs.get("timeout")
+            if isinstance(remaining, (int, float)):
+                scope = max(float(remaining), 0.0)
+            if response_cap is not None:
+                scope = min(scope, response_cap) if scope is not None else response_cap
+            # A mutable holder is not enough across the wait_for child task:
+            # read the attempt through the ContextVar inside that task.
+            attempt_box["attempt"] = current_attempt.get()
+
+            async def _inner() -> Any:
+                attempt = current_attempt.get()
+                stream: Any = None
+                from src.config import get_config
+
+                # The first-chunk budget starts at the real outbound and is
+                # shared by awaiting the response headers and receiving the
+                # first chunk — a slow server cannot reset it by delivering
+                # headers alone. Later chunks switch to the idle cap.
+                first_deadline = monotonic() + float(get_config().llm_stream_first_chunk_timeout)
+                idle_chunk_timeout = float(get_config().llm_stream_idle_chunk_timeout)
+                chunks: List[Any] = []
+                try:
+                    stream = await asyncio.wait_for(
+                        acompletion_fn(**kwargs),
+                        timeout=max(first_deadline - monotonic(), 0.0),
+                    )
+                    # The raw wrapper is the Router-recorded stream_transport
+                    # or the direct call's own litellm wrapper; without
+                    # either, the observation degrades to honest unknown.
+                    wrapper = getattr(attempt, "stream_transport", None)
+                    if wrapper is None and isinstance(stream, CustomStreamWrapper):
+                        wrapper = stream
+                    await _observe_raw_stream(wrapper, attempt, raw)
+                    # Manual iteration keeps the first-chunk and per-chunk
+                    # idle caps in force for the whole read — including the
+                    # usage tail after finish and native streams without any
+                    # [DONE]. An expired cap cancels the blocked read, so the
+                    # transport closes and the failure propagates as timeout.
+                    aiter = stream.__aiter__()
+                    chunk_deadline: Optional[float] = max(first_deadline - monotonic(), 0.0)
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_deadline)
+                        except StopAsyncIteration:
+                            break
+                        chunk_deadline = idle_chunk_timeout
+                        chunks.append(chunk)
+                    return litellm.stream_chunk_builder(chunks, messages=messages)
+                finally:
+                    # Provider-actual usage reaches the attempt ledger before
+                    # the response-level adoption and any parsing — on success
+                    # and on failure alike, including a cancellation that
+                    # lands before the response even opened.
+                    from src.llm.concurrency import adopt_raw_stream_usage
+
+                    adopt_raw_stream_usage(attempt, raw.get("usage"), observed=bool(raw.get("observed")))
+                    if stream is not None:
+                        aclose = getattr(stream, "aclose", None)
+                        try:
+                            if aclose is not None:
+                                await aclose()
+                            else:
+                                # Some native wrappers expose no async close
+                                # of their own; say so instead of claiming
+                                # cleanup.
+                                logger.debug(
+                                    "stream type %s exposes no aclose; cleanup relies on the transport layer",
+                                    type(stream).__name__,
+                                )
+                        except AttributeError:
+                            logger.debug(
+                                "stream type %s close unavailable on this SDK; cleanup relies on the transport layer",
+                                type(stream).__name__,
+                            )
+
+            # Python 3.10 compatible wall-clock scope: wait_for cancels the
+            # admitted coroutine on expiry, so a blocked read exits and the
+            # transport closes before the failure propagates.
+            return await asyncio.wait_for(_inner(), timeout=scope)
+
+        async def _with_run_watch() -> Any:
+            main_task = asyncio.current_task()
+            watcher: Optional["asyncio.Task[None]"] = None
+            if run is not None:
+                async def _watch() -> None:
+                    while True:
+                        if run.stop_reason:
+                            if main_task is not None:
+                                main_task.cancel()
+                            return
+                        await asyncio.sleep(_STREAM_CANCEL_POLL_SECONDS)
+
+                watcher = asyncio.create_task(_watch())
+            try:
+                return await _with_recovery()
+            finally:
+                if watcher is not None:
+                    watcher.cancel()
+
+        async def _with_recovery() -> Any:
+            started = monotonic()
+            try:
+                # Full call kwargs flow through the admission: it owns the
+                # queue deadline, attaches the per-attempt observer and
+                # reduces the timeout before handing everything back to the
+                # SDK call. Parameter recovery repeats the same admission
+                # with the already-consumed original budget — never a reset.
+                return await limited_acompletion(_admitted_call, **call_kwargs)
+            except Exception as exc:
+                recovery = classify_litellm_generation_param_error(exc)
+                if recovery is None:
+                    raise
+                retry_kwargs = apply_litellm_param_recovery(dict(call_kwargs), recovery)
+                if retry_kwargs == call_kwargs:
+                    raise
+                logger.warning(
+                    "[LiteLLM] %s generation parameter rejected (%s), retrying once with request-scoped recovery",
+                    model,
+                    recovery.reason,
+                )
+                retry_budget: Optional[float] = None
+                if isinstance(timeout, (int, float)):
+                    retry_budget = float(timeout) - (monotonic() - started)
+                    if retry_budget <= 0:
+                        raise TimeoutError("LLM deadline exhausted before parameter recovery") from exc
+                retry_call_kwargs = dict(retry_kwargs)
+                if retry_budget is not None:
+                    retry_call_kwargs["timeout"] = retry_budget
+                # Only a recovered success is cached process-wide: a retry
+                # that times out, is cancelled or is rejected again must not
+                # poison every later call with this recovery.
+                recovered = await limited_acompletion(_admitted_call, **retry_call_kwargs)
+                remember_litellm_generation_param_recovery(
+                    model,
+                    recovery,
+                    model_list=model_list,
+                    request_overrides=retry_kwargs,
+                )
+                return recovered
+
+        try:
+            aggregated = asyncio.run(_with_run_watch())
+        except asyncio.CancelledError:
+            # The run's own cancellation watcher cancelled the task: keep the
+            # existing ResearchStopped semantics for the fallback loop.
+            if run is not None and run.stop_reason:
+                raise ResearchStopped(run.reason_text) from None
+            raise
+        finally:
+            attempt = attempt_box.get("attempt")
+            if attempt is not None:
+                attempt.stream_transport = None  # never retain a transport ref
+                last_attempt.set(attempt)
+
+        if raw.get("finish") is None:
+            # A stream that ended without the provider's own finish evidence
+            # (empty body, missing terminal chunk) was never completed by the
+            # provider; LiteLLM synthesizing stop must not turn it into a
+            # success. The attempt becomes a parse failure via the caller.
+            _refine_parse_error(ValueError("model stream ended without finish evidence"))
+            raise ValueError("model stream ended without finish evidence")
+        if aggregated is None or not getattr(aggregated, "choices", None):
+            _refine_parse_error(ValueError("model stream produced no aggregated response"))
+            raise ValueError("model stream produced no aggregated response")
+        return aggregated, raw.get("usage")
 
     def _convert_messages(
         self,
@@ -802,6 +1247,7 @@ class LLMToolAdapter:
         messages: Optional[List[Dict[str, Any]]] = None,
         *,
         model_list: Optional[List[Dict[str, Any]]] = None,
+        stream_raw_usage: Any = _NON_STREAM_USAGE,
     ) -> LLMResponse:
         """Parse litellm OpenAI-compatible response into LLMResponse."""
         choice = response.choices[0]
@@ -824,12 +1270,26 @@ class LLMToolAdapter:
 
         if choice.message.tool_calls:
             for tc in choice.message.tool_calls:
-                args: Dict[str, Any] = {}
-                if tc.function.arguments:
+                # Tool calls are only executable once the arguments form a
+                # complete JSON object. A truncated or non-object payload is
+                # a parse failure of the whole response — never a call with
+                # guessed arguments, and never a silent `{"raw": ...}` pass.
+                raw_arguments = tc.function.arguments or ""
+                if raw_arguments.strip():
                     try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        args = {"raw": tc.function.arguments}
+                        args: Dict[str, Any] = json.loads(raw_arguments)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(
+                            f"model returned malformed tool arguments for "
+                            f"{tc.function.name!r}: not valid JSON"
+                        ) from exc
+                    if not isinstance(args, dict):
+                        raise ValueError(
+                            f"model returned malformed tool arguments for "
+                            f"{tc.function.name!r}: expected a JSON object"
+                        )
+                else:
+                    args = {}
 
                 provider_specific_fields = _provider_specific_fields_from(
                     getattr(tc, "provider_specific_fields", None)
@@ -861,7 +1321,15 @@ class LLMToolAdapter:
         usage_model, provider_name = resolved_model_provider_identity(
             model, usage_model_list
         )
-        usage_payload = extract_usage_payload(response)
+        if stream_raw_usage is _NON_STREAM_USAGE:
+            usage_payload = extract_usage_payload(response)
+        else:
+            # Streamed responses: only the usage keys observed on the raw
+            # provider chunks count. LiteLLM fills an aggregated stream
+            # response with synthesized estimates when the provider sent no
+            # tail, and those must never pass as provider actuals — absent
+            # provider usage stays unknown.
+            usage_payload = stream_raw_usage or None
         if usage_payload:
             usage = normalize_litellm_usage(
                 usage_payload,

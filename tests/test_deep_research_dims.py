@@ -757,13 +757,17 @@ class TestGuardrailEventPlans:
 
 
 class TestChanlunFactsInjection:
-    def test_engine_facts_empty_on_failure(self, monkeypatch):
-        """引擎/数据失败时返回空串，研究员退回工具取数（不阻断）。"""
-        from src.agent.deep_research import explore_agents
-        from src.services import history_loader
+    """缠论结构事实注入：真实引擎计算产出权威事实，数据失败/不足按缺口如实空串（issue #56）。"""
 
-        monkeypatch.setattr(history_loader, "load_history_df", lambda *a, **k: (None, "none"))
-        assert explore_agents._chanlun_engine_facts("000000") == ""  # 无数据 → 空串兜底
+    def test_engine_facts_real_output_and_failure_gap(self) -> None:
+        """≥60 根日线由真实缠论引擎计算结构事实；无数据/不足 60 根返回空串作真实缺项。"""
+        from src.agent.deep_research import explore_agents
+
+        facts = explore_agents._chanlun_structure_facts(_fake_history(80))
+        assert facts.startswith("【缠论引擎结构（权威，禁止矛盾）】趋势=")
+        assert "背驰=" in facts
+        assert explore_agents._chanlun_structure_facts([]) == ""  # 无数据 → 空串兜底
+        assert explore_agents._chanlun_structure_facts(_fake_history(59)) == ""  # 不足 60 根
 
 
 class TestSupplyChainReuse:

@@ -29,6 +29,9 @@ export type UsageCallRecord = {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** 'known' | 'partial' | 'unknown' — provider did not report unknownFields. */
+  completeness?: 'known' | 'partial' | 'unknown';
+  unknownFields?: string[];
 };
 
 export type UsageDashboard = {

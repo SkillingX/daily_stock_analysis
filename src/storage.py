@@ -2869,6 +2869,28 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             logger.error("save_deep_research_report failed [%s]: %s", report_id, exc)
             return False
 
+    def update_deep_research_total_tokens(self, report_id: str, total_tokens: int) -> bool:
+        """Refresh only the report's confirmable token total after cleanup."""
+
+        def _write(session: Session) -> bool:
+            rec = (
+                session.execute(
+                    select(DeepResearchReport).where(DeepResearchReport.id == report_id)
+                )
+                .scalars()
+                .first()
+            )
+            if rec is None:
+                return False
+            rec.total_tokens = total_tokens
+            return True
+
+        try:
+            return bool(self._run_write_transaction(f"update_usage[{report_id}]", _write))
+        except Exception as exc:
+            logger.error("update_deep_research_total_tokens failed [%s]: %s", report_id, exc)
+            return False
+
     def set_deep_research_pdf_path(self, report_id: str, pdf_path: str) -> bool:
         """PDF 惰性生成后，回填 pdf_path 到元数据。"""
 
@@ -4748,8 +4770,13 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         total_tokens: int,
         stock_code: Optional[str] = None,
         **telemetry: Any,
-    ) -> None:
-        """Append one LLM call record to llm_usage."""
+    ) -> Optional[int]:
+        """Append one LLM call record; return the committed row id or None.
+
+        Returning the id lets callers (per-attempt ledger) link their record
+        to the audit row by identity instead of duplicating attribution
+        columns. Existing callers that ignore the return value are unaffected.
+        """
         row_values: Dict[str, Any] = {
             "call_type": call_type,
             "model": model or "unknown",
@@ -4765,8 +4792,16 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 else telemetry.get(column)
             )
         row = LLMUsage(**row_values)
+        row_id: Optional[int] = None
         with self.session_scope() as session:
             session.add(row)
+            try:
+                session.flush()
+                if row.id is not None:
+                    row_id = int(row.id)
+            except Exception:
+                row_id = None
+        return row_id if row_id is not None and row_id > 0 else None
 
     def get_llm_usage_summary(
         self,
@@ -4892,6 +4927,9 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     LLMUsage.prompt_tokens,
                     LLMUsage.completion_tokens,
                     LLMUsage.total_tokens,
+                    LLMUsage.normalized_prompt_tokens,
+                    LLMUsage.normalized_completion_tokens,
+                    LLMUsage.normalized_total_tokens,
                     LLMUsage.called_at,
                 )
                 .where(
@@ -4904,6 +4942,22 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 .limit(normalized_limit)
             ).all()
 
+        def _row_completeness(r: Any) -> tuple[str, list[str]]:
+            unknown = [
+                name
+                for name, value in (
+                    ("prompt_tokens", r.normalized_prompt_tokens),
+                    ("completion_tokens", r.normalized_completion_tokens),
+                    ("total_tokens", r.normalized_total_tokens),
+                )
+                if value is None
+            ]
+            if not unknown:
+                return "known", []
+            if len(unknown) < 3:
+                return "partial", unknown
+            return "unknown", unknown
+
         return [
             {
                 "id": r.id,
@@ -4913,9 +4967,14 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
                 "total_tokens": r.total_tokens,
+                # Per-row honesty: legacy numerics keep their old values, the
+                # appended completeness says which fields were unknown.
+                "completeness": completeness,
+                "unknown_fields": unknown_fields,
                 "called_at": r.called_at,
             }
             for r in rows
+            for completeness, unknown_fields in (_row_completeness(r),)
         ]
 
 
@@ -4930,8 +4989,12 @@ def persist_llm_usage(
     model: str,
     call_type: str,
     stock_code: Optional[str] = None,
-) -> None:
-    """Fire-and-forget: write one LLM call record to llm_usage. Never raises."""
+) -> Optional[int]:
+    """Fire-and-forget: write one LLM call record to llm_usage. Never raises.
+
+    Returns the committed row id when the record was written, else None; no
+    caller-visible failure and never a fabricated id.
+    """
     try:
         usage = usage or {}
         prompt_tokens = (
@@ -4950,21 +5013,9 @@ def persist_llm_usage(
             telemetry[column] = _coerce_llm_usage_non_negative_int(
                 telemetry.get(column)
             )
-        telemetry["normalized_prompt_tokens"] = (
-            telemetry.get("normalized_prompt_tokens")
-            if telemetry.get("normalized_prompt_tokens") is not None
-            else prompt_tokens
-        )
-        telemetry["normalized_completion_tokens"] = (
-            telemetry.get("normalized_completion_tokens")
-            if telemetry.get("normalized_completion_tokens") is not None
-            else completion_tokens
-        )
-        telemetry["normalized_total_tokens"] = (
-            telemetry.get("normalized_total_tokens")
-            if telemetry.get("normalized_total_tokens") is not None
-            else total_tokens
-        )
+        # Normalized telemetry keeps provider-absent fields as NULL: a partial
+        # provider payload (e.g. prompt_tokens only) must not be padded with
+        # the legacy numeric zero, which would turn unknown into confirmed 0.
         has_usage_payload = bool(usage.get("provider_usage_json")) or any(
             key in usage
             for key in (
@@ -4982,7 +5033,7 @@ def persist_llm_usage(
             "no_usage" if not has_usage_payload else "unknown"
         )
         db = DatabaseManager.get_instance()
-        db.record_llm_usage(
+        return db.record_llm_usage(
             call_type=call_type,
             model=model,
             prompt_tokens=prompt_tokens,
@@ -4995,6 +5046,7 @@ def persist_llm_usage(
         logging.getLogger(__name__).warning(
             "[LLM usage] failed to persist usage record: %s", exc
         )
+        return None
 
 
 def _coerce_llm_usage_non_negative_int(value: Any) -> Optional[int]:

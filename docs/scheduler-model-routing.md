@@ -14,7 +14,8 @@ SCHEDULER_LITELLM_CONFIG=docs/examples/litellm_kimi_code.example.yaml
 ```
 
 密钥不进入 YAML。示例 YAML 使用 `https://api.kimi.com/coding/v1`、
-`kimi-for-coding` 和中档推理 `high`。按账号地域和模型权益修改 YAML；
+模型 ID `k3.1-pro` 和 `low` 推理强度。K3.1 Pro 只支持 `low`、`high`、`max`；
+Kimi 将第三方请求的 `medium` 映射为 `high`。按账号地域和模型权益修改 YAML；
 海外入口为 `https://api.kimi.ai/coding/v1`。
 Kimi Code 套餐 Key 与 Moonshot 开放平台按量计费 Key 不通用。
 后台批量调用须符合账号实际开通范围；本次接入的后台调用范围已由项目方确认。

@@ -2358,7 +2358,8 @@ class NotificationService(
             )
             lines.append("、".join(names))
         else:
-            lines.append(f"未取得：{error}")
+            from data_provider.cross_source_validator import source_failure_text
+            lines.append(f"未取得：{source_failure_text(error)}")
         lines.append("")
 
     def _should_use_image_for_channel(

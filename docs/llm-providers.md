@@ -4,7 +4,7 @@
 
 > 本页未引入新的外部 provider、模型名或 Base URL 兼容行为，仅整理配置参考与官方来源；实际兼容性仍以仓库当前运行时依赖与测试结论为准。
 
-> - 运行时基础：`requirements.txt` 当前锁定 `litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0`，兼容语义以该版本约束下实现为准。
+> - 运行时基础：`requirements.txt` 当前锁定 `litellm==1.106.4`，兼容语义以该版本实现为准。Gemini 渠道当前暂不支持（无启用用户）；针对 Gemini 的专项发现不作为发布门禁。
 > - 验证闭环：系统配置链路回归见 `tests/test_system_config_service.py` 与 `tests/test_system_config_api.py`，`Web` 侧配置页交互回归见现有组件测试用例。
 > - 回退路径：保留旧变量不做自动迁移；可通过 Web/桌面导出备份后 `POST /api/v1/system/config/import` 回滚，或手动恢复历史 `LLM_*` / `LITELLM_*` / `AGENT_*` / `VISION_MODEL` 配置。
 
@@ -67,7 +67,7 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 | DeepSeek | `deepseek` | `deepseek` | `https://api.deepseek.com` | `deepseek-v4-flash,deepseek-v4-pro` |
 | Gemini | `gemini` | `gemini` | 留空 | `gemini-3.1-pro-preview,gemini-3-flash-preview` |
 | Anthropic Claude | `anthropic` | `anthropic` | 留空 | `claude-sonnet-4-6,claude-opus-4-7` |
-| Kimi / Moonshot | `moonshot` | `openai` | `https://api.moonshot.cn/v1` | `kimi-k2.6,kimi-k2.5` |
+| Kimi / Moonshot | `moonshot` | `openai` | `https://api.moonshot.cn/v1` | `kimi-k3.1-pro` |
 | 通义千问 / DashScope | `dashscope` | `openai` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen3.6-plus,qwen3.6-flash` |
 | 智谱 GLM | `zhipu` | `openai` | `https://open.bigmodel.cn/api/paas/v4` | `glm-5.1,glm-4.7-flash` |
 | MiniMax | `minimax` | `openai` | `https://api.minimax.io/v1` | `MiniMax-M3.1-Flash,MiniMax-M3,MiniMax-M2.7,MiniMax-M2.7-highspeed` |
@@ -86,17 +86,17 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 | DeepSeek | [快速开始](https://api-docs.deepseek.com/) | 官方 OpenAI Base URL 为 `https://api.deepseek.com`；`deepseek-chat` / `deepseek-reasoner` 将于 2026-07-24 弃用，当前模板直接使用 `deepseek-v4-flash` / `deepseek-v4-pro`。 |
 | Gemini | [模型列表](https://ai.google.dev/gemini-api/docs/models) | Gemini 3.1 Pro / Gemini 3 Flash 仍为 preview；如需生产稳定性，可在控制台改回 2.5 稳定模型。 |
 | Anthropic Claude | [模型概览](https://docs.anthropic.com/en/docs/about-claude/models/all-models) | Claude 当前 API ID 包含 `claude-sonnet-4-6`、`claude-opus-4-7`；Sonnet 更适合作为默认性价比入口。 |
-| Kimi / Moonshot | [Kimi K2.6 快速开始](https://platform.kimi.com/docs/guide/kimi-k2-6-quickstart)、[模型列表](https://platform.kimi.com/docs/models) | 官方推荐 `kimi-k2.6`；`kimi-k2` 系列将在 2026-05-25 下线，旧 `moonshot-v1-*` 仅保留为稳定旧工作负载选择。 |
+| Kimi / Moonshot | [Kimi K3.1 Pro 快速开始](https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart)、[模型列表](https://platform.kimi.ai/docs/models) | 官方推荐 `kimi-k3.1-pro`（K3.1 Pro 固定 `temperature=1.0`/`top_p=0.95` 等采样参数并要求请求中省略，本项目会自动省略 `temperature`）；`kimi-k2.6` 保留为旧工作负载兼容选择（thinking 固定 `temperature=1.0`、non-thinking 固定 `0.6`，仓库自动适配）。 |
 | 通义千问 / DashScope | [文本生成](https://help.aliyun.com/zh/model-studio/text-generation-model/) | 百炼推荐 `qwen3.6-plus`，确认效果后可用 `qwen3.6-flash` 降低成本。 |
-| 智谱 GLM | [模型概览](https://docs.bigmodel.cn/cn/guide/start/model-overview)、[GLM-5.1](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1) | `glm-5.1` 是当前旗舰；`glm-4.7-flash` 作为轻量/免费模型示例。 |
-| MiniMax | [OpenAI API 兼容与参数](https://platform.minimax.io/docs/api-reference/text-openai-api)、[获取模型列表](https://platform.minimax.io/docs/api-reference/models/openai/list-models)、[Pricing](https://platform.minimax.io/docs/pricing/overview) | Web 新建渠道默认使用 `MiniMax-M3.1-Flash`；thinking 保持开启，`.env` 中的 `MINIMAX_REASONING_EFFORT` 可选 `low`、`medium`、`high`、`xhigh`、`max`，仅该模型会按档位调节推理深度。`MiniMax-M3` 仍为现有配置的兼容选项，但不再作为默认。M3.1-Flash 用量按官方按量 API 标价估算，不代表套餐实际扣费。Base URL 示例为 `https://api.minimax.io/v1`；实际权限、套餐路由与计费以账户控制台为准。 |
+| 智谱 GLM | [模型概览](https://docs.bigmodel.cn/cn/guide/start/model-overview)、[GLM-5.3](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3) | 深研当前模型规格为 `glm-5.3`，配置示例见[GLM YAML 示例](examples/litellm_glm.example.yaml)与配置指南的 GLM-5.3 节；`glm-4.7-flash` 作为轻量/免费模型示例。 |
+| MiniMax | [OpenAI API 兼容与参数](https://platform.minimax.io/docs/api-reference/text-openai-api)、[获取模型列表](https://platform.minimax.io/docs/api-reference/models/openai/list-models)、[Pricing](https://platform.minimax.io/docs/pricing/overview) | Web 新建渠道默认使用 `MiniMax-M3.1-Flash`；thinking 保持开启，`.env` 中的 `MINIMAX_REASONING_EFFORT` 可选 `low`、`medium`、`high`、`xhigh`、`max`，仅该模型会按档位调节推理深度。`MiniMax-M3` 仍为现有配置的兼容选项，但不再作为默认。M3.1-Flash / M3 官方当前把 `temperature` 固定为 1，传入其他值不会生效；仓库不改写你保存的 `LLM_TEMPERATURE`。M3.1-Flash 用量按官方按量 API 标价估算，不代表套餐实际扣费。Base URL 示例为 `https://api.minimax.io/v1`；实际权限、套餐路由与计费以账户控制台为准。 |
 | 小米 MiMo | 官方文档 / 控制台 | 当前按 OpenAI-compatible 方式接入，Base URL、模型名与权限以 MiMo 官方文档/控制台为准；`mimo` 渠道在仓库默认 workflow 中未显式映射，Actions 使用请按本文“GitHub Actions 配置”补齐自定义映射。 |
 | 火山方舟 / 豆包 | [在线推理（常规）](https://www.volcengine.com/docs/82379/2121998)、[模型列表](https://www.volcengine.com/docs/82379/1949118) | 官方示例使用 `https://ark.cn-beijing.volces.com/api/v3` 与 `doubao-seed-1-6-251015`；如使用 Coding Plan，请改用其专用 Base URL 和模型名，不要套用本表的在线推理模板。 |
 | SiliconFlow | [模型列表](https://docs.siliconflow.cn/quickstart/models)、[获取模型列表 API](https://docs.siliconflow.cn/cn/api-reference/models/get-model-list) | 平台模型实时更新且 `/models` 需要 API Key；模板只给常见新模型示例，保存前建议在 Web 设置页点击「获取模型」确认账号可见性。 |
 | OpenRouter | [Models API](https://openrouter.ai/docs/api/api-reference/models/get-models) | OpenRouter 支持 `~anthropic/claude-sonnet-latest`、`~openai/gpt-latest` 等 latest router alias；2026-05-03 的一次手动 live smoke 以 Claude Sonnet latest 作为默认示例通过，GPT latest 保留为可按账号权限切换的备选。 |
 | LiteLLM | [OpenAI-Compatible Endpoints](https://docs.litellm.ai/docs/providers/openai_compatible) | OpenAI-compatible 端点需要把运行时模型写成 `openai/<model>`，Base URL 只填到服务商兼容入口，不额外拼接 `/chat/completions`。 |
 
-本页预设只保证配置形状与当前依赖的 OpenAI-compatible 路由规则一致；实际连通性仍取决于服务商账号权限、地域、额度和模型开通状态。当前 LiteLLM 版本约束为 `litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0`（见 `requirements.txt`），保留历史最低版本、显式排除 PyPI 事故版本，并避免未来大版本自动进入。
+本页预设只保证配置形状与当前依赖的 OpenAI-compatible 路由规则一致；实际连通性仍取决于服务商账号权限、地域、额度和模型开通状态。当前 LiteLLM 版本为精确锁定 `litellm==1.106.4`（见 `requirements.txt`），升级需显式修改该 pin。
 
 ## OpenAI-compatible 与 LiteLLM 规则
 
@@ -172,7 +172,7 @@ Ollama 默认 Base URL `http://127.0.0.1:11434` 主要面向本地、Docker 或�
 - 检测结果只代表当前账号、模型和 endpoint 的一次 best-effort 运行时结果。
 - 检测结果不会写回 `.env`，也不会阻止保存配置。
 - 能力检测失败不等于 provider 全局不支持；失败可能来自账号权限、模型未开通、endpoint 区域、余额、服务商兼容层或 LiteLLM 转换路径。
-- 当前实现未对所有真实 provider 做在线 smoke，兼容依据是 `litellm>=1.80.10,!=1.82.7,!=1.82.8,<2.0.0`（见 `requirements.txt`）、[LiteLLM Python SDK / OpenAI I/O format](https://docs.litellm.ai/)、[LiteLLM OpenAI-compatible 路由](https://docs.litellm.ai/docs/providers/openai_compatible)，以及 OpenAI Chat Completions 的 [JSON mode](https://platform.openai.com/docs/guides/structured-outputs?api-mode=chat)、[tool calling](https://platform.openai.com/docs/guides/function-calling?api-mode=chat)、[streaming](https://platform.openai.com/docs/guides/streaming-responses?api-mode=chat) 和 [vision input](https://platform.openai.com/docs/guides/images-vision?api-mode=chat) 请求形状。
+- 当前实现未对所有真实 provider 做在线 smoke，兼容依据是 `litellm==1.106.4`（见 `requirements.txt`）、[LiteLLM Python SDK / OpenAI I/O format](https://docs.litellm.ai/)、[LiteLLM OpenAI-compatible 路由](https://docs.litellm.ai/docs/providers/openai_compatible)，以及 OpenAI Chat Completions 的 [JSON mode](https://platform.openai.com/docs/guides/structured-outputs?api-mode=chat)、[tool calling](https://platform.openai.com/docs/guides/function-calling?api-mode=chat)、[streaming](https://platform.openai.com/docs/guides/streaming-responses?api-mode=chat) 和 [vision input](https://platform.openai.com/docs/guides/images-vision?api-mode=chat) 请求形状。
 
 ## 回滚方式
 

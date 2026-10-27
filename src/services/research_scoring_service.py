@@ -528,7 +528,9 @@ class ResearchScoringService:
                 if raw_data.get("northbound_data"):
                     ctx.set_data("northbound_flow", raw_data["northbound_data"])
 
-            result = self._supply_chain_agent.run(ctx)
+            import asyncio
+
+            result = await asyncio.to_thread(self._supply_chain_agent.run, ctx)
 
             if result.opinion and result.opinion.raw_data:
                 return {
@@ -593,7 +595,9 @@ class ResearchScoringService:
                         "financial_indicators", raw_data["financial_indicators"]
                     )
 
-            result = self._value_agent.run(ctx)
+            import asyncio
+
+            result = await asyncio.to_thread(self._value_agent.run, ctx)
 
             if result.opinion and result.opinion.raw_data:
                 return {

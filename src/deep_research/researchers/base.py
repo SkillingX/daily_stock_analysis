@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
+from src.report_language import adopt_structured_source_grades
 from src.schemas.deep_research_dims import DIM_MODELS, DimEnvelope
 
 
@@ -52,7 +53,10 @@ def generic_parse(dim_id: str, parsed: Dict[str, Any], steps: int) -> tuple[DimE
     model = DIM_MODELS[dim_id]
     fields = model.model_fields
     payload: Dict[str, Any] = {}
-    for k, v in (parsed or {}).items():
+    parsed = adopt_structured_source_grades(parsed or {})
+    if not isinstance(parsed, dict):
+        parsed = {}
+    for k, v in parsed.items():
         if k not in fields:
             continue
         ann = fields[k].annotation

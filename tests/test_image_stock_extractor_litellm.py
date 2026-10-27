@@ -8,6 +8,7 @@ Covers:
 - extract_stock_codes_from_image(): magic bytes check, parsing
 """
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # Stub out litellm and heavy chain-imports before any project code is loaded,
@@ -75,6 +76,32 @@ def _cfg(**kwargs) -> Config:
 def _make_jpeg_bytes() -> bytes:
     """Return minimal valid JPEG bytes (correct magic bytes + padding)."""
     return b"\xff\xd8\xff" + b"\x00" * 20
+
+
+def _llm_response(
+    content: str | None = None,
+    *,
+    choices: list[SimpleNamespace] | None = None,
+    model: str = "gemini/gemini-3.1-pro-preview",
+) -> SimpleNamespace:
+    """LiteLLM chat.completion response fixture with an explicit no-usage contract.
+
+    Real LiteLLM responses expose absent provider usage as None (usage /
+    usage_metadata / _hidden_params); spec-less MagicMocks would auto-synthesize
+    those attributes plus a self-replicating model_dump, which breaks the
+    usage-adoption path in limited_completion.
+    """
+    if choices is None:
+        choices = [
+            SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")
+        ]
+    return SimpleNamespace(
+        choices=choices,
+        model=model,
+        usage=None,
+        usage_metadata=None,
+        _hidden_params=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -157,20 +184,11 @@ class TestGetApiKeysForModel:
 # ---------------------------------------------------------------------------
 
 class TestCallLitellmVision:
-    def _good_response(self):
-        msg = MagicMock()
-        msg.content = '["600519"]'
-        choice = MagicMock()
-        choice.message = msg
-        resp = MagicMock()
-        resp.choices = [choice]
-        return resp
-
     def test_calls_litellm_with_image(self):
         cfg = _cfg(openai_vision_model=None, litellm_model="", gemini_api_keys=[_GEMINI_KEY])
         with patch("src.services.image_stock_extractor.get_config", return_value=cfg), \
              patch("src.services.image_stock_extractor.litellm.completion",
-                   return_value=self._good_response()) as mock_comp:
+                   return_value=_llm_response('["600519"]')) as mock_comp:
             result = _call_litellm_vision("base64data", "image/jpeg")
             assert result == '["600519"]'
             mock_comp.assert_called_once()
@@ -186,7 +204,7 @@ class TestCallLitellmVision:
         )
         with patch("src.services.image_stock_extractor.get_config", return_value=cfg), \
              patch("src.services.image_stock_extractor.litellm.completion",
-                   return_value=self._good_response()) as mock_comp:
+                   return_value=_llm_response('["600519"]', model="openai/gpt-4o-mini")) as mock_comp:
             _call_litellm_vision("b64", "image/jpeg")
             kwargs = mock_comp.call_args[1]
             assert kwargs["api_base"] == "https://aihubmix.com/v1"
@@ -206,8 +224,7 @@ class TestCallLitellmVision:
 
     def test_raises_when_completion_returns_empty(self):
         cfg = _cfg(gemini_api_keys=[_GEMINI_KEY])
-        empty_resp = MagicMock()
-        empty_resp.choices = []
+        empty_resp = _llm_response(choices=[])
         with patch("src.services.image_stock_extractor.get_config", return_value=cfg), \
              patch("src.services.image_stock_extractor.litellm.completion",
                    return_value=empty_resp):
@@ -293,21 +310,12 @@ class TestParseItemsFromText:
 # ---------------------------------------------------------------------------
 
 class TestExtractStockCodesFromImage:
-    def _good_vision_response(self, codes='["600519", "300750"]'):
-        msg = MagicMock()
-        msg.content = codes
-        choice = MagicMock()
-        choice.message = msg
-        resp = MagicMock()
-        resp.choices = [choice]
-        return resp
-
     def test_returns_items_and_raw(self):
         cfg = _cfg(gemini_api_keys=[_GEMINI_KEY])
         jpeg = _make_jpeg_bytes()
         with patch("src.services.image_stock_extractor.get_config", return_value=cfg), \
              patch("src.services.image_stock_extractor.litellm.completion",
-                   return_value=self._good_vision_response()):
+                   return_value=_llm_response('["600519", "300750"]')):
             items, raw = extract_stock_codes_from_image(jpeg, "image/jpeg")
             codes = [i[0] for i in items]
             assert "600519" in codes

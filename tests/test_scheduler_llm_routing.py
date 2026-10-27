@@ -22,18 +22,28 @@ def model_server() -> Iterator[tuple[str, list[str], dict[str, bool]]]:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             paths.append(self.path)
             failed = state["fail_scheduler"] and self.path.startswith("/scheduler/")
-            body = (
-                {"error": {"message": "controlled rejection", "type": "authentication_error"}}
-                if failed else {
-                    "id": "fixture", "object": "chat.completion", "created": 0,
-                    "model": request["model"], "choices": [{"index": 0, "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": '{"status":"ok"}'}}],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                }
-            )
-            payload = json.dumps(body).encode()
-            self.send_response(401 if failed else 200)
-            self.send_header("Content-Type", "application/json")
+            if failed:
+                payload = json.dumps({"error": {"message": "controlled rejection", "type": "authentication_error"}}).encode()
+                status, content_type = 401, "application/json"
+            else:
+                def sse_event(delta: dict[str, Any] | None = None, finish: str | None = None, usage: dict[str, Any] | None = None) -> str:
+                    chunk: dict[str, Any] = {"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                                             "model": request["model"], "choices": []}
+                    if usage is None:
+                        chunk["choices"] = [{"index": 0, "delta": delta or {}, "finish_reason": finish}]
+                    else:
+                        chunk["usage"] = usage
+                    return f"data: {json.dumps(chunk)}\n\n"
+                content = '{"status":"ok"}'
+                events = [sse_event({"role": "assistant"})]
+                events += [sse_event({"content": content[at:at+8]}) for at in range(0, len(content), 8)]
+                events += [sse_event(finish="stop"),
+                           sse_event(usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}),
+                           "data: [DONE]\n\n"]
+                payload = "".join(events).encode()
+                status, content_type = 200, "text/event-stream"
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

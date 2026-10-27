@@ -256,6 +256,20 @@ async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
     record.control.track(future)
 
     def clean() -> None:
+        # The run is finalized and all in-flight attempts have returned: fold
+        # late usage into the final terminal event and saved artifacts before
+        # the terminal is delivered and the per-stock gate is released.
+        terminal = record.terminal
+        terminal_usage = terminal.get("model_usage") if isinstance(terminal, dict) else None
+        if (
+            isinstance(terminal, dict)
+            and terminal_usage is not None
+            and not terminal.get("cache_hit")
+            and (terminal_usage or {}).get("origin_run_id") in (None, run_id)
+        ):
+            refreshed = deep_research_service.refresh_report_usage(record.control, terminal.get("report_id"), code, request.dims)
+            if refreshed is not None:
+                terminal["model_usage"] = refreshed
         with _RUNS_LOCK:
             record.cleaned.set()
             if _IN_FLIGHT_REQUESTS.get(code) == run_id:
