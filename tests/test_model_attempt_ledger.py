@@ -40,7 +40,37 @@ def usage_provider() -> Iterator[tuple[str, dict[str, Any]]]:
     lock = threading.Lock()
 
     class Provider(BaseHTTPRequestHandler):
-        def _respond(self, message: dict[str, Any], usage: dict[str, int] | None, status: int = 200, model: str = "fixture") -> None:
+        def _respond(self, message: dict[str, Any], usage: dict[str, int] | None, status: int = 200, model: str = "fixture", stream: bool = False) -> None:
+            if stream and status == 200:
+                # The same business payload rendered as a legal stream.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def sse(payload: dict[str, Any]) -> None:
+                    self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                    self.wfile.flush()
+
+                if message.get("tool_calls"):
+                    tool_call = message["tool_calls"][0]["function"]
+                    sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,
+                         "choices": [{"index": 0, "delta": {
+                             "role": "assistant",
+                             "tool_calls": [{"index": 0, "id": message["tool_calls"][0]["id"], "type": "function",
+                                             "function": {"name": tool_call["name"], "arguments": tool_call["arguments"]}}],
+                         }, "finish_reason": None}]})
+                else:
+                    sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,
+                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": message.get("content")}, "finish_reason": None}]})
+                sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,
+                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                if usage is not None:
+                    sse({"id": "fixture", "object": "chat.completion.chunk", "created": 0, "model": model,
+                         "choices": [], "usage": usage})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
             payload: dict[str, Any] = {
                 "id": "fixture", "object": "chat.completion", "created": 0, "model": model,
                 "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
@@ -113,9 +143,9 @@ def usage_provider() -> Iterator[tuple[str, dict[str, Any]]]:
                 if mode == "alias_model":
                     # The provider echoes a different model name in the
                     # response body: a response alias, never the wire request.
-                    self._respond({"role": "assistant", "content": '{"status":"ok"}'}, usage, model="fixture-alias-echo")
+                    self._respond({"role": "assistant", "content": '{"status":"ok"}'}, usage, model="fixture-alias-echo", stream=bool(request.get("stream")))
                     return
-                self._respond({"role": "assistant", "content": '{"status":"ok"}'}, usage)
+                self._respond({"role": "assistant", "content": '{"status":"ok"}'}, usage, stream=bool(request.get("stream")))
             finally:
                 with lock:
                     state["active"] -= 1
@@ -322,6 +352,46 @@ def test_reasoning_and_cache_details_are_not_double_counted(ledger_env: tuple[An
     assert provided["completion_tokens_details"]["reasoning_tokens"] == 3
 
 
+def test_sync_stream_detail_usage_keeps_nested_actuals(ledger_env: tuple[Any, dict[str, Any]]) -> None:
+    """The shared sync stream keeps the nested usage details providers send.
+
+    GLM/Kimi-compatible providers deliver prompt_tokens_details and
+    completion_tokens_details as nested objects on the raw SDK usage object;
+    the sync observation must recursively keep exactly the fields the
+    provider actually sent, matching the async agent path above. Nested
+    details stay inside input/output — totals are never re-added.
+    """
+    adapter, state = ledger_env
+    state["mode"] = "detail_usage"
+    from src.config import Config
+    from src.core.research_run import ResearchRun
+    from src.llm import concurrency
+    import litellm
+
+    config = Config._instance
+    assert config is not None
+    base_url = config.llm_model_list[0]["litellm_params"]["api_base"]
+    run = ResearchRun(30)
+    with run.bind():
+        with attempt_scope(ENTRY_AGENT, "sync-details"):
+            stream = concurrency.limited_completion(
+                litellm.completion, model="openai/fixture", messages=_messages(),
+                timeout=15, stream=True, api_key="fixture-key", api_base=base_url,
+                stream_options={"include_usage": True},
+            )
+            consumed = list(stream)
+    assert consumed
+    [attempt] = run.attempts
+    assert attempt.status == STATUS_OK
+    assert attempt.usage_presence == "provided"
+    provided = attempt.usage_provided
+    assert provided["prompt_tokens_details"]["cached_tokens"] == 4
+    assert provided["completion_tokens_details"]["reasoning_tokens"] == 3
+    assert provided["total_tokens"] == 15
+    summary = summarize_attempts(run.attempts)
+    assert summary["known"] == {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+
 def test_queue_timeout_records_pre_outbound_without_request(ledger_env: tuple[Any, dict[str, Any]]) -> None:
     adapter, state = ledger_env
     state["hold"] = 2.0
@@ -411,9 +481,15 @@ def test_cancelled_in_flight_keeps_outbound_and_usage(ledger_env: tuple[Any, dic
     in_flight = [a for a in run.attempts if a.outbound]
     assert len(in_flight) == 1
     assert in_flight[0].status == STATUS_CANCELLED_IN_FLIGHT
-    assert in_flight[0].usage_provided.get("total_tokens") == 15
+    # The streamed response was cancelled while the server was still holding
+    # the headers: the call went out and stayed attributed, but the stream
+    # never opened, so nothing was observed at all (the old non-stream path
+    # returned a full payload the provider had computed).
+    assert in_flight[0].usage_presence == "unset"
+    assert in_flight[0].usage_provided == {}
     summary = summarize_attempts(run.attempts)
-    assert summary["known"]["total_tokens"] == 15
+    assert summary["known"]["total_tokens"] == 0
+    assert summary["completeness"] == "unknown"
 
 
 def test_provider_rejection_and_outbound_timeout_states(ledger_env: tuple[Any, dict[str, Any]]) -> None:
@@ -626,7 +702,9 @@ def test_stream_success_releases_permit_and_records_usage_unknown(ledger_env: tu
     # Natural exhaustion finalizes the stream attempt itself as ok — not
     # inferred from the second call succeeding.
     assert streamed.status == STATUS_OK
-    assert streamed.usage_presence == "unset"  # no final usage chunk in stream
+    # include_usage was requested and the stream completed: a missing tail
+    # is an observed absence, never an unobserved transport.
+    assert streamed.usage_presence == "absent"
     assert streamed.exec_seconds is not None
     assert second.status == STATUS_OK
 

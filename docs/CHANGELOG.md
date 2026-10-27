@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [新功能] 深研公共 Agent 模型调用改为流式接收上游响应并完整聚合后进入原有解析、保存与页面展示，覆盖 Router、直连与既有备用路径，报告接口与载荷契约不变；单次响应上限从真正出站起算整段流墙钟（排队仍消耗报告预算），取消中断流读取并释放名额；供应商用量未返回保持未知，无 finish 证据的流不当成功，不新增流式失败转非流式的静默重试。依赖固定为 `litellm==1.106.4`（本票验收时的当前稳定版；部署需更新依赖/镜像）。
+- [修复] 共享同步流式调用（limited_completion）的供应商用量现在递归保留嵌套明细（prompt_tokens_details 缓存命中、completion_tokens_details 推理），与异步 Agent 路径同口径；嵌套 Pydantic 对象不再因被当作不透明对象而丢失，缺失/显式全零/部分字段的未知纪律不变。
+- [测试] 流生命周期测试的 choice 级用量用例改为真实渲染 choices[0].usage（Kimi 把用量尾包放在 choice 上）：choice-only 用例与顶层优先（两值不同）用例分开断言，并新增共享同步流嵌套用量明细回归。
+- [测试] 修复 tests/test_agent_pipeline.py 在先装 litellm stub 的全新子进程中的导入顺序：stub 移除提前到全部真实 SDK 导入之前，消除 ModuleNotFoundError（模块级 xfail 保持不变）。
+- [文档] 服务商文档、机器人命令文档（中英）、AlphaSift 集成与完整指南（中英）的当前运行时依赖描述同步为精确锁定 `litellm==1.106.4`（带日期的历史线上复核记录保留原约束）；服务商文档注明 Gemini 渠道暂不支持，Gemini 专项发现不作为发布门禁。
+- [文档] 深研文档与 `.env.example` 补充流式生命周期与护栏语义；服务商文档与中英文配置指南补充 MiniMax 固定 `temperature=1` 口径、统一温度偏好边界及配置生效/重建边界。
 - [改进] Kimi 公开 API 预设与示例默认模型更新为 `kimi-k3.1-pro`：Web 新建 Moonshot 渠道默认收敛为单个当前模型（不把旧 K2.6 混入新建列表），`.env.example` 与服务商文档示例同步；已有自定义渠道模型不迁移。请求层对 `kimi-k3.1-pro`（含 `kimi-k3.1-pro-highspeed` 变体）省略 `temperature`——官方固定 `temperature=1.0`/`top_p=0.95` 等采样参数并要求请求中省略，已保存的 `LLM_TEMPERATURE` 不改写；`kimi-k2.6` 固定温度（thinking 1.0 / non-thinking 0.6）兼容代码与测试原样保留，仅存在于旧配置兼容说明。独立 Scheduler 的 Kimi Code 套餐路由（`openai/k3.1-pro`）不受影响。
 - [文档] 温度配置指南（中英）与 `.env.example` 改为按服务商/模型说明温度取值口径（不再写统一 0-2 范围），并引用 Kimi K3.1 Pro 官方快速开始文档；K2.6 历史兼容排障条目保留。
 - [文档] 补充模型调用优化分阶段规格：明确调用归因与技术/资金单轮分析试点、后续分析成文收敛及报告有界等待的推进条件，保留19维报告、规则交易计划和真实质量对照要求；规格不表示运行功能已上线。

@@ -96,6 +96,11 @@ class ModelAttempt:
     # Audit-row id in llm_usage when this attempt's usage was persisted;
     # None (no fabricated id) when nothing was written.
     usage_record_id: int | None = None
+    # Runtime handle to the streamed-response wrapper (litellm
+    # CustomStreamWrapper) observed at the post-call transport boundary, used
+    # by the stream consumer to reach the raw SDK stream. Never serialized
+    # and cleared as soon as the consumer takes it over; not a ledger fact.
+    stream_transport: Any = field(default=None, repr=False, compare=False)
     finish_reason: str | None = None
     started_at: float = field(default_factory=monotonic)
     _recorded: bool = field(default=False, repr=False)

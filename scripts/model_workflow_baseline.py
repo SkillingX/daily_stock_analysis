@@ -398,6 +398,34 @@ def start_loopback_provider() -> tuple[str, dict[str, Any]]:
                     payload = {"error": {"message": f"baseline-fixture: unmapped model request (dim={dim})",
                                          "type": "invalid_request_error"}}
                     self.send_response(400)
+                    encoded = json.dumps(payload, ensure_ascii=False).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                elif body.get("stream"):
+                    # The same frozen business payload rendered as a legal
+                    # SSE stream (content chunk, stop, usage tail, [DONE]).
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+                    def sse(payload: dict[str, Any]) -> None:
+                        self.wfile.write(("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode())
+                        self.wfile.flush()
+
+                    sse({"id": "baseline-fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture", "choices": [{
+                             "index": 0, "finish_reason": None,
+                             "delta": {"role": "assistant",
+                                       "content": json.dumps(response["content"], ensure_ascii=False)}}]})
+                    sse({"id": "baseline-fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                    sse({"id": "baseline-fixture", "object": "chat.completion.chunk", "created": 0,
+                         "model": "fixture", "choices": [], "usage": dict(response["usage"])})
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
                 else:
                     payload = {
                         "id": "baseline-fixture", "object": "chat.completion", "created": 0,
@@ -410,11 +438,11 @@ def start_loopback_provider() -> tuple[str, dict[str, Any]]:
                         "usage": dict(response["usage"]),
                     }
                     self.send_response(200)
-                encoded = json.dumps(payload, ensure_ascii=False).encode()
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
+                    encoded = json.dumps(payload, ensure_ascii=False).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
             finally:
                 state["active"] -= 1
 

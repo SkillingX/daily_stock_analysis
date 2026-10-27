@@ -169,10 +169,12 @@ def test_day_cache_hit_keeps_origin_usage_without_new_outbound(report_http: tupl
 
 
 def test_cancel_after_partial_ready_keeps_late_usage_consistent(report_http: tuple[str, dict[str, int], Path]) -> None:
-    """Cancel with an in-flight model call: partial_ready shows the outbound
-    as in-flight with unknown usage; the final done (after cleanup) carries
-    the late usage; saved artifacts, history reads and the per-call audit
-    rows agree with no double counting."""
+    """Cancel while the streamed response headers are still being held: the
+    call went out and stays attributed as cancelled in-flight, the run may
+    finish with a direct done (the promptly interrupted call leaves nothing
+    worth a partial snapshot), usage stays honestly unknown because no
+    stream data ever arrived, no per-call audit row is written, and the
+    saved artifacts and history reads agree without any extra outbound."""
     base, observed, reports_dir = report_http
     observed["hold_seconds"] = 3.0
     observed["hold_models"] = True
@@ -185,22 +187,26 @@ def test_cancel_after_partial_ready_keeps_late_usage_consistent(report_http: tup
             assert client.post(f"/runs/{run_id}/cancel").status_code == 200
             response = generating.result(timeout=90)
             events = _events(response.text)
-            partial = next(e for e in events if e["type"] == "partial_ready")
+            # A prompt cancellation can finish the run with a direct done:
+            # the interrupted stream leaves nothing worth a partial snapshot.
+            partial = next((e for e in events if e["type"] == "partial_ready"), None)
             done = next(e for e in events if e["type"] == "done")
+            if partial is not None:
+                partial_usage = partial["model_usage"]
+                assert partial_usage["outbound"] >= 1
+                statuses = {a["status"] for a in partial_usage["attempt_records"] if a["outbound"]}
+                assert "ok" not in statuses  # in-flight is not a success terminal
 
-            # The partial snapshot already shows the real outbound (never
-            # zero) and honestly reports unknown usage for the in-flight call.
-            partial_usage = partial["model_usage"]
-            assert partial_usage["outbound"] >= 1
-            assert server_seen >= 1
-            statuses = {a["status"] for a in partial_usage["attempt_records"] if a["outbound"]}
-            assert "ok" not in statuses  # in-flight is not a success terminal
-
-            # The final done is refreshed after cleanup with the late usage.
+            # The final ledger: exactly the real outbound, cancelled terminal,
+            # honest unknown usage — the stream never delivered any data.
             final_usage = done["model_usage"]
-            assert final_usage["outbound"] == partial_usage["outbound"] or final_usage["outbound"] >= partial_usage["outbound"]
-            provided = [a for a in final_usage["attempt_records"] if a["usage_presence"] == "provided"]
-            assert provided, "late provider usage must land in the final snapshot"
+            assert final_usage["outbound"] >= 1
+            assert observed["count"] == server_seen, "a cancelled run must not send extra requests"
+            records = final_usage["attempt_records"]
+            statuses = {a["status"] for a in records if a["outbound"]}
+            assert statuses == {"cancelled_in_flight"}
+            assert all(a["usage_presence"] != "provided" for a in records)
+            assert final_usage["completeness"] == "unknown"
 
             report_id = done["report_id"]
             dims_path = reports_dir / f"{report_id}_dims.json"
@@ -215,11 +221,10 @@ def test_cancel_after_partial_ready_keeps_late_usage_consistent(report_http: tup
             database = service.get_db()
             with database.get_session() as session:  # type: ignore[attr-defined]
                 rows = session.query(LLMUsage).all()
-            # Audit rows equal the provider-served requests that reported
-            # usage: no missing row, no double count.
-            recorded = len(rows)
-            assert recorded >= 1
-            assert recorded <= observed["count"]
+            # No usage was served for the cancelled stream: no audit row at
+            # all, and never more rows than provider-served requests.
+            assert len(rows) == 0
+            assert len(rows) <= observed["count"]
     finally:
         observed["hold_models"] = False
         observed.pop("hold_seconds", None)

@@ -159,21 +159,27 @@ def test_minimax_reasoning_effort_reaches_supported_models_at_http_boundary(chan
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             bodies.append(body)
+            def sse_event(delta: dict[str, Any] | None = None, finish: str | None = None) -> str:
+                chunk: dict[str, Any] = {'id': 'fixture', 'object': 'chat.completion.chunk', 'created': 0, 'model': body['model'],
+                                         'choices': [{'index': 0, 'delta': delta or {}, 'finish_reason': finish}]}
+                return f'data: {json.dumps(chunk)}\n\n'
             status = 200
             if fallback and len(bodies) == 2:
-                data = {'error': {'message': 'Fixture model unavailable', 'type': 'invalid_request_error', 'code': 'model_not_found'}}
+                encoded = json.dumps({'error': {'message': 'Fixture model unavailable', 'type': 'invalid_request_error', 'code': 'model_not_found'}}).encode()
                 status = 400
             elif len(bodies) == 1:
-                message = {'role': 'assistant', 'content': '', 'tool_calls': [{'id': 's1', 'type': 'function', 'function': {'name': 'search_comprehensive_intel', 'arguments': '{}'}}]}
-                finish = 'tool_calls'
+                events = [sse_event({'role': 'assistant', 'tool_calls': [
+                    {'index': 0, 'id': 's1', 'type': 'function', 'function': {'name': 'search_comprehensive_intel', 'arguments': '{}'}}]}),
+                    sse_event(finish='tool_calls'), 'data: [DONE]\n\n']
+                encoded = ''.join(events).encode()
             else:
-                message = {'role': 'assistant', 'content': '{"business_model":{"value":"主营材料"},"narrative":"已有证据"}'}
-                finish = 'stop'
-            if status == 200:
-                data = {'id': 'fixture', 'object': 'chat.completion', 'created': 0, 'model': body['model'], 'choices': [{'index': 0, 'message': message, 'finish_reason': finish}]}
-            encoded = json.dumps(data).encode()
+                content = '{"business_model":{"value":"主营材料"},"narrative":"已有证据"}'
+                events = [sse_event({'role': 'assistant'})]
+                events += [sse_event({'content': content[at:at+12]}) for at in range(0, len(content), 12)]
+                events += [sse_event(finish='stop'), 'data: [DONE]\n\n']
+                encoded = ''.join(events).encode()
             self.send_response(status)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', 'application/json' if status == 400 else 'text/event-stream')
             self.send_header('Content-Length', str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)

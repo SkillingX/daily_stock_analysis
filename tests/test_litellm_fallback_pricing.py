@@ -13,20 +13,7 @@ except ModuleNotFoundError:
     ensure_litellm_stub()
 
 from src.agent import llm_adapter
-
-
-def _fake_litellm_response(content: str = "agent ok") -> SimpleNamespace:
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(
-                    content=content,
-                    tool_calls=[],
-                )
-            )
-        ],
-        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-    )
+from tests.test_agent_pipeline import _streamed_ok
 
 
 def _fake_agent_config(**overrides) -> SimpleNamespace:
@@ -142,12 +129,12 @@ class LiteLLMFallbackPricingTestCase(unittest.TestCase):
         def _register(models):
             events.append(("register", list(models)))
 
-        def _completion(**_kwargs):
+        async def _acompletion(**_kwargs):
             events.append(("completion", _kwargs["model"]))
-            return _fake_litellm_response()
+            return _streamed_ok(model="openai/mimo-alpha")
 
         with patch.object(llm_adapter, "register_fallback_model_pricing", side_effect=_register):
-            with patch.object(llm_adapter.litellm, "completion", side_effect=_completion):
+            with patch.object(llm_adapter.litellm, "acompletion", new=_acompletion):
                 result = adapter._call_litellm_model(
                     [{"role": "user", "content": "hi"}],
                     [],
@@ -175,11 +162,11 @@ class LiteLLMFallbackPricingTestCase(unittest.TestCase):
         def _register(models):
             events.append(("register", list(models)))
 
-        def _router_completion(**_kwargs):
+        async def _router_acompletion(**_kwargs):
             events.append(("router", _kwargs["model"]))
-            return _fake_litellm_response()
+            return _streamed_ok(model="openai/mimo-router")
 
-        adapter._router = SimpleNamespace(completion=_router_completion)
+        adapter._router = SimpleNamespace(acompletion=_router_acompletion)
 
         with patch.object(llm_adapter, "register_fallback_model_pricing", side_effect=_register):
             result = adapter._call_litellm_model(
@@ -213,11 +200,11 @@ class LiteLLMFallbackPricingTestCase(unittest.TestCase):
         def _register(models):
             events.append(("register", list(models)))
 
-        def _router_completion(**_kwargs):
+        async def _router_acompletion(**_kwargs):
             events.append(("router", _kwargs["model"]))
-            return _fake_litellm_response()
+            return _streamed_ok(model="openai/mimo-alpha")
 
-        adapter._router = SimpleNamespace(completion=_router_completion)
+        adapter._router = SimpleNamespace(acompletion=_router_acompletion)
 
         with patch.object(llm_adapter, "register_fallback_model_pricing", side_effect=_register):
             result = adapter._call_litellm_model(

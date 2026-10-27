@@ -392,6 +392,24 @@ def normalize_litellm_usage(
             cache_field_observed = True
             capability = "supported"
 
+    if provider_name in {"gemini", "vertex_ai"} and completion_tokens is not None:
+        # Gemini reports thinking tokens separately from the visible
+        # candidates while both belong to the completion side of its
+        # accounting. Add the separate thinking count only when the
+        # completion number came from the raw visible-candidates key: an
+        # already normalized completion/output value includes reasoning, and
+        # adding it again would double-count and trip the impossible-total
+        # guard.
+        thinking_tokens = _nested_int(
+            usage, ("completion_tokens_details", "reasoning_tokens")
+        )
+        completion_from_visible_candidates = (
+            "candidates_token_count" in usage
+            and _first_int(usage, "completion_tokens", "output_tokens") is None
+        )
+        if thinking_tokens is not None and completion_from_visible_candidates:
+            completion_tokens = completion_tokens + thinking_tokens
+
     if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + completion_tokens
 

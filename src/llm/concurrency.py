@@ -90,6 +90,15 @@ class _LimitedStream(Iterator[Any]):
         # chunk text the SDK iterates.
         self._raw_usage: dict[str, Any] | None = None
         self._raw_finish: str | None = None
+        # The litellm stream wrapper observed at the transport boundary: its
+        # ``completion_stream`` is the raw SDK stream regardless of whether a
+        # Router fallback wraps the outer object. Taken over from the attempt
+        # (which no longer needs it) so nothing else holds a transport ref.
+        self._raw_wrapper = getattr(attempt, "stream_transport", None) if attempt is not None else None
+        if attempt is not None:
+            attempt.stream_transport = None
+        if self._raw_wrapper is None and hasattr(getattr(stream, "completion_stream", None), "_iterator"):
+            self._raw_wrapper = stream
         # The run that owned this stream at creation. Consumption may happen
         # after the caller's bind() scope exited, so cancellation and usage
         # attribution must use this captured reference, not a fresh lookup.
@@ -144,10 +153,10 @@ class _LimitedStream(Iterator[Any]):
         captures ``model_fields_set`` — the keys the provider actually sent —
         and forwards every chunk unchanged. No SSE re-parsing, no raw text.
         """
-        inner = getattr(self._stream, "completion_stream", None)
-        iterator = getattr(inner, "_iterator", None)
-        if iterator is None:
+        inner = getattr(self._raw_wrapper, "completion_stream", None)
+        if inner is None or not hasattr(inner, "_iterator"):
             return
+        iterator = inner._iterator
         owner = self
 
         class _ObservingIter:
@@ -157,12 +166,39 @@ class _LimitedStream(Iterator[Any]):
             def __iter__(self) -> _ObservingIter:
                 return self
 
+            @staticmethod
+            def _provider_keys(usage: Any) -> dict[str, Any] | None:
+                """The usage fields the provider actually sent, if any.
+
+                Providers deliver usage either as a pydantic payload (top
+                level) or a plain dict (current Kimi puts it on the choice);
+                only explicit keys count, never defaults. ``exclude_unset``
+                recurses into nested Pydantic details (cache and reasoning
+                breakdowns): hand-picking top-level fields would keep those
+                details as opaque objects the Mapping-only sanitizer drops.
+                """
+                if usage is None:
+                    return None
+                if isinstance(usage, dict):
+                    return dict(usage)
+                fields = getattr(usage, "model_fields_set", None)
+                if fields:
+                    dumped = usage.model_dump(exclude_unset=True)
+                    return {key: dumped[key] for key in fields if key in dumped}
+                return None
+
             def __next__(self) -> Any:
                 chunk = next(self._source)
-                usage = getattr(chunk, "usage", None)
-                fields = getattr(usage, "model_fields_set", None)
-                if usage is not None and fields:
-                    owner._raw_usage = {key: getattr(usage, key) for key in fields}
+                top_level = self._provider_keys(getattr(chunk, "usage", None))
+                if top_level is not None:
+                    owner._raw_usage = top_level
+                else:
+                    # Some providers deliver the usage tail on the choice
+                    # instead of the chunk; the top level keeps priority.
+                    choices = getattr(chunk, "choices", None) or []
+                    choice_usage = self._provider_keys(getattr(choices[0], "usage", None)) if choices else None
+                    if choice_usage is not None:
+                        owner._raw_usage = choice_usage
                 # Stream finish lives on the chunk, not the response object.
                 choices = getattr(chunk, "choices", None)
                 finish = getattr(choices[0], "finish_reason", None) if choices else None
@@ -185,6 +221,11 @@ class _LimitedStream(Iterator[Any]):
                 self._attempt.status = STATUS_OK
                 if self._raw_finish:
                     self._attempt.finish_reason = self._raw_finish
+            if self._attempt.usage_presence == "unset" and self._attempt.status == STATUS_OK:
+                # The stream was fully consumed with include_usage requested:
+                # a missing provider usage is an observed absence, not an
+                # unobserved transport.
+                self._attempt.usage_presence = "absent"
         self.close()
 
     def close(self) -> None:
@@ -202,7 +243,7 @@ class _LimitedStream(Iterator[Any]):
                 if close is None:
                     # LiteLLM sync streams expose the provider stream, but only
                     # an async close of their own; close the actual sync transport.
-                    close = getattr(getattr(self._stream, "completion_stream", None), "close", None)
+                    close = getattr(getattr(self._raw_wrapper, "completion_stream", None), "close", None)
                 if close is not None:
                     close()
             finally:
@@ -318,6 +359,14 @@ def _make_usage_observer(attempt: ModelAttempt) -> Callable[[dict[str, Any]], No
             except (TypeError, ValueError):
                 return
         if not isinstance(original, dict):
+            # A streamed response arrives as the litellm stream wrapper; the
+            # consumer needs its raw SDK stream (usage observation, forced
+            # close), which is unreachable through the Router's own outer
+            # wrapper. The wrapper reference is handed over and cleared by
+            # the consumer; nothing is serialized.
+            raw_stream = getattr(original, "completion_stream", None)
+            if raw_stream is not None and hasattr(raw_stream, "_iterator"):
+                attempt.stream_transport = original
             return
         usage = original.get("usage")
         if isinstance(usage, dict):
@@ -459,6 +508,34 @@ def _persist_attempt_audit(attempt: ModelAttempt) -> None:
     row_id = persist_llm_usage(usage, model_for_usage, call_type=entry)
     if row_id is not None:
         attempt.usage_record_id = row_id
+
+
+def adopt_raw_stream_usage(
+    attempt: ModelAttempt | None,
+    raw_usage: dict[str, Any] | None,
+    *,
+    observed: bool = False,
+) -> None:
+    """Adopt provider-actual usage observed at a raw stream iterator.
+
+    Async stream consumption cannot reuse the sync wrapper's chunk hook, so
+    the consumer calls this once its raw observation is complete — always
+    before the response-level adoption, so the per-attempt ledger sees only
+    the keys the provider actually sent. ``observed`` marks that a raw
+    iterator was really attached and consumed: without it the call never
+    reached the stream (e.g. an HTTP error before the first chunk) and the
+    absence must stay unset so error-body usage can still be adopted.
+    """
+    if not observed or attempt is None or attempt.usage_presence != "unset":
+        return
+    if not raw_usage:
+        attempt.usage_presence = "absent"
+        return
+    from src.llm.usage import sanitized_provider_usage
+
+    attempt.usage_presence = "provided"
+    attempt.usage_provided = sanitized_provider_usage(raw_usage)
+    _persist_attempt_audit(attempt)
 
 
 def limited_completion(call: Callable[..., Any], **kwargs: Any) -> Any:

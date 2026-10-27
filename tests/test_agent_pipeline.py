@@ -19,15 +19,30 @@ import types
 import unittest
 import sys
 import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from tests.litellm_stub import ensure_litellm_stub
+from tests.litellm_stub import remove_litellm_stub
 
-ensure_litellm_stub()
+# Issue57: the streaming seam consumes the real LiteLLM SDK (CustomStreamWrapper,
+# stream_chunk_builder), which the legacy module-level stub cannot satisfy.
+# Drop the stub when another test module installed it earlier in this process,
+# then import the real package pinned in requirements.txt (litellm==1.106.4).
+# The removal must run before any real SDK import below: a stub installed by
+# an earlier module makes "litellm" a plain module, so submodule imports fail.
+remove_litellm_stub()
+
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+from openai.types.chat import ChatCompletionChunk
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.completion_usage import CompletionUsage
+import litellm  # noqa: F401
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -2125,6 +2140,75 @@ class TestAnalyzeWithAgentStockName(unittest.TestCase):
 # Agent construction chain (real objects, mocked LLM)
 # ============================================================
 
+class _FakeAsyncStream:
+    """openai ``AsyncStream`` shape: iteration goes through ``_iterator``."""
+
+    def __init__(self, chunks: List[ChatCompletionChunk]) -> None:
+        self._iterator = self._gen(chunks)
+
+    async def _gen(self, chunks: List[ChatCompletionChunk]) -> Any:
+        for chunk in chunks:
+            yield chunk
+
+    def __aiter__(self) -> "_FakeAsyncStream":
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        return await self._iterator.__anext__()
+
+
+def _stream_logging_obj(model: str) -> Logging:
+    """Minimal real litellm Logging object for one CustomStreamWrapper."""
+    return Logging(
+        model=model,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime.now(),
+        litellm_call_id="test-stream-call",
+        function_id="test-stream-fn",
+    )
+
+
+def _streamed_ok(
+    content: str = "agent ok",
+    *,
+    model: str = "openai/kimi-k2.6",
+    finish_reason: str = "stop",
+    usage: Optional[Any] = (1, 2, 3),
+) -> CustomStreamWrapper:
+    """One fresh SDK-shaped LiteLLM stream per attempt.
+
+    Aggregates through the real CustomStreamWrapper/stream_chunk_builder path
+    into the legacy full-response contract: content, provider finish evidence
+    (stop) and an explicit provider usage tail chunk.
+    """
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-agent", object="chat.completion.chunk", created=0, model=model,
+            choices=[ChunkChoice(index=0, delta=ChoiceDelta(role="assistant", content=content), finish_reason=None)],
+        ),
+        ChatCompletionChunk(
+            id="chunk-agent", object="chat.completion.chunk", created=0, model=model,
+            choices=[ChunkChoice(index=0, delta=ChoiceDelta(), finish_reason=finish_reason)],
+        ),
+    ]
+    if usage is not None:
+        chunks.append(
+            ChatCompletionChunk(
+                id="chunk-agent", object="chat.completion.chunk", created=0, model=model,
+                choices=[],
+                usage=CompletionUsage(prompt_tokens=usage[0], completion_tokens=usage[1], total_tokens=usage[2]),
+            )
+        )
+    return CustomStreamWrapper(
+        completion_stream=_FakeAsyncStream(chunks),
+        model=model,
+        logging_obj=_stream_logging_obj(model),
+        custom_llm_provider="openai",
+    )
+
+
 class TestAgentConstructionChain(unittest.TestCase):
     """Test that the agent construction chain wires up correctly."""
 
@@ -2246,8 +2330,7 @@ class TestAgentConstructionChain(unittest.TestCase):
         self.assertEqual(calls, ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"])
         self.assertEqual(result.content, "ok")
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_normalizes_kimi_k26_temperature(self, _mock_router):
+    def test_llm_adapter_normalizes_kimi_k26_temperature(self):
         """Agent direct LiteLLM calls should not send unsupported temperatures to Kimi K2.6."""
         mock_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2260,24 +2343,18 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
         adapter._router = None
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
 
-        with patch("src.agent.llm_adapter.litellm.completion", return_value=response) as mock_completion:
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_streamed_ok(),
+        ) as mock_acompletion:
             result = adapter._call_litellm_model(
                 [{"role": "user", "content": "hi"}],
                 [],
@@ -2286,10 +2363,9 @@ class TestAgentConstructionChain(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "agent ok")
-        self.assertEqual(mock_completion.call_args.kwargs["temperature"], 1.0)
+        self.assertEqual(mock_acompletion.call_args.kwargs["temperature"], 1.0)
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_normalizes_kimi_k26_temperature_for_yaml_alias(self, _mock_router):
+    def test_llm_adapter_normalizes_kimi_k26_temperature_for_yaml_alias(self):
         """Agent direct LiteLLM calls should normalize through routed YAML aliases."""
         mock_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2307,24 +2383,18 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
         adapter._router = None
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
 
-        with patch("src.agent.llm_adapter.litellm.completion", return_value=response) as mock_completion:
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_streamed_ok(),
+        ) as mock_acompletion:
             result = adapter._call_litellm_model(
                 [{"role": "user", "content": "hi"}],
                 [],
@@ -2333,10 +2403,9 @@ class TestAgentConstructionChain(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "agent ok")
-        self.assertEqual(mock_completion.call_args.kwargs["temperature"], 1.0)
+        self.assertEqual(mock_acompletion.call_args.kwargs["temperature"], 1.0)
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_normalizes_kimi_k26_temperature_for_non_thinking_yaml_alias(self, _mock_router):
+    def test_llm_adapter_normalizes_kimi_k26_temperature_for_non_thinking_yaml_alias(self):
         """Agent direct LiteLLM calls should honor non-thinking Kimi YAML overrides."""
         mock_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2357,24 +2426,18 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
         adapter._router = None
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
 
-        with patch("src.agent.llm_adapter.litellm.completion", return_value=response) as mock_completion:
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_streamed_ok(),
+        ) as mock_acompletion:
             result = adapter._call_litellm_model(
                 [{"role": "user", "content": "hi"}],
                 [],
@@ -2383,10 +2446,9 @@ class TestAgentConstructionChain(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "agent ok")
-        self.assertEqual(mock_completion.call_args.kwargs["temperature"], 0.6)
+        self.assertEqual(mock_acompletion.call_args.kwargs["temperature"], 0.6)
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_omits_temperature_for_gpt5_family(self, _mock_router):
+    def test_llm_adapter_omits_temperature_for_gpt5_family(self):
         """Agent direct LiteLLM calls should omit temperature for strict default-temperature models."""
         mock_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2399,24 +2461,18 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
         adapter._router = None
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
 
-        with patch("src.agent.llm_adapter.litellm.completion", return_value=response) as mock_completion:
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_streamed_ok(),
+        ) as mock_acompletion:
             result = adapter._call_litellm_model(
                 [{"role": "user", "content": "hi"}],
                 [],
@@ -2425,10 +2481,44 @@ class TestAgentConstructionChain(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "agent ok")
-        self.assertNotIn("temperature", mock_completion.call_args.kwargs)
+        self.assertNotIn("temperature", mock_acompletion.call_args.kwargs)
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_recovers_from_unsupported_temperature(self, _mock_router):
+    def test_llm_adapter_omits_temperature_for_kimi_k31_pro(self):
+        """Agent direct LiteLLM calls should omit temperature for the current Kimi K3.1 Pro family."""
+        mock_cfg = SimpleNamespace(
+            agent_litellm_model="",
+            litellm_model="openai/kimi-k3.1-pro",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+            llm_temperature=0.2,
+            gemini_api_keys=[],
+            anthropic_api_keys=[],
+            openai_api_keys=[],
+            deepseek_api_keys=[],
+            openai_base_url=None,
+            minimax_reasoning_effort="low",
+        )
+
+        from src.agent.llm_adapter import LLMToolAdapter
+        adapter = LLMToolAdapter(config=mock_cfg)
+        adapter._router = None
+
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            return_value=_streamed_ok(model="openai/kimi-k3.1-pro"),
+        ) as mock_acompletion:
+            result = adapter._call_litellm_model(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "openai/kimi-k3.1-pro",
+                temperature=0.2,
+            )
+
+        self.assertEqual(result.content, "agent ok")
+        self.assertNotIn("temperature", mock_acompletion.call_args.kwargs)
+
+    def test_llm_adapter_recovers_from_unsupported_temperature(self):
         """Agent direct LiteLLM calls should retry once with a request-scoped parameter repair."""
         from src.llm.generation_params import clear_litellm_generation_param_recovery_cache
 
@@ -2444,28 +2534,21 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
         adapter._router = None
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
 
-        with patch("src.agent.llm_adapter.litellm.completion") as mock_completion:
-            mock_completion.side_effect = [
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=[
                 RuntimeError("Unsupported parameter: temperature is not supported"),
-                response,
-            ]
+                _streamed_ok(),
+            ],
+        ) as mock_acompletion:
             result = adapter._call_litellm_model(
                 [{"role": "user", "content": "hi"}],
                 [],
@@ -2474,33 +2557,22 @@ class TestAgentConstructionChain(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "agent ok")
-        self.assertEqual(mock_completion.call_args_list[0].kwargs["temperature"], 0.2)
-        self.assertNotIn("temperature", mock_completion.call_args_list[1].kwargs)
+        self.assertEqual(mock_acompletion.call_args_list[0].kwargs["temperature"], 0.2)
+        self.assertNotIn("temperature", mock_acompletion.call_args_list[1].kwargs)
 
-    @patch("src.agent.llm_adapter.Router")
+    @patch("src.agent.llm_adapter._StreamAttemptRouter")
     def test_llm_adapter_legacy_router_recovery_cache_is_scoped_to_endpoint(self, mock_router):
         """Legacy multi-key Router recoveries should not leak across base URLs."""
         from src.llm.generation_params import clear_litellm_generation_param_recovery_cache
 
         clear_litellm_generation_param_recovery_cache()
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="agent ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
         strict_router = MagicMock()
         flex_router = MagicMock()
-        strict_router.completion.side_effect = [
+        strict_router.acompletion = AsyncMock(side_effect=[
             RuntimeError("Unsupported parameter: temperature is not supported"),
-            response,
-        ]
-        flex_router.completion.return_value = response
+            _streamed_ok(),
+        ])
+        flex_router.acompletion = AsyncMock(return_value=_streamed_ok())
         mock_router.side_effect = [strict_router, flex_router]
 
         strict_cfg = SimpleNamespace(
@@ -2514,6 +2586,7 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=["sk-strict-key-1", "sk-strict-key-2"],
             deepseek_api_keys=[],
             openai_base_url="https://strict.example/v1",
+            minimax_reasoning_effort="low",
         )
         flex_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2526,6 +2599,7 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=["sk-flex-key-1", "sk-flex-key-2"],
             deepseek_api_keys=[],
             openai_base_url="https://flex.example/v1",
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
@@ -2547,12 +2621,11 @@ class TestAgentConstructionChain(unittest.TestCase):
 
         self.assertEqual(strict_result.content, "agent ok")
         self.assertEqual(flex_result.content, "agent ok")
-        self.assertEqual(strict_router.completion.call_args_list[0].kwargs["temperature"], 0.2)
-        self.assertNotIn("temperature", strict_router.completion.call_args_list[1].kwargs)
-        self.assertEqual(flex_router.completion.call_args.kwargs["temperature"], 0.2)
+        self.assertEqual(strict_router.acompletion.call_args_list[0].kwargs["temperature"], 0.2)
+        self.assertNotIn("temperature", strict_router.acompletion.call_args_list[1].kwargs)
+        self.assertEqual(flex_router.acompletion.call_args.kwargs["temperature"], 0.2)
 
-    @patch("src.agent.llm_adapter.Router")
-    def test_llm_adapter_fallback_does_not_leak_kimi_fixed_temperature(self, _mock_router):
+    def test_llm_adapter_fallback_does_not_leak_kimi_fixed_temperature(self):
         """Non-Kimi fallbacks should keep the requested temperature after a Kimi failure."""
         mock_cfg = SimpleNamespace(
             agent_litellm_model="",
@@ -2565,30 +2638,24 @@ class TestAgentConstructionChain(unittest.TestCase):
             openai_api_keys=[],
             deepseek_api_keys=[],
             openai_base_url=None,
+            minimax_reasoning_effort="low",
         )
 
         from src.agent.llm_adapter import LLMToolAdapter
         adapter = LLMToolAdapter(config=mock_cfg)
-        response = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(
-                        content="fallback ok",
-                        tool_calls=[],
-                    )
-                )
-            ],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
-        )
         temperatures = []
 
         def fake_completion(**kwargs):
             temperatures.append((kwargs["model"], kwargs["temperature"]))
             if kwargs["model"] == "openai/kimi-k2.6":
                 raise RuntimeError("primary failed")
-            return response
+            return _streamed_ok("fallback ok", model="openai/gpt-4o-mini")
 
-        with patch("src.agent.llm_adapter.litellm.completion", side_effect=fake_completion):
+        with patch(
+            "src.agent.llm_adapter.litellm.acompletion",
+            new_callable=AsyncMock,
+            side_effect=fake_completion,
+        ):
             result = adapter.call_completion(
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[],
@@ -2629,7 +2696,7 @@ class TestAgentConstructionChain(unittest.TestCase):
 
         adapter._call_litellm_model = MagicMock(side_effect=fake_call)
 
-        with patch("src.agent.llm_adapter.time.time", side_effect=[0.0, 0.0, 7.0, 7.0]):
+        with patch("src.agent.llm_adapter.time.monotonic", side_effect=[0.0, 0.0, 7.0, 7.0]):
             result = adapter.call_completion(
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[],
@@ -2683,7 +2750,7 @@ class TestAgentConstructionChain(unittest.TestCase):
 
         with patch("src.agent.llm_adapter.litellm.RateLimitError", FakeRateLimitError), \
              patch("src.agent.llm_adapter.logger.warning"), \
-             patch("src.agent.llm_adapter.time.time", side_effect=fake_time), \
+             patch("src.agent.llm_adapter.time.monotonic", side_effect=fake_time), \
              patch("src.agent.llm_adapter.time.sleep", side_effect=fake_sleep) as mock_sleep:
             result = adapter.call_completion(
                 messages=[{"role": "user", "content": "hi"}],
