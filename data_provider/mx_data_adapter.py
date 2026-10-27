@@ -180,7 +180,7 @@ def _post(
         try:
             r = requests.post(url, headers=headers, json=body, timeout=remaining)
             if r.status_code != 200:
-                last_err = "authentication_failed" if r.status_code in (401, 403) else "quota_exhausted" if r.status_code == 429 else f"http_{r.status_code}"
+                last_err = "authentication_failed" if r.status_code in (401, 403) else "rate_limited" if r.status_code == 429 else f"http_{r.status_code}"
                 if r.status_code in (401, 403):  # key 问题不重试
                     break
                 if i + 1 < attempts:

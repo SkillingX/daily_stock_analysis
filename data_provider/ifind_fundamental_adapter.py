@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, DecimalException
+from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
@@ -119,19 +120,39 @@ _PERIOD_FIELDS = {
 # ------------------------------------------------------------------
 
 
+_IFIND_TABLE_SEPARATOR = re.compile(r"\s*\|[\s\-:|]+\|\s*")
+
+
+def _ifind_prose(answer: str) -> str:
+    """供应商散文文本（markdown 表格之外的行）：拒绝文案在这里，业务事实在表格里。"""
+    lines = answer.splitlines()
+    consumed: set[int] = set()
+    for index, line in enumerate(lines):
+        if index == 0 or index in consumed or not _IFIND_TABLE_SEPARATOR.fullmatch(line):
+            continue
+        start = index - 1
+        end = index
+        for row in lines[index + 1:]:
+            if not row.strip().startswith("|") or _IFIND_TABLE_SEPARATOR.fullmatch(row):
+                break
+            end += 1
+        consumed.update(range(start, end + 1))
+    return "\n".join(line for index, line in enumerate(lines) if index not in consumed)
+
+
 def _ifind_tables(text: str) -> list[list[dict[str, str]]]:
     """Preserve separate tables and empty cells; reject ragged rows."""
     tables: list[list[dict[str, str]]] = []
     lines = text.splitlines()
     for index, line in enumerate(lines):
-        if index == 0 or not re.fullmatch(r"\s*\|[\s\-:|]+\|\s*", line):
+        if index == 0 or not _IFIND_TABLE_SEPARATOR.fullmatch(line):
             continue
         headers = [cell.strip() for cell in lines[index - 1].strip().strip("|").split("|")]
         if len(set(headers)) != len(headers):
             raise SourceReadError("ifind", "invalid_response")
         rows = []
         for row in lines[index + 1:]:
-            if not row.strip().startswith("|") or re.fullmatch(r"\s*\|[\s\-:|]+\|\s*", row):
+            if not row.strip().startswith("|") or _IFIND_TABLE_SEPARATOR.fullmatch(row):
                 break
             cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
             if len(cells) != len(headers) or cells == headers:
@@ -268,6 +289,7 @@ class IfindReply(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
     code: int
     msg: str = ""
+    sub_msg: str | None = Field(default=None, validation_alias="subMsg")
     data: IfindData | None = None
 
 
@@ -421,16 +443,70 @@ def _detail_reading(cell: _RankedCell, period: str, field: str) -> AnchorReading
                          normalization_error=error, fetched_at=datetime.now(timezone.utc).isoformat())
 
 
+def _ifind_failure_reason(message: str) -> str | None:
+    """Keep permission, authentication, throttling and quota distinct.
+
+    HTTP status is not an input: a generic 429 is not quota, and a permission
+    phrase is not a login failure.
+    """
+    lowered = message.lower()
+    if any(term in message or term in lowered for term in ("用量已耗尽", "调用次数已达到上限", "额度耗尽", "quota")):
+        return "quota_exhausted"
+    if any(term in message or term in lowered for term in ("权限不足", "无权限", "permission denied", "permission_denied")):
+        return "permission_denied"
+    if any(term in message or term in lowered for term in ("未认证", "token已过期", "token invalid", "认证失败", "登录失败")):
+        return "authentication_failed"
+    if any(term in message or term in lowered for term in ("限流", "频率超限", "too many requests", "rate limit")):
+        return "rate_limited"
+    return None
+
+
+def _mcp_payload(result: object) -> object | None:
+    """Supplier envelope from structured content, filled from text if needed."""
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
+    from src.services.mcp_client import json_object_from_text
+    texts: list[dict[str, object]] = []
+    for block in getattr(result, "content", None) or []:
+        parsed = json_object_from_text(getattr(block, "text", None) or "")
+        if parsed is not None:
+            texts.append(parsed)
+    if isinstance(structured, dict):
+        merged = dict(structured)
+        for payload in texts:
+            for key in ("code", "subCode", "sub_code", "msg", "subMsg", "sub_msg", "data"):
+                if key not in merged and key in payload:
+                    merged[key] = payload[key]
+        return merged
+    if texts:
+        return texts[0]
+    return structured if structured is not None else None
+
+
 def _ifind_data(raw: object) -> IfindData:
+    if isinstance(raw, dict) and ("sub_msg" in raw or "subMsg" in raw):
+        payload = {key: value for key, value in raw.items() if key != "sub_msg"}
+        chosen = payload.get("subMsg")
+        alternate = raw.get("sub_msg")
+        if (not isinstance(chosen, str) or not chosen) and isinstance(alternate, str) and alternate:
+            payload["subMsg"] = alternate
+        elif "subMsg" not in payload:
+            payload["subMsg"] = alternate
+        raw = payload
     try:
         reply = IfindReply.model_validate(raw)
     except ValidationError:
         raise SourceReadError("ifind", "invalid_response") from None
-    message = reply.msg + (reply.data.answer if reply.data else "")
-    if any(term in message for term in ("用量已耗尽", "调用次数已达到上限", "额度耗尽", "quota")):
-        raise SourceReadError("ifind", "quota_exhausted")
-    if any(term in message for term in ("未认证", "无权限", "权限不足", "Token已过期", "token invalid")):
-        raise SourceReadError("ifind", "authentication_failed")
+    # Classify the supplier status text plus refusal prose outside business tables.
+    # A numeric subCode is not a reason, and table cells are business facts: a value
+    # like 受限流通股 must not read as 限流 throttling, while a plain-text refusal
+    # (e.g. 用量已耗尽) in the answer still classifies.
+    prose = _ifind_prose(reply.data.answer) if reply.data else ""
+    message = reply.msg + (reply.sub_msg or "") + prose
+    reason = _ifind_failure_reason(message)
+    if reason is not None:
+        raise SourceReadError("ifind", reason)
     if reply.code != 1:
         raise SourceReadError("ifind", "business_error")
     if reply.data is None or not reply.data.answer.strip():
@@ -610,39 +686,68 @@ class IfindFetcher:
         return cls._instance
 
     def query(self, tool: str, question: str, *, deadline: float | None = None) -> IfindData:
-        from src.core.research_run import current_research, ResearchStopped
-        if run := current_research.get():
-            run.check()
+        from src.core.research_run import ResearchStopped, current_research, supplier_need_key
+        from src.patches.eastmoney_patch import request_deadline
+        from src.services import mcp_client
+        from data_provider.mx_data_adapter import financial_refresh
+        run = current_research.get()
+        outer = request_deadline.get()
+        if outer is not None:
+            deadline = outer if deadline is None else min(deadline, outer)
+        if run is not None:
+            deadline = run.deadline if deadline is None else min(deadline, run.deadline)
         if not self.available:
             raise SourceReadError("ifind", "invalid_configuration")
         timeout = min(self._timeout, deadline - monotonic()) if deadline is not None else self._timeout
-        if timeout <= 0:
-            raise SourceReadError("ifind", "timeout")
+        # Issue #51: every iFinD outbound passes this one boundary, so the same
+        # report, tool, question, contract and refresh share one tools/call —
+        # including the known failure. An already-expired or cancelled call still
+        # enters the boundary so the undispatched attempt is recorded.
+        def _once() -> IfindData:
+            call_token = mcp_client.current_call_id.set(uuid4().hex[:12])
+            try:
+                coro = self._async_query(tool, question, deadline=deadline)
+                raw = asyncio.run(coro if timeout <= 0 else asyncio.wait_for(coro, timeout))
+                return _ifind_data(raw)
+            finally:
+                mcp_client.current_call_id.reset(call_token)
         try:
-            raw = asyncio.run(asyncio.wait_for(self._async_query(tool, question, deadline=deadline), timeout))
-            return _ifind_data(raw)
+            stopped = run is not None and (run.stop_reason or run.finalized or run.remaining() <= 0)
+            if run is None or stopped:
+                return _once()
+            refresh = financial_refresh.get()
+            marker = refresh[1] if refresh else ""
+            from src.config import get_config
+            remaining = max(0.0, deadline - monotonic()) if deadline is not None else None
+            key = supplier_need_key("ifind", get_config().data_source_contract, tool, question, marker)
+            return run.single_fetch(key, _once, timeout=remaining)
         except ResearchStopped:
             raise
-        except Exception as exc:
+        except SourceReadError:
+            raise
+        except (Exception, BaseExceptionGroup) as exc:
             if run := current_research.get():
                 run.check()
+            if isinstance(exc, (json.JSONDecodeError, ValidationError)):
+                raise SourceReadError("ifind", "invalid_response") from None
             raise SourceReadError("ifind", source_failure_reason(exc)) from None
 
     async def _async_query(self, tool: str, question: str, *, deadline: float | None = None) -> object:
         from src.services.mcp_client import call_mcp_tool
-        from src.core.research_run import current_research
-        if run := current_research.get():
-            run.check()
         result = await call_mcp_tool(self._endpoint, self._token, tool, {"query": question}, timeout_seconds=self._timeout, deadline=deadline)
-        if getattr(result, "is_error", getattr(result, "isError", False)):
+        payload = _mcp_payload(result)
+        is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
+        if is_error:
+            if payload is None:
+                raise SourceReadError("ifind", "business_error")
+            try:
+                _ifind_data(payload)
+            except SourceReadError:
+                raise
             raise SourceReadError("ifind", "business_error")
-        structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
-        if structured is not None:
-            return structured
-        for block in result.content:
-            if getattr(block, "text", None):
-                return json.loads(block.text)
-        raise SourceReadError("ifind", "invalid_response")
+        if payload is None:
+            raise SourceReadError("ifind", "invalid_response")
+        return payload
 
     def financial_snapshot(self, code: str, period: str | None, *, deadline: float) -> dict[str, AnchorReading]:
         from data_provider.choice_adapter import ChoiceAdapter
@@ -728,7 +833,8 @@ class IfindFetcher:
         只证明最新归属；空结果、字段错误、证券不匹配、鉴权/额度拒绝、超时
         由 SourceReadError 或 ConceptMembership.errors 区分，不补造日期。
         """
-        data = self.query("get_stock_info", f"{code} 所属概念", deadline=deadline)
+        from data_provider.choice_adapter import ChoiceAdapter
+        data = self.query("get_stock_info", f"{ChoiceAdapter.stock_code(code)} 所属概念", deadline=deadline)
         return _parse_concepts(data, code)
 
 

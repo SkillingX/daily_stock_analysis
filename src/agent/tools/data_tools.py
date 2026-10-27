@@ -631,17 +631,18 @@ def _concept_membership(stock_code: str, deadline: float) -> dict[str, Any]:
 
     返回 {concepts, source, as_of_nature, error}；无数据/字段错误/证券不匹配/
     鉴权拒绝/超时以 error 区分，不补造日期、不回退公开概念接口。
+    issue #51：出站单飞只在 IfindFetcher.query。同一报告按证券、实际查询、
+    数据契约和刷新标记共享一次，含已知失败；失败不写入成功缓存。
     """
     from data_provider.cross_source_validator import SourceReadError
     from data_provider.ifind_fundamental_adapter import IfindFetcher
     from src.config import get_config
-    from src.core.research_run import current_research, ResearchStopped
+    from src.core.research_run import ResearchStopped
 
     config = get_config()
     if not config.enable_ifind_mcp:
         return {"concepts": [], "source": "ifind", "as_of_nature": "latest", "error": "ifind_disabled"}
-    if run := current_research.get():
-        run.check()
+
     try:
         membership = IfindFetcher(
             config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds,
@@ -741,6 +742,7 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
     sector_rankings = compact_context.get("boards", {}).get("data", {})
     # 概念归属与行业板块分开（issue #45）：概念只进 concept_membership，
     # 不再覆盖 belong_boards，也不再访问东财公开概念接口。
+    # issue #51：报告内单飞，阶段 0 已取得的结果由 _concept_membership 复用。
     concept_membership = _concept_membership(stock_code, deadline)
     belong_boards: list[dict[str, Any]] = []
     stock_name = stock_code.upper()

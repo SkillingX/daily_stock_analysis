@@ -33,7 +33,7 @@ from src.agent.deep_research.explore_agents import (  # noqa: F401
 from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import SharedContext, build_shared_context
-from src.deep_research_dims.data_dim import build_data_dim
+from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
@@ -984,6 +984,10 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
             continue
         if dim.status == "ok" or dim.retained_evidence or dim.retained_facts:
             return True
+        # 已验证供应商概念名（issue #51）是已取得事实：足以让部分报告成文留存，
+        # 不抬升任何评分或投资结论；仅有错误码、无概念名不算可用数据。
+        if getattr(getattr(dim, "concept_membership", None), "concepts", None):
+            return True
         if any(getattr(dim, field, None) for field in ("business_model", "main_products", "controller", "top_holders")):
             return True
         if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments", "shareholder_details")):
@@ -1040,7 +1044,13 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         from src.core.research_run import retained_tool_facts
         facts = retained_tool_facts("get_realtime_quote", ctx.quote)
         facts += retained_tool_facts("get_daily_history", {"data": ctx.history})
-        dims["data"] = DIM_MODELS["data"](status="degraded", degraded_reason=run.reason_text, retained_facts=facts)
+        # 中断报告同样保留阶段 0 已取得的概念归属（issue #51）。
+        dims["data"] = DIM_MODELS["data"](
+            status="degraded",
+            degraded_reason=run.reason_text,
+            retained_facts=facts,
+            concept_membership=adopt_concept_membership(ctx),
+        )
     for dim_id in DIM_IDS:
         if dim_id not in dims:
             dims[dim_id] = DIM_MODELS[dim_id](

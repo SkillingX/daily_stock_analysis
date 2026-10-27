@@ -125,6 +125,14 @@
 {% if data.perspective and data.perspective.volume_analysis %}
 - 量比 {{ data.perspective.volume_analysis.volume_ratio or 'N/A' }}（{{ data.perspective.volume_analysis.volume_status or 'N/A' }}）
 {% endif %}
+{% if data.concept_membership %}
+{% set cm = data.concept_membership %}
+{% if cm.concepts %}
+- **最新概念归属**（证券：{{ cm.code }}｜来源：{{ cm.source }}｜口径：查询时点最新，非历史区间）：{{ cm.concepts | join('、') }}
+{% else %}
+- **最新概念归属**（证券：{{ cm.code }}｜来源：{{ cm.source }}）：本次未取得{% if cm.errors %}（{{ cm.errors | join('、') }}）{% endif %}；按纪律不把概念推断为行业、客户或供应链关系
+{% endif %}
+{% endif %}
 
 **根因四要素**（消息面 Agent 产出）：
 {% if intel.root_cause %}

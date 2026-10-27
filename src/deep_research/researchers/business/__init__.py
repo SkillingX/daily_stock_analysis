@@ -12,6 +12,7 @@ from data_provider.ifind_fundamental_adapter import ProductSegments
 
 from src.agent.deep_research.explore_agents import run_business_agent
 from src.deep_research.researchers.base import generic_parse
+from src.report_language import adopt_structured_source_grades
 from src.schemas.deep_research_dims import BusinessDim
 
 DIM_ID = "business"
@@ -59,7 +60,7 @@ def _core_complete(dim: BusinessDim) -> bool:
 
 
 def parse(parsed: dict[str, Any], steps: int) -> tuple[BusinessDim, int]:
-    payload = _strip_noise_keys(parsed or {})
+    payload = adopt_structured_source_grades(_strip_noise_keys(parsed or {}))
     products = payload.pop("product_segments", None)
     dim, used = generic_parse(DIM_ID, payload, steps)
     assert isinstance(dim, BusinessDim)

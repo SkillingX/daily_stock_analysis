@@ -710,6 +710,56 @@ def is_chip_placeholder_value(value: Any) -> bool:
     return any(hint in lowered for hint in _CHIP_PLACEHOLDER_HINTS)
 
 
+_SOURCE_GRADE_KEYS = ("source_grade", "source_level")
+_VALID_SOURCE_GRADES = {
+    "primary": "primary",
+    "news": "news",
+    "industry": "industry",
+    "inferred": "inferred",
+    "unverified": "unverified",
+    "公告级信源": "primary",
+    "新闻": "news",
+    "产业": "industry",
+    "推断": "inferred",
+    "未验证": "unverified",
+    "未核实": "unverified",
+}
+# 已停用的社区评价标签。不在此扩大退休范围，也不根据标题文字判断证据资格。
+_RETIRED_COMMUNITY_GRADES = {"community", "community_cn", "community_global"}
+
+
+def _canonical_source_grade(value: Any) -> Optional[str]:
+    """Map a declared grade token. Retired community grades and unknown tokens are not valid."""
+    if not isinstance(value, str):
+        return None
+    token = value.strip()
+    if not token or token in _RETIRED_COMMUNITY_GRADES or token.lower() in _RETIRED_COMMUNITY_GRADES:
+        return None
+    return _VALID_SOURCE_GRADES.get(token) or _VALID_SOURCE_GRADES.get(token.lower())
+
+
+def adopt_structured_source_grades(value: Any) -> Any:
+    """Adopt declared source_grade/source_level fields only.
+
+    Retired community grades and unknown tokens become unverified. They are not
+    rewritten into primary/news/industry. Citation text is not inspected, and
+    narrative strings are left unchanged.
+    """
+    if isinstance(value, list):
+        return [adopt_structured_source_grades(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    adopted = {key: adopt_structured_source_grades(item) for key, item in value.items()}
+    if not any(key in adopted for key in _SOURCE_GRADE_KEYS):
+        return adopted
+    for key in _SOURCE_GRADE_KEYS:
+        if key not in adopted:
+            continue
+        canonical = _canonical_source_grade(adopted[key])
+        adopted[key] = canonical if canonical is not None else "unverified"
+    return adopted
+
+
 def strip_retired_chip_structure(dashboard: Optional[Dict[str, Any]]) -> None:
     """Drop the retired chip_structure block from a freshly adopted dashboard (issue #46).
 

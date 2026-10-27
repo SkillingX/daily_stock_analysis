@@ -1110,8 +1110,23 @@ class StockAnalysisPipeline:
         if isinstance(enriched_context.get("concept_membership"), dict):
             return
         from time import monotonic
-        from src.agent.tools.data_tools import _concept_membership
         from src.config import get_config
+        from src.core.research_run import current_research
+
+        # 阶段 0 已独立取得的概念归属（issue #51）只在同一证券上复用。
+        run = current_research.get()
+        stage_context = getattr(run, "context", None)
+        stage_membership = getattr(stage_context, "concept_membership", None)
+        stage_code = str(getattr(stage_context, "stock_code", "") or "")
+        if (
+            isinstance(stage_membership, dict)
+            and stage_membership
+            and normalize_stock_code(stage_code) == normalize_stock_code(code)
+            and normalize_stock_code(code)
+        ):
+            enriched_context["concept_membership"] = stage_membership
+            return
+        from src.agent.tools.data_tools import _concept_membership
 
         timeout = getattr(get_config(), "ifind_mcp_timeout_seconds", 30)
         enriched_context["concept_membership"] = _concept_membership(code, monotonic() + float(timeout))

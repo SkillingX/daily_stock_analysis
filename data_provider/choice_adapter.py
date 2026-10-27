@@ -11,6 +11,8 @@ import logging
 import math
 import multiprocessing
 import os
+from contextvars import ContextVar
+from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from threading import Lock
@@ -18,7 +20,8 @@ from time import monotonic
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal, Annotated
+from typing import Any, Callable, Literal, Annotated, NoReturn, TypeGuard, TypeVar
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError, Field, model_validator
 from icontract import ensure
@@ -28,11 +31,159 @@ from data_provider.cross_source_validator import AnchorQuality, AnchorReading, S
 
 logger = logging.getLogger(__name__)
 
+# 非研究入口也能用 call_id 关联：没有诊断上下文时日志仍要写出
+choice_call_id: ContextVar[str] = ContextVar("choice_call_id", default="")
+
+_EVIDENCE_TEXT_LIMIT = 300
+_EVIDENCE_CHAIN_LIMIT = 4
+_PROGRESS_INTERVAL_SECONDS = 1.0
+
+
+def _known_secrets() -> tuple[str, ...]:
+    return tuple(secret for secret in (os.getenv("CHOICE_USERNAME", ""), os.getenv("CHOICE_PASSWORD", "")) if secret.strip())
+
+
+def redact_native_text(text: object, *, known_secrets: tuple[str, ...] = ()) -> str:
+    """脱敏原生错误正文：先替换已知凭据值，再复用诊断脱敏，结果有界。"""
+    sanitized = str(text or "")
+    for secret in known_secrets:
+        if secret:
+            sanitized = sanitized.replace(secret, "[REDACTED]")
+    from src.services.run_diagnostics import sanitize_diagnostic_text
+    return sanitize_diagnostic_text(sanitized, max_length=_EVIDENCE_TEXT_LIMIT) or ""
+
+
+class _Trace:
+    def __init__(self) -> None:
+        self.stage = "not_dispatched"
+        self.dispatched = False
+        self.reason = "ok"
+        self.evidence: dict[str, object] = {}
+        self.observed = ""
+        self.call_id = ""
+        self.method = ""
+        self.indicators = ""
+        self.deadline = 0.0
+        self.started = 0.0
+        self.lock_acquired_at: float | None = None
+        self.dispatched_at: float | None = None
+        self.trace_token: object = None
+        self.id_token: object = None
+        self.finished = False
+
+
+_trace: ContextVar[_Trace | None] = ContextVar("choice_call_trace", default=None)
+_defer_terminal: ContextVar[bool] = ContextVar("choice_defer_terminal", default=False)
+
+
+def _safe_log(level: str, message: str, *args: object) -> None:
+    try:
+        getattr(logger, level)(message, *args)
+    except Exception:
+        return
+
+
+def _remember(stage: str, reason: str | None = None, evidence: dict[str, object] | None = None, *, dispatched: bool | None = None, observed: str | None = None) -> None:
+    trace = _trace.get()
+    if trace is None:
+        return
+    trace.stage = stage
+    if reason is not None:
+        trace.reason = reason
+    if evidence is not None:
+        trace.evidence = evidence
+    if dispatched is not None:
+        trace.dispatched = dispatched
+    if observed is not None:
+        trace.observed = observed
+
+
+_Parsed = TypeVar("_Parsed")
+
+
+def _is_progress(payload: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(payload, dict) and set(payload) == {"stage"} and payload.get("stage") in {"waiting_login", "waiting_query"}
+
+
+def _fail(reason: str, stage: str, evidence: dict[str, object] | None = None, cause: BaseException | None = None) -> NoReturn:
+    _remember(stage, reason, evidence, dispatched=stage not in {"not_dispatched", "waiting_lock", "lock_wait_timeout"})
+    if cause is None:
+        raise SourceReadError("choice", reason)
+    raise SourceReadError("choice", reason) from cause
+
+
+def _scope_labels() -> tuple[str, str]:
+    try:
+        from src.core.research_run import current_research, research_dimension
+        run = current_research.get()
+        run_id = run.run_id if run is not None and run.run_id else "-"
+        dimension = research_dimension.get() or "-"
+    except Exception:
+        return "-", "-"
+    return run_id, dimension
+
+
+def _durations(trace: _Trace, end: float) -> tuple[float, float]:
+    if trace.dispatched_at is not None:
+        return max(0.0, trace.dispatched_at - trace.started), max(0.0, end - trace.dispatched_at)
+    return max(0.0, end - trace.started), 0.0
+
+
+def _finish_call(trace: _Trace) -> None:
+    if trace.finished:
+        return
+    trace.finished = True
+    end = monotonic()
+    wait_s, execute_s = _durations(trace, end)
+    run_id, dimension = _scope_labels()
+    evidence = trace.evidence
+    text = evidence.get("error_text")
+    if text is not None:
+        text = redact_native_text(text, known_secrets=_known_secrets())
+    level = "info" if trace.reason in {"ok", "cancelled"} else "warning"
+    _safe_log(
+        level,
+        "Choice call terminal: call_id=%s run_id=%s method=%s indicators=%s dim=%s stage=%s observed=%s "
+        "remaining_budget_s=%.1f elapsed_s=%.1f wait_s=%.1f execute_s=%.1f dispatched=%s reason=%s "
+        "native_code=%s error_text=%s exception_chain=%s",
+        trace.call_id, run_id, trace.method, trace.indicators, dimension, trace.stage, trace.observed or "-",
+        trace.deadline - end, end - trace.started, wait_s, execute_s, trace.dispatched, trace.reason,
+        evidence.get("native_code"), text, evidence.get("exception_chain"),
+    )
+    if trace.trace_token is not None:
+        _trace.reset(trace.trace_token)  # type: ignore[arg-type]
+        trace.trace_token = None
+    if trace.id_token is not None:
+        choice_call_id.reset(trace.id_token)  # type: ignore[arg-type]
+        trace.id_token = None
+
+
+def _exception_chain(exc: BaseException) -> tuple[str, ...]:
+    """只保留异常类型链，不带消息（消息可能含凭据）。"""
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < _EVIDENCE_CHAIN_LIMIT:
+        seen.add(id(current))
+        chain.append(type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _native_error_evidence(code: int, message: str, *, known_secrets: tuple[str, ...]) -> dict[str, object]:
+    return {"error": _native_error(code, message), "native_code": code,
+            "error_text": redact_native_text(message, known_secrets=known_secrets)}
+
 
 class NativeReply(BaseModel):
     model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True, allow_inf_nan=False)
     error: str | None = None
     native_code: int | None = None
+    # 有返回时保留脱敏后的原生错误正文与异常类型链；无返回时两者均为空
+    error_text: str | None = None
+    exception_chain: tuple[str, ...] = ()
+    # 进度回执只用 waiting_*；终态回执携带产生它的 login / query，父进程不得按原因猜测
+    stage: Literal["waiting_login", "waiting_query", "login", "query"] | None = None
     codes: list[str] = Field(default_factory=list)
     indicators: list[str] = Field(default_factory=list)
     dates: list[str] = Field(default_factory=list)
@@ -123,6 +274,22 @@ def _serve_native(connection: Connection) -> None:
             if request is None:
                 break
             method, args, options, seconds = request
+            # 进度回执沿用原有 pipe，共享父进程给的同一绝对截止时间
+            deadline = monotonic() + max(0.0, seconds)
+            known_secrets = tuple(secret for secret in (os.getenv("CHOICE_USERNAME", ""), os.getenv("CHOICE_PASSWORD", "")) if secret.strip())
+            progress = [0.0, ""]
+
+            def report_stage(stage: str) -> None:
+                # 阶段变化立即回执；同阶段重复回执按间隔节流
+                if stage == progress[1] and monotonic() < progress[0]:
+                    return
+                try:
+                    connection.send({"stage": stage})
+                except (BrokenPipeError, OSError):
+                    pass
+                progress[0] = monotonic() + _PROGRESS_INTERVAL_SECONDS
+                progress[1] = stage
+
             try:
                 if not logged_in:
                     username = os.getenv("CHOICE_USERNAME", "")
@@ -131,32 +298,41 @@ def _serve_native(connection: Connection) -> None:
                         not username.strip() or not password.strip()
                         or any(char in username + password for char in ",\r\n\x00")
                     ):
-                        connection.send({"error": "invalid_configuration"})
+                        connection.send({"error": "invalid_configuration", "stage": "login"})
                         continue
                     force_login = os.getenv("CHOICE_FORCE_LOGIN", "false").strip().lower() or "false"
                     if force_login not in {"true", "false", "1", "0"}:
-                        connection.send({"error": "invalid_configuration"})
+                        connection.send({"error": "invalid_configuration", "stage": "login"})
                         continue
                     options_login = f"ForceLogin={int(force_login in {'true', '1'})},RecordLoginInfo=0,HTTPTimeout={max(1, int(seconds))}"
                     if username and password:
                         options_login += f",UserName={username},PassWord={password}"
                     if sdk is None:
                         sdk = importlib.import_module("EmQuantAPI").c
+                    report_stage("waiting_login")
                     login = sdk.start(options_login, logcallback=lambda _: 1)
                     if login.ErrorCode:
-                        connection.send({"error": _native_error(login.ErrorCode, login.ErrorMsg), "native_code": login.ErrorCode})
+                        connection.send({**_native_error_evidence(login.ErrorCode, login.ErrorMsg, known_secrets=known_secrets), "stage": "login"})
                         continue
                     logged_in = True
+                if monotonic() >= deadline:
+                    # 登录已耗尽共享截止时间，查询没有新预算
+                    connection.send({"error": "login_timeout", "stage": "login"})
+                    continue
+                report_stage("waiting_query")
                 result = getattr(sdk, method)(*args, options)
                 if result.ErrorCode:
-                    connection.send({"error": _native_error(result.ErrorCode, result.ErrorMsg), "native_code": result.ErrorCode})
+                    connection.send({**_native_error_evidence(result.ErrorCode, result.ErrorMsg, known_secrets=known_secrets), "stage": "query"})
                 else:
                     connection.send({"codes": result.Codes, "indicators": result.Indicators,
-                                     "dates": [str(d) for d in result.Dates], "data": result.Data})
-            except (ImportError, OSError):
-                connection.send({"error": "sdk_unavailable"})
-            except Exception:
-                connection.send({"error": "invalid_response"})
+                                     "dates": [str(d) for d in result.Dates], "data": result.Data, "stage": "query"})
+            except (ImportError, OSError) as exc:
+                connection.send({"error": "sdk_unavailable", "stage": "query" if progress[1] == "waiting_query" else "login",
+                                 "exception_chain": _exception_chain(exc)})
+            except Exception as exc:
+                connection.send({"error": "invalid_response", "stage": "query" if progress[1] == "waiting_query" else "login",
+                                 "error_text": redact_native_text(exc, known_secrets=known_secrets),
+                                 "exception_chain": _exception_chain(exc)})
     except (EOFError, BrokenPipeError):
         pass
     finally:
@@ -187,8 +363,13 @@ class ChoiceAdapter:
                 connection.send(None)
             except (BrokenPipeError, OSError):
                 pass
-            connection.close()
-        if process is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if process is None:
+            return
+        try:
             process.join(timeout=0.2)
             if process.is_alive():
                 process.terminate()
@@ -197,70 +378,156 @@ class ChoiceAdapter:
                 process.kill()
                 process.join(timeout=0.1)
             process.close()
+        except (OSError, ValueError):
+            if process.is_alive():
+                try:
+                    process.kill()
+                    process.join(timeout=0.1)
+                except (OSError, ValueError):
+                    return
 
     @classmethod
     def _native_request(cls, method: Literal["css", "csd", "tradedates"], args: tuple[str, ...], options: str, deadline: float) -> object:
         from src.core.research_run import current_research, ResearchStopped
         run = current_research.get()
-        while True:
-            if run is not None:
-                run.check()
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise SourceReadError(cls.name, "timeout")
-            if cls._lock.acquire(timeout=min(0.05, remaining) if run is not None else remaining):
-                break
+        started = monotonic()
+        stage = "waiting_lock"
+        sent = False
+        _remember(stage)
         try:
-            if run is not None:
-                run.check()
-            if deadline <= monotonic():
-                raise SourceReadError(cls.name, "timeout")
-            if cls._process is None or not cls._process.is_alive():
+            while True:
+                if run is not None:
+                    run.check()
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    _fail("lock_wait_timeout", "lock_wait_timeout")
+                if cls._lock.acquire(timeout=min(0.05, remaining) if run is not None else remaining):
+                    held = _trace.get()
+                    if held is not None and held.lock_acquired_at is None:
+                        held.lock_acquired_at = monotonic()
+                    break
+            try:
+                if run is not None:
+                    run.check()
+                if deadline <= monotonic():
+                    _fail("lock_wait_timeout", "lock_wait_timeout")
+                if cls._process is None or not cls._process.is_alive():
+                    cls.close()
+                    context = multiprocessing.get_context("spawn")
+                    parent, child = context.Pipe()
+                    cls._process = context.Process(target=_serve_native, args=(child,), daemon=True, name="choice-native")
+                    cls._connection = parent
+                    cls._process.start()
+                    child.close()
+                assert cls._connection is not None
+                if run is not None:
+                    run.check()
+                if deadline <= monotonic():
+                    _fail("lock_wait_timeout", "lock_wait_timeout")
+                stage = "dispatched"
+                _remember(stage, dispatched=True)
+                cls._connection.send((method, args, options, max(0.0, deadline - monotonic())))
+                sent = True
+                held = _trace.get()
+                if held is not None:
+                    held.dispatched_at = monotonic()
+                while True:
+                    if run is not None:
+                        run.check()
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        break
+                    if cls._connection.poll(min(0.1, remaining)):
+                        payload: object = cls._connection.recv()
+                        if _is_progress(payload):
+                            stage = str(payload["stage"])
+                            _remember(stage, observed=stage)
+                            _safe_log(
+                                "info", "Choice call progress: call_id=%s stage=%s elapsed_s=%.1f",
+                                choice_call_id.get() or "-", stage, monotonic() - started,
+                            )
+                            continue
+                        if isinstance(payload, dict) and payload.get("error") == "authentication_failed":
+                            cls.close()
+                        return payload
+                while cls._connection.poll(0):
+                    pending: object = cls._connection.recv()
+                    if _is_progress(pending):
+                        stage = str(pending["stage"])
+                        _remember(stage, observed=stage)
+                    elif isinstance(pending, dict):
+                        return pending
+                if stage == "waiting_login":
+                    reason, terminal = "login_timeout", "waiting_login"
+                elif stage == "waiting_query":
+                    reason, terminal = "query_timeout", "waiting_query"
+                else:
+                    reason, terminal = "timeout", "no_response"
                 cls.close()
-                context = multiprocessing.get_context("spawn")
-                parent, child = context.Pipe()
-                cls._process = context.Process(target=_serve_native, args=(child,), daemon=True, name="choice-native")
-                cls._connection = parent
-                cls._process.start()
-                child.close()
-            assert cls._connection is not None
-            if run is not None:
-                run.check()
-            if deadline <= monotonic():
-                raise SourceReadError(cls.name, "timeout")
-            cls._connection.send((method, args, options, max(0.0, deadline - monotonic())))
-            if not cls._connection.poll(max(0.0, deadline - monotonic())):
+                _fail(reason, terminal, {"error_text": "未收到响应"} if terminal == "no_response" else None)
+            except ResearchStopped:
+                if sent:
+                    cls.close()
+                    _remember("cancelled", "cancelled", observed=stage if stage.startswith("waiting_") else "", dispatched=True)
+                raise
+            except SourceReadError:
+                raise
+            except (EOFError, BrokenPipeError, OSError) as exc:
                 cls.close()
-                raise SourceReadError(cls.name, "timeout")
-            payload: object = cls._connection.recv()
-            if isinstance(payload, dict) and payload.get("error") == "authentication_failed":
-                cls.close()
-            return payload
+                _fail("source_error", "no_response", {"exception_chain": _exception_chain(exc), "error_text": "未收到响应"}, exc)
+            finally:
+                cls._lock.release()
         except ResearchStopped:
             raise
-        except (EOFError, BrokenPipeError, OSError) as exc:
-            cls.close()
-            raise SourceReadError(cls.name, "source_error") from exc
-        finally:
-            cls._lock.release()
 
     def query(self, method: Literal["css", "csd", "tradedates"], args: tuple[str, ...], options: str, *, deadline: float) -> NativeReply:
-        from src.core.research_run import current_research
-        if run := current_research.get():
-            run.check()
-        remaining = int(deadline - monotonic())
-        if remaining < 1:
-            raise SourceReadError(self.name, "timeout")
-        raw = self._native_request(method, args, f"{options},RECVtimeout={remaining}".strip(","), deadline)
+        from src.core.research_run import current_research, ResearchStopped
+        trace = _Trace()
+        trace.call_id = uuid4().hex[:12]
+        trace.method = method
+        trace.indicators = args[1] if len(args) > 1 else ""
+        trace.deadline = deadline
+        trace.started = monotonic()
+        trace.trace_token = _trace.set(trace)
+        trace.id_token = choice_call_id.set(trace.call_id)
+        run_id, dimension = _scope_labels()
         try:
-            reply = NativeReply.model_validate(raw)
-        except ValidationError as exc:
-            raise SourceReadError(self.name, "invalid_response") from exc
-        if reply.error:
-            error = SourceReadError(self.name, reply.error)
-            logger.warning("Choice request failed: method=%s reason=%s native_code=%s", method, error.reason_code, reply.native_code)
-            raise error
-        return reply
+            _safe_log(
+                "info",
+                "Choice call start: call_id=%s run_id=%s method=%s indicators=%s dim=%s initial_budget_s=%.1f wait_s=0.0 execute_s=0.0",
+                trace.call_id, run_id, method, trace.indicators, dimension, deadline - trace.started,
+            )
+            if run := current_research.get():
+                run.check()
+            remaining = int(deadline - monotonic())
+            if remaining < 1:
+                _remember("not_dispatched", "budget_exhausted", dispatched=False)
+                raise SourceReadError(self.name, "budget_exhausted")
+            raw = self._native_request(method, args, f"{options},RECVtimeout={remaining}".strip(","), deadline)
+            try:
+                reply = NativeReply.model_validate(raw)
+            except ValidationError as exc:
+                _remember("parse", "invalid_response", {"exception_chain": _exception_chain(exc)}, dispatched=True)
+                raise SourceReadError(self.name, "invalid_response") from exc
+            if reply.error:
+                stage = reply.stage if reply.stage in {"login", "query"} else "unspecified"
+                _remember(stage, reply.error, {
+                    "native_code": reply.native_code,
+                    "error_text": reply.error_text,
+                    "exception_chain": reply.exception_chain,
+                }, dispatched=True)
+                raise SourceReadError(self.name, reply.error)
+            if not _defer_terminal.get():
+                _remember("completed", "ok", dispatched=True)
+            return reply
+        except ResearchStopped:
+            if trace.reason != "cancelled":
+                observed = trace.observed or (trace.stage if trace.stage.startswith("waiting_") else "")
+                _remember("cancelled", "cancelled", observed=observed, dispatched=trace.dispatched)
+            raise
+        finally:
+            if not _defer_terminal.get():
+                _finish_call(trace)
 
     @staticmethod
     def stock_code(code: str) -> str:
@@ -270,32 +537,34 @@ class ChoiceAdapter:
         return f"{code}.{'BJ' if is_bse_code(code) else 'SH' if code.startswith(('6', '9')) else 'SZ'}"
 
     def trading_dates(self, start: date, end: date, *, deadline: float) -> list[str]:
-        reply = self.query("tradedates", (start.isoformat(), end.isoformat()), "Market=CNSESH", deadline=deadline)
-        if not isinstance(reply.data, list):
-            raise SourceReadError(self.name, "invalid_response")
-        dates = sorted({self.report_date(d) for d in reply.data if d})
-        if any(d < start.isoformat() or d > end.isoformat() for d in dates):
-            raise SourceReadError(self.name, "invalid_response")
-        return dates
+        def accept(reply: NativeReply) -> list[str]:
+            if not isinstance(reply.data, list):
+                raise SourceReadError(self.name, "invalid_response")
+            dates = sorted({self.report_date(d) for d in reply.data if d})
+            if any(d < start.isoformat() or d > end.isoformat() for d in dates):
+                raise SourceReadError(self.name, "invalid_response")
+            return dates
+        return self._parsed("tradedates", (start.isoformat(), end.isoformat()), "Market=CNSESH", deadline, accept)
 
     def capital_series(self, code: str, start: date, end: date, *, deadline: float) -> list[tuple[str, float | None]]:
-        reply = self.query("csd", (self.stock_code(code), "NETINFLOW", start.isoformat(), end.isoformat()),
-                           "Period=1,AdjustFlag=1,CurType=1,Order=1,Market=CNSESH", deadline=deadline)
-        if reply.indicators != ["NETINFLOW"] or not isinstance(reply.data, dict):
-            raise SourceReadError(self.name, "invalid_response")
-        rows = reply.data.get(self.stock_code(code))
-        if rows is None or len(rows) != 1 or not isinstance(rows[0], list) or len(rows[0]) != len(reply.dates):
-            raise SourceReadError(self.name, "invalid_response")
-        values: dict[str, float | None] = {}
-        for raw_date, raw_value in zip(reply.dates, rows[0]):
-            day = self.report_date(raw_date)
-            if day < start.isoformat() or day > end.isoformat():
+        def accept(reply: NativeReply) -> list[tuple[str, float | None]]:
+            if reply.indicators != ["NETINFLOW"] or not isinstance(reply.data, dict):
                 raise SourceReadError(self.name, "invalid_response")
-            value = self.number(raw_value)
-            if day in values and values[day] != value:
+            rows = reply.data.get(self.stock_code(code))
+            if rows is None or len(rows) != 1 or not isinstance(rows[0], list) or len(rows[0]) != len(reply.dates):
                 raise SourceReadError(self.name, "invalid_response")
-            values[day] = value
-        return sorted(values.items(), reverse=True)
+            values: dict[str, float | None] = {}
+            for raw_date, raw_value in zip(reply.dates, rows[0]):
+                day = self.report_date(raw_date)
+                if day < start.isoformat() or day > end.isoformat():
+                    raise SourceReadError(self.name, "invalid_response")
+                value = self.number(raw_value)
+                if day in values and values[day] != value:
+                    raise SourceReadError(self.name, "invalid_response")
+                values[day] = value
+            return sorted(values.items(), reverse=True)
+        return self._parsed("csd", (self.stock_code(code), "NETINFLOW", start.isoformat(), end.isoformat()),
+                            "Period=1,AdjustFlag=1,CurType=1,Order=1,Market=CNSESH", deadline, accept)
 
     @staticmethod
     def report_date(value: object) -> str:
@@ -306,13 +575,37 @@ class ChoiceAdapter:
             raise SourceReadError("choice", "invalid_response") from exc
 
     def css(self, code: str, indicators: str, options: str, *, deadline: float) -> dict[str, object]:
-        reply = self.query("css", (self.stock_code(code), indicators), options, deadline=deadline)
-        if not isinstance(reply.data, dict):
-            raise SourceReadError(self.name, "invalid_response")
-        values = reply.data.get(self.stock_code(code))
-        if values is None or len(values) != len(reply.indicators) or reply.indicators != indicators.split(","):
-            raise SourceReadError(self.name, "invalid_response")
-        return dict(zip(reply.indicators, values))
+        requested = self.stock_code(code)
+        def accept(reply: NativeReply) -> dict[str, object]:
+            if not isinstance(reply.data, dict):
+                raise SourceReadError(self.name, "invalid_response")
+            values = reply.data.get(requested)
+            if values is None or len(values) != len(reply.indicators) or reply.indicators != indicators.split(","):
+                raise SourceReadError(self.name, "invalid_response")
+            return dict(zip(reply.indicators, values))
+        return self._parsed("css", (requested, indicators), options, deadline, accept)
+
+    def _parsed(self, method: Literal["css", "csd", "tradedates"], args: tuple[str, ...], options: str, deadline: float, accept: Callable[[NativeReply], _Parsed]) -> _Parsed:
+        token = _defer_terminal.set(True)
+        try:
+            reply = self.query(method, args, options, deadline=deadline)
+            try:
+                result = accept(reply)
+            except BaseException as exc:
+                current = _trace.get()
+                if current is not None and current.reason == "ok":
+                    reason = exc.reason_code if isinstance(exc, SourceReadError) else "invalid_response"
+                    _remember("parse", reason, {"exception_chain": _exception_chain(exc)})
+                raise
+            current = _trace.get()
+            if current is not None and current.reason == "ok":
+                _remember("completed", "ok", dispatched=True)
+            return result
+        finally:
+            current = _trace.get()
+            if current is not None:
+                _finish_call(current)
+            _defer_terminal.reset(token)
 
     @staticmethod
     def number(value: object) -> float | None:
@@ -328,7 +621,15 @@ class ChoiceAdapter:
             raise SourceReadError("choice", "invalid_response")
         return number
 
-    def snapshot(self, code: str, *, deadline: float, omit_indicators: tuple[str, ...] = ()) -> dict[str, Any]:
+    def _record_failure(self, out: dict[str, Any], scope: str, exc: SourceReadError) -> None:
+        """预算耗尽未分派只记阶段原因，不伪装成供应商连接故障。"""
+        code = exc.reason_code
+        if code in {"budget_exhausted", "lock_wait_timeout", "login_timeout", "query_timeout"}:
+            out["errors"].append(f"choice:{scope}:{code}")
+        else:
+            out["errors"].append(str(exc))
+
+    def snapshot(self, code: str, *, deadline: float, omit_indicators: tuple[str, ...] = (), include_optional: bool = True) -> dict[str, Any]:
         today = date.today()
         out: dict[str, Any] = {"growth": {}, "valuation": {}, "field_meta": {}, "errors": [], "contract": self.contract_version}
         omitted = set(omit_indicators)
@@ -344,7 +645,7 @@ class ChoiceAdapter:
                 else:
                     out["errors"].append("choice:period_unknown")
             except SourceReadError as exc:
-                out["errors"].append(str(exc))
+                self._record_failure(out, "header", exc)
                 field_errors["growth"] = exc.reason_code
             if report is not None:
                 growth_indicators = [
@@ -371,7 +672,7 @@ class ChoiceAdapter:
                                         None if disclosure and disclosure <= today.isoformat() and report <= today.isoformat() else "disclosure_unknown")
                         out["growth"].update(report_date=report, disclosure_date=disclosure)
                     except SourceReadError as exc:
-                        out["errors"].append(str(exc))
+                        self._record_failure(out, "growth", exc)
                         field_errors["growth"] = exc.reason_code
                 try:
                     balance = self.css(code, "SUMASSETNEW,SUMLIABNEW,ACTUALISSUINGDATE", f"ReportDate={report},Type=1,CurType=2,DataAdjustType=2", deadline=deadline)
@@ -393,28 +694,13 @@ class ChoiceAdapter:
                     self._adopt(out, "valuation", field, fields.get(indicator), "currency_base" if field == "total_mv" else "multiple", caliber, None, trade_day, "unadjusted", indicator)
                 out["valuation"]["trade_date"] = trade_day
             except SourceReadError as exc:
-                out["errors"].append(str(exc))
+                self._record_failure(out, "valuation", exc)
                 field_errors["valuation"] = exc.reason_code
-            out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": []}
-            for name, indicators, options in (
-                ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
-                ("company", ",".join(name for name in ("MAINBUSINESS", "MAINPRODUCT", "COMPROFILE", "AHOLDER", "AHOLDERTYPE") if name not in omitted), f"EndDate={today}"),
-                ("targets", "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180"),
-            ):
-                if not indicators:
-                    continue
-                try:
-                    out["research"][name] = self.css(code, indicators, options, deadline=deadline)
-                except SourceReadError as exc:
-                    out["research"]["errors"].append(f"choice:{name}:{exc.reason_code}")
-            out["research"]["target_window_days"] = 180
-            if report and disclosure and "HOLDNAMER" not in omitted:
-                try:
-                    holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
-                    out["research"]["holders"] = {**holders, "period": report, "disclosed_at": disclosure,
-                                                  "note": "HOLDPCTR为前十名合计持股比例（%），不可分配为各股东比例"}
-                except SourceReadError as exc:
-                    out["research"]["errors"].append(f"choice:holders:{exc.reason_code}")
+            out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": [], "target_window_days": 180}
+            try:
+                out["research"]["targets"] = self.css(code, "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180", deadline=deadline)
+            except SourceReadError as exc:
+                out["research"]["errors"].append(f"choice:targets:{exc.reason_code}")
         except ResearchStopped:
             # A stopped run may still render completed, validated source facts.
             pass
@@ -427,7 +713,39 @@ class ChoiceAdapter:
                     })
         out.update(as_of=trade_day, report_date=report, disclosure_date=disclosure)
         out.setdefault("research", {"source": "choice", "as_of": today.isoformat(), "errors": []})
+        if include_optional:
+            self.append_optional_research(out, code, deadline=deadline, omit_indicators=omit_indicators)
         return out
+
+    def append_optional_research(self, out: dict[str, Any], code: str, *, deadline: float, omit_indicators: tuple[str, ...] = ()) -> None:
+        """行业/公司/股东在必要目标价之后补；调用方可先用 iFinD 结果决定 omit。"""
+        from src.core.research_run import ResearchStopped
+        today = date.today()
+        research = out.setdefault("research", {"source": "choice", "as_of": today.isoformat(), "errors": []})
+        research.setdefault("errors", [])
+        omitted = set(omit_indicators)
+        report = out.get("report_date")
+        disclosure = out.get("disclosure_date")
+        try:
+            for name, indicators, options in (
+                ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
+                ("company", ",".join(name for name in ("MAINBUSINESS", "MAINPRODUCT", "COMPROFILE", "AHOLDER", "AHOLDERTYPE") if name not in omitted), f"EndDate={today}"),
+            ):
+                if not indicators:
+                    continue
+                try:
+                    research[name] = self.css(code, indicators, options, deadline=deadline)
+                except SourceReadError as exc:
+                    research["errors"].append(f"choice:{name}:{exc.reason_code}")
+            if report and disclosure and "HOLDNAMER" not in omitted:
+                try:
+                    holders = self.css(code, "HOLDNAMER,HOLDPCTR", f"ReportDate={report},Rank=11", deadline=deadline)
+                    research["holders"] = {**holders, "period": report, "disclosed_at": disclosure,
+                                           "note": "HOLDPCTR为前十名合计持股比例（%），不可分配为各股东比例"}
+                except SourceReadError as exc:
+                    research["errors"].append(f"choice:holders:{exc.reason_code}")
+        except ResearchStopped:
+            pass
 
     def annual_reports(self, code: str, limit: int = 4, *, deadline: float) -> dict[str, Any]:
         from src.core.research_run import ResearchStopped
@@ -464,7 +782,7 @@ class ChoiceAdapter:
                 break
             except SourceReadError as error:
                 out["errors"].append(f"choice:{report_date}:{error.reason_code}")
-                if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "timeout"}:
+                if error.reason_code in {"sdk_unavailable", "authentication_failed", "quota_exhausted", "rate_limited", "timeout", "login_timeout", "query_timeout"}:
                     break
         from src.core.research_run import current_research
         run = current_research.get()
