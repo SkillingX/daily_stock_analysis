@@ -211,15 +211,43 @@ class TestStaleLockRetry:
             acquire_task_lock,
             release_task_lock,
             _set_task_running,
+            _task_running_start,
         )
 
-        # Set the in-process guard to "running" with a very old start time
+        # _set_task_running records "now", so the guard is not actually old;
+        # backdate the start to make the claimed expired precondition real.
+        # _set_task_running 记录的是当前时刻，显式回拨才真正建立"旧开始时间"。
         _set_task_running("inproc_timeout_test", True)
+        _task_running_start["inproc_timeout_test"] = time.time() - 3600.0
 
         # acquire_task_lock with 0-second timeout should detect and recover
         token = acquire_task_lock(mock_config, "inproc_timeout_test", timeout_seconds=0)
         assert token is not None, "should recover from timed-out in-process guard"
         release_task_lock(token)
+
+    def test_inprocess_lock_same_tick_start_still_blocks(self, mock_config, monkeypatch):
+        """A same-tick start (elapsed == 0) must not count as expired at
+        timeout_seconds=0: recovery requires elapsed > timeout. 本控制用模块
+        级受控常量时钟固定 elapsed==0 边界，相邻真实时钟调用会竞速。"""
+        import src.core.scheduled_task_lock as lock_module
+        from src.core.scheduled_task_lock import (
+            acquire_task_lock,
+            _set_task_running,
+        )
+
+        class _FrozenClock:
+            @staticmethod
+            def time() -> float:
+                return 1000.0
+
+        monkeypatch.setattr(lock_module, "time", _FrozenClock)
+        _set_task_running("inproc_zero_timeout_test", True)  # start = 1000.0
+        token = acquire_task_lock(
+            mock_config, "inproc_zero_timeout_test", timeout_seconds=0
+        )
+        assert token is None, "a same-tick start (elapsed == 0) must not count as expired"
+        # acquire_task_lock returned None, so the guard stays running.
+        _set_task_running("inproc_zero_timeout_test", False)
 
 
 class TestDifferentTaskNames:

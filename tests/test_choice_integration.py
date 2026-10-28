@@ -144,18 +144,20 @@ def test_refresh_replaces_snapshot_value_and_metadata_together(choice_transport,
 
 
 def test_public_details_are_retained_without_overwriting_choice_financials(choice_transport, monkeypatch):
-    import akshare
     import pandas as pd
     from data_provider.fundamental_adapter import AkshareFundamentalAdapter
-    monkeypatch.setattr(akshare, "stock_institute_hold", lambda: pd.DataFrame([{"代码": "300260", "持股变化": 12.5}]))
+
     def transport(self, candidates):
         if candidates[0][0] == "stock_yjyg_em":
-            return pd.DataFrame([{"代码": "300260", "业绩变动": "公开业绩预告"}]), "stock_yjyg_em", []
+            # 真实端点形状：预告记录带自身预告期（issue #60 适用记录选择）。
+            return pd.DataFrame([{"代码": "300260", "预告期": "2025-12-31", "业绩变动": "公开业绩预告"}]), "stock_yjyg_em", []
         return None, "fixture_public", []
     monkeypatch.setattr(AkshareFundamentalAdapter, "_call_df_candidates", transport)
     context = DataFetcherManager().get_fundamental_context("300260")
     assert context["growth"]["data"]["roe"] == 0.0
-    assert context["institution"]["data"]["institution_holding_change"] == 12.5
+    # 公共机构/股东接口无统计对象、财期与单位证据，不再产生持仓值（issue #60）。
+    assert context["institution"]["data"].get("institution_holding_change") is None
+    assert context["institution"]["data"].get("top10_holder_change") is None
     assert context["earnings"]["data"]["forecast_summary"] == "公开业绩预告"
     assert context["boards"]["data"]
 
