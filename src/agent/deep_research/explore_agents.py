@@ -543,17 +543,53 @@ def run_technical_agent(
     return _run_explore("technical", set(), task, llm_adapter, progress_callback, max_steps=1)
 
 
+def _stage_zero_capital_flow(stock_code: str, run: Any) -> Optional[Dict[str, Any]]:
+    """同报告阶段 0 已取得的合格资金块，无合格块时返回 None（issue #58）。
+
+    股票身份、交易时点、窗口覆盖、来源、单位与字段资格记录随块原样到达；
+    部分窗口按既有投影如实保留有效性，只有缺块或金额/量纲不合格才回退
+    既有有界补查。主块零重取、不跨报告、不放宽资格；既有 opt-in 交叉验证
+    对复用块同样生效（验证关闭时为空操作、零新增出站，开启时核验二源按
+    既有语义出站——与有界取数路径完全同语义）。
+    """
+    from src.agent.tools.data_tools import _apply_capital_cross_validation, _capital_flow_tool_result
+
+    ctx = getattr(run, "context", None)
+    if ctx is None or getattr(ctx, "stock_code", None) != stock_code:
+        return None
+    block = (getattr(ctx, "fundamental", None) or {}).get("capital_flow")
+    if not isinstance(block, dict) or not block.get("data"):
+        return None
+    flow = _capital_flow_tool_result(stock_code, block)
+    if flow.get("main_net_inflow") is None or not _flow_unit_known(flow):
+        return None
+    from src.config import get_config
+
+    deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+    return _apply_capital_cross_validation(stock_code, flow, block, deadline)
+
+
 def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
-    """资金流固定输入：既有有界入口 + 同报告去重（issue #56，#51 single_fetch 模式）。"""
+    """资金流固定输入：同一资本需求键下阶段 0 合格块复用或既有有界入口
+    （issue #58/#56，#51 single_fetch 模式）。
+
+    阶段 0 投影与可选独立源验证在既有 single_fetch 键内完成，与有界路径
+    同 supplier/contract/stock/refresh 身份：主块零重取、失败同报告共享，
+    重复/并发消费者共享同一次出站并各取深拷贝；无 run 时走既有有界入口。
+    """
     from src.agent.tools.data_tools import _handle_get_capital_flow
 
-    if run := current_research.get():
+    run = current_research.get()
+    if run is not None:
         run.check()
 
     def _fetch() -> Dict[str, Any]:
+        if run is not None:
+            reused = _stage_zero_capital_flow(stock_code, run)
+            if reused is not None:
+                return reused
         return _handle_get_capital_flow(stock_code)
 
-    run = current_research.get()
     if run is None:
         return _fetch()
     from src.config import get_config

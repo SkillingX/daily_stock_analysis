@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 深研资金研究员的阶段 0 复用投影（含 opt-in 独立源验证）收回既有资本需求 single_fetch 键内（与有界取数同 supplier/contract/stock/refresh 身份）：验证源失败不进缓存时，同报告重复/并发消费者不再重复出站验证，主块零重取、失败与资格证据保留、消费者各取深拷贝；补真实边界重复/并发回归与调用自身预算（`call_budget`）耐久回归，深研文档超时阶段措辞校正为五个 `timeout_phase` 取值+准入单独状态。
+- [修复] 深研主动取消贯通终态与清理：共享 MCP 边界与 iFinD 同步包装按 ResearchRun 自身状态把取消形态异常（裸 CancelledError 或含其的异常组）翻译为 ResearchStopped，真实 SDK 超时不再被误标为用户取消；日线包装不再把 ResearchStopped 包装为 DataFetchError（取消不污染来源失败计数、熔断与 fallback）；阶段 0 收尾读取资料 future 遵守同一契约；API 生命周期保证已接收任务恰好交付一个终态并结束 SSE，无用户停止的意外取消保留真实失败语义，`KeyboardInterrupt`/`SystemExit` 及含其成员的异常组继续传播；有效部分报告与已知/未知用量保留，同股票门禁在真实清理后释放。
+- [修复] 部署依赖固定为已验证组合 `mcp==2.3.0`（配合既有 `litellm==1.106.4`）：普通工具声明即使不含 MCP 工具也进入 LiteLLM 懒加载 MCP 导入路径，旧 MCP 1.x 在请求时因 `CacheableResult` 导入失败而 `pip check`/健康检查不报；新增 `scripts/check_tool_deps.py` 预检并接入 `scripts/deploy.sh`（安装后、停止旧服务前），失败保留旧服务运行并中止切换；不建设旧 SDK 兼容路径。
+- [修复] 阶段 0 已取得的合格资金块保留进本次运行的共享上下文（金额、交易时点、窗口覆盖、来源、单位与字段资格原样），资金研究员经同一投影函数直接复用、零新增 NETINFLOW 出站；既有 opt-in 交叉验证对复用块与取数块同语义（关闭时空操作零出站，开启时主块零重取、核验二源照常，冲突保持不合格）；资金块不写入 24h 财务快照缓存，命中缓存的新报告不继承前次资金、按自身有界补查取得；部分有效资料保留有效性并如实携带缺口与拒绝元数据，身份/时点不匹配不构成复用依据。
+- [改进] 模型尝试账本新增 `timeout_phase` 归因，区分准入等待、首响应（响应头+首 chunk 共用窗口）、chunk 空闲、响应总上限（配置的响应上限为实际限制时钟）、调用自身预算（小于响应上限并先到期，记 `call_budget`——调高响应上限无法修复该类失败）与报告总预算六类耗尽原因并进入报告 sidecar，排队/取消不互相冒充；新增深研取消/资金复用/超时归因/部署预检回归测试（真实入口、无网络）。
+- [文档] 深研文档新增取消终态、资金复用与超时阶段归因说明及参数候选实验边界（阶段预算 25→40、取数预算 10→20、首响应 10→30 的本地确定性对照均为候选值而非生产推荐值）；`.env.example` 同步候选实验注释。
 - [新功能] 深研公共 Agent 模型调用改为流式接收上游响应并完整聚合后进入原有解析、保存与页面展示，覆盖 Router、直连与既有备用路径，报告接口与载荷契约不变；单次响应上限从真正出站起算整段流墙钟（排队仍消耗报告预算），取消中断流读取并释放名额；供应商用量未返回保持未知，无 finish 证据的流不当成功，不新增流式失败转非流式的静默重试。依赖固定为 `litellm==1.106.4`（本票验收时的当前稳定版；部署需更新依赖/镜像）。
 - [修复] 共享同步流式调用（limited_completion）的供应商用量现在递归保留嵌套明细（prompt_tokens_details 缓存命中、completion_tokens_details 推理），与异步 Agent 路径同口径；嵌套 Pydantic 对象不再因被当作不透明对象而丢失，缺失/显式全零/部分字段的未知纪律不变。
 - [测试] 流生命周期测试的 choice 级用量用例改为真实渲染 choices[0].usage（Kimi 把用量尾包放在 choice 上）：choice-only 用例与顶层优先（两值不同）用例分开断言，并新增共享同步流嵌套用量明细回归。
