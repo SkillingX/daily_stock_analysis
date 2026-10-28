@@ -1013,7 +1013,12 @@ def _append_board_lines(info: Dict[str, Any], parts: List[str]) -> None:
     if board_names:
         parts.append("所属板块=" + ",".join([_safe_format_value(n) for n in board_names]))
     membership = info.get("concept_membership") or {}
-    concepts = [item.get("name") for item in membership.get("concepts") or [] if isinstance(item, dict) and item.get("name")]
+    concepts: List[str] = []
+    for item in membership.get("concepts") or []:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                concepts.append(name)
     if concepts:
         parts.append(
             "最新概念归属=" + ",".join(concepts)

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 补齐组合查询的 ORM 字段与可空聚合结果、Agent 正常/预算耗尽分支的工具结果类型契约；概念归属仅拼接有效字符串，避免异常供应商字段触发格式化错误。保持数据库列规格、工具消息顺序和现有预算规则不变。
 - [测试] 修复两个既有门禁测试的确定性缺陷（非运行时行为变更）：锁测试真实建立过期与 same-tick 边界前置（受控常量时钟）；流式超时相位测试与共享 loopback 夹具把 endless 自停锚点移到真实响应开始（绝对 deadline 语义保留），新增真实持槽准入等待 >5s 仍归因 `response_total` 且连接关闭的回归；产品超时预算与锁语义不变。
 - [修复] 公共基本面资料不再把股东户数增减冒充机构/十大股东持仓变化：移除 `stock_zh_a_gdhs_detail_em` 户数映射与 `stock_institute_hold`（季度参数默认隐式 20051、泛化"变化"列、无行级期间证据）映射，公共 institution 块保留真实缺口，合格机构持仓仍由 Choice/iFinD 既有资格链提供；辅助表适用记录改为按行级证券代码与指标自身业务期间选择（正序/倒序/打乱行序结果一致），无代码列、无期间证据、日期字段冲突、同期多值且无披露时间可区分时保留缺口不造「最新」，快报/资金流等已发生数据排除未来期间、业绩预告目标期合法保留、同期修订按最新披露时间选择，scoped 资金流按 stock+market 逐股请求并取最新交易日值与观察时间；基本面映射版本升到 19，旧错映射阶段 0 快照不再命中、按当前契约重新取数（资本维度经核实本就不读写维度缓存），历史报告与旧缓存不回写。
 - [修复] 深研资金研究员的阶段 0 复用投影（含 opt-in 独立源验证）收回既有资本需求 single_fetch 键内（与有界取数同 supplier/contract/stock/refresh 身份）：验证源失败不进缓存时，同报告重复/并发消费者不再重复出站验证，主块零重取、失败与资格证据保留、消费者各取深拷贝；补真实边界重复/并发回归与调用自身预算（`call_budget`）耐久回归，深研文档超时阶段措辞校正为五个 `timeout_phase` 取值+准入单独状态。

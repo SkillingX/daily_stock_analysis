@@ -848,7 +848,7 @@ class PortfolioTrade(Base):
     symbol = Column(String(16), nullable=False, index=True)
     market = Column(String(8), nullable=False, default="cn")
     currency = Column(String(8), nullable=False, default="CNY")
-    trade_date = Column(Date, nullable=False, index=True)
+    trade_date: Mapped[date_type] = mapped_column(Date, nullable=False, index=True)
     side = Column(String(8), nullable=False)  # buy/sell
     quantity = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
@@ -876,7 +876,7 @@ class PortfolioCashLedger(Base):
     account_id = Column(
         Integer, ForeignKey("portfolio_accounts.id"), nullable=False, index=True
     )
-    event_date = Column(Date, nullable=False, index=True)
+    event_date: Mapped[date_type] = mapped_column(Date, nullable=False, index=True)
     direction = Column(String(8), nullable=False)  # in/out
     amount = Column(Float, nullable=False)
     currency = Column(String(8), nullable=False, default="CNY")
@@ -900,7 +900,7 @@ class PortfolioCorporateAction(Base):
     symbol = Column(String(16), nullable=False, index=True)
     market = Column(String(8), nullable=False, default="cn")
     currency = Column(String(8), nullable=False, default="CNY")
-    effective_date = Column(Date, nullable=False, index=True)
+    effective_date: Mapped[date_type] = mapped_column(Date, nullable=False, index=True)
     action_type = Column(String(24), nullable=False)  # cash_dividend/split_adjustment
     cash_dividend_per_share = Column(Float)
     split_ratio = Column(Float)
@@ -922,10 +922,10 @@ class PortfolioPosition(Base):
         Integer, ForeignKey("portfolio_accounts.id"), nullable=False, index=True
     )
     cost_method = Column(String(8), nullable=False, default="fifo")
-    symbol = Column(String(16), nullable=False, index=True)
-    market = Column(String(8), nullable=False, default="cn")
+    symbol: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    market: Mapped[str] = mapped_column(String(8), nullable=False, default="cn")
     currency = Column(String(8), nullable=False, default="CNY")
-    quantity = Column(Float, nullable=False, default=0.0)
+    quantity: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     avg_cost = Column(Float, nullable=False, default=0.0)
     total_cost = Column(Float, nullable=False, default=0.0)
     last_price = Column(Float, nullable=False, default=0.0)
@@ -981,7 +981,7 @@ class PortfolioDailySnapshot(Base):
     account_id = Column(
         Integer, ForeignKey("portfolio_accounts.id"), nullable=False, index=True
     )
-    snapshot_date = Column(Date, nullable=False, index=True)
+    snapshot_date: Mapped[date_type] = mapped_column(Date, nullable=False, index=True)
     cost_method = Column(String(8), nullable=False, default="fifo")  # fifo/avg
     base_currency = Column(String(8), nullable=False, default="CNY")
     total_cash = Column(Float, nullable=False, default=0.0)
@@ -1014,7 +1014,7 @@ class PortfolioFxRate(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     from_currency = Column(String(8), nullable=False, index=True)
     to_currency = Column(String(8), nullable=False, index=True)
-    rate_date = Column(Date, nullable=False, index=True)
+    rate_date: Mapped[date_type] = mapped_column(Date, nullable=False, index=True)
     rate = Column(Float, nullable=False)
     source = Column(String(32), nullable=False, default="manual")
     is_stale = Column(Boolean, nullable=False, default=False)

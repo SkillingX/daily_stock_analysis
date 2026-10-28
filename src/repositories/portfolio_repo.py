@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.sql.elements import ColumnElement
 
 from src.storage import (
     DatabaseManager,
@@ -620,7 +621,7 @@ class PortfolioRepository:
     ) -> Optional[date]:
         """Return earliest event date (trade/cash/corporate action) for one account."""
         with self.db.get_session() as session:
-            first_trade = session.execute(
+            first_trade: Optional[date] = session.execute(
                 select(func.min(PortfolioTrade.trade_date)).where(
                     and_(
                         PortfolioTrade.account_id == account_id,
@@ -628,7 +629,7 @@ class PortfolioRepository:
                     )
                 )
             ).scalar_one()
-            first_cash = session.execute(
+            first_cash: Optional[date] = session.execute(
                 select(func.min(PortfolioCashLedger.event_date)).where(
                     and_(
                         PortfolioCashLedger.account_id == account_id,
@@ -636,7 +637,7 @@ class PortfolioRepository:
                     )
                 )
             ).scalar_one()
-            first_action = session.execute(
+            first_action: Optional[date] = session.execute(
                 select(func.min(PortfolioCorporateAction.effective_date)).where(
                     and_(
                         PortfolioCorporateAction.account_id == account_id,
@@ -652,8 +653,7 @@ class PortfolioRepository:
             ]
             if not candidates:
                 return None
-            result: Optional[date] = min(candidates)  # type: ignore[assignment]
-            return result
+            return min(candidates)
 
     def query_trades(
         self,
@@ -667,7 +667,7 @@ class PortfolioRepository:
         page_size: int,
     ) -> Tuple[List[PortfolioTrade], int]:
         with self.db.get_session() as session:
-            conditions = []
+            conditions: List[ColumnElement[bool]] = []
             if account_id is not None:
                 conditions.append(PortfolioTrade.account_id == account_id)
             if date_from is not None:
@@ -722,7 +722,7 @@ class PortfolioRepository:
         page_size: int,
     ) -> Tuple[List[PortfolioCashLedger], int]:
         with self.db.get_session() as session:
-            conditions = []
+            conditions: List[ColumnElement[bool]] = []
             if account_id is not None:
                 conditions.append(PortfolioCashLedger.account_id == account_id)
             if date_from is not None:
@@ -777,7 +777,7 @@ class PortfolioRepository:
         page_size: int,
     ) -> Tuple[List[PortfolioCorporateAction], int]:
         with self.db.get_session() as session:
-            conditions = []
+            conditions: List[ColumnElement[bool]] = []
             if account_id is not None:
                 conditions.append(PortfolioCorporateAction.account_id == account_id)
             if date_from is not None:
