@@ -321,14 +321,15 @@ def test_slow_auxiliary_query_preserves_financial_snapshot(financial_sources, mo
     def financial(**kwargs):
         received.set()
         return original(**kwargs)
-    def slow_shareholders(**kwargs):
+    def slow_dividend(**kwargs):
         try:
             release.wait(1)
             return pd.DataFrame()
         finally:
             finished.set()
     monkeypatch.setattr(akshare, 'stock_financial_abstract', financial)
-    monkeypatch.setattr(akshare, 'stock_zh_a_gdhs_detail_em', slow_shareholders)
+    # issue #60 后股东户数接口不再是辅助链成员；慢载体改用仍在链上的分红明细。
+    monkeypatch.setattr(akshare, 'stock_fhps_detail_em', slow_dividend)
     cfg = Config(fundamental_stage_timeout_seconds=0.2, fundamental_fetch_timeout_seconds=0.1, fundamental_cache_ttl_seconds=0)
     monkeypatch.setattr('src.config.get_config', lambda: cfg)
     try:

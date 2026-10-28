@@ -125,7 +125,8 @@ def test_native_capital_adapter_and_manager_share_one_value_and_do_not_count_met
     from data_provider.fundamental_adapter import AkshareFundamentalAdapter
     from src.config import Config
     adapter = AkshareFundamentalAdapter()
-    responses = iter([(pd.DataFrame({"主力净流入(亿元)": [raw]}), "stock_individual_fund_flow", []), (None, None, [])])
+    # 真实端点形状：资金流记录带证券代码与交易日列，适用记录是该指标业务时点最新的一天（issue #60）。
+    responses = iter([(pd.DataFrame({"股票代码": ["600519"], "日期": ["2026-10-27"], "主力净流入(亿元)": [raw]}), "stock_individual_fund_flow", []), (None, None, [])])
     monkeypatch.setattr(adapter, "_call_df_candidates", lambda *args: next(responses, (None, None, [])))
     mgr = DataFetcherManager(fetchers=[])
     mgr._fundamental_adapter = adapter

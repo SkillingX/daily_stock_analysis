@@ -96,12 +96,26 @@ def _normalize_code(raw: Any) -> str:
     return s
 
 
-def _pick_by_keywords(row: pd.Series, keywords: List[str]) -> Optional[Any]:
+def _market_suffix(stock_code: str) -> Optional[str]:
+    """Exchange suffix required by symbol-scoped endpoints (sh/sz/bj)."""
+    code = _normalize_code(stock_code)
+    if code.startswith(("60", "68", "90")):
+        return "sh"
+    if code.startswith(("00", "30")):
+        return "sz"
+    if code.startswith(("43", "83", "87", "92")):
+        return "bj"
+    return None
+
+
+def _pick_by_keywords(row: pd.Series, keywords: List[str], exclude: Optional[set[str]] = None) -> Optional[Any]:
     """
     Return first non-empty row value whose column name contains any keyword.
     """
     for col in row.index:
         col_s = str(col)
+        if exclude is not None and col_s in exclude:
+            continue
         if any(k in col_s for k in keywords):
             val = row.get(col)
             if val is not None and str(val).strip() not in ("", "-", "nan", "None"):
@@ -361,9 +375,61 @@ def _build_dividend_payload(
     }
 
 
-def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series]:
-    """
-    Select the most relevant row for the given stock.
+# 指标业务时点列（报告期/统计期/交易日）优先于披露时间列；拿公告日替代统计期同样错误。
+_BUSINESS_PERIOD_KEYWORDS: Tuple[str, ...] = ("报告期", "预告期", "统计截止", "截止日期", "交易日", "日期", "时间")
+_DISCLOSURE_TIME_KEYWORDS: Tuple[str, ...] = ("公告", "披露", "发布")
+_SECURITY_CODE_COLUMN_KEYWORDS: Tuple[str, ...] = ("代码", "股票代码", "证券代码", "ts_code", "symbol")
+
+
+def _record_business_period(row: pd.Series, period_cols: List[Any]) -> Optional[str]:
+    """One record's own business period; conflicting date fields invalidate it."""
+    actuals: set[str] = set()
+    for col in period_cols:
+        raw = row.get(col)
+        entries = raw.tolist() if isinstance(raw, pd.Series) else [raw]
+        for entry in entries:
+            actual = normalize_report_period(entry)[0]
+            if actual is not None:
+                actuals.add(actual)
+    return next(iter(actuals)) if len(actuals) == 1 else None
+
+
+def _time_columns(row: pd.Series) -> set[str]:
+    """Date/time columns never carry narrative text; summaries must not pick them."""
+    return {
+        str(col) for col in row.index
+        if any(k in str(col) for k in (*_BUSINESS_PERIOD_KEYWORDS, *_DISCLOSURE_TIME_KEYWORDS))
+    }
+
+
+def _period_columns(df: pd.DataFrame) -> List[Any]:
+    """Business-period columns only; a publication date never qualifies as one."""
+    return [
+        col for col in df.columns
+        if any(k in str(col) for k in _BUSINESS_PERIOD_KEYWORDS)
+        and not any(k in str(col) for k in _DISCLOSURE_TIME_KEYWORDS)
+    ]
+
+
+def _extract_latest_row(df: pd.DataFrame, stock_code: str, *, allow_future_target: bool = False) -> Optional[pd.Series]:
+    """Select the applicable record by row-level security identity and business period.
+
+    Row order never decides recency: the adopted record is the one whose own
+    date fields carry the metric's latest business period. Records without a
+    parseable period are unknown evidence, not "latest"; a record whose date
+    fields conflict with each other, or several different records sharing the
+    latest period, stay ineligible (no invented recency, no gap papering).
+
+    A record must also carry a row-level code column: without it the adapter
+    cannot prove the row belongs to the requested security, because unscoped
+    provider defaults may silently return a different stock.
+
+    ``allow_future_target=True`` marks forecast-target semantics: a future
+    forecast period is a legitimate record of its own. Realized-data
+    semantics (trading days, published quick reports) keep the default and
+    exclude periods that have not happened yet. Within one tied period,
+    records are disambiguated by the latest disclosure time when the table
+    provides one; otherwise the tie stays an explicit gap.
     """
     if df is None or df.empty:
         return None
@@ -371,24 +437,51 @@ def _extract_latest_row(df: pd.DataFrame, stock_code: str) -> Optional[pd.Series
     code_cols = [
         c
         for c in df.columns
-        if any(
-            k in str(c) for k in ("代码", "股票代码", "证券代码", "ts_code", "symbol")
-        )
+        if any(k in str(c) for k in _SECURITY_CODE_COLUMN_KEYWORDS)
     ]
+    if not code_cols:
+        return None  # 无行级证券身份证据：unscoped 默认返回可能属于别的股票
     target = _normalize_code(stock_code)
-    if code_cols:
-        for col in code_cols:
-            try:
-                series = df[col].astype(str).map(_normalize_code)
-                matched = df[series == target]
-                if not matched.empty:
-                    return matched.iloc[0]
-            except Exception:
-                continue
+    combined: Optional[pd.Series] = None
+    for col in code_cols:
+        try:
+            mask = df[col].astype(str).map(_normalize_code) == target
+        except Exception:
+            continue
+        combined = mask if combined is None else (combined & mask)
+    if combined is None:
+        return None
+    matched = df[combined]
+    if matched.empty:
         return None
 
-    # Fallback: use latest row
-    return df.iloc[0]
+    period_cols = _period_columns(matched)
+    if not period_cols:
+        return None  # 无行级期间证据：不编造"最新"
+
+    dated = matched.assign(_business_period=matched.apply(lambda row: _record_business_period(row, period_cols), axis=1))
+    dated = dated[dated["_business_period"].notna()]
+    if dated.empty:
+        return None
+    if not allow_future_target:
+        today = datetime.now().date().isoformat()
+        dated = dated[dated["_business_period"] <= today]
+        if dated.empty:
+            return None
+    tied = dated[dated["_business_period"] == dated["_business_period"].max()].drop(columns=["_business_period"]).drop_duplicates()
+    if len(tied) > 1:
+        # 同期多份不同记录：有披露时间列时按最新修订选择（统计期不变），否则值歧义。
+        disclosure_cols = [col for col in tied.columns if any(k in str(col) for k in _DISCLOSURE_TIME_KEYWORDS)]
+        if not disclosure_cols:
+            return None
+        tied = tied.assign(_disclosed_at=tied.apply(lambda row: _record_business_period(row, disclosure_cols), axis=1))
+        tied = tied[tied["_disclosed_at"].notna()]
+        if tied.empty:
+            return None
+        tied = tied[tied["_disclosed_at"] == tied["_disclosed_at"].max()].drop(columns=["_disclosed_at"]).drop_duplicates()
+    if len(tied) != 1:
+        return None  # 同期同披露时间仍多份不同记录：值歧义，保留明确缺口
+    return cast(pd.Series, tied.iloc[0])
 
 
 class AkshareFundamentalAdapter:
@@ -506,10 +599,11 @@ class AkshareFundamentalAdapter:
         )
         result["errors"].extend(forecast_errors)
         if forecast_df is not None:
-            row = _extract_latest_row(forecast_df, stock_code)
+            # 预告的目标报告期可以是未来季度：那是预告自身的合法业务时点。
+            row = _extract_latest_row(forecast_df, stock_code, allow_future_target=True)
             if row is not None:
                 result["earnings"]["forecast_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"])
+                    _pick_by_keywords(row, ["预告", "业绩变动", "内容", "摘要", "公告"], exclude=_time_columns(row))
                 )[:200]
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
@@ -524,7 +618,7 @@ class AkshareFundamentalAdapter:
             row = _extract_latest_row(quick_df, stock_code)
             if row is not None:
                 result["earnings"]["quick_report_summary"] = _safe_str(
-                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"])
+                    _pick_by_keywords(row, ["快报", "摘要", "公告", "说明"], exclude=_time_columns(row))
                 )[:200]
                 result["source_chain"].append(f"earnings_quick:{quick_source}")
 
@@ -548,59 +642,16 @@ class AkshareFundamentalAdapter:
                 result["earnings"]["dividend"] = dividend_payload
                 result["source_chain"].append(f"dividend:{dividend_source}")
 
-        # Institution / top shareholders
-        # 注意：stock_institute_hold 无个股筛选参数，返回全市场表格；stock_institute_recommend
-        # 为新浪评级页面，已无法访问。先尝试全市场表再内存过滤；失败则静默降级。
-        inst_df: Optional[pd.DataFrame] = None
-        inst_source: Optional[str] = None
-        inst_errors: List[str] = []
-        try:
-            import akshare as ak
-            fn = getattr(ak, "stock_institute_hold", None)
-            if fn:
-                df_all = fn()
-                if isinstance(df_all, pd.DataFrame) and not df_all.empty:
-                    code_cols = [c for c in df_all.columns if any(k in str(c) for k in ("代码", "证券代码", "symbol", "ts_code"))]
-                    if code_cols:
-                        target = _normalize_code(stock_code)
-                        for col in code_cols:
-                            try:
-                                mask = df_all[col].astype(str).map(_normalize_code) == target
-                                inst_df = df_all[mask]
-                                inst_source = "stock_institute_hold"
-                                break
-                            except Exception:
-                                continue
-        except Exception as exc:  # noqa: BLE001
-            inst_errors.append(f"stock_institute_hold:{type(exc).__name__}")
-        # stock_institute_recommend（新天财经评级页面）已无法访问，跳过
-
-        result["errors"].extend(inst_errors)
-        if inst_df is not None and not inst_df.empty:
-            row = _extract_latest_row(inst_df, stock_code)
-            if row is not None:
-                inst_change = _safe_float(
-                    _pick_by_keywords(row, ["增减", "变化", "变动", "持股变化"])
-                )
-                result["institution"]["institution_holding_change"] = inst_change
-                result["source_chain"].append(f"institution:{inst_source}")
-
-        # 十大股东：stock_zh_a_gdhs_detail_em 支持个股筛选，稳定可用
-        top10_df, top10_source, top10_errors = self._call_df_candidates(
-            [
-                ("stock_zh_a_gdhs_detail_em", {"symbol": stock_code}),
-                ("stock_zh_a_gdhs_detail_em", {}),
-            ]
-        )
-        result["errors"].extend(top10_errors)
-        if top10_df is not None:
-            row = _extract_latest_row(top10_df, stock_code)
-            if row is not None:
-                holder_change = _safe_float(
-                    _pick_by_keywords(row, ["增减", "变化", "持股变化", "变动"])
-                )
-                result["institution"]["top10_holder_change"] = holder_change
-                result["source_chain"].append(f"top10:{top10_source}")
+        # 机构/十大股东持仓：公开接口均无合格证据，不再错误映射（issue #60）。
+        # - stock_institute_hold 的 symbol 参数是季度筛选（如默认 "20051"=2005 年
+        #   一季度），无个股筛选参数：不传参时隐式返回 20051 季度全市场表，且表格
+        #   无行级期间列，无法证明所选行属于当前证券或任何已确认期间；其"机构数
+        #   变化"是机构家数变化、"持股比例增幅"单位口径未证实，均不是持仓数量/
+        #   比例变化。
+        # - stock_zh_a_gdhs_detail_em 是股东户数表，"股东户数-增减"不是持股变化。
+        # 两者都不具备把值写成 institution_holding_change / top10_holder_change 的
+        # 统计对象、财期与单位证据；合格机构持仓接入需另行按真实能力验证，本处
+        # 保留真实缺口（institution 块空 → 触发既有 iFinD fallback 资格门槛）。
 
         has_content = bool(
             any(value is not None for key, value in result["growth"].items() if key not in {"report_date", "field_meta"})
@@ -621,17 +672,37 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
-        stock_df, stock_source, stock_errors = self._call_df_candidates(
-            [
-                ("stock_individual_fund_flow", {"stock": stock_code}),
-                ("stock_individual_fund_flow", {"symbol": stock_code}),
-                ("stock_individual_fund_flow", {}),
-                ("stock_main_fund_flow", {"symbol": stock_code}),
-                ("stock_main_fund_flow", {}),
-            ]
-        ) if include_stock else (None, "", [])
+        # stock_individual_fund_flow 按 stock+market 逐股请求；无参调用会返回默认股
+        # 600094 而非请求证券，因此只做显式 scoped 候选。scoped 逐股响应自身不带
+        # 代码列，其证券身份由请求参数保证，注入请求代码后进入同一选择契约；
+        # 全市场排名表（带代码列）仅作 scoped 失败时的备选。
+        stock_df: Optional[pd.DataFrame] = None
+        stock_source: Optional[str] = None
+        stock_errors: List[str] = []
+        market = _market_suffix(stock_code)
+        if include_stock and market is not None:
+            stock_df, stock_source, scoped_errors = self._call_df_candidates(
+                [
+                    ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
+                ]
+            )
+            stock_errors.extend(scoped_errors)
+            if stock_df is not None and not any(
+                keyword in str(col) for col in stock_df.columns for keyword in _SECURITY_CODE_COLUMN_KEYWORDS
+            ):
+                # 仅当 scoped 响应不带行级代码列时传播请求身份；已有代码列按行级证据过滤。
+                stock_df = stock_df.assign(**{"股票代码": _normalize_code(stock_code)})
+        if stock_df is None and include_stock:
+            fallback_df, fallback_source, fallback_errors = self._call_df_candidates(
+                [
+                    ("stock_main_fund_flow", {}),
+                ]
+            )
+            stock_errors.extend(fallback_errors)
+            stock_df, stock_source = fallback_df, fallback_source
         result["errors"].extend(stock_errors)
         if stock_df is not None:
+            # 资金流是交易日观察语义：正序历史表中"最新行"由日期决定，未来观察日期不是已发生数据。
             row = _extract_latest_row(stock_df, stock_code)
             if row is not None:
                 flow_meta: Dict[str, Any] = {}

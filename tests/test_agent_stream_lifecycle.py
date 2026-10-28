@@ -48,6 +48,9 @@ def stream_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tupl
         "endless": False,
         "endless_delay": 0.05,
         "endless_deadline": 0.0,
+        # Optional self stop armed at real response start (see _serve_stream),
+        # instead of an absolute deadline computed at test arrangement time.
+        "endless_self_stop_seconds": None,
         "script_queue": [],
     }
     lock = threading.Lock()
@@ -69,6 +72,7 @@ def stream_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tupl
                     script = list(state["script"])
                 endless = bool(state["endless"])
                 endless_deadline = float(state["endless_deadline"])
+                endless_self_stop = state.get("endless_self_stop_seconds")
             try:
                 if not request.get("stream"):
                     payload = {
@@ -86,7 +90,7 @@ def stream_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tupl
                     return
                 with lock:
                     state["streams"] += 1
-                self._serve_stream(script, endless, endless_deadline)
+                self._serve_stream(script, endless, endless_deadline, endless_self_stop)
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
@@ -112,7 +116,13 @@ def stream_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tupl
                 time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
             return self._client_gone()
 
-        def _serve_stream(self, script: list[dict[str, Any]], endless: bool, endless_deadline: float) -> None:
+        def _serve_stream(
+            self,
+            script: list[dict[str, Any]],
+            endless: bool,
+            endless_deadline: float,
+            endless_self_stop: float | None = None,
+        ) -> None:
             # Headers go out immediately; body timing follows the script so
             # tests can separate "headers arrived" from "first SSE chunk".
             self.send_response(200)
@@ -148,6 +158,11 @@ def stream_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tupl
                 if endless:
                     # Fixture-owned self stop: never feed past the deadline so
                     # a broken product cannot keep a server thread alive.
+                    if endless_self_stop is not None:
+                        # Arm at real response start: admission/prep latency
+                        # must not consume the guard before the window under
+                        # test is measured (root-stream-fixture-clock.log).
+                        endless_deadline = time.monotonic() + float(endless_self_stop)
                     while time.monotonic() < endless_deadline:
                         if self._sleep_observing(float(state["endless_delay"])):
                             return

@@ -57,7 +57,7 @@ _SOURCE_LABEL_DIMS = frozenset({
 })
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 18  # Choice latest-period balance sheet and research evidence
+FUNDAMENTAL_MAPPING_VERSION = 19  # issue #60：公共持仓错映射移除与辅助表适用记录选择语义
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-import time
+import threading
 
 import pytest
 
@@ -23,7 +23,9 @@ def test_response_wall_clock_and_report_budget_stay_distinguishable(stream_env):
     Config._instance.llm_stream_first_chunk_timeout = 3.0
     Config._instance.llm_stream_idle_chunk_timeout = 3.0
     state["endless"] = True
-    state["endless_deadline"] = time.monotonic() + 5.0
+    # 5s backstop armed at real response start, not arrangement time, so
+    # admission/prep latency cannot consume it before the 0.8s cap is measured.
+    state["endless_self_stop_seconds"] = 5.0
     run = ResearchRun(15.0)
     with run.bind():
         response = adapter.call_completion(_messages(), timeout=12)
@@ -34,7 +36,7 @@ def test_response_wall_clock_and_report_budget_stay_distinguishable(stream_env):
     assert attempt.timeout_phase == "response_total"
 
     state["endless"] = True
-    state["endless_deadline"] = time.monotonic() + 5.0
+    state["endless_self_stop_seconds"] = 5.0
     exhausted = ResearchRun(0.8)
     with exhausted.bind():
         response = adapter.call_completion(_messages(), timeout=12)
@@ -57,7 +59,7 @@ def test_call_budget_beats_configured_response_cap_and_releases_connection(strea
     Config._instance.llm_stream_first_chunk_timeout = 3.0
     Config._instance.llm_stream_idle_chunk_timeout = 3.0
     state["endless"] = True
-    state["endless_deadline"] = time.monotonic() + 5.0
+    state["endless_self_stop_seconds"] = 5.0
     run = ResearchRun(15.0)
     with run.bind():
         response = adapter.call_completion(_messages(), timeout=0.8)
@@ -86,3 +88,49 @@ def test_first_response_and_idle_windows_are_distinct_causes(stream_env, window)
     assert attempt.status == "timeout"
     assert attempt.timeout_phase == window
     assert state["active"] == 0, "the expired window must release the connection"
+
+
+def test_response_cap_measured_after_real_admission_wait_beyond_fixture_guard(stream_env):  # noqa: F811
+    """真实准入等待（持有唯一并发槽 5.4s）超过旧 5s 布置时刻自停守卫后，
+    响应阶段开始时自锚定的自停仍让 0.8s 响应上限被真实测量：记
+    response_total 并关闭连接。旧锚点下同样等待会以干净 [DONE] 无 finish
+    结束流制造 parse_error 假失败（root-stream-fixture-clock.log 反例）。
+    真实槽位/定时器/SDK，不 mock 准入、计时或传输。"""
+    adapter, state = stream_env
+    from src.llm import concurrency
+
+    Config._instance.llm_stream_response_timeout = 0.8
+    Config._instance.llm_stream_first_chunk_timeout = 3.0
+    Config._instance.llm_stream_idle_chunk_timeout = 3.0
+    slots = concurrency._get_slots()
+    assert slots.acquire(blocking=False), "the fixture owns exactly one admission slot"
+    released = threading.Event()
+
+    def release() -> None:
+        slots.release()
+        released.set()
+
+    state["endless"] = True
+    # No absolute endless_deadline: the guard anchors itself when the handler
+    # starts the endless phase, so this 5s window begins at real response
+    # start even though the call was admitted 5.4s later.
+    state["endless_self_stop_seconds"] = 5.0
+    timer = threading.Timer(5.4, release)
+    timer.start()
+    run = ResearchRun(15.0)
+    try:
+        with run.bind():
+            response = adapter.call_completion(_messages(), timeout=12)
+    finally:
+        timer.join(timeout=7)
+    assert released.is_set(), "the real admission slot must be released"
+    [attempt] = run.attempts
+    # The model call itself queued beyond the old arrangement-time guard; a
+    # released-but-never-waited call would not prove the anchor under late
+    # handler entry. 模型调用本身排队超过旧守卫时长，而非仅计时器最终释放。
+    assert attempt.queue_seconds is not None and attempt.queue_seconds > 5.0
+    _wait_server_idle(state)
+    assert response.provider == "error"
+    assert attempt.status == "timeout"
+    assert attempt.timeout_phase == "response_total"
+    assert state["active"] == 0, "the expired response cap must release the connection"
