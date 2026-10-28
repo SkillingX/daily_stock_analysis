@@ -181,6 +181,21 @@ def test_all_obtained_with_failed_supplements_is_not_reported_as_incomplete(
     assert "快照不缓存" not in notice
 
 
+def test_sector_funds_are_not_replaced_by_board_price_rankings(
+    fundamental_env: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.agent.tools import data_tools
+    funds = {"top": [{"name": "资金流入板块", "net_inflow": 100.0}], "bottom": []}
+    compact = {**_FULL_COMPACT,
+               "boards": {"data": {"top": [{"name": "涨幅板块", "change_pct": 5.0}]}},
+               "capital_flow": {"data": {"sector_rankings": funds}}}
+    monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: SimpleNamespace(
+        get_fundamental_context=lambda code, budget_seconds: compact,
+    ))
+    ctx = SharedContext("300260", "样本", "2026-10-29")
+    assert _safe_fundamental("300260", ctx)["sector_rankings"] == funds
+
+
 def test_partial_indicators_list_the_missing_fields(
     fundamental_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
