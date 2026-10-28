@@ -95,6 +95,10 @@ basis: Literal["rule", "llm"] = "rule"
 
 ### CI 集成
 
+全模块 audit 与治理模块检查必须分别验证；前者通过不能替代 `.github/workflows/type-safety.yml` 中的 `mypy --follow-imports=silent -p ...` 模块清单。补足 ORM 类型时，沿现有 `Mapped` / `mapped_column` 入口逐字段修改，并显式保留原 SQL 类型、可空性、默认值和索引；不以类型修复引入数据库迁移。正常与预算耗尽等分支共享的工具结果使用同一精确类型契约，保证排序和消息回填仍保留工具身份。
+
+SQLAlchemy 支持同一模型逐字段混用旧 `Column` 与 `mapped_column`，见[官方说明](https://docs.sqlalchemy.org/en/21/orm/declarative_tables.html#declarative-table-with-mapped-column)。本项目对应回归为 `tests/test_governed_type_contracts.py`；修改 ORM 声明时还应比较修复前后的表、索引和约束，不能仅以静态检查通过认定结构不变。
+
 ```yaml
 # .github/workflows/type-safety.yml
 - name: Pyright type check

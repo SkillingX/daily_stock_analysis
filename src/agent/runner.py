@@ -26,14 +26,20 @@ from concurrent.futures import (
     as_completed,
 )
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, TypedDict
 
-from src.agent.llm_adapter import LLMToolAdapter
+from src.agent.llm_adapter import LLMToolAdapter, ToolCall
 from src.agent.tools.registry import ToolRegistry
 from src.agent.stock_scope import StockScope
 from src.llm.attempt import ENTRY_AGENT, attempt_scope
 
 logger = logging.getLogger(__name__)
+
+
+class _ToolExecutionResult(TypedDict):
+    tc: ToolCall
+    result_str: str
+
 
 # Tool name → friendly label for progress messages
 _THINKING_TOOL_LABELS: Dict[str, str] = {
@@ -731,7 +737,7 @@ def run_agent_loop(
                 research_remaining = max(0.0, research_deadline - time.monotonic())
                 effective_tool_timeout = min(effective_tool_timeout, research_remaining) if effective_tool_timeout is not None else research_remaining
             if effective_tool_timeout is not None and effective_tool_timeout <= 0:
-                tool_results = [
+                tool_results: List[_ToolExecutionResult] = [
                     {"tc": tc, "result_str": json.dumps({"error": "Research budget exhausted", "timeout": True})}
                     for tc in response.tool_calls
                 ]
@@ -833,7 +839,7 @@ def run_agent_loop(
 
 
 def _execute_tools(
-    tool_calls: Any,
+    tool_calls: List[ToolCall],
     tool_registry: ToolRegistry,
     step: int,
     progress_callback: Optional[Callable[..., Any]],
@@ -841,7 +847,7 @@ def _execute_tools(
     non_retriable_tool_results: Optional[Dict[str, str]] = None,
     tool_wait_timeout_seconds: Optional[float] = None,
     stock_scope: Optional[StockScope] = None,
-) -> List[Dict[str, Any]]:
+) -> List[_ToolExecutionResult]:
     """Execute one or more tool calls, returning ordered result dicts.
 
     Single tools run inline; multiple tools run in parallel threads.
@@ -854,7 +860,9 @@ def _execute_tools(
         eastmoney_patch(budget_only=True)
     batch_deadline = time.monotonic() + tool_wait_timeout_seconds if tool_wait_timeout_seconds is not None else None
 
-    def _exec_single(tc_item: Any) -> Any:
+    def _exec_single(
+        tc_item: ToolCall,
+    ) -> tuple[ToolCall, str, bool, float, bool, Optional[Dict[str, Any]]]:
         t0 = time.monotonic()
         cache_key = _build_tool_cache_key(tc_item.name, tc_item.arguments)
         guard_result = _guard_tool_stock_scope(
@@ -917,7 +925,7 @@ def _execute_tools(
         dur = round(time.monotonic() - t0, 2)
         return tc_item, res_str, ok, dur, False, None
 
-    results: List[Dict[str, Any]] = []
+    results: List[_ToolExecutionResult] = []
 
     if len(tool_calls) == 1:
         tc = tool_calls[0]
