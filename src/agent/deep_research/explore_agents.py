@@ -543,12 +543,43 @@ def run_technical_agent(
     return _run_explore("technical", set(), task, llm_adapter, progress_callback, max_steps=1)
 
 
+def _stage_zero_capital_flow(stock_code: str, run: Any) -> Optional[Dict[str, Any]]:
+    """同报告阶段 0 已取得的合格资金块，无合格块时返回 None（issue #58）。
+
+    股票身份、交易时点、窗口覆盖、来源、单位与字段资格记录随块原样到达；
+    部分窗口按既有投影如实保留有效性，只有缺块或金额/量纲不合格才回退
+    既有有界补查。主块零重取、不跨报告、不放宽资格；既有 opt-in 交叉验证
+    对复用块同样生效（验证关闭时为空操作、零新增出站，开启时核验二源按
+    既有语义出站——与有界取数路径完全同语义）。
+    """
+    from src.agent.tools.data_tools import _apply_capital_cross_validation, _capital_flow_tool_result
+
+    ctx = getattr(run, "context", None)
+    if ctx is None or getattr(ctx, "stock_code", None) != stock_code:
+        return None
+    block = (getattr(ctx, "fundamental", None) or {}).get("capital_flow")
+    if not isinstance(block, dict) or not block.get("data"):
+        return None
+    flow = _capital_flow_tool_result(stock_code, block)
+    if flow.get("main_net_inflow") is None or not _flow_unit_known(flow):
+        return None
+    from src.config import get_config
+
+    deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+    return _apply_capital_cross_validation(stock_code, flow, block, deadline)
+
+
 def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
-    """资金流固定输入：既有有界入口 + 同报告去重（issue #56，#51 single_fetch 模式）。"""
+    """资金流固定输入：阶段 0 合格块直接复用（issue #58），否则既有有界入口
+    + 同报告去重（issue #56，#51 single_fetch 模式）。"""
     from src.agent.tools.data_tools import _handle_get_capital_flow
 
     if run := current_research.get():
         run.check()
+        reused = _stage_zero_capital_flow(stock_code, run)
+        if reused is not None:
+            run.retain("get_capital_flow", reused)
+            return reused
 
     def _fetch() -> Dict[str, Any]:
         return _handle_get_capital_flow(stock_code)

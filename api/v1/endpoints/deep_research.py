@@ -39,7 +39,7 @@ from fastapi import APIRouter, HTTPException, Path as PathParam, Query
 from fastapi.responses import FileResponse, StreamingResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.core.research_run import ResearchRun
+from src.core.research_run import ResearchRun, ResearchStopped
 from src.config import get_config
 from src.services.deep_research_service import (
     DeepResearchInputError,
@@ -240,6 +240,34 @@ async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
             )
             if record.terminal is None:
                 progress({"type": "done", **result})
+        except ResearchStopped:
+            # The interrupted-result path folds completed evidence into a
+            # normal return; reaching this handler means that fold itself could
+            # not deliver a result, so the accepted job still gets exactly one
+            # terminal carrying the run's own reason (issue #58).
+            logger.warning("[DeepResearch] Run %s stopped: %s", run_id, record.control.reason_text)
+            progress({"type": "error", "message": record.control.reason_text})
+        except (asyncio.CancelledError, BaseExceptionGroup) as exc:
+            # A cancellation-shaped escape is a user cancel only when the run's
+            # own state says so (issue #58): an explicit stop_reason or an
+            # actually exhausted deadline — finalization alone (the service's
+            # own ``finally``) is not budget exhaustion and must not invent a
+            # timeout/cancel attribution. An unexpected cancellation with no
+            # run stop keeps the honest failure wording.
+            from src.core.research_run import is_cancellation_exception
+
+            if isinstance(exc, BaseExceptionGroup) and exc.subgroup((KeyboardInterrupt, SystemExit)) is not None:
+                raise
+            control = record.control
+            stopped = control.stop_reason is not None or control.remaining() <= 0
+            if stopped and is_cancellation_exception(exc):
+                if control.stop_reason is None:
+                    control.stop("report_budget")
+                logger.warning("[DeepResearch] Run %s stopped: %s", run_id, control.reason_text)
+                progress({"type": "error", "message": control.reason_text})
+            else:
+                logger.exception("[DeepResearch] Run %s failed", run_id)
+                progress({"type": "error", "message": "报告生成失败，请查看服务日志。"})
         except Exception:
             logger.exception("[DeepResearch] Run %s failed", run_id)
             progress({"type": "error", "message": "报告生成失败，请查看服务日志。"})

@@ -96,6 +96,45 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 | 报告标注「不完整」 | 五层穿透某层工具未调用或内容缺失，可重新生成 |
 | 非 A 股被拒 | MVP 仅支持 A 股（6 位数字代码）；港股/美股待扩展 |
 
+## 取消终态、资金复用与超时阶段归因（issue #58）
+
+### 取消契约
+
+- 取消形态异常（裸 `asyncio.CancelledError` 或携带它的 `BaseExceptionGroup`）只有在 **ResearchRun 自身状态**（显式 `stop_reason` 或真实预算耗尽）支持下才解释为用户取消/预算耗尽；SDK 真实超时也会以取消形态冒出，不能见 CancelledError 就宣称用户取消。
+- 翻译发生在既有边界：共享 MCP 边界（`call_mcp_tool`）与 iFinD 同步包装（`IfindFetcher.query`）依据 run 状态把取消形态异常翻译为 `ResearchStopped`（未发生用户取消/耗尽时保留真实超时或错误语义）；日线包装（`BaseFetcher.get_daily_data`）不再把 `ResearchStopped` 包装为 `DataFetchError`，取消不污染来源失败计数、熔断与 fallback。
+- 阶段 0 收尾读取资料 future 时遵守同一契约：worker 取消形态异常不穿透装配，run 已停止时以 `ResearchStopped` 冒出由编排层收敛中断结果；run 未停止的真实中断如实记入 limitations，不伪装成功。
+- API 生命周期（`run_sync`）保证已接收任务**恰好交付一个终态**并结束 SSE：用户取消且中断结果可用时走既有 partial 报告路径；中断结果本身无法交付时发一次携带 run 原因的 error 终态；无用户停止的意外取消保留「报告生成失败」真实语义，不冒充取消/预算耗尽。`KeyboardInterrupt`/`SystemExit` 及含其成员的异常组继续传播，不被终态处理器吞掉。同股票门禁只在真实清理（`cleaned`）后释放，浏览器断线继续执行的语义不变。
+
+### 资金资料复用
+
+- 阶段 0 已取得的合格资金块（金额、交易时点、窗口覆盖、来源、单位与字段资格记录）随本次 run 的装配结果保留到 `SharedContext.fundamental["capital_flow"]`；资金研究员优先复用（同一投影函数），**零新增 NETINFLOW 出站**；无合格块或身份/时点不匹配时走既有有界补查与同报告 single_fetch 去重。opt-in 交叉验证对复用块与取数块完全同语义：验证关闭时为空操作（零出站），开启时主块零重取、核验二源按既有语义出站，冲突结论保持不合格。
+- 资金块**不写入 24h 财务快照缓存**：跨报告、跨交易日的动态资金不借财务缓存复活，命中财务缓存的新报告仍按自己的有界补查取得资金。部分资料（如 10 日窗口不完整但当日金额有效）保留其有效性并如实携带缺口与拒绝元数据，不放宽完整窗口或资格门槛。
+
+### 超时阶段归因与参数候选
+
+模型尝试账本（`attempt_records.timeout_phase`）区分五个耗尽原因，彼此独立计时、互不替代：
+
+| 阶段 | 含义 | 配置键 |
+|------|------|--------|
+| 准入等待 | 排队等并发名额（消耗调用/报告预算，不占响应上限） | （`queue_seconds`，状态 `queue_timeout`） |
+| `first_response` | 响应头 + 首 chunk 共用一个窗口，从真正出站起算 | `LLM_STREAM_FIRST_CHUNK_TIMEOUT` |
+| `idle_chunk` | 后续 chunk 间空闲 | `LLM_STREAM_IDLE_CHUNK_TIMEOUT` |
+| `response_total` | 已获准出站后的整段响应墙钟，且配置的响应上限是实际限制时钟（调用自身预算更小时不冒充此项），新块不重置 | `LLM_STREAM_RESPONSE_TIMEOUT` |
+| `call_budget` | 调用自身预算小于响应上限并先到期（调高响应上限无法修复该失败） | 调用方传入的 timeout |
+| `report_budget` | 报告总预算耗尽并取消了同一协程（限制时钟是调用/报告预算；取消走取消契约，不冒充超时） | `DEEP_RESEARCH_TIMEOUT_SECONDS` |
+
+参数候选实验（本地确定性对照，一次只变一个变量；**候选值不是生产推荐值，未部署**。复跑方式与逐次证据记录在 issue #58 的施工/验收记录中，仓库内回归为 `tests/test_issue58_timeout_phase.py` 等真实入口测试）：
+
+- 阶段预算 25→40 秒（`FUNDAMENTAL_STAGE_TIMEOUT_SECONDS`）：虚拟时钟回放生产冷启动耗时 + 合成目标价响应，25 秒重现「目标价仅余约 1.6 秒后超时」，40 秒候选可完成。
+- 取数预算 10→20 秒（`FUNDAMENTAL_FETCH_TIMEOUT_SECONDS`）：虚拟时钟回放 worker 重启/登录序列（tradedates 约 6.7 秒 + 合成 NETINFLOW 约 6.7 秒），10 秒重现「NETINFLOW 仅余约 3.3 秒后超时」，20 秒候选在同一合成序列内完成。
+- 首响应 10→30 秒（`LLM_STREAM_FIRST_CHUNK_TIMEOUT`）：真实 SDK/loopback 对照（同一延迟响应、固定响应墙钟）：首响应窗口不足时失败、放宽后成功；排队中的请求不占首响应窗口，证明提高响应总上限不能替代首响应设置。
+
+以上合成计时均为确定性反例回放，不是供应商实测；更高覆盖与可接受等待的最终取舍以真实对照和 PM 目标为依据，生产修改需单独授权并重启对应进程。
+
+### 部署依赖组合
+
+已验证组合为 `litellm==1.106.4` + `mcp==2.3.0`（`requirements.txt` 明确固定）。普通工具声明即使不含 MCP 工具也会进入 LiteLLM 的懒加载 MCP 导入路径，旧 MCP 1.x 下该路径在请求时因 `CacheableResult` 导入失败，而 `pip check`、健康检查与普通模块导入均不报错；`scripts/check_tool_deps.py` 在部署脚本安装依赖之后、停止旧服务之前检查该真实导入链，失败时保留旧服务继续运行并中止切换。不建设旧 SDK 兼容路径。
+
 ## 缺失估值与刷新
 
 情景概率不等于目标价证据。当前情景载荷不包含目标价来源及计算依据，因此保留定性情景，取消现价固定倍数和无来源模型目标价生成的 EV、价值区间与时间目标；仅有 PE/PB 数字也不构成完整估值。相关情景、结论和信号明确降级为观察，独立技术点位仍按已有 ATR/支撑规则提供，不增加新的估值模型。

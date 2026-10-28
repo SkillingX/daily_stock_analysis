@@ -38,6 +38,35 @@ class ResearchStopped(TimeoutError):
     """No new work may start; completed evidence can still be rendered."""
 
 
+def is_cancellation_exception(exc: BaseException) -> bool:
+    """True for a bare CancelledError or an exception group carrying one.
+
+    SDK internals (asyncio.wait_for, anyio task groups) surface real timeouts
+    and user cancels alike as cancellation-shaped exceptions. This predicate
+    only recognises the shape; callers pair it with the run's own state
+    (``stop_reason`` / ``finalized`` / ``remaining()``) to tell a user cancel
+    from a transport timeout (issue #58).
+    """
+    import asyncio
+
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    return isinstance(exc, BaseExceptionGroup) and exc.subgroup(asyncio.CancelledError) is not None
+
+
+def carries_fatal_group_member(exc: BaseException) -> bool:
+    """True for an exception group whose members include a system-exit signal.
+
+    A cancellation member never gives the cancellation handling permission to
+    absorb an unrelated fatal member (issue #58): callers re-raise such groups
+    untouched so ``KeyboardInterrupt``/``SystemExit`` keep propagating, and
+    only then apply their cancellation translation to pure-cancel shapes.
+    """
+    if not isinstance(exc, BaseExceptionGroup):
+        return False
+    return exc.subgroup((KeyboardInterrupt, SystemExit)) is not None
+
+
 @dataclass
 class ResearchRun:
     timeout_seconds: float

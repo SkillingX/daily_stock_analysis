@@ -925,24 +925,19 @@ ALL_DATA_TOOLS = [
 # ============================================================
 
 
-def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
-    """Get main-force capital flow data for a stock."""
-    from src.core.market_policy import require_stock_market
-    require_stock_market(stock_code)
+def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str, Any]:
+    """Project one fetched capital-flow block into the tool result shape.
 
+    Pure, IO-free projection of an already-fetched manager block (issue #58):
+    status, amounts, window coverage, source/unit identity and field
+    qualification records pass through unchanged, whether the block came from
+    stage zero or a bounded refetch. The shared opt-in cross-source
+    qualification (``_apply_capital_cross_validation``) runs on top of this
+    projection on either path: with the switch off it adds nothing, with it
+    on it may query the independent source — the fetched primary block is
+    never refetched.
+    """
     from src.config import get_config
-    deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
-    manager = _get_fetcher_manager()
-    try:
-        budget = {"budget_seconds": min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))} if "budget_seconds" in signature(manager.get_capital_flow_context).parameters else {}
-        ctx = manager.get_capital_flow_context(stock_code, **budget)
-    except Exception as exc:
-        logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
-        return {
-            "stock_code": stock_code,
-            "status": "error",
-            "error": f"capital flow fetch failed: {exc}",
-        }
 
     status = ctx.get("status", "not_supported")
     if status == "not_supported":
@@ -983,25 +978,64 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
         result["note"] = "Choice 个股主力净流入金额单位：人民币元；按交易日历和最近已收盘日期计算日/5日/10日窗口，窗口缺数据时金额为空。单源数据，未做独立跨源核验。"
     if note:
         result["note"] = note
-    # opt-in 交叉验证：主力净流入/融资余额 MX↔iFinD 双源验证（方向+量级）；开关关 → _cv None，零回归。
     records = dict(ctx.get("field_meta") or stock_flow.get("field_meta") or {})
     main = reading_from_field_record(result["main_net_inflow"], records.get("main_inflow"))
     if main is not None:
         records["main_inflow"] = adopted_field_record("main_inflow", main, previous_record=records.get("main_inflow"))
     result["field_meta"] = records
-    currency = ctx.get("currency") or stock_flow.get("currency") or (records.get("main_inflow") or {}).get("currency")
+    return result
+
+
+def _apply_capital_cross_validation(
+    stock_code: str, result: dict[str, Any], ctx: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    """Apply the existing opt-in cross-source qualification to a capital result.
+
+    Shared by the bounded fetch and the stage-zero reuse path (issue #58):
+    with the switch off this is a no-op (zero outbound); with it on, the valid
+    primary block is not refetched — only the independent second source runs,
+    exactly as the bounded fetch always did. iFinD 多日累计（稳定源）：
+    akshare push2his 不可达 → 主力净流入/5d/10d 回填。
+    """
+    records = result["field_meta"]
+    main = reading_from_field_record(result["main_net_inflow"], records.get("main_inflow"))
+    currency = ctx.get("currency") or (ctx.get("data", {}).get("stock_flow") or {}).get("currency") or (records.get("main_inflow") or {}).get("currency")
     _cv = build_cross_validation_block(stock_code, ["main_inflow", "margin_balance"], deadline=deadline, expected_currencies={field: currency for field in ("main_inflow", "margin_balance")} if currency else None, primary_readings={"main_inflow": main} if main is not None else None)
     if _cv:
         for field, anchor in _cv["anchors"].items():
             record = field_record_from_validation(field, anchor)
             if record is not None:
                 records[field] = record
-        # iFinD 多日累计（稳定源）：akshare push2his 不可达 → 主力净流入/5d/10d 回填
         result = _backfill_capital_flow(
             result, _cv, get_main_inflow_cumulative(stock_code, deadline=deadline) if deadline > monotonic() else {}
         )
         result["cross_validation"] = _cv
     return result
+
+
+def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
+    """Get main-force capital flow data for a stock."""
+    from src.core.market_policy import require_stock_market
+    require_stock_market(stock_code)
+
+    from src.config import get_config
+    deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
+    manager = _get_fetcher_manager()
+    try:
+        budget = {"budget_seconds": min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))} if "budget_seconds" in signature(manager.get_capital_flow_context).parameters else {}
+        ctx = manager.get_capital_flow_context(stock_code, **budget)
+    except Exception as exc:
+        logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)
+        return {
+            "stock_code": stock_code,
+            "status": "error",
+            "error": f"capital flow fetch failed: {exc}",
+        }
+
+    result = _capital_flow_tool_result(stock_code, ctx)
+    if result.get("status") in ("not_supported", "error"):
+        return result
+    return _apply_capital_cross_validation(stock_code, result, ctx, deadline)
 
 
 get_capital_flow_tool = ToolDefinition(

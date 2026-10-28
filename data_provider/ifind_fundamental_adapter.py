@@ -721,11 +721,25 @@ class IfindFetcher:
             remaining = max(0.0, deadline - monotonic()) if deadline is not None else None
             key = supplier_need_key("ifind", get_config().data_source_contract, tool, question, marker)
             return run.single_fetch(key, _once, timeout=remaining)
+        except asyncio.CancelledError:
+            # A bare SDK cancellation is a user cancel only when the run's own
+            # state says so (issue #58); run.check() translates that state,
+            # otherwise the real cancellation keeps propagating instead of
+            # becoming a source failure or a mislabelled cancel.
+            if run := current_research.get():
+                run.check()
+            raise
         except ResearchStopped:
             raise
         except SourceReadError:
             raise
         except (Exception, BaseExceptionGroup) as exc:
+            # A group carrying a system-exit member keeps propagating: the
+            # cancellation/run-state translation below must not absorb it.
+            from src.core.research_run import carries_fatal_group_member
+
+            if isinstance(exc, BaseExceptionGroup) and carries_fatal_group_member(exc):
+                raise
             if run := current_research.get():
                 run.check()
             if isinstance(exc, (json.JSONDecodeError, ValidationError)):
