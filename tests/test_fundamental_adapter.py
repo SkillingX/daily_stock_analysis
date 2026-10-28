@@ -38,11 +38,15 @@ class TestFundamentalAdapter(unittest.TestCase):
         row = _extract_latest_row(df, "600519")
         self.assertIsNone(row)
 
-    def test_extract_latest_row_fallback_when_no_code_column(self) -> None:
+    def test_extract_latest_row_without_period_evidence_is_a_gap(self) -> None:
+        # 无代码列也无行级期间证据的两行表：不能拿第一行冒充"最新"（issue #60）。
         df = pd.DataFrame({"值": [1, 2]})
-        row = _extract_latest_row(df, "600519")
-        self.assertIsNotNone(row)
-        self.assertEqual(row["值"], 1)
+        self.assertIsNone(_extract_latest_row(df, "600519"))
+
+    def test_extract_latest_row_without_identity_column_cannot_claim_stock(self) -> None:
+        # 无代码列的返回可能是供应商 unscoped 默认（另一只股票）：不能声明属于请求证券。
+        df = pd.DataFrame({"日期": ["2026-10-27", "2026-10-28"], "值": [1, 2]})
+        self.assertIsNone(_extract_latest_row(df, "600519"))
 
     def test_dragon_tiger_no_match_with_code_column_is_ok(self) -> None:
         adapter = AkshareFundamentalAdapter()
