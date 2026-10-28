@@ -570,21 +570,26 @@ def _stage_zero_capital_flow(stock_code: str, run: Any) -> Optional[Dict[str, An
 
 
 def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
-    """资金流固定输入：阶段 0 合格块直接复用（issue #58），否则既有有界入口
-    + 同报告去重（issue #56，#51 single_fetch 模式）。"""
+    """资金流固定输入：同一资本需求键下阶段 0 合格块复用或既有有界入口
+    （issue #58/#56，#51 single_fetch 模式）。
+
+    阶段 0 投影与可选独立源验证在既有 single_fetch 键内完成，与有界路径
+    同 supplier/contract/stock/refresh 身份：主块零重取、失败同报告共享，
+    重复/并发消费者共享同一次出站并各取深拷贝；无 run 时走既有有界入口。
+    """
     from src.agent.tools.data_tools import _handle_get_capital_flow
 
-    if run := current_research.get():
+    run = current_research.get()
+    if run is not None:
         run.check()
-        reused = _stage_zero_capital_flow(stock_code, run)
-        if reused is not None:
-            run.retain("get_capital_flow", reused)
-            return reused
 
     def _fetch() -> Dict[str, Any]:
+        if run is not None:
+            reused = _stage_zero_capital_flow(stock_code, run)
+            if reused is not None:
+                return reused
         return _handle_get_capital_flow(stock_code)
 
-    run = current_research.get()
     if run is None:
         return _fetch()
     from src.config import get_config

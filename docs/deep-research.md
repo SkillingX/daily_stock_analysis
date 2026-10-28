@@ -112,7 +112,7 @@ src/services/deep_research_service.py (编排: 校验→生成→存盘→清理
 
 ### 超时阶段归因与参数候选
 
-模型尝试账本（`attempt_records.timeout_phase`）区分五个耗尽原因，彼此独立计时、互不替代：
+模型尝试账本（`attempt_records.timeout_phase`）区分五个 `timeout_phase` 取值，准入等待单独记状态（`queue_timeout`），不占 `timeout_phase`；各窗口不是六个互不相关的时钟——实际限制时钟按既有最小预算约束取更小者（排队后剩余预算、调用自身预算与配置上限中的生效者），归因不互相冒充：
 
 | 阶段 | 含义 | 配置键 |
 |------|------|--------|

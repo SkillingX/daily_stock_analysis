@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 > For user-friendly release highlights, see the [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases) page.
 
 ## [Unreleased]
+- [修复] 深研资金研究员的阶段 0 复用投影（含 opt-in 独立源验证）收回既有资本需求 single_fetch 键内（与有界取数同 supplier/contract/stock/refresh 身份）：验证源失败不进缓存时，同报告重复/并发消费者不再重复出站验证，主块零重取、失败与资格证据保留、消费者各取深拷贝；补真实边界重复/并发回归与调用自身预算（`call_budget`）耐久回归，深研文档超时阶段措辞校正为五个 `timeout_phase` 取值+准入单独状态。
 - [修复] 深研主动取消贯通终态与清理：共享 MCP 边界与 iFinD 同步包装按 ResearchRun 自身状态把取消形态异常（裸 CancelledError 或含其的异常组）翻译为 ResearchStopped，真实 SDK 超时不再被误标为用户取消；日线包装不再把 ResearchStopped 包装为 DataFetchError（取消不污染来源失败计数、熔断与 fallback）；阶段 0 收尾读取资料 future 遵守同一契约；API 生命周期保证已接收任务恰好交付一个终态并结束 SSE，无用户停止的意外取消保留真实失败语义，`KeyboardInterrupt`/`SystemExit` 及含其成员的异常组继续传播；有效部分报告与已知/未知用量保留，同股票门禁在真实清理后释放。
 - [修复] 部署依赖固定为已验证组合 `mcp==2.3.0`（配合既有 `litellm==1.106.4`）：普通工具声明即使不含 MCP 工具也进入 LiteLLM 懒加载 MCP 导入路径，旧 MCP 1.x 在请求时因 `CacheableResult` 导入失败而 `pip check`/健康检查不报；新增 `scripts/check_tool_deps.py` 预检并接入 `scripts/deploy.sh`（安装后、停止旧服务前），失败保留旧服务运行并中止切换；不建设旧 SDK 兼容路径。
 - [修复] 阶段 0 已取得的合格资金块保留进本次运行的共享上下文（金额、交易时点、窗口覆盖、来源、单位与字段资格原样），资金研究员经同一投影函数直接复用、零新增 NETINFLOW 出站；既有 opt-in 交叉验证对复用块与取数块同语义（关闭时空操作零出站，开启时主块零重取、核验二源照常，冲突保持不合格）；资金块不写入 24h 财务快照缓存，命中缓存的新报告不继承前次资金、按自身有界补查取得；部分有效资料保留有效性并如实携带缺口与拒绝元数据，身份/时点不匹配不构成复用依据。

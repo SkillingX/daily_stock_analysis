@@ -47,6 +47,27 @@ def test_response_wall_clock_and_report_budget_stay_distinguishable(stream_env):
     assert exhausted.stop_reason == "report_budget"
 
 
+def test_call_budget_beats_configured_response_cap_and_releases_connection(stream_env):  # noqa: F811
+    """调用自身预算(0.8s)小于配置响应上限(10s)并先到期：记 call_budget 并释放连接。
+
+    持续 chunk 的 endless 流：归因不冒充配置的 response_total（调高响应上限
+    无法修复该类失败），报告预算(15s)仍有余量，到期连接真实关闭。"""
+    adapter, state = stream_env
+    Config._instance.llm_stream_response_timeout = 10.0
+    Config._instance.llm_stream_first_chunk_timeout = 3.0
+    Config._instance.llm_stream_idle_chunk_timeout = 3.0
+    state["endless"] = True
+    state["endless_deadline"] = time.monotonic() + 5.0
+    run = ResearchRun(15.0)
+    with run.bind():
+        response = adapter.call_completion(_messages(), timeout=0.8)
+    [attempt] = run.attempts
+    _wait_server_idle(state)
+    assert response.provider == "error"
+    assert attempt.timeout_phase == "call_budget"
+    assert state["active"] == 0, "the expired call budget must release the connection"
+
+
 @pytest.mark.parametrize("window", ["first_response", "idle_chunk"])
 def test_first_response_and_idle_windows_are_distinct_causes(stream_env, window):  # noqa: F811
     """首响应（响应头+首 chunk 共用窗口）与后续 chunk 空闲分别归因。"""
