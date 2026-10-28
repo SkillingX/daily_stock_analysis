@@ -249,7 +249,12 @@ async def call_mcp_tool(
     """No retries or background session; callers own response validation and errors."""
     from mcp import ClientSession
     from mcp.client import streamable_http
-    from src.core.research_run import current_research, research_dimension
+    from src.core.research_run import (
+        carries_fatal_group_member,
+        current_research,
+        is_cancellation_exception,
+        research_dimension,
+    )
 
     run = current_research.get()
     call_id = current_call_id.get() or uuid4().hex[:12]
@@ -295,6 +300,15 @@ async def call_mcp_tool(
             duration_ms=int((monotonic() - started) * 1000), http=http_log or None,
             error_kind=type(exc).__name__, exception_chain=_exception_chain(exc),
         )
+        # A cancellation-shaped exception only means a user cancel or an
+        # exhausted report budget when the run's own state says so (issue #58);
+        # a real transport timeout keeps its timeout/error semantics instead of
+        # being mislabelled, and run.check() raises the preserved
+        # ResearchStopped through the existing stop-aware call sites. A fatal
+        # member (KeyboardInterrupt/SystemExit) in the same group is never
+        # absorbed by the cancellation translation.
+        if run is not None and is_cancellation_exception(exc) and not carries_fatal_group_member(exc):
+            run.check()
         status = _failure_http_status(http_log)
         if (
             status is not None

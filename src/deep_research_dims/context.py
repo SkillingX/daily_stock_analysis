@@ -3,12 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextvars import copy_context
 import logging
 from time import monotonic
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             # 不再为单一机构字段重跑整套基本面装配。
             "institution": institution_block,
             "balance_sheet": financial.get("balance_sheet") or {},
+            # issue #58：保留本报告已取得的资金流块（status/窗口覆盖/来源、单位与
+            # 字段资格原样），资金研究员优先复用，不再为同一需求重复出站。
+            "capital_flow": compact.get("capital_flow") or {},
             "sector_rankings": (((compact.get("capital_flow") or {}).get("data") or {}).get("sector_rankings") or {}),
             "stock_name": raw.get("stock_name"),
             "source": raw.get("source", "choice") if config.data_source_profile == "choice" else "fundamental_context",
@@ -222,7 +226,9 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         run = current_research.get()
         stopped = run is not None and (bool(run.stop_reason) or run.finalized or run.remaining() <= 0)
         if not stopped and not result.get("errors") and all(result.get(key) is not None for key in financial_keys):
-            save_snapshot(cache_key, result)
+            # issue #58：资金块只随本次 run 的装配结果返回，不写入 24h 财务快照；
+            # 跨报告/跨交易日的动态资金不得借财务缓存复活，下一报告按既有有界补查取得。
+            save_snapshot(cache_key, {key: value for key, value in result.items() if key != "capital_flow"})
         elif not stopped:
             # 已取得指标与未完成查询分开说；部分来源失败不写成全部财务无数据，
             # 逐条来源错误已由上方“基本面取数: …”记录，缓存行为不进用户可见文案。
@@ -348,18 +354,50 @@ def build_shared_context(stock_code: str, stock_name: str, *, deadline: float | 
         # Preserve stage-zero's partial-return contract; the orchestrator checks run.
         pass
     finally:
-        for key, future in futures.items():
-            if future.done():
-                setattr(ctx, key, future.result())
-                if key == "history":
-                    ctx.history_source = workers[key].history_source
-                for limitation in workers[key].limitations:
-                    ctx.limitation(limitation)
-            else:
-                future.cancel()
-                ctx.limitation(f"{key} {STAGE_TIMEOUT_NOTE_SUFFIX}")
-        request_deadline.reset(token)
-        pool.shutdown(wait=False, cancel_futures=True)
+        # Worker futures are fail-open helpers; a cancellation-shaped escape
+        # from one of them must not punch through the stage's partial-return
+        # contract (issue #58). Only the run's own state establishes a user
+        # cancel or an exhausted budget — run.check() raises the preserved
+        # ResearchStopped so the orchestrator folds completed evidence into
+        # the interrupted result; a real transport cancellation that is not a
+        # run stop stays an honest stage limitation instead of pretending
+        # success. A fatal group member (KeyboardInterrupt/SystemExit) is
+        # remembered and re-raised only after every remaining future has been
+        # collected and the deadline/pool cleanup has run unconditionally.
+        from src.core.research_run import carries_fatal_group_member
+
+        cancelled = False
+        fatal: Optional[BaseException] = None
+        try:
+            for key, future in futures.items():
+                if future.done():
+                    try:
+                        setattr(ctx, key, future.result())
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except BaseExceptionGroup as exc:
+                        # A cancellation member never absorbs an unrelated
+                        # fatal member (issue #58).
+                        if exc.subgroup(asyncio.CancelledError) is None or carries_fatal_group_member(exc):
+                            fatal = fatal if fatal is not None else exc
+                        else:
+                            cancelled = True
+                    if key == "history":
+                        ctx.history_source = workers[key].history_source
+                    for limitation in workers[key].limitations:
+                        ctx.limitation(limitation)
+                else:
+                    future.cancel()
+                    ctx.limitation(f"{key} {STAGE_TIMEOUT_NOTE_SUFFIX}")
+        finally:
+            request_deadline.reset(token)
+            pool.shutdown(wait=False, cancel_futures=True)
+        if fatal is not None:
+            raise fatal
+        if cancelled:
+            if run is not None:
+                run.check()
+            ctx.limitation("阶段0装配被中断，部分资料未采用")
     if run is None or not run.stop_reason:
         ctx.history_reports = _safe_history_reports(stock_code, ctx)
     return ctx

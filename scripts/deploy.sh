@@ -38,10 +38,19 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
 fi
 source "$VENV_DIR/bin/activate"
 
-echo "[4/6] 安装/更新 Python 依赖..."
+echo "[4/7] 安装/更新 Python 依赖..."
 pip install --no-cache-dir -r requirements.txt -q
 
-echo "[5/6] 停止旧服务..."
+# issue #58：普通工具声明会进入 LiteLLM 的懒加载 MCP 导入路径；pip check、
+# 健康检查与普通模块导入识别不了这一缺口。预检必须在停止旧服务之前完成，
+# 失败时保留旧服务继续运行并中止切换。
+echo "[5/7] 工具依赖预检（安装后、停止旧服务前）..."
+if ! "$VENV_DIR/bin/python" scripts/check_tool_deps.py; then
+    echo "  预检失败：工具处理依赖不兼容，旧服务未停止，本次部署已中止。"
+    exit 1
+fi
+
+echo "[6/7] 停止旧服务..."
 OLD_PID=$(pgrep -f "venv/bin/python.*main.py.*--serve-only" || true)
 if [ -n "$OLD_PID" ]; then
     echo "  停止现有进程 PID=$OLD_PID ..."
@@ -55,7 +64,7 @@ else
     echo "  未发现运行中的服务"
 fi
 
-echo "[6/6] 启动新服务..."
+echo "[7/7] 启动新服务..."
 nohup "$VENV_DIR/bin/python" main.py --serve-only --host 0.0.0.0 --port 8000 \
     > "$LOG_DIR/deploy_stdout.log" 2>&1 &
 NEW_PID=$!

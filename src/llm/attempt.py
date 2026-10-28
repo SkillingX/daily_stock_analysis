@@ -87,6 +87,14 @@ class ModelAttempt:
     queue_seconds: float | None = None
     exec_seconds: float | None = None
     status: str = STATUS_OK
+    # Which wall-clock window a timed-out outbound hit (issue #58):
+    # "first_response" (headers + first chunk share one window), "idle_chunk",
+    # "response_total" (the configured response cap was the limiting clock),
+    # "call_budget" (the caller's own budget was the smaller clock — raising
+    # the configured cap cannot fix it), or "report_budget" (the exhausted
+    # report budget cancelled the same coroutine). Queue waits and user
+    # cancels keep their own statuses and stay empty here.
+    timeout_phase: str = ""
     # Only the usage keys the provider actually supplied (sanitized); absent
     # keys stay absent and must never be filled with zero.
     usage_provided: dict[str, Any] = field(default_factory=dict)
@@ -273,7 +281,7 @@ def attempts_detail(attempts: list[ModelAttempt]) -> list[dict[str, Any]]:
             "outbound": a.outbound, "transport_observed": a.transport_observed,
             "queue_seconds": None if a.queue_seconds is None else round(a.queue_seconds, 3),
             "exec_seconds": None if a.exec_seconds is None else round(a.exec_seconds, 3),
-            "status": a.status, "finish_reason": a.finish_reason,
+            "status": a.status, "timeout_phase": a.timeout_phase, "finish_reason": a.finish_reason,
             "usage_presence": a.usage_presence, "usage_provided": dict(a.usage_provided),
             "usage_record_id": a.usage_record_id,
         }

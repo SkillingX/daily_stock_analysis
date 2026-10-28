@@ -400,6 +400,24 @@ def _refine_parse_error(error: BaseException) -> None:
         attempt.refine_status(STATUS_PARSE_ERROR)
 
 
+def _note_timeout_phase(attempt: Any, phase: str) -> None:
+    """Attribute a timed-out outbound to its wall-clock window (issue #58).
+
+    ``first_response`` covers response headers plus the first chunk on one
+    shared budget, later chunk gaps are ``idle_chunk`` reads, and the admitted
+    call's outer wait_for names whichever clock was actually limiting:
+    ``call_budget`` when the caller's own budget was smaller than the
+    configured response cap, ``response_total`` when the cap limited the call,
+    and ``report_budget`` when an exhausted report budget cancelled the same
+    coroutine. First writer wins, so an inner window exhausted on the same
+    failure is not overwritten when the outer scope expires on the cancelled
+    child.
+    """
+    if attempt is None or getattr(attempt, "timeout_phase", ""):
+        return
+    attempt.timeout_phase = phase
+
+
 # How often the cancellation watcher polls the run while a streamed model
 # response is being consumed in the local event loop.
 _STREAM_CANCEL_POLL_SECONDS = 0.05
@@ -999,9 +1017,11 @@ class LLMToolAdapter:
             permit is held until aggregation and transport close are done.
             """
             scope: Optional[float] = None
+            caller_budget: Optional[float] = None
             remaining = kwargs.get("timeout")
             if isinstance(remaining, (int, float)):
-                scope = max(float(remaining), 0.0)
+                caller_budget = max(float(remaining), 0.0)
+                scope = caller_budget
             if response_cap is not None:
                 scope = min(scope, response_cap) if scope is not None else response_cap
             # A mutable holder is not enough across the wait_for child task:
@@ -1016,15 +1036,25 @@ class LLMToolAdapter:
                 # The first-chunk budget starts at the real outbound and is
                 # shared by awaiting the response headers and receiving the
                 # first chunk — a slow server cannot reset it by delivering
-                # headers alone. Later chunks switch to the idle cap.
+                # headers alone. Later chunks switch to the idle cap. Each
+                # exhausted window is attributed on the attempt ledger
+                # (issue #58) so first_response, idle_chunk and the outer
+                # response wall clock stay distinguishable.
                 first_deadline = monotonic() + float(get_config().llm_stream_first_chunk_timeout)
                 idle_chunk_timeout = float(get_config().llm_stream_idle_chunk_timeout)
                 chunks: List[Any] = []
                 try:
-                    stream = await asyncio.wait_for(
-                        acompletion_fn(**kwargs),
-                        timeout=max(first_deadline - monotonic(), 0.0),
-                    )
+                    try:
+                        stream = await asyncio.wait_for(
+                            acompletion_fn(**kwargs),
+                            timeout=max(first_deadline - monotonic(), 0.0),
+                        )
+                    except asyncio.TimeoutError:
+                        _note_timeout_phase(attempt, "first_response")
+                        logger.warning(
+                            "[LiteLLM] first-response window exhausted (LLM_STREAM_FIRST_CHUNK_TIMEOUT), closing stream",
+                        )
+                        raise
                     # The raw wrapper is the Router-recorded stream_transport
                     # or the direct call's own litellm wrapper; without
                     # either, the observation degrades to honest unknown.
@@ -1039,12 +1069,22 @@ class LLMToolAdapter:
                     # transport closes and the failure propagates as timeout.
                     aiter = stream.__aiter__()
                     chunk_deadline: Optional[float] = max(first_deadline - monotonic(), 0.0)
+                    window = "first_response"
                     while True:
                         try:
                             chunk = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_deadline)
                         except StopAsyncIteration:
                             break
+                        except asyncio.TimeoutError:
+                            _note_timeout_phase(attempt, window)
+                            logger.warning(
+                                "[LiteLLM] %s window exhausted (%s), closing stream",
+                                window,
+                                "LLM_STREAM_FIRST_CHUNK_TIMEOUT" if window == "first_response" else "LLM_STREAM_IDLE_CHUNK_TIMEOUT",
+                            )
+                            raise
                         chunk_deadline = idle_chunk_timeout
+                        window = "idle_chunk"
                         chunks.append(chunk)
                     return litellm.stream_chunk_builder(chunks, messages=messages)
                 finally:
@@ -1076,8 +1116,27 @@ class LLMToolAdapter:
 
             # Python 3.10 compatible wall-clock scope: wait_for cancels the
             # admitted coroutine on expiry, so a blocked read exits and the
-            # transport closes before the failure propagates.
-            return await asyncio.wait_for(_inner(), timeout=scope)
+            # transport closes before the failure propagates. The scope is the
+            # minimum of the caller/call budget and the configured response
+            # cap, so an expiry here names whichever clock was actually
+            # limiting (issue #58): an exhausted report budget keeps its own
+            # attribution, a smaller caller budget is "call_budget" (raising
+            # the configured cap cannot fix it), and only a limiting response
+            # cap is "response_total". A user cancel is not a clock window. An
+            # inner window that already attributed the failure keeps its phase.
+            try:
+                return await asyncio.wait_for(_inner(), timeout=scope)
+            except asyncio.TimeoutError:
+                attempt = attempt_box.get("attempt")
+                if run is not None and run.stop_reason == "cancelled":
+                    pass  # not a clock window; the ledger keeps cancelled_in_flight
+                elif run is not None and (run.stop_reason or run.remaining() <= 0):
+                    _note_timeout_phase(attempt, "report_budget")
+                elif response_cap is not None and (caller_budget is None or response_cap <= caller_budget):
+                    _note_timeout_phase(attempt, "response_total")
+                else:
+                    _note_timeout_phase(attempt, "call_budget")
+                raise
 
         async def _with_run_watch() -> Any:
             main_task = asyncio.current_task()

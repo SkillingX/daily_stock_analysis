@@ -508,6 +508,12 @@ class BaseFetcher(ABC):
             )
             return df
 
+        except ResearchStopped:
+            # Cancellation / report-budget stop is a run signal, not a source
+            # failure (issue #58): wrap neither the type nor the cause, so the
+            # manager keeps recognising the stop and failure counters, circuit
+            # breaking and fallback stay clean.
+            raise
         except Exception as e:
             elapsed = time.time() - request_start
             error_type, error_reason = summarize_exception(e)
