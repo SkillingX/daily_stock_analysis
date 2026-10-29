@@ -723,7 +723,6 @@ class AkshareFundamentalAdapter:
         sector_df, sector_source, sector_errors = self._call_df_candidates(
             [
                 ("stock_sector_fund_flow_rank", {}),
-                ("stock_sector_fund_flow_summary", {}),
             ]
         )
         result["errors"].extend(sector_errors)

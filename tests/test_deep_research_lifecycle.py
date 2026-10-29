@@ -98,10 +98,14 @@ def test_cancel_waits_for_real_cleanup_and_cannot_cancel_a_new_run(research_http
         assert client.get(f"/reports/{done['report_id']}").json()["data"]["markdown"] == done["markdown"]
         assert client.post(f"/runs/{run_id}/cancel").json()["status"] == "finished"
         newer_id = uuid4().hex
+        previous_count = observed["count"]
         newer = pool.submit(client.post, "/generate/stream", json=request_body(newer_id))
-        wait_until(lambda: observed["active"] > 0)
+        # The cancelled provider may still be draining; wait for the new dispatch.
+        wait_until(lambda: observed["count"] > previous_count)
         assert client.post(f"/runs/{run_id}/cancel").json()["status"] == "finished"
-        assert client.get(f"/runs/{newer_id}").json()["end_reason"] is None
+        newer_status = client.get(f"/runs/{newer_id}")
+        assert newer_status.status_code == 200, newer_status.text
+        assert newer_status.json()["end_reason"] is None
         assert newer.result(timeout=10).status_code == 200
 
 

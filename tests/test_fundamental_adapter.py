@@ -22,6 +22,37 @@ from data_provider.fundamental_adapter import (
 
 
 class TestFundamentalAdapter(unittest.TestCase):
+    def test_sector_rankings_do_not_fall_back_to_individual_stock_flows(self) -> None:
+        import akshare as ak
+
+        individual_flows = pd.DataFrame([
+            {"代码": "300750", "名称": "宁德时代", "今日主力净流入-净额": 1000000.0},
+        ])
+        with patch.object(ak, "stock_sector_fund_flow_rank", side_effect=ValueError("non-JSON response")), patch.object(
+            ak, "stock_sector_fund_flow_summary", return_value=individual_flows,
+        ) as summary:
+            result = AkshareFundamentalAdapter().get_capital_flow("300260", include_stock=False)
+        summary.assert_not_called()
+        self.assertEqual(result["sector_rankings"], {"top": [], "bottom": []})
+        self.assertEqual(result["status"], "not_supported")
+        self.assertEqual(result["errors"], ["stock_sector_fund_flow_rank:ValueError"])
+
+    def test_sector_rankings_keep_the_valid_industry_fund_flow_table(self) -> None:
+        import akshare as ak
+
+        sector_flows = pd.DataFrame([
+            {"名称": "半导体", "今日主力净流入-净额": 1000000.0},
+            {"名称": "化工", "今日主力净流入-净额": -1000000.0},
+        ])
+        with patch.object(ak, "stock_sector_fund_flow_rank", return_value=sector_flows), patch.object(
+            ak, "stock_sector_fund_flow_summary",
+        ) as summary:
+            result = AkshareFundamentalAdapter().get_capital_flow("300260", include_stock=False)
+        summary.assert_not_called()
+        self.assertEqual(result["sector_rankings"]["top"][0]["name"], "半导体")
+        self.assertEqual(result["sector_rankings"]["bottom"][0]["name"], "化工")
+        self.assertEqual(result["source_chain"], ["capital_sector:stock_sector_fund_flow_rank"])
+
     def test_parse_dividend_plan_to_per_share_supports_cn_patterns(self) -> None:
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("10派3元(含税)"), 0.3, places=6)
         self.assertAlmostEqual(_parse_dividend_plan_to_per_share("每10股派发2.5元"), 0.25, places=6)
