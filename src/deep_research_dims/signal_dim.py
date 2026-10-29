@@ -13,7 +13,7 @@ from math import isfinite
 from icontract import ensure
 
 from src.deep_research_dims.context import SharedContext
-from src.deep_research_dims.scenarios_dim import with_valuation_cascade
+from src.deep_research_dims.scenarios_dim import NON_VALUATION_SCOPE, with_valuation_cascade
 from src.schemas.deep_research_dims import Confidence, Rating, SignalDim
 
 
@@ -54,6 +54,25 @@ def build_signal_dim(
 
 
     if scenarios_payload.get("status") != "ok" or target is None:
+        # 非估值分支同样依赖结论实际完成（issue #64/R7）：结论降级时信号不得单独 ok。
+        if (
+            scenarios_payload.get("status") == "ok"
+            and scenarios_payload.get("valuation_basis") == "none"
+            and (conclusion_payload or {}).get("status") == "ok"
+        ):
+            # 合法非估值分支（issue #64 §2.2）：有效的观察结果——中性/低置信度，
+            # 明确不提供估值驱动评级与收益空间；不代表看多或看空。
+            return SignalDim(
+                status="ok",
+                rating="中性",
+                confidence="低",
+                signal_type="非估值观察",
+                one_sentence="无目标价，不提供估值驱动买卖评级与预期收益空间；维持观察与条件跟踪。",
+                narrative=(
+                    f"{NON_VALUATION_SCOPE}该信号表示有效的观察结论，不表示看多或看空；"
+                    "独立技术计划仍按其原有证据与守卫执行。"
+                ),
+            )
         return SignalDim(status="degraded", degraded_reason=with_valuation_cascade("估值依据不足"), rating="中性", confidence="低",
                          one_sentence="估值不可用，暂观察；技术点位见独立行动计划。", narrative="缺少估值依据，不生成目标价或期望收益。")
 

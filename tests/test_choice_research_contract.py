@@ -183,15 +183,12 @@ def test_target_reference_never_promotes_missing_or_negative_upside(price):
         assert signal.status == 'degraded'
 
 
-def test_model_failure_preserves_choice_company_and_holder_evidence(choice_transport, monkeypatch):
+def test_model_failure_preserves_choice_company_evidence(choice_transport, monkeypatch):
+    """issue #64：股权 runner 退役；business 的模型失败留存契约保持。"""
     from src.agent.deep_research import explore_agents
     from src.agent.tools import data_tools
     monkeypatch.setattr(explore_agents, '_run_explore', lambda *a, **kw: {'ok': False, 'error': 'timeout'})
     monkeypatch.setattr(data_tools, '_handle_get_stock_info', lambda *a, **kw: {'fundamental_context': {'research': {'as_of': date.today().isoformat(), 'company': {'AHOLDER': '实控人甲', 'MAINBUSINESS': '制造设备'}, 'holders': {'HOLDNAMER': '股东甲;股东乙', 'period': '2026-06-30'}}}})
-    ownership = explore_agents.run_ownership_agent('300260', 'fixture', None)
-    assert ownership['ok'] and ownership['data']['status'] == 'degraded'
-    assert ownership['data']['top_holders'][1]['name'] == '股东乙'
-    assert '实控人甲' in ownership['data']['controller']
     business = explore_agents.run_business_agent('300260', 'fixture', None)
     assert business['data']['business_model']['value'] == '制造设备'
     assert business['data']['status'] == 'degraded'

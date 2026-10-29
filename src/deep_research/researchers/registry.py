@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""研究员注册表：dim_id → Researcher。新增研究员 = 一个模块 + 一条记录。"""
+"""研究员注册表：dim_id → Researcher。新增研究员 = 一个模块 + 一条记录。
+
+issue #64：ownership（股权高管）研究退役，从可执行注册表移除；其维度契约与
+解析保留供历史报告使用（src/schemas/deep_research_dims.py / render）。
+"""
 
 from __future__ import annotations
 
@@ -7,7 +11,7 @@ from typing import Dict
 
 from src.deep_research.researchers.base import Researcher
 from src.deep_research.researchers import (
-    business, capital, news, ownership, sentiment, supply_chain, technical, us_china,
+    business, capital, news, sentiment, supply_chain, technical, us_china,
 )
 
 # runner 以名字引用：编排器从全局按名解析（保证测试可 monkeypatch）
@@ -18,14 +22,13 @@ _RUNNER_NAMES = {
     "technical": "run_technical_agent",
     "capital": "run_capital_agent",
     "sentiment": "run_sentiment_agent",
-    "ownership": "run_ownership_agent",
     "us_china": "run_us_china_agent",
     "business": "run_business_agent",
 }
 
 _MODULES = {
     "news": news, "supply_chain": supply_chain, "technical": technical,
-    "capital": capital, "sentiment": sentiment, "ownership": ownership,
+    "capital": capital, "sentiment": sentiment,
     "us_china": us_china, "business": business,
 }
 

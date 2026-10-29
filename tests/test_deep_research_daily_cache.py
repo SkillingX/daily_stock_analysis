@@ -20,19 +20,18 @@ class TestDateKey:
     """_date_key 按自然日生成缓存 key。"""
 
     def test_date_key_format(self):
-        """key 格式为 {code}:{YYYYMMDD}:{dims指纹}，全量 dims 指纹为 full。"""
+        """key 格式为 {contract}:{scope}:{code}:{YYYYMMDD}:{dims指纹}（issue #64 加范围 scope）。"""
         key = _date_key("600519")
         today = datetime.now().strftime("%Y%m%d")
-        assert key == f"legacy:600519:{today}:full"
-        assert len(key) == len("legacy:") + 6 + 1 + 8 + 1 + 4  # code:date:full
+        assert key == f"legacy:v2.2:600519:{today}:full"
 
     def test_date_key_different_codes(self):
         """不同股票代码 key 不同。"""
         key1 = _date_key("600519")
         key2 = _date_key("000001")
         assert key1 != key2
-        assert key1.startswith("legacy:600519:")
-        assert key2.startswith("legacy:000001:")
+        assert key1.startswith("legacy:v2.2:600519:")
+        assert key2.startswith("legacy:v2.2:000001:")
 
 
 class TestReportCacheMechanism:
@@ -217,4 +216,58 @@ class TestCacheServiceLevel:
         # 使用一个 mock 的方式验证缓存写入路径存在
         # （实际 LLM 调用由集成测试覆盖）
         cache_key = _date_key("600519")
-        assert cache_key == f"legacy:600519:{datetime.now().strftime('%Y%m%d')}:full"
+        assert cache_key == f"legacy:v2.2:600519:{datetime.now().strftime('%Y%m%d')}:full"
+
+
+class TestCachedDoneDimReports:
+    """B4（issue #64）：缓存命中路径同样暴露实际存在的维度子报告列表。"""
+
+    def setup_method(self):
+        with _cache_lock:
+            _report_cache.clear()
+
+    def teardown_method(self):
+        with _cache_lock:
+            _report_cache.clear()
+
+    def test_cached_done_and_payload_expose_actual_dim_reports(self, tmp_path, monkeypatch):
+        """缓存载荷里的过期/伪造列表不得透传：done 事件与返回值重算实际文件。"""
+        from src.services import deep_research_service as service_module
+        from src.services.deep_research_service import DeepResearchService
+
+        monkeypatch.setattr(service_module, "_DEEP_RESEARCH_DIR", tmp_path)
+        report_id = "600519_202609290900"
+        (tmp_path / f"{report_id}_dim_signal.md").write_text("# 信号", encoding="utf-8")
+        (tmp_path / f"{report_id}_dim_capital.md").write_text("# 资金", encoding="utf-8")
+        cached_data = {
+            "report_id": report_id,
+            "stock_code": "600519",
+            "stock_name": "贵州茅台",
+            "markdown": "# 缓存报告",
+            "status": "success",
+            "quality_score": 100,
+            "missing_layers": [],
+            "engine": "dual_track",
+            "dimensions": {"signal": {"status": "ok"}},
+            "guardrail_events": [],
+            # 伪造：ghost 文件不存在，缓存载荷里的列表不得原样透传
+            "available_dim_reports": ["ghost"],
+            "error": None,
+        }
+        with _cache_lock:
+            _report_cache[_date_key("600519")] = (report_id, time.time(), cached_data)
+
+        events: list = []
+        out = DeepResearchService().generate_report(
+            raw_code="600519",
+            raw_name="贵州茅台",
+            progress_callback=events.append,
+        )
+        actual = sorted(path.stem.split(f"{report_id}_dim_", 1)[1]
+                        for path in tmp_path.glob(f"{report_id}_dim_*.md"))
+        assert out.get("cache_hit") is True
+        assert out.get("available_dim_reports") == actual == ["capital", "signal"]
+        done = [e for e in events if e.get("type") == "done"]
+        assert len(done) == 1, f"缓存命中必须恰好推送 1 个 done，实际: {[e.get('type') for e in events]}"
+        assert done[0].get("cache_hit") is True
+        assert done[0].get("available_dim_reports") == ["capital", "signal"]

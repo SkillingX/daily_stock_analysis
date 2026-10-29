@@ -314,7 +314,9 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
     import math
 
     fields = {
-        "get_capital_flow": {"main_net_inflow": "当日主力净流入", "inflow_5d": "5交易日主力净流入", "inflow_10d": "10交易日主力净流入"},
+        # issue #64：单日窗口不再称「当日」——实际截至日随 field_meta.observed_at/
+        # as_of_date 投影进 period。
+        "get_capital_flow": {"main_net_inflow": "单日主力净流入", "inflow_5d": "5交易日主力净流入", "inflow_10d": "10交易日主力净流入"},
         "get_realtime_quote": {"price": "价格", "change_pct": "涨跌幅", "volume": "成交量", "amount": "成交额"},
         "get_stock_info": {"name": "公司名称", "pe_ratio": "PE", "pb_ratio": "PB", "total_mv": "总市值", "circ_mv": "流通市值", "revenue": "营业收入", "net_profit": "归母净利润", "roe": "加权ROE", "gross_margin": "毛利率", "revenue_yoy": "营收同比", "net_profit_yoy": "归母净利同比"},
         "get_daily_history": {"open": "最近交易日开盘", "high": "最近交易日最高", "low": "最近交易日最低", "close": "最近交易日收盘", "volume": "最近交易日成交量"},
@@ -350,7 +352,9 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
         if key == "top10_holder_change" and meta.get("caliber") == "top10_shareholder_concentration":
             label = "十大股东集中度变化（计算）"
         quality = meta.get("quality") or {}
-        period = str(meta.get("period") or meta.get("observed_at") or values.get("date") or result.get("latest_date") or result.get("date") or "")
+        # issue #64：资金窗口无字段级 meta 时优先用实际共同截至日 as_of_date，
+        # 不得把序列最新有效日（latest_date）当作窗口截至日。
+        period = str(meta.get("period") or meta.get("observed_at") or result.get("as_of_date") or values.get("date") or result.get("latest_date") or result.get("date") or "")
         if meta.get("previous_period"):
             period = f"{meta['previous_period']} → {period}"
         try:

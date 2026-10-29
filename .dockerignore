@@ -29,5 +29,7 @@ test_*.py
 *.md
 !README.md
 
-# Required runtime prompt, kept outside the mutable data volume
+# Required runtime prompts, kept outside the mutable data volume
 !src/deep_research_dims/prompts/business.md
+# issue #64：capital 现行规则为强制项，随镜像分发（缺失时研究员显式失败）
+!src/deep_research/researchers/capital/SKILL.md

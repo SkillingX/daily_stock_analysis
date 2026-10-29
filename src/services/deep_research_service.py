@@ -43,14 +43,41 @@ def _cacheable_report(result: Dict[str, Any]) -> bool:
     )
 
 
+def _day_cache_capital_within_boundary(cached_result: Dict[str, Any], now: Any = None) -> bool:
+    """B2/R12：日缓存命中校验资金实际截至日仍在允许边界（共享谓词）。
+
+    报告级缓存按自然日有效，但跨收盘（15:10 后 T 前进）时旧回退资金可能越界；
+    越界则视为 miss 走正常重新生成（不修改已保存报告）。
+    """
+    from src.deep_research_dims.dim_cache import capital_block_within_date_boundary
+
+    capital = (cached_result.get("dimensions") or {}).get("capital")
+    if capital is None:
+        return True  # 无资金维度的报告不受此边界约束
+    status = str(capital.get("status") or "")
+    if status != "ok":
+        return True  # 降级资金不构成"可用资金结论"，无越界采用风险
+    return capital_block_within_date_boundary(capital, now=now)
+
+
 def _date_key(code: str, dims: Optional[List[str]] = None) -> str:
-    """返回今日缓存 key（按自然日 + 维度子集指纹，同一天同子集复用同一报告）。
+    """返回今日缓存 key（按自然日 + 范围版本 + 维度子集指纹，同一天同子集复用同一报告）。
 
     dims 指纹：省钱模式下不同维度子集各自独立缓存，避免全量/子集报告互相串包。
+    scope 版本（issue #64）：有效范围/评分口径变化后旧报告日缓存不可命中。
+    B3：等价全量请求（None/空/旧19/显式18）经共享解析规范化为同一指纹——避免
+    同一有效请求生成多份付费报告；真子集与仅退役请求不折叠进 full。
     """
-    dims_fp = ",".join(sorted(d for d in (dims or []) if d)) or "full"
     from src.config import get_config
-    return f"{get_config().data_source_contract}:{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
+    from src.schemas.deep_research_dims import ACTIVE_DIM_IDS, resolve_dim_selection
+    from src.scoring.weights_v2 import SCORING_VERSION_V2
+
+    resolved = resolve_dim_selection(dims)
+    if resolved is None or resolved == set(ACTIVE_DIM_IDS):
+        dims_fp = "full"
+    else:
+        dims_fp = ",".join(sorted(resolved))
+    return f"{get_config().data_source_contract}:{SCORING_VERSION_V2}:{code}:{datetime.now().strftime('%Y%m%d')}:{dims_fp}"
 
 
 # 报告产物目录：项目根/reports/deep_research/（对齐 notification.py 的 reports/ 约定）
@@ -183,6 +210,18 @@ class DeepResearchService:
         run: Optional["ResearchRun"] = None,
     ) -> Dict[str, Any]:
         from src.core.research_run import ResearchRun
+        from src.schemas.deep_research_dims import (
+            RetiredDimRequestError,
+            resolve_dim_selection,
+        )
+
+        # issue #64：直接服务/CLI 等调用边界与 API 同决策——未知 ID 拒绝（ValueError），
+        # 仅退役维度受理/取数前拒绝（400 语义），混合请求剔除退役 ID 后受理。
+        try:
+            resolved_dims = resolve_dim_selection(dims)
+        except RetiredDimRequestError as exc:
+            raise DeepResearchInputError(str(exc))
+        dims = sorted(resolved_dims) if resolved_dims else None
         run = run or ResearchRun(get_config().deep_research_timeout_seconds)
         run.progress = progress_callback
         with run.bind():
@@ -218,7 +257,7 @@ class DeepResearchService:
             now = time.time()
             with _cache_lock:
                 cached = _report_cache.get(cache_key)
-            if cached and _cacheable_report(cached[2]):
+            if cached and _cacheable_report(cached[2]) and _day_cache_capital_within_boundary(cached[2]):
                 cached_id, cached_ts, cached_result = cached
                 logger.info(
                     "[DeepResearch] 日缓存命中 %s（%.0fs前生成），直接返回缓存报告",
@@ -246,10 +285,14 @@ class DeepResearchService:
                     for _k in ("engine", "dimensions", "guardrail_events", "dims_degraded", "final_conclusion", "model_usage"):
                         if _k in cached_result:
                             done_event[_k] = cached_result[_k]
+                    # B4 冻结接口：缓存载荷里的列表可能过期/被清理，done 按当前
+                    # 实际子文件重算（与 fresh done/detail 同一事实源）。
+                    done_event["available_dim_reports"] = self._available_dim_reports(cached_id)
                     progress_callback(done_event)
                 # 追加 cache_hit 标记，前端据此显示"来自缓存"
                 cached_result = dict(cached_result)
                 cached_result["cache_hit"] = True
+                cached_result["available_dim_reports"] = self._available_dim_reports(cached_id)
                 return cached_result
 
         report_id = _REPORT_ID_PATTERN.format(code=code, ts=datetime.now())
@@ -392,6 +435,10 @@ class DeepResearchService:
         if dims_payload is not None:
             # 增量字段：旧前端可忽略（兼容 §7.3）
             done_event["engine"] = "dual_track"
+            # B4 冻结接口：实际落盘的维度子报告（write_ok 后计算）
+            done_event["available_dim_reports"] = (
+                self._available_dim_reports(report_id) if write_ok else []
+            )
             done_event["dimensions"] = dims_payload
             done_event["guardrail_events"] = guardrail_events
             done_event["dims_degraded"] = list(result.missing_layers)
@@ -422,6 +469,10 @@ class DeepResearchService:
             return_dict["engine"] = "dual_track"
             return_dict["dimensions"] = dims_payload
             return_dict["guardrail_events"] = guardrail_events
+            # B4 冻结接口：日缓存命中路径的 done/返回值据此透传实际可用子报告
+            return_dict["available_dim_reports"] = (
+                self._available_dim_reports(report_id) if write_ok else []
+            )
             # 终读结论必须进缓存 payload，否则日缓存命中路径的 done 事件会丢字段
             return_dict["final_conclusion"] = (
                 getattr(result, "final_conclusion", "") or ""
@@ -481,6 +532,23 @@ class DeepResearchService:
             logger.warning("[DeepResearch] 迟到用量刷新失败 %s: %s", report_id, exc)
             return None
 
+    def _available_dim_reports(self, report_id: str) -> List[str]:
+        """实际存在的维度子报告文件列表（B4 冻结接口：available_dim_reports）。
+
+        由现有实际子文件存在性计算（`_dim_report_path` 同一事实源）；历史报告
+        动态提供；未知/空不伪造链接。前端据此渲染可下载链接，不再按维度载荷
+        猜测文件存在。
+        """
+        report_dir = get_deep_research_dir()
+        try:
+            return sorted(
+                path.stem.split(f"{report_id}_dim_", 1)[1]
+                for path in report_dir.glob(f"{report_id}_dim_*.md")
+                if f"{report_id}_dim_" in path.stem
+            )
+        except (OSError, ValueError):
+            return []
+
     # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
@@ -514,6 +582,8 @@ class DeepResearchService:
             for key in ("engine", "dimensions", "guardrail_events", "run_id", "end_reason", "model_usage"):
                 if key in payload:
                     data[key] = payload[key]
+        # B4 冻结接口：实际存在的维度子报告文件（历史动态提供，未知/空不伪造）
+        data["available_dim_reports"] = self._available_dim_reports(report_id)
         return data
 
     def get_dims_payload(self, report_id: str) -> Optional[Dict[str, Any]]:

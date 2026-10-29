@@ -9,7 +9,7 @@
 # {{ stock_name }}（{{ stock_code }}）深度投研{% if title_angle %}：{{ title_angle }}{% endif %}
 
 > 报告类型：{{ report_type }} ｜ 数据截至：{{ as_of }}（阶段 0 快照时点）｜ 评分框架 {{ six_dim.scoring_version }}
-> 评级：**{{ signal.rating if investment_available else '依据不足' }}** ｜ {{ valuation_label }}：**{{ valuation_price|round(2) if valuation_price is not none else 'N/A' }} 元** ｜ 现价：**{{ current_price or 'N/A' }}**{% if upside_pct is not none %} ｜ 参考价差：**{{ upside_pct }}%**{% endif %} ｜ 置信度：{{ signal.confidence }}{{ range_bit }}{{ pe_bit }}
+> 评级：**{{ signal.rating if investment_available else '依据不足' }}** ｜ {% if scenarios.status == 'ok' and scenarios.valuation_basis == 'none' %}估值口径：**非估值分析（无目标价，不提供收益空间）**{% else %}{{ valuation_label }}：**{{ valuation_price|round(2) if valuation_price is not none else 'N/A' }} 元**{% endif %} ｜ 现价：**{{ current_price or 'N/A' }}**{% if upside_pct is not none %} ｜ 参考价差：**{{ upside_pct }}%**{% endif %} ｜ 置信度：{{ signal.confidence }}{{ range_bit }}{{ pe_bit }}
 > 核心逻辑：{{ signal.one_sentence if investment_available else final_conclusion }}
 > 本次章节：{{ research_summary }}。正常表示本次章节完成，不代表数据准确率或股票质量。
 > 本报告为模拟盘研究记录，不构成投资建议
@@ -57,7 +57,7 @@
 3. 走势：三种世界观与钥匙事件
 4. 风险矩阵：什么会打掉上面的判断
 5. 评分表：六维加权
-6. 分项依据：九维度深度
+6. 分项依据：深度研究
 7. 附录
 
 ---
@@ -151,6 +151,10 @@
 {% if section_narrative('worldview') %}{{ section_narrative('worldview') }}
 
 {% elif scenarios.narrative %}{{ scenarios.narrative }}
+
+{% endif %}
+{% if scenarios.status == 'ok' and scenarios.valuation_basis == 'none' %}
+> ⚠️ **范围说明**：未取得可追溯目标价，本报告采用非估值分析——不提供目标价、预期收益空间或估值驱动买卖评级；信号为中性观察，不代表看多或看空。
 
 {% endif %}
 {{ degraded_note(scenarios) }}
@@ -263,7 +267,7 @@
 
 ---
 
-## 六、分项依据：九维度深度
+## 六、分项依据：深度研究
 
 {% for s in dim_sections %}
 <!-- dim:{{ s.id }} -->

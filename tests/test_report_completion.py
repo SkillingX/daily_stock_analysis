@@ -85,11 +85,18 @@ def test_phase_calendar_failure_keeps_explicit_rule_fallback(monkeypatch: pytest
     assert "兜底" in dim.phase.data_limitations[0]
 
 
-def test_sector_gap_keeps_the_capital_ranking_contract() -> None:
+def test_sector_ranking_retired_keeps_formal_industry_contract() -> None:
+    # issue #64：行业资金榜退役——新报告不再产生「板块资金排行未取得」缺口，
+    # rankings 不再消费；正式行业分类（政策倾向/基率）与普通缺口提示保留。
     from src.deep_research_dims.context import SharedContext
     from src.deep_research_dims.sector_dim import build_sector_dim
     dim = build_sector_dim(SharedContext("600519", "样本", "2026-10-29", fundamental={"industry_hint": "食品饮料"}))
-    assert "板块资金排行未取得" in dim.data_gaps
+    assert "板块资金排行未取得" not in dim.data_gaps
+    assert dim.rankings == {}
+    assert dim.status == "ok" and dim.sector_hint == "食品饮料"
+    assert dim.base_rate is not None and "行业基率" in dim.narrative
+    ordinary = build_sector_dim(SharedContext("600519", "样本", "2026-10-29"))
+    assert "所属行业未取得" in ordinary.data_gaps and ordinary.status == "degraded"
 
 
 @pytest.mark.parametrize("skip_narrations", [False, True])

@@ -414,8 +414,10 @@ def test_fuyao_fallback_preserves_verification_budget(monkeypatch: pytest.Monkey
     fallback_budgets: list[float] = []
     verification_budgets: list[float] = []
     class Manager:
-        def get_fundamental_context(self, code: str, *, budget_seconds: float) -> dict[str, Any]:
+        def get_fundamental_context(self, code: str, *, budget_seconds: float, include_sector_flows: bool) -> dict[str, Any]:
             assert budget_seconds == 5.0
+            # issue #64：深研阶段 0 行业榜退役，_safe_fundamental 显式传 False。
+            assert include_sector_flows is False
             clock[0] += fetch_elapsed
             return {}
         def _run_with_timeout(self, task: Any, remaining: float, name: str) -> tuple[None, str, int]:

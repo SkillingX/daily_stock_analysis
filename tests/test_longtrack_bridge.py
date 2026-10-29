@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from src.schemas.deep_research_dims import DIM_IDS
+from src.schemas.deep_research_dims import ACTIVE_DIM_IDS, DIM_IDS
 from typing import Any, Dict, List
 
 
@@ -511,7 +511,7 @@ class TestSkipNarrationsPropagation:
         monkeypatch.setattr(orch, "run_supply_chain_agent", lambda *a, **k: {"ok": True, "data": {"company_position": "白酒"}, "steps": 1})
         for _name in (
             "run_technical_agent", "run_capital_agent", "run_sentiment_agent",
-            "run_ownership_agent", "run_us_china_agent",
+            "run_us_china_agent",
         ):
             monkeypatch.setattr(
                 orch, _name,
@@ -533,4 +533,6 @@ class TestSkipNarrationsPropagation:
         assert result.status == "partial"
         assert result.dims['scenarios'].status == result.dims['conclusion'].status == result.dims['signal'].status == 'degraded'
         assert result.dims['scenarios'].expected_value is None
-        assert len(result.dims) == len(DIM_IDS) == 19
+        # issue #64：新报告可执行范围为当前 18 项；DIM_IDS 保留 19 项历史目录。
+        assert len(result.dims) == len(ACTIVE_DIM_IDS) == 18
+        assert len(DIM_IDS) == 19 and "ownership" not in result.dims

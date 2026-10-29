@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
-import { useDeepResearch, DUAL_TRACK_DIMS } from '../hooks/useDeepResearch';
+import { useDeepResearch, DUAL_TRACK_DIMS, ACTIVE_DUAL_TRACK_DIMS } from '../hooks/useDeepResearch';
 import {
   deepResearchApi,
   type DeepResearchGuardrailEvent,
@@ -82,8 +82,9 @@ export function DeepResearchPage() {
     useDeepResearch();
 
   const [dimsInfo, setDimsInfo] = useState<DimsInfo | null>(null);
-  // 分析范围：维度子集（默认全选；非全选时传 dims，后端自动补依赖闭包）
-  const [selectedDims, setSelectedDims] = useState<string[]>(DUAL_TRACK_DIMS.map((d) => d.id));
+  // 分析范围：维度子集（默认全选；非全选时传 dims，后端自动补依赖闭包）。
+  // issue #64：默认选择集 = 当前 18 项活动维度（退役维度不再参与新报告）。
+  const [selectedDims, setSelectedDims] = useState<string[]>(ACTIVE_DUAL_TRACK_DIMS.map((d) => d.id));
   const [forceRefresh, setForceRefresh] = useState(false);
 
   const isGenerating = status === 'generating' || status === 'cancelling';
@@ -102,10 +103,20 @@ export function DeepResearchPage() {
     ? Object.values(effectiveDims.dimensions).filter((dim) => typeof dim === 'object' && dim !== null && 'status' in dim && dim.status === 'ok').length
     : 0;
 
-  const reliableCounts = effectiveDims && DUAL_TRACK_DIMS.every(({ id }) => {
-    const dim = effectiveDims.dimensions[id];
-    return typeof dim === 'object' && dim !== null && 'status' in dim && ['ok', 'degraded', 'skipped'].includes(String(dim.status));
-  });
+  // 完成计数可靠性按报告自身保存范围全量校验（issue #64：含 ownership 的历史
+  // 19 项 payload 按历史全集校验，否则按当前 18 项全集校验；子集报告本就含
+  // skipped 占位，残缺 fragment 不构成可靠计数）。
+  const reliableCounts =
+    effectiveDims &&
+    (() => {
+      const keys = Object.keys(effectiveDims.dimensions);
+      if (keys.length === 0) return false;
+      const expected = keys.includes('ownership') ? DUAL_TRACK_DIMS : ACTIVE_DUAL_TRACK_DIMS;
+      return expected.every(({ id }) => {
+        const dim = effectiveDims.dimensions[id];
+        return typeof dim === 'object' && dim !== null && 'status' in dim && ['ok', 'degraded', 'skipped'].includes(String(dim.status));
+      });
+    })();
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -150,7 +161,8 @@ export function DeepResearchPage() {
     setCurrentDetail(null);
     setDimsInfo(null);
     reset();
-    const allSelected = selectedDims.length === DUAL_TRACK_DIMS.length;
+    // 全选 = 当前 18 项活动维度全选（不发 dims，后端默认全量语义一致）
+    const allSelected = selectedDims.length === ACTIVE_DUAL_TRACK_DIMS.length;
     void generate(selectedStock.code, selectedStock.name, {
       dims: allSelected ? undefined : selectedDims,
       forceRefresh: forceRefresh || undefined,
@@ -238,6 +250,9 @@ export function DeepResearchPage() {
   // 展示的报告：生成结果优先，否则历史选中
   const displayReport = report || currentDetail;
   const displayId = displayReport?.id;
+  // 子报告链接只来自后端确认的实际产物（issue #64：dimensions JSON 条目不是文件；
+  // available_dim_reports 缺失/空 = 不推测链接，无已知产物时不回退全目录）
+  const availableDimLinks = (displayReport?.available_dim_reports ?? []).filter((id) => DIM_ID_SET.has(id));
   const showReport =
     !!displayReport && !!displayReport.markdown && !isGenerating && status !== 'error';
 
@@ -395,10 +410,10 @@ export function DeepResearchPage() {
               <div className="flex flex-wrap gap-1.5">
                 {(
                   [
-                    { label: `全部（${DUAL_TRACK_DIMS.length} 维）`, dims: DUAL_TRACK_DIMS.map((d) => d.id) },
+                    { label: `全部（${ACTIVE_DUAL_TRACK_DIMS.length} 维）`, dims: ACTIVE_DUAL_TRACK_DIMS.map((d) => d.id) },
                     {
                       label: '快速版（无情报/产业链探索）',
-                      dims: DUAL_TRACK_DIMS.map((d) => d.id).filter((x) => x !== 'intel' && x !== 'supply_chain'),
+                      dims: ACTIVE_DUAL_TRACK_DIMS.map((d) => d.id).filter((x) => x !== 'intel' && x !== 'supply_chain'),
                     },
                     {
                       label: '长线投研（五段式+探索）',
@@ -421,7 +436,7 @@ export function DeepResearchPage() {
                 ))}
               </div>
               <div className="flex flex-wrap gap-x-3 gap-y-1">
-                {DUAL_TRACK_DIMS.map((d) => (
+                {ACTIVE_DUAL_TRACK_DIMS.map((d) => (
                   <label key={d.id} className="inline-flex items-center gap-1 text-xs text-secondary-text">
                     <input
                       type="checkbox"
@@ -458,9 +473,9 @@ export function DeepResearchPage() {
                 <Loader2 className="h-5 w-5 animate-spin text-cyan" />
                 <span>{status === 'cancelling' ? '正在停止后续研究并保留有效资料；在途工作结束后完成取消。' : '正在生成深度投研报告。关闭页面后仍会继续，可稍后到历史记录查看。'}</span>
               </div>
-              {/* 双轨维度徽章进度 */}
+              {/* 双轨维度徽章进度（issue #64：新报告进度 = 当前 18 项活动维度） */}
               <div className="flex flex-wrap gap-1.5">
-                {DUAL_TRACK_DIMS.map((d) => {
+                {ACTIVE_DUAL_TRACK_DIMS.map((d) => {
                   const st = dimStatuses[d.id] ?? 'pending';
                   return (
                     <span
@@ -580,32 +595,6 @@ export function DeepResearchPage() {
                     </span>
                   </div>
                   <p className="text-xs text-muted-text">章节状态表示本次研究进度，不代表数据准确率或股票质量。各项资料的来源与核验状态见正文。</p>
-                  {/* 逐维度子报告：直接查看（新标签页）/ 下载 */}
-                  {displayId && (
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="text-[11px] text-muted-text">子报告：</span>
-                      {DUAL_TRACK_DIMS.map((d) => (
-                        <span key={d.id} className="inline-flex items-center gap-0.5">
-                          <a
-                            href={deepResearchApi.dimReportUrl(displayId, d.id)}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="rounded border border-white/10 px-1.5 py-0.5 text-[11px] text-muted-text transition-colors hover:border-cyan/40 hover:text-cyan"
-                          >
-                            {d.label}
-                          </a>
-                          <a
-                            href={`${deepResearchApi.dimReportUrl(displayId, d.id)}?download=1`}
-                            download
-                            aria-label={`下载${d.label}子报告`}
-                            className="rounded px-0.5 text-[11px] text-muted-text/50 transition-colors hover:text-cyan"
-                          >
-                            ⬇
-                          </a>
-                        </span>
-                      ))}
-                    </div>
-                  )}
                   {effectiveDims.guardrailEvents.length > 0 && (
                     <details className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
                       <summary className="cursor-pointer text-sm font-medium text-amber-300">
@@ -635,6 +624,32 @@ export function DeepResearchPage() {
                       </div>
                     </details>
                   )}
+                </div>
+              )}
+              {/* 逐维度子报告：仅列出后端确认实际存在的产物（含历史 ownership），直接查看（新标签页）/ 下载 */}
+              {displayId && availableDimLinks.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-muted-text">子报告：</span>
+                  {availableDimLinks.map((id) => (
+                    <span key={id} className="inline-flex items-center gap-0.5">
+                      <a
+                        href={deepResearchApi.dimReportUrl(displayId, id)}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded border border-white/10 px-1.5 py-0.5 text-[11px] text-muted-text transition-colors hover:border-cyan/40 hover:text-cyan"
+                      >
+                        {dimName(id)}
+                      </a>
+                      <a
+                        href={`${deepResearchApi.dimReportUrl(displayId, id)}?download=1`}
+                        download
+                        aria-label={`下载${dimName(id)}子报告`}
+                        className="rounded px-0.5 text-[11px] text-muted-text/50 transition-colors hover:text-cyan"
+                      >
+                        ⬇
+                      </a>
+                    </span>
+                  ))}
                 </div>
               )}
               <div className="flex flex-wrap items-center gap-2">

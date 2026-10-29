@@ -548,7 +548,9 @@ def build_view(
     technical: Any = dims["technical"]
     capital: Any = dims["capital"]
     sentiment: Any = dims["sentiment"]
-    ownership: Any = dims["ownership"]
+    # issue #64：新报告维度集合为当前 18 项（无 ownership 键）；历史 19 项报告
+    # 渲染仍带该维度。
+    ownership: Any = dims.get("ownership")
     us_china: Any = dims["us_china"]
 
     from src.deep_research_dims.manager_writeup import (

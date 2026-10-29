@@ -22,14 +22,16 @@ from typing import Any, Dict
 logger = logging.getLogger(__name__)
 
 # 长线子集（依赖闭包自动补 data；跳过快照类短线维度不为批量场景付费）
-# 注意：必须包含所有 researcher 维度，否则这些研究员根本不会被调用
+# 注意：必须包含所有 researcher 维度，否则这些研究员根本不会被调用。
+# issue #64：ownership 已随本版退役，混合范围在源头剔除（编排器对传入集合
+# 亦按同一边界过滤，历史调用方无需改动）。
 LONG_TRACK_SUBSET = frozenset(
     {
         # system 维度
         "supply_chain", "intel", "six_dim", "bayesian", "scenarios",
         "conclusion", "plan", "signal", "data", "phase", "history",
         # researcher 维度（核心研究维度，必须包含）
-        "technical", "capital", "ownership", "sentiment", "us_china",
+        "technical", "capital", "sentiment", "us_china",
         "business", "fundamental", "sector",
     }
 )

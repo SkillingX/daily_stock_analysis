@@ -309,8 +309,11 @@ def test_model_http_reject_keeps_prepared_facts_in_saved_report(reject_http: tup
     The shared context is the report fixture's stubbed assembly boundary with
     typed stage-zero materials injected below — assembly itself is covered by
     the root frozen-supplier probes, not here. Saved and history-read dims
-    keep the prepared scalars with source/unit/period/statistical-object
-    qualification; scores stay null and statuses stay degraded.
+    keep the prepared scalars with source/unit/period qualification; scores
+    stay null and statuses stay degraded. issue #64：注入的 institution 块是
+    刻意保留的退役遗留输入，新报告必须忽略它；仅期望输出随退役变化——
+    capital 保留事实只含市值锚点与 Choice 资金窗口（单日/5/10 交易日），
+    旧机构字段不得复活。
     """
     import json
 
@@ -331,7 +334,9 @@ def test_model_http_reject_keeps_prepared_facts_in_saved_report(reject_http: tup
     def with_prepared_facts(*args: Any, **kwargs: Any) -> Any:
         context = original_builder(*args, **kwargs)
         # Deterministic stage-zero materials: quote, history, qualified market
-        # caps and the institution block, all zero extra outbound.
+        # caps and the institution block, all zero extra outbound. issue #64：
+        # institution 块是刻意的退役遗留输入——完整退役契约要求旧字段即使存在
+        # 也不得复活进新报告；下方断言验证它不再被消费/留存。
         context.history = history
         context.history_source = "fixture-source"
         context.quote = {"price": 50.0, "source": "fixture",
@@ -371,15 +376,11 @@ def test_model_http_reject_keeps_prepared_facts_in_saved_report(reject_http: tup
         assert by_dim[dim] == done["dimensions"][dim]
         assert by_dim[dim]["status"] == "degraded" and by_dim[dim]["score"] is None
     capital_facts = {fact["label"]: fact for fact in by_dim["capital"]["retained_facts"]}
-    assert {"总市值", "流通市值", "机构持仓变化", "当日主力净流入"} <= set(capital_facts)
+    assert {"总市值", "流通市值", "单日主力净流入", "5交易日主力净流入", "10交易日主力净流入"} <= set(capital_facts)
     assert capital_facts["总市值"]["value"] == "2050000000000.0"
     assert capital_facts["总市值"]["unit"] == "currency_base / CNY"
     assert "single_source" in capital_facts["总市值"]["qualification"]
-    assert capital_facts["机构持仓变化"]["unit"] == "percentage_point"
-    assert capital_facts["机构持仓变化"]["period"] == "2026中报"
-    # 统计对象不丢失：退化报告能区分十大股东变动与全部机构口径
-    assert "top10_shareholders" in capital_facts["机构持仓变化"]["qualification"]
-    assert "YTD" in capital_facts["机构持仓变化"]["qualification"]
+    assert all("机构" not in label for label in capital_facts), "机构持仓评分已退役，不得再进入资金保留事实"
     technical_facts = {fact["label"]: fact for fact in by_dim["technical"]["retained_facts"]}
     assert {"20日均线", "6日RSI", "最近交易日收盘", "价格"} <= set(technical_facts)
     assert technical_facts["20日均线"]["source"] == "代码指标计算，日线来源 fixture-source"
@@ -387,7 +388,8 @@ def test_model_http_reject_keeps_prepared_facts_in_saved_report(reject_http: tup
     assert detail["model_usage"] == done["model_usage"]
     assert detail["run_id"] == run_id
     # 历史读取的维度与落盘产物逐字段一致（不只是 usage 一致），
-    # 且渲染正文中统计对象口径可见
+    # 且渲染正文保留市值原值与资金窗口的实际资料
     for dim in ("technical", "capital"):
         assert detail["dimensions"][dim] == payload["dimensions"][dim]
-    assert "top10_shareholders" in detail["markdown"]
+    assert "2050000000000.0" in detail["markdown"]
+    assert "单日主力净流入" in detail["markdown"]

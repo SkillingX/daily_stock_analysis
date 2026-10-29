@@ -90,52 +90,31 @@ def _assert_vendor(dim_id, payload, research, *, details=True):
     dim = parse_dim(dim_id, payload)
     assert dim.status == "degraded" and dim.score is None
     assert dim.degraded_reason
-    if dim_id == "ownership":
-        assert "可信实控人" in dim.controller and "Choice" in dim.controller
-        assert research["as_of"] in dim.controller
-        assert {holder.name for holder in dim.top_holders} == {"股东甲", "股东乙"}
-        assert all("Choice" in holder.source and research["holders"]["period"] in holder.source for holder in dim.top_holders)
-        if details:
-            assert dim.shareholder_details is not None
-            assert len(dim.shareholder_details.items) == 10
-            holder = dim.shareholder_details.items[0]
-            assert holder.name == "李水波" and holder.report_date == "2025-12-31"
-            assert holder.shares.source == "ifind" and holder.shares.unit == "shares"
-            assert holder.shares.value == 102200000 and holder.ratio.value == 25.06
-    else:
-        assert dim.business_model["value"] == "供应商公司业务资料"
-        assert "Choice" in dim.business_model["source"] and research["as_of"] in dim.business_model["source"]
-        assert dim.main_products["value"] == "供应商主营产品资料"
-        if details:
-            assert dim.product_segments is not None
-            assert len(dim.product_segments.items) == 4
-            product = dim.product_segments.items[0]
-            assert product.name == "无菌包材" and product.report_date == "2025-12-31"
-            assert product.revenue.source == "ifind" and product.revenue.unit == "currency_base"
-            assert product.revenue.value == 1411150168.69
+    assert dim.business_model["value"] == "供应商公司业务资料"
+    assert "Choice" in dim.business_model["source"] and research["as_of"] in dim.business_model["source"]
+    assert dim.main_products["value"] == "供应商主营产品资料"
+    if details:
+        assert dim.product_segments is not None
+        assert len(dim.product_segments.items) == 4
+        product = dim.product_segments.items[0]
+        assert product.name == "无菌包材" and product.report_date == "2025-12-31"
+        assert product.revenue.source == "ifind" and product.revenue.unit == "currency_base"
+        assert product.revenue.value == 1411150168.69
     return dim
 
 
-@pytest.mark.parametrize("dim_id,mode", [("ownership", "bad_list"), ("ownership", "object_gaps"), ("business", "bad_score"), ("business", "runner_error"), ("business", "data_gaps")])
-def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runtime, monkeypatch, dim_id, mode):
+@pytest.mark.parametrize("mode", ["bad_score", "runner_error", "data_gaps"])
+def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runtime, monkeypatch, mode):
+    # issue #64：ownership 研究退役，失败保留覆盖收敛到 business 维度；
+    # 显式 ownership 请求的拒绝语义由 test_issue64_scope_compat 覆盖。
     runtime = vendor_runtime
-    invalid = {"executives": {"source_note": "模型错误列表"}, "recent_changes": {"window": "本期未取得"}} if dim_id == "ownership" else {"score": 999, "narrative": "模型未通过契约"}
+    invalid = {"score": 999, "narrative": "模型未通过契约"}
     if mode == "data_gaps":
         invalid = {"data_gaps": ["证据不足"], "business_model": {}, "main_products": {}}
-    if mode == "object_gaps":
-        invalid = {"executives": [{"name": "高管甲", "source": "公告"}], "data_gaps": [{"item": "近一年减持公告未取得"}], "narrative": "模型已取得的股权研究"}
-    if mode not in {"runner_error", "data_gaps", "object_gaps"}:
+    if mode == "bad_score":
         from src.deep_research.researchers import REGISTRY
-        if dim_id == "ownership":
-            # 契约收敛（#35）：包装列表形状在股权适配边界解包/记缺项，不再抛
-            # ValidationError；本用例继续验证坏形状下供应商资料保留与不写成功缓存。
-            dim, _steps = REGISTRY[dim_id].parser(invalid, 1)
-            assert dim.status == "degraded"
-            assert dim.executives == [] and dim.recent_changes == []
-            assert any("核心高管" in gap for gap in dim.data_gaps)
-        else:
-            with pytest.raises(ValidationError):
-                REGISTRY[dim_id].parser(invalid, 1)
+        with pytest.raises(ValidationError):
+            REGISTRY["business"].parser(invalid, 1)
 
     def model(*args, **kwargs):
         if mode == "runner_error":
@@ -143,9 +122,9 @@ def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runt
         return {"ok": True, "steps": 1, "data": deepcopy(invalid)}
 
     monkeypatch.setattr(runtime["explore"], "_run_explore", model)
-    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=[dim_id], force_refresh=True)
+    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=["business"], force_refresh=True)
     assert report["status"] == "partial" and report["report_id"]
-    _assert_vendor(dim_id, report["dimensions"][dim_id], runtime["research"])
+    _assert_vendor("business", report["dimensions"]["business"], runtime["research"])
     assert not runtime["cache_writes"]
     assert not runtime["deep"]._report_cache
     rid = report["report_id"]
@@ -155,43 +134,75 @@ def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runt
         download = client.get(f"/api/v1/deep-research/reports/{rid}/markdown")
     assert detail.status_code == download.status_code == 200
     saved = detail.json()["data"]
-    _assert_vendor(dim_id, saved["dimensions"][dim_id], runtime["research"])
+    _assert_vendor("business", saved["dimensions"]["business"], runtime["research"])
     assert report["markdown"] == saved["markdown"] == download.text
-    if mode == "object_gaps":
-        ownership = saved["dimensions"]["ownership"]
-        assert ownership["executives"][0]["name"] == "高管甲"
-        assert ownership["data_gaps"] == ["近一年减持公告未取得"]
-        assert ownership["narrative"] == "模型已取得的股权研究"
-        assert "近一年减持公告未取得" in download.text
-        assert "validation error" not in download.text and "{'item':" not in download.text
-    assert ("李水波" if dim_id == "ownership" else "无菌包材") in download.text
+    assert "无菌包材" in download.text
     assert "iFinD" in download.text and "2025-12-31" in download.text
 
 
-@pytest.mark.parametrize("core_gaps,expected", [([], "ok"), (["控制关系未核实"], "degraded")])
-def test_ownership_core_assessment_matches_saved_history_and_download(
-    vendor_runtime: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
-    core_gaps: list[str], expected: str,
-) -> None:
-    runtime = vendor_runtime
-    payload = {"core_data_gaps": core_gaps, "data_gaps": ["完整履历未取得"], "score": 80,
+def _seed_historical_ownership_report(runtime: dict[str, Any], report_id: str, core_gaps: list[str]) -> tuple[Any, str]:
+    """Seed an honestly stored legacy 19-dim ownership report (files + DB row).
+
+    issue #64：ownership 研究退役后不再有新生成路径；历史报告按保存内容展示、
+    不裁剪不回写。读取链（dims.json + 正文文件 + DB 行）与解析防线均真实。
+    """
+    from src.deep_research.researchers.ownership import parse as parse_ownership
+    from src.services.deep_research_service import get_deep_research_dir
+
+    payload = {"controller": "公告披露的实际控制人甲（定期报告）",
+               "top_holders": [{"name": "股东甲", "source": "定期报告"}],
+               "core_data_gaps": core_gaps,
+               # 历史产物常见对象形状缺口：读取时由解析防线适配为文字。
+               "data_gaps": [{"item": "完整履历未取得"}],
+               "score": 80,
                "executives": [{"name": "高管甲", "detail": "董事长", "source": "任职公告"}],
                "narrative": "已有可追溯股权资料，补充履历仍有缺口。"}
-    monkeypatch.setattr(runtime["explore"], "_run_explore", lambda *a, **kw: {"ok": True, "steps": 1, "data": deepcopy(payload)})
-    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=["ownership"], force_refresh=True)
-    ownership = report["dimensions"]["ownership"]
-    assert ownership["status"] == expected
-    assert ownership["core_data_gaps"] == core_gaps
-    assert ownership["score"] == (80 if expected == "ok" else None)
-    assert "完整履历未取得" in report["markdown"]
-    rid = report["report_id"]
+    dim, _steps = parse_ownership(payload, 1)
+    expected = "degraded" if core_gaps else "ok"
+    assert dim.status == expected and dim.score == (80 if expected == "ok" else None)
+    assert dim.core_data_gaps == core_gaps
+    assert "完整履历未取得" in dim.data_gaps
+
+    markdown = (f"# 新莱应材（300260）深度投研报告\n\n## 股权高管\n\n{dim.narrative}\n\n"
+                "- 高管甲：董事长（任职公告）\n\n"
+                f"资料缺口：{'、'.join(dim.data_gaps)}。\n")
+    report_dir = get_deep_research_dir()
+    md_path = report_dir / f"{report_id}.md"
+    md_path.write_text(markdown, encoding="utf-8")
+    (report_dir / f"{report_id}_dims.json").write_text(json.dumps({
+        "engine": "dual_track",
+        "dimensions": {"ownership": dim.model_dump(mode="json")},
+        "guardrail_events": [],
+    }, ensure_ascii=False), encoding="utf-8")
+    assert runtime["database"].save_deep_research_report(
+        report_id, "300260", "新莱应材", str(md_path), "partial",
+        quality_score=0, missing_layers=[] if expected == "ok" else ["ownership"],
+        total_steps=1, total_tokens=0, provider="fixture",
+    )
+    return dim, markdown
+
+
+@pytest.mark.parametrize("core_gaps,expected", [([], "ok"), (["控制关系未核实"], "degraded")])
+def test_historical_ownership_report_matches_saved_status_api_and_download(
+    vendor_runtime: dict[str, Any], core_gaps: list[str], expected: str,
+) -> None:
+    runtime = vendor_runtime
+    rid = "300260_202609011200"
+    dim, markdown = _seed_historical_ownership_report(runtime, rid, core_gaps)
     with TestClient(runtime["app"]) as client:
         detail = client.get(f"/api/v1/deep-research/reports/{rid}").json()["data"]
         downloaded = client.get(f"/api/v1/deep-research/reports/{rid}/markdown")
         history = client.get("/api/v1/deep-research/reports").json()["data"]
-    assert detail["dimensions"]["ownership"] == ownership
-    assert detail["markdown"] == downloaded.text == report["markdown"]
-    assert next(row for row in history if row["id"] == rid)["status"] == report["status"]
+    saved_ownership = detail["dimensions"]["ownership"]
+    assert saved_ownership == dim.model_dump(mode="json")
+    assert saved_ownership["status"] == expected
+    assert saved_ownership["core_data_gaps"] == core_gaps
+    assert detail["markdown"] == downloaded.text == markdown
+    assert "完整履历未取得" in detail["markdown"] and "高管甲" in detail["markdown"]
+    row = next(row for row in history if row["id"] == rid)
+    assert row["status"] == "partial"
+    # 历史 missing_layers 按保存内容原样返回，不因新 18 项默认回写
+    assert row["missing_layers"] == ([] if expected == "ok" else ["ownership"])
 
 
 @pytest.mark.parametrize("mode", ["bad_score", "model_error", "missing_prompt", "data_gaps"])
@@ -229,6 +240,8 @@ def test_fundamentals_keeps_business_facts_on_failure_without_success_cache(vend
 
 @pytest.mark.parametrize("reason", ["cancelled", "report_budget"])
 def test_stage_zero_stop_keeps_choice_facts_before_researchers_start(vendor_runtime, monkeypatch, reason):
+    # issue #64：ownership 退役，中断保留覆盖收敛到 business 公司资料区；
+    # Choice 原始字段（AHOLDER + 带报告期 HOLDNAMER）带真实来源/期间留存。
     runtime = vendor_runtime
     run = ResearchRun(30)
     shared = runtime["shared"]
@@ -246,11 +259,13 @@ def test_stage_zero_stop_keeps_choice_facts_before_researchers_start(vendor_runt
 
     monkeypatch.setattr(runtime["orchestrator"], "build_shared_context", stopped_stage_zero)
     monkeypatch.setattr(runtime["explore"], "_run_explore", forbidden)
-    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=["business", "ownership"], force_refresh=True, run=run)
+    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=["business"], force_refresh=True, run=run)
     assert report["status"] == "partial" and report["end_reason"] == reason
     assert not run.vendor_research and len(runtime["calls"]) == calls_before
-    for dim_id in ("business", "ownership"):
-        _assert_vendor(dim_id, report["dimensions"][dim_id], runtime["research"], details=False)
+    _assert_vendor("business", report["dimensions"]["business"], runtime["research"], details=False)
+    period = runtime["research"]["holders"]["period"]
+    assert "公司资料（Choice 原始字段留存" in report["markdown"]
     assert "供应商公司业务资料" in report["markdown"] and "可信实控人" in report["markdown"]
+    assert f"报告期 {period}" in report["markdown"] and "股东甲；股东乙" in report["markdown"]
     assert run.reason_text in report["markdown"]
     assert not runtime["cache_writes"]

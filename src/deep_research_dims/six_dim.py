@@ -8,6 +8,9 @@
 - F1/F2/intel 供数指标（基本面-板块对比/业务财务、消息面两项）在 P1 接线，
   本期按纪律记缺口。
 - v2.1（issue #46）：筹码成本与社区评价退休，不评分、不补 50、不算缺口。
+- v2.2（issue #64）：股权高管（equity_mgmt）与机构持仓变动（institution_change）
+  退休，基本面按 31.25/43.75/25 归一，资金面资金流 100%；退休项不评分、
+  不补 50、不算缺口、不进入权重分母。
 """
 
 from __future__ import annotations
@@ -37,7 +40,6 @@ from src.schemas.research_framework import DimensionScore, IndicatorScore, Resea
 logger = logging.getLogger(__name__)
 
 _LLM_INDICATOR_IDS = (
-    "equity_mgmt",
     "institute_view",
     "liquidity",
     "risk_appetite",
@@ -229,11 +231,11 @@ def _scoring_timeout() -> float:
 
 
 # 待补指标 → fundamental 相关子键（按需选取：缺哪类评分就优先保留其证据字段）
+# issue #64：行业资金榜与机构持仓块退役，宏观/机构评价不再引用其子键。
 _INDICATOR_FACT_PRIORITY: Dict[str, tuple] = {
-    "equity_mgmt": ("research",),
-    "institute_view": ("research", "institution_holding_change"),
-    "liquidity": ("sector_rankings", "research"),
-    "risk_appetite": ("sector_rankings", "research"),
+    "institute_view": ("research",),
+    "liquidity": ("research",),
+    "risk_appetite": ("research",),
 }
 
 
@@ -542,9 +544,8 @@ def build_six_dim(
     technical_payload: Optional[Dict[str, Any]] = None,
     capital_payload: Optional[Dict[str, Any]] = None,
     sentiment_payload: Optional[Dict[str, Any]] = None,
-    ownership_payload: Optional[Dict[str, Any]] = None,
 ) -> SixDimDim:
-    """L1 v2：规则 + 缠论 + 罗盘 + LLM 混合打分，单一评分源。"""
+    """L1 v2：规则 + 缠论 + 罗盘 + LLM 混合打分，单一评分源（v2.2 起不含退役指标）。"""
     validate_v2_weights()
     data = (data_dim_payload or {}).get("perspective") or {}
     price_pos = data.get("price_position") or {}
@@ -556,7 +557,6 @@ def build_six_dim(
         "基本面": {
             "sector_vs_leader": _score_from_f2(f2_payload),
             "business_financial": _score_from_f1(f1_payload),
-            "equity_mgmt": _researcher_score(ownership_payload),
         },
         "消息面": {
             "real_news": intel_scores["real_news"],
@@ -564,7 +564,6 @@ def build_six_dim(
         },
         "资金面": {
             "capital_flow": _researcher_score(capital_payload, "flow_score"),
-            "institution_change": _researcher_score(capital_payload, "institution_change_score"),
         },
         "情绪面": {
             "institute_view": _researcher_score(sentiment_payload, "institute_score"),
@@ -588,9 +587,8 @@ def build_six_dim(
     )
     indicator_results["基本面"]["valuation"] = valuation
 
-    # 补充评分只填真正缺项：已有研究员评分（equity_mgmt / 机构评价）优先保留
+    # 补充评分只填真正缺项：已有研究员评分（机构评价）优先保留
     llm_existing = {
-        "equity_mgmt": indicator_results["基本面"].get("equity_mgmt"),
         "institute_view": indicator_results["情绪面"].get("institute_view"),
         "liquidity": indicator_results["宏观"].get("liquidity"),
         "risk_appetite": indicator_results["宏观"].get("risk_appetite"),
@@ -599,7 +597,7 @@ def build_six_dim(
         ctx, ctx.stock_name, llm_adapter, intel_payload, existing=llm_existing
     )
     for ind_id, result in llm_results.items():
-        dim = "基本面" if ind_id == "equity_mgmt" else ("情绪面" if ind_id == "institute_view" else "宏观")
+        dim = "情绪面" if ind_id == "institute_view" else "宏观"
         if indicator_results[dim].get(ind_id) is None:
             indicator_results[dim][ind_id] = result
 

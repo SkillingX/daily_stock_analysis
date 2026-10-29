@@ -93,6 +93,38 @@ class TestGetCapitalFlowContract(unittest.TestCase):
         self.assertLessEqual(len(result["sector_rankings"]["top_inflow_sectors"]), 3)
         self.assertEqual(result["errors"], [])
 
+    def test_deep_scope_omits_retired_sector_rankings_key(self) -> None:
+        """深研范围块整键无行业榜（issue #64 真实报告反例）：投影不再合成空占位。
+
+        既有公开消费者契约不变：块带 sector_rankings 键时照常投影
+        （见 test_ok_response_shape）。
+        """
+
+        class _DummyManagerDeepScope:
+            """include_sector_flows=False 的源块：只含个股资金，无行业榜键。"""
+
+            def get_capital_flow_context(self, _stock_code: str):
+                return {
+                    "status": "ok",
+                    "data": {
+                        "stock_flow": {
+                            "main_net_inflow": 1500000.0,
+                            "inflow_5d": 8000000.0,
+                            "inflow_10d": 15000000.0,
+                        },
+                    },
+                    "errors": [],
+                }
+
+        with patch(
+            "src.agent.tools.data_tools._get_fetcher_manager",
+            return_value=_DummyManagerDeepScope(),
+        ):
+            result = _handle_get_capital_flow("600519", include_sector_flows=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("sector_rankings", result)
+
     def test_not_supported_for_non_cn_or_etf(self) -> None:
         """ETF / non-CN stocks return status=not_supported with an explanatory note."""
         with patch(

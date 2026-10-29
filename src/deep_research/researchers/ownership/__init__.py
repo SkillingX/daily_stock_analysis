@@ -11,18 +11,17 @@ from pydantic import ValidationError
 
 from data_provider.ifind_fundamental_adapter import IfindShareholders
 
-from src.agent.deep_research.explore_agents import run_ownership_agent
 from src.deep_research.researchers.base import generic_parse
 from src.schemas.deep_research_dims import HolderInfo, OwnershipDim
 
+# issue #64：股权高管研究员已退役（不再注册进 registry、不启动 runner/取数）。
+# 本模块仅保留 read-only 解析（历史 19 项产物的兼容读取防线），无出站。
 DIM_ID = "ownership"
-DISPLAY_NAME = "股权高管研究员"
+DISPLAY_NAME = "股权高管研究员（本版已停用）"
 SKILL_MD = "researchers/ownership/SKILL.md"
-TOOLS = frozenset(frozenset({'search_comprehensive_intel', 'search_stock_news', 'search_knowledge_base'}))
+TOOLS = frozenset()
 TTL_HOURS = 24.0
 SCORE_KEY = 'score'
-
-runner_fn = run_ownership_agent
 
 
 def _adapt_holder_list(value: Any, label: str) -> tuple[list[HolderInfo], list[str]]:
