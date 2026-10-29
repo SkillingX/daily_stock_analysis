@@ -106,7 +106,14 @@ def test_cancel_waits_for_real_cleanup_and_cannot_cancel_a_new_run(research_http
         newer_status = client.get(f"/runs/{newer_id}")
         assert newer_status.status_code == 200, newer_status.text
         assert newer_status.json()["end_reason"] is None
-        assert newer.result(timeout=10).status_code == 200
+        newer_response = newer.result(timeout=10)
+        assert newer_response.status_code == 200, newer_response.text
+        newer_events = [json.loads(line[6:]) for line in newer_response.text.splitlines() if line.startswith("data: ")]
+        newer_terminal = [event for event in newer_events if event["type"] in {"done", "error"}]
+        assert len(newer_terminal) == 1
+        assert newer_terminal[0]["type"] == "done"
+        assert newer_terminal[0]["run_id"] == newer_id
+        assert newer_terminal[0]["end_reason"] is None
 
 
 @pytest.mark.parametrize("research_http", ["dual_track", "legacy"], indirect=True)
