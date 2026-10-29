@@ -48,7 +48,7 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 13  # issue #46：筹码/社区指标退休，六维与资金/情绪契约变更
+SCHEMA_VERSION = 14  # 股权核心缺口分类与资金两期集中度口径；旧缓存重算，历史报告不改写
 # 本次来源提示已变、且编排器会读入新报告的维度。缺版本即 miss，不改 payload 正文。
 # 不 bump 全局 SCHEMA_VERSION / 基本面 mapping，context 维度本就不走这段缓存。
 SOURCE_LABEL_VERSION = 1

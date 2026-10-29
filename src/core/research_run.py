@@ -347,12 +347,17 @@ def retained_tool_facts(tool: str, result: Any) -> list[dict[str, str]]:
         if isinstance(value, (int, float)) and not math.isfinite(value):
             continue
         meta = metadata.get({"main_net_inflow": "main_inflow", "price": "current_price"}.get(key, key)) or {}
+        if key == "top10_holder_change" and meta.get("caliber") == "top10_shareholder_concentration":
+            label = "十大股东集中度变化（计算）"
         quality = meta.get("quality") or {}
+        period = str(meta.get("period") or meta.get("observed_at") or values.get("date") or result.get("latest_date") or result.get("date") or "")
+        if meta.get("previous_period"):
+            period = f"{meta['previous_period']} → {period}"
         try:
             record = RetainedFact(
                 tool=tool, label=label, value=str(value)[:300],
                 source=str(meta.get("source") or result.get("source") or "工具未标注来源")[:160],
-                period=str(meta.get("period") or meta.get("observed_at") or values.get("date") or result.get("latest_date") or result.get("date") or "")[:80],
+                period=period[:80],
                 unit=" / ".join(str(part) for part in (meta.get("unit") or result.get("source_unit"), meta.get("currency") or result.get("currency")) if part)[:80],
                 qualification="；".join([str(quality.get("status") or "未独立核验"), *[str(code) for code in quality.get("reason_codes", [])], *[str(code) for code in meta.get("input_reasons", [])], *[str(meta[key]) for key in ("caliber", "period_basis", "statement_scope", "adjustment") if meta.get(key)], *([str(meta["normalization_error"])] if meta.get("normalization_error") else []), *(["资格不合格"] if meta.get("rule_eligible") is False else []), *(["历史估算"] if result.get("estimated") else [])])[:300],
             )
