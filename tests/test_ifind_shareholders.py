@@ -42,22 +42,3 @@ def test_cross_period_holder_names_cannot_borrow_other_period_values(ifind_trans
     assert result.coverage == 'partial'
     assert all(item.shares is None and item.ratio is None for item in result.items)
     assert all(item.report_date == '2024-12-31' for item in result.items)
-
-
-def test_model_failure_keeps_details_without_inventing_controller(ifind_transport, monkeypatch):
-    holders_response(ifind_transport)
-    from src.agent.deep_research import explore_agents
-    from src.deep_research.researchers.ownership import parse
-    from src.agent.tools import data_tools
-    from data_provider.base import DataFetcherManager
-    monkeypatch.setattr(data_tools,'_fetcher_manager_singleton',DataFetcherManager())
-    monkeypatch.setattr(explore_agents,'_run_explore',lambda *a, **kw:{'ok':False,'error':'model unavailable'})
-    out=explore_agents.run_ownership_agent('300260','新莱应材',None,research={})
-    dim,_=parse(out['data'],0)
-    assert len(dim.shareholder_details.items) == 10
-    assert dim.controller == ''
-    assert dim.score is None and dim.status == 'degraded'
-    from src.schemas.deep_research_dims import parse_dim
-    restored = parse_dim('ownership', dim.model_dump())
-    assert len(restored.shareholder_details.items) == 10
-    assert restored.shareholder_details.items[0].shares.source == 'ifind'

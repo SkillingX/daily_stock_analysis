@@ -660,9 +660,11 @@ class AkshareFundamentalAdapter:
         result["status"] = "partial" if has_content else "not_supported"
         return result
 
-    def get_capital_flow(self, stock_code: str, top_n: int = 5, *, include_stock: bool = True) -> Dict[str, Any]:
+    def get_capital_flow(self, stock_code: str, top_n: int = 5, *, include_stock: bool = True, include_sector: bool = True) -> Dict[str, Any]:
         """
         Return stock + sector capital flow.
+
+        ``include_sector=False``（issue #64 深研路径）：跳过行业资金榜取数。
         """
         result: Dict[str, Any] = {
             "status": "not_supported",
@@ -720,10 +722,14 @@ class AkshareFundamentalAdapter:
                 result["stock_flow"]["field_meta"] = flow_meta
                 result["source_chain"].append(f"capital_stock:{stock_source}")
 
-        sector_df, sector_source, sector_errors = self._call_df_candidates(
-            [
-                ("stock_sector_fund_flow_rank", {}),
-            ]
+        sector_df, sector_source, sector_errors = (
+            (None, "sector_skipped", [])
+            if not include_sector
+            else self._call_df_candidates(
+                [
+                    ("stock_sector_fund_flow_rank", {}),
+                ]
+            )
         )
         result["errors"].extend(sector_errors)
         if sector_df is not None:

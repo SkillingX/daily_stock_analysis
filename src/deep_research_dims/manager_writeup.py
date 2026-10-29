@@ -144,7 +144,7 @@ SECTION_FALLBACK_TITLES: Dict[str, str] = {
     "valuation": "估值锚从哪里来",
 }
 
-# 七个维度节 key → 规则回退标题
+# 维度节 key → 规则回退标题（issue #64：ownership 已退役，不再出现在新报告）
 DIM_SECTION_KEYS: Dict[str, str] = {
     "business": "业务画像与竞争地位",
     "intel": "消息面详析",
@@ -152,7 +152,6 @@ DIM_SECTION_KEYS: Dict[str, str] = {
     "technical": "技术面分析",
     "sentiment": "情绪面分析",
     "us_china": "中美竞争分析",
-    "ownership": "股权架构与高管",
 }
 
 ALL_SECTION_KEYS: List[str] = list(SECTION_FALLBACK_TITLES) + list(DIM_SECTION_KEYS)
@@ -386,6 +385,12 @@ def _wave_a_facts(
     scenarios = dims.get("scenarios")
     framework = getattr(six_dim, "framework", None)
     root_cause = getattr(intel, "root_cause", None)
+    # B5：非估值模式事实带范围说明，经理波次不得请求/编造概率、目标价或收益。
+    nonvaluation = (
+        getattr(scenarios, "status", None) == "ok"
+        and getattr(scenarios, "valuation_basis", None) == "none"
+        and getattr(scenarios, "target_price", None) is None
+    )
     return {
         "stock": f"{stock_name}（{stock_code}）",
         "total_score": getattr(framework, "dimension_total", None),
@@ -401,6 +406,10 @@ def _wave_a_facts(
         "expected_value": getattr(scenarios, "expected_value", None),
         "target_price": getattr(scenarios, "target_price", None),
         "valuation_basis": getattr(scenarios, "valuation_basis", None),
+        "nonvaluation_scope": (
+            "本报告无目标价，采用非估值分析：不给目标价/预期收益/胜率估计，"
+            "不写估值驱动买卖建议；结论表述为观察与条件跟踪。" if nonvaluation else ""
+        ),
         "guardrail_count": len(guardrail_events),
         "guardrail_rules": [getattr(e, "rule_id", "") for e in guardrail_events],
     }
@@ -456,11 +465,28 @@ def generate_manager_writeup(
 
     constitution = load_constitution()
     expert_persona = _load_expert_persona()
+    # B5：非估值范围指令一致供给全部波次（base_system 条件注入）——禁止任何
+    # 胜率/概率数字、目标价或收益空间猜测；观察结论合法保留。
+    scenarios_dim = dims.get("scenarios")
+    nonvaluation_active = (
+        getattr(scenarios_dim, "status", None) == "ok"
+        and getattr(scenarios_dim, "valuation_basis", None) == "none"
+        and getattr(scenarios_dim, "target_price", None) is None
+    )
+    nonvaluation_rule = (
+        "\n\n【本报告范围（必须遵守）】该报告无目标价，采用非估值分析：全部输出"
+        "（含标题、概括、论点、风险、路径与情景触发）不得出现任何胜率/概率估计"
+        "（如「约50%」）、目标价、预期收益或估值驱动买卖建议；路径的 win_rate 一律"
+        "写「不提供」；结论表述为观察与条件跟踪，不视为看多或看空。"
+        if nonvaluation_active
+        else ""
+    )
     base_system = (
         constitution
         + ("\n\n" + expert_persona if expert_persona else "")
         + "\n\n你是卖方深度研报的主笔基金经理，正在为这只股票写报告终稿。"
         + _STYLE_RULES
+        + nonvaluation_rule
     )
 
     # 波 A：标题定调 + 内容概括 + 全部节标题

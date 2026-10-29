@@ -649,7 +649,7 @@ def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ..
     )
 
 
-def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any) -> Dict[str, Any]:
+def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True) -> Dict[str, Any]:
     """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。
 
     失败不再静默：供应商、操作与原因记入 errors，随 research 一路保留
@@ -675,6 +675,12 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     except SourceReadError as exc:
         errors.append(f"ifind:products:{exc.reason_code}")
     if time.monotonic() >= deadline:
+        payload["omit"] = tuple(omitted)
+        if errors:
+            payload["errors"] = errors
+        return payload
+    if not include_holders:
+        # issue #64：深研范围退役机构/股东侧——不发起 iFinD 股东查询；产品保留。
         payload["omit"] = tuple(omitted)
         if errors:
             payload["errors"] = errors
@@ -1066,19 +1072,40 @@ class DataFetcherManager:
             pass
 
     def _get_fundamental_cache_key(
-        self, stock_code: str, budget_seconds: Optional[float] = None
+        self, stock_code: str, budget_seconds: Optional[float] = None,
+        include_sector_flows: bool = True,
     ) -> str:
-        """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。"""
+        """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。
+
+        issue #64：范围位（sf）隔离深研（无行业榜/股东）与其他消费者的缓存。
+        """
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
-            return f"{normalized_code}|facts=6|budget=default"
+            return f"{normalized_code}|facts=6|budget=default|sf={int(include_sector_flows)}"
         try:
             budget = max(0.0, float(budget_seconds))
         except (TypeError, ValueError):
             budget = 0.0
         # 100ms bucket to balance cache reuse and scenario isolation.
         budget_bucket = int(round(budget * 10))
-        return f"{normalized_code}|facts=6|budget={budget_bucket}"
+        return f"{normalized_code}|facts=6|budget={budget_bucket}|sf={int(include_sector_flows)}"
+
+    @staticmethod
+    def _capital_within_adoption_boundary(context: Dict[str, Any]) -> Dict[str, Any]:
+        """B2/R12：基本面缓存读取边界——越界资金块剥离，其余财务证据保留。
+
+        跨收盘后旧回退资金无法证明仍在允许边界（共享谓词），不得借缓存复活；
+        剥离是读取边界过滤（零出站），资金缺口由各消费者的既有有界补查处理。
+        fresh 取数路径不经此处，不受影响。
+        """
+        flow_block = context.get("capital_flow")
+        if not flow_block:
+            return context
+        from src.deep_research_dims.dim_cache import capital_block_within_date_boundary
+
+        if capital_block_within_date_boundary(flow_block):
+            return context
+        return {key: value for key, value in context.items() if key != "capital_flow"}
 
     def _prune_fundamental_cache(self, ttl_seconds: int, max_entries: int) -> None:
         """Prune expired and overflow fundamental cache items."""
@@ -3582,10 +3609,14 @@ class DataFetcherManager:
         }
 
     def get_fundamental_context(
-        self, stock_code: str, budget_seconds: Optional[float] = None
+        self, stock_code: str, budget_seconds: Optional[float] = None,
+        include_sector_flows: bool = True,
     ) -> Dict[str, Any]:
         """
         Aggregate fundamental blocks with fail-open semantics.
+
+        ``include_sector_flows=False``（issue #64 深研阶段 0）：行业资金榜退役，
+        个股资金块不取板块榜；其余消费者默认不变。
         """
         from src.config import get_config
 
@@ -3607,7 +3638,7 @@ class DataFetcherManager:
             )
 
         if getattr(config, "data_source_profile", "legacy") == "choice":
-            return self._build_choice_fundamental_context(stock_code, budget_seconds)
+            return self._build_choice_fundamental_context(stock_code, budget_seconds, include_sector_flows=include_sector_flows)
 
         stage_timeout = float(
             budget_seconds
@@ -3622,7 +3653,7 @@ class DataFetcherManager:
         cache_max_entries = max(
             0, int(getattr(config, "fundamental_cache_max_entries", 256))
         )
-        cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout)
+        cache_key = self._get_fundamental_cache_key(stock_code, stage_timeout, include_sector_flows=include_sector_flows)
         from .mx_data_adapter import financial_refresh
         refresh = financial_refresh.get()
         if cache_ttl > 0 and not (refresh and refresh[0] == stock_code):
@@ -3632,7 +3663,9 @@ class DataFetcherManager:
                 if cache_item:
                     age = time.time() - float(cache_item.get("ts", 0))
                     if age <= cache_ttl and self._should_cache_fundamental_context(cache_item.get("context")):
-                        return cast(Dict[str, Any], cache_item.get("context", {}))
+                        context = cast(Dict[str, Any], cache_item.get("context", {}))
+                        # issue #64/B2：同 Choice 路径——边界只在深研 false-scope 生效。
+                        return self._capital_within_adoption_boundary(context) if not include_sector_flows else context
 
         remaining_seconds = stage_timeout
         stage_deadline = time.monotonic() + stage_timeout
@@ -3795,7 +3828,7 @@ class DataFetcherManager:
         if self._tushare_ifind_adapter.available and (
             self._is_growth_block_thin(growth_payload)
             or self._is_earnings_block_thin(earnings_payload)
-            or self._is_institution_block_thin(institution_payload)
+            or (self._is_institution_block_thin(institution_payload) and include_sector_flows)
             or self._is_block_stale_for_fallback(earnings_payload)
         ):
             # The fallback runs in a worker thread via ``_run_with_retry``
@@ -3813,7 +3846,7 @@ class DataFetcherManager:
                     lambda: self._tushare_ifind_adapter.get_fundamental_bundle(
                         stock_code,
                         fields=tuple(field for field in ("revenue_yoy", "net_profit_yoy", "roe", "gross_margin") if growth_payload.get(field) is None),
-                        include_institution=self._is_institution_block_thin(institution_payload),
+                        include_institution=self._is_institution_block_thin(institution_payload) and include_sector_flows,
                         deadline=min(stage_deadline, time.monotonic() + fallback_budget),
                     ),
                     fallback_budget,
@@ -4186,21 +4219,24 @@ class DataFetcherManager:
             self._prune_fundamental_cache(cache_ttl, cache_max_entries)
         return result_ctx
 
-    def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float]) -> Dict[str, Any]:
+    def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float], include_sector_flows: bool = True) -> Dict[str, Any]:
         from src.config import get_config
         from data_provider.mx_data_adapter import financial_refresh
         from src.core.research_run import current_research, supplier_need_key
         run = current_research.get()
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         if not (refresh and refresh[0] == code):
             with self._fundamental_cache_lock:
                 cached = self._fundamental_cache.get(key)
                 if cached is not None:
-                    return cast(Dict[str, Any], cached["context"])
+                    context = cast(Dict[str, Any], cached["context"])
+                    # issue #64/B2：资金日期边界只在深研 false-scope 读取点强制；
+                    # 普通消费者（include_sector_flows=True）按既有契约原样返回。
+                    return self._capital_within_adoption_boundary(context) if not include_sector_flows else context
         if _is_etf_code(code):
             return self._build_market_not_supported("cn", "Choice financial reports are not applicable to ETFs")
         if run is not None:
@@ -4208,11 +4244,11 @@ class DataFetcherManager:
             # (stage zero) owns the outbound; concurrent researchers share its
             # outcome — success or known failure — instead of re-running the
             # whole aggregation. Run-scoped: nothing is revived across runs.
-            run_key = supplier_need_key("choice", config.data_source_contract, "fundamental_full", code, refresh[1] if refresh else "")
-            return run.single_fetch(run_key, lambda: self._build_choice_fundamental_context_uncached(code, budget_seconds, run), timeout=max(0.0, budget))
-        return self._build_choice_fundamental_context_uncached(code, budget_seconds, run)
+            run_key = supplier_need_key("choice", config.data_source_contract, "fundamental_full" if include_sector_flows else "fundamental_full:no_sector", code, refresh[1] if refresh else "")
+            return run.single_fetch(run_key, lambda: self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows), timeout=max(0.0, budget))
+        return self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows)
 
-    def _build_choice_fundamental_context_uncached(self, code: str, budget_seconds: Optional[float], run: Any) -> Dict[str, Any]:
+    def _build_choice_fundamental_context_uncached(self, code: str, budget_seconds: Optional[float], run: Any, include_sector_flows: bool = True) -> Dict[str, Any]:
         from src.config import get_config
         from data_provider.choice_adapter import ChoiceAdapter
         from src.core.research_run import current_research, ResearchStopped
@@ -4221,7 +4257,7 @@ class DataFetcherManager:
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds)}"
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}"
         from data_provider.cross_source_validator import AnchorReading, SourceReadError
         prefer_ifind = config.financial_primary_source == "ifind"
         readings: dict[str, AnchorReading] = {}
@@ -4245,7 +4281,8 @@ class DataFetcherManager:
         ifind_research: Dict[str, Any] = {}
         research_omit: tuple[str, ...] = ()
         if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
-            ifind_research = _ifind_research_omissions(code, readings, deadline, config)
+            # issue #64：深研 scope（include_sector_flows=False）同时禁 iFinD 股东隐式出站。
+            ifind_research = _ifind_research_omissions(code, readings, deadline, config, include_holders=include_sector_flows)
             research_omit = tuple(ifind_research.pop("omit", ()))
         if time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
             adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
@@ -4390,7 +4427,7 @@ class DataFetcherManager:
                 errors.extend(result[block].get("errors") or [])
             if run is not None:
                 run.check()
-            result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()))
+            result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()), include_sector_flows=include_sector_flows)
             errors.extend(result["capital_flow"].get("errors") or [])
         except ResearchStopped:
             pass
@@ -4441,9 +4478,14 @@ class DataFetcherManager:
         return result
 
     def get_capital_flow_context(
-        self, stock_code: str, budget_seconds: Optional[float] = None
+        self, stock_code: str, budget_seconds: Optional[float] = None,
+        include_sector_flows: bool = True,
     ) -> Dict[str, Any]:
-        """资金流向块（fail-open）。"""
+        """资金流向块（fail-open）。
+
+        ``include_sector_flows=False``（issue #64 深研路径）：跳过行业资金榜取数，
+        完成状态只由个股资金块决定；其余消费者默认不变。
+        """
         from src.config import get_config
 
         config = get_config()
@@ -4484,6 +4526,15 @@ class DataFetcherManager:
             from data_provider.capital_flow_provider import get_main_inflow_cumulative
             deadline = time.monotonic() + timeout
             stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline)
+            if not include_sector_flows:
+                # issue #64：行业资金榜退役路径——零 sector 出站，状态只看个股资金；
+                # 退役字段整键缺席（真实报告反例：{} 空占位曾进入模型输入）。
+                return self._build_fundamental_block(
+                    "ok" if stock_flow["status"] == "ok" else "partial",
+                    {"stock_flow": stock_flow},
+                    [{"provider": "choice", "result": stock_flow["status"], "duration_ms": 0}],
+                    stock_flow["errors"],
+                )
             # Sector flows have their own definition; retain their public path.
             sector, sector_error, cost_ms = self._run_with_timeout(
                 lambda: self._fundamental_adapter.get_capital_flow(stock_code, include_stock=False),
@@ -4496,7 +4547,7 @@ class DataFetcherManager:
                 stock_flow["errors"] + sector.get("errors", []) + ([sector_error] if sector_error else []),
             )
         payload, err, cost_ms = self._run_with_retry(
-            lambda: self._fundamental_adapter.get_capital_flow(stock_code),
+            lambda: self._fundamental_adapter.get_capital_flow(stock_code, include_sector=include_sector_flows),
             timeout,
             "capital_flow",
         )
@@ -4530,12 +4581,14 @@ class DataFetcherManager:
         else:
             capital_flow_status = "partial"
 
+        # issue #64：深研范围（include_sector_flows=False）退役字段整键缺席，
+        # 与 Choice 分支收敛；True 时既有公开榜单契约不变。
+        block_data: Dict[str, Any] = {"stock_flow": payload.get("stock_flow", {})}
+        if include_sector_flows:
+            block_data["sector_rankings"] = payload.get("sector_rankings", {})
         return self._build_fundamental_block(
             capital_flow_status,
-            {
-                "stock_flow": payload.get("stock_flow", {}),
-                "sector_rankings": payload.get("sector_rankings", {}),
-            },
+            block_data,
             self._normalize_source_chain(
                 payload.get("source_chain", []),
                 "capital_flow",

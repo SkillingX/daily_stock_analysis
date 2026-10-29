@@ -39,6 +39,11 @@ export interface DeepResearchReportDetail extends DeepResearchReportItem {
   engine?: 'legacy' | 'dual_track';
   run_id?: string;
   end_reason?: 'report_budget' | 'cancelled' | null;
+  /**
+   * 实际存在子报告文件的维度 id（后端从落盘产物推导，含历史 ownership）。
+   * 可选：旧 payload 无此字段；缺失/空 = 无可列子报告，前端不得推测链接。
+   */
+  available_dim_reports?: string[];
 }
 
 /** 双轨引擎 done 事件的护栏事件（规则 id / 维度 / 处置 / 理由） */

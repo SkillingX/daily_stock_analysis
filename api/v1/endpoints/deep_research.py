@@ -203,9 +203,20 @@ async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
     except DeepResearchInputError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if request.dims:
-        from src.schemas.deep_research_dims import DIM_IDS
-        if unknown := [dim for dim in request.dims if dim not in DIM_IDS]:
-            raise HTTPException(status_code=422, detail=f"未知分析维度：{', '.join(unknown)}")
+        from src.schemas.deep_research_dims import (
+            RetiredDimRequestError,
+            resolve_dim_selection,
+        )
+
+        # issue #64：先校验未知 ID（422），再剔除退役 ID；仅退役在受理/取数前 400。
+        try:
+            resolved_dims = resolve_dim_selection(request.dims)
+        except RetiredDimRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    else:
+        resolved_dims = None
     run_id = request.run_id or uuid4().hex
     record = _StreamRun(ResearchRun(config.deep_research_timeout_seconds, run_id=run_id), code)
     with _RUNS_LOCK:
@@ -235,7 +246,9 @@ async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
         try:
             result = deep_research_service.generate_report(
                 raw_code=code, raw_name=request.stock_name, report_type=request.report_type,
-                progress_callback=progress, dims=request.dims, force_refresh=request.force_refresh,
+                progress_callback=progress,
+                dims=sorted(resolved_dims) if resolved_dims else None,
+                force_refresh=request.force_refresh,
                 run=record.control,
             )
             if record.terminal is None:
@@ -295,7 +308,10 @@ async def generate_stream(request: DeepResearchRequest) -> StreamingResponse:
             and not terminal.get("cache_hit")
             and (terminal_usage or {}).get("origin_run_id") in (None, run_id)
         ):
-            refreshed = deep_research_service.refresh_report_usage(record.control, terminal.get("report_id"), code, request.dims)
+            refreshed = deep_research_service.refresh_report_usage(
+                record.control, terminal.get("report_id"), code,
+                sorted(resolved_dims) if resolved_dims else None,
+            )
             if refreshed is not None:
                 terminal["model_usage"] = refreshed
         with _RUNS_LOCK:

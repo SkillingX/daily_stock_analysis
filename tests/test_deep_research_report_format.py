@@ -97,10 +97,15 @@ def test_partial_report_keeps_useful_content_before_limits_and_reference_in_its_
         'narrative': '已取得主营产品收入。',
         'retained_evidence': [RetainedEvidence(tool='search', title='公司公告', url='https://example.com/report', source='公告', snippet='主营收入资料')],
     })
+    # 情景研究未完成且无定性内容：合法非估值模式不成立，全局依据不足时才应
+    # 出现独立技术点位与 EV N/A（issue #64：不能用默认空壳冒充完整非估值报告）。
+    dims['scenarios'] = dims['scenarios'].model_copy(update={
+        'status': 'degraded', 'degraded_reason': '模型请求超时，未完成本维度研究',
+    })
     dims['ownership'] = dims['ownership'].model_copy(update={'status': 'skipped'})
     md = render_markdown(build_view('样本', '300260', 'fixture', [], dims, []))
     assert '降级占位' not in md and '省钱模式' not in md
-    assert '正常17项' in md and '未完整完成1项' in md and '主动未选1项' in md
+    assert '正常16项' in md and '未完整完成2项' in md and '主动未选1项' in md
     business = split_dim_sections(md)['business']
     assert business.index('已取得主营产品收入') < business.index('模型请求超时')
     assert '[公司公告](https://example.com/report)' in business

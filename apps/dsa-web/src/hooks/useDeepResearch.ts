@@ -19,7 +19,11 @@ export interface DeepResearchProgressStep {
   status?: string;
 }
 
-/** 双轨引擎19维度（与后端 DIM_IDS 严格对齐，徽章展示用） */
+/**
+ * 双轨引擎历史维度目录（19 项，与旧版后端 DIM_IDS 对齐）。
+ * 仅用于历史报告的标签解析与状态识别（含已退役 ownership）；
+ * 新报告进度、选择集与完成计数分母使用 ACTIVE_DUAL_TRACK_DIMS。
+ */
 export const DUAL_TRACK_DIMS: { id: string; label: string }[] = [
   { id: 'fundamental', label: '财务' },
   { id: 'sector', label: '板块' },
@@ -56,8 +60,14 @@ export interface DualTrackExtras {
   cacheHit?: boolean;
 }
 
+/** issue #64：本版退役维度（不再进入新报告进度、选择集与完成计数分母）。 */
+const RETIRED_DIM_IDS = new Set(['ownership']);
+
+/** 当前活动维度投影（本版 18 项）：新报告进度徽章、选择集与初始状态的单一来源。 */
+export const ACTIVE_DUAL_TRACK_DIMS = DUAL_TRACK_DIMS.filter((d) => !RETIRED_DIM_IDS.has(d.id));
+
 const INITIAL_DIM_STATUSES: DimStatusMap = Object.fromEntries(
-  DUAL_TRACK_DIMS.map((d) => [d.id, 'pending' as const]),
+  ACTIVE_DUAL_TRACK_DIMS.map((d) => [d.id, 'pending' as const]),
 );
 
 /**
@@ -193,6 +203,8 @@ export function useDeepResearch() {
               status?: string;
               quality_score?: number;
               missing_layers?: string[];
+              /** 实际存在子报告文件的维度 id（后端从落盘产物推导；缺失/空 = 无可列子报告） */
+              available_dim_reports?: string[];
               message?: string;
               error?: string;
               success?: boolean;
@@ -222,6 +234,7 @@ export function useDeepResearch() {
                 status: event.status,
                 quality_score: event.quality_score,
                 missing_layers: event.missing_layers || [],
+                available_dim_reports: event.available_dim_reports,
                 engine: event.engine,
                 run_id: runId,
                 end_reason: event.end_reason,
@@ -240,6 +253,7 @@ export function useDeepResearch() {
                   setDimStatuses((prev) => {
                     const next = { ...prev };
                     for (const [dimId, payload] of Object.entries(event.dimensions!)) {
+                      if (!(dimId in INITIAL_DIM_STATUSES)) continue; // issue #64：退役维度（兼容广播）不进入当前状态
                       if (!['ok', 'degraded', 'skipped'].includes(payload?.status ?? '')) continue;
                       next[dimId] =
                         payload?.status === 'degraded'
@@ -280,6 +294,8 @@ export function useDeepResearch() {
 
             // 双轨维度徽章事件（dim_start/dim_done）
             if (['dim_queued', 'model_queued', 'model_start', 'dim_start', 'dim_done'].includes(event.type) && event.dim) {
+              // issue #64：退役维度事件（旧客户端兼容广播）不进入当前进度展示
+              if (!(event.dim in INITIAL_DIM_STATUSES)) continue;
               const dimId = event.dim;
               setDimStatuses((prev) =>
                 prev[dimId] === undefined

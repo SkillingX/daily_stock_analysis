@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""评分框架 v2：六维 × 细分指标 × 权重（方案 v2.1 定稿，单一评分源）。
+"""评分框架 v2：六维 × 细分指标 × 权重（v2.2，单一评分源）。
 
 权重（用户定稿 2026-10-02）：基本面 30 / 情绪 15 / 资金 15 / 消息 15 / 技术 15 / 宏观 10。
 每维度内指标权重和 = 1.0；全维度权重和 = 1.0（icontract 校验）。
@@ -14,7 +14,10 @@ from typing import Dict, List, Tuple
 
 from icontract import require
 
-SCORING_VERSION_V2 = "v2.1"
+# v2.2（issue #64）：股权高管（equity_mgmt）与机构持仓变动（institution_change）
+# 退休；基本面剩余三项按原 25:35:20 归一为 31.25/43.75/25，资金面资金流 100%。
+# 退休项不评分、不补 50、不算缺口、不进入权重分母。
+SCORING_VERSION_V2 = "v2.2"
 
 # 维度 → 权重
 DIMENSION_WEIGHTS_V2: Dict[str, float] = {
@@ -28,22 +31,19 @@ DIMENSION_WEIGHTS_V2: Dict[str, float] = {
 
 # 维度 → [(指标 id, 指标名, 维度内权重, 打分来源)]
 # 打分来源：rule=机器规则 / llm=LLM 依据句打分 / f1/f2/intel=对应维度供数（P1 接线）
-# v2.1（issue #46）：筹码成本与社区评价退休。资金面剩余资金流/机构变动按原 34:33
-# 归一；情绪面仅机构评价（100%）。退休项不评分、不补 50、不算缺口。
+# v2.1（issue #46）：筹码成本与社区评价退休。
 INDICATORS_V2: Dict[str, List[Tuple[str, str, float, str]]] = {
     "基本面": [
-        ("sector_vs_leader", "大盘/板块/龙头对比", 0.25, "f2"),
-        ("equity_mgmt", "股权架构与高管", 0.20, "llm"),
-        ("business_financial", "业务与财务健康", 0.35, "f1"),
-        ("valuation", "估值", 0.20, "rule"),
+        ("sector_vs_leader", "大盘/板块/龙头对比", 0.3125, "f2"),
+        ("business_financial", "业务与财务健康", 0.4375, "f1"),
+        ("valuation", "估值", 0.25, "rule"),
     ],
     "消息面": [
         ("real_news", "真消息与市场关注点", 0.50, "intel"),
         ("event_plan", "未来事件与预案", 0.50, "intel"),
     ],
     "资金面": [
-        ("capital_flow", "资金流向", round(34 / 67, 6), "rule"),
-        ("institution_change", "机构/大户持仓变动", round(33 / 67, 6), "rule"),
+        ("capital_flow", "资金流向", 1.00, "rule"),
     ],
     "情绪面": [
         ("institute_view", "机构评价", 1.00, "llm"),

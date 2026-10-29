@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from datetime import date
 from functools import partial
@@ -44,7 +45,7 @@ _PILOT_SCOPE = (
     "你没有工具、不重新研究公司；你的 JSON 是既有规则与聚合层的分区输入，不是完整研究报告。\n"
     "职责分工：投资评级（买入/增持/中性/减持等）、目标价、时间维度、交易行动词表"
     "（加仓/持有/减仓等）与 PM 七问投资决策由报告的既有规则与聚合层负责，不在本轮输出义务内；"
-    "score 字段仍按下方 schema 照常输出。报告末尾免责声明由聚合层统一附，"
+    "本维度 schema 定义的评分字段仍照常输出。报告末尾免责声明由聚合层统一附，"
     "你在 JSON 之外不得再输出任何文字。\n"
     "仍然有效的纪律：来源等级标签、数据日期/财期/单位、资格拒绝记录、单源未独立核验的标注、"
     "真实缺口披露与禁止编造数字，全部按上文通用要求执行。\n"
@@ -274,11 +275,6 @@ def run_supply_chain_agent(
 # ---------------------------------------------------------------------------
 
 _SENTIMENT_TOOLS = {"search_stock_news"}
-_OWNERSHIP_TOOLS = {
-    "search_comprehensive_intel",
-    "search_stock_news",
-    "search_knowledge_base",
-}
 _US_CHINA_TOOLS = {"search_comprehensive_intel", "get_stock_info"}
 
 
@@ -560,6 +556,9 @@ def _stage_zero_capital_flow(stock_code: str, run: Any) -> Optional[Dict[str, An
     block = (getattr(ctx, "fundamental", None) or {}).get("capital_flow")
     if not isinstance(block, dict) or not block.get("data"):
         return None
+    # issue #64/B2：这里的块是本报告阶段0刚取得的 fresh 证据（如周末读取时
+    # expected=最近收盘日）——已由取数日历保证合格；缓存合法性在缓存读取边界
+    # （快照/manager/日缓存）用共享谓词强制，此处不再叠加守卫误拒 fresh 块。
     flow = _capital_flow_tool_result(stock_code, block)
     if flow.get("main_net_inflow") is None or not _flow_unit_known(flow):
         return None
@@ -588,7 +587,8 @@ def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
             reused = _stage_zero_capital_flow(stock_code, run)
             if reused is not None:
                 return reused
-        return _handle_get_capital_flow(stock_code)
+        # issue #64：行业资金榜退役——深研资金路径零 sector 出站。
+        return _handle_get_capital_flow(stock_code, include_sector_flows=False)
 
     if run is None:
         return _fetch()
@@ -602,119 +602,6 @@ def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
     result = run.single_fetch(key, _fetch)
     run.retain("get_capital_flow", result)
     return result
-
-
-def _retain_institution_block(run: Any, block: Dict[str, Any]) -> None:
-    """机构标量沿既有 get_fundamental_context 抽取留存（issue #56 A2）。
-
-    值经既有抽取器的资格投影进 run.facts：来源/单位（percentage_point）/
-    财期/口径（caliber，如 top10_shareholders 统计对象）/质量与拒绝原因
-    等既有 RetainedFact 字段保留，非整条原始 field_meta 归档；股东户数不
-    等于持仓，已知限制原样随投影保留。
-    """
-    data = block.get("data") or {}
-    meta = block.get("field_meta") or {}
-    payload = {key: data.get(key) for key in ("institution_holding_change", "top10_holder_change")
-               if data.get(key) is not None or isinstance(meta.get(key), dict)}
-    if run is not None and payload:
-        run.retain_facts("get_fundamental_context", {**payload, "field_meta": meta})
-
-
-def _institution_materials(stock_code: str) -> Dict[str, Any]:
-    """机构/股东固定输入：优先消费本报告已取得的 institution 块（issue #56）。
-
-    阶段 0 快照（同报告、同证券）自本票起保留 institution 块，命中时零新增
-    出站；仅当该块整体未保留（旧日缓存/装配异常）才走既有有界入口
-    ``manager.get_fundamental_context``（choice 下经 #51 single_fetch 与阶段 0
-    同飞）。块内失败/空值如实保留，不整装配 stock_info，不因缺项重复出站。
-    """
-    run = current_research.get()
-    if run is not None:
-        run.check()
-    ctx = getattr(run, "context", None)
-    fundamental = getattr(ctx, "fundamental", None) or {}
-    block = fundamental.get("institution")
-    if isinstance(block, dict):
-        block = _supplement_holder_change(stock_code, fundamental, block)
-        _retain_institution_block(run, block)
-        return block
-    from src.agent.tools.data_tools import _get_fetcher_manager
-
-    if run is None:
-        run = current_research.get()
-    if run is not None:
-        run.check()
-    from src.config import get_config
-
-    budget = max(0.0, get_config().fundamental_stage_timeout_seconds)
-    try:
-        context = _get_fetcher_manager().get_fundamental_context(stock_code, budget_seconds=budget)
-    except Exception as exc:  # noqa: BLE001 - 机构资料失败如实降级
-        return {"status": "failed", "data": {}, "field_meta": {}, "errors": [str(exc)]}
-    fetched = context.get("institution")
-    if not isinstance(fetched, dict):
-        return {"status": "failed", "data": {}, "field_meta": {}, "errors": ["机构资料块缺失"]}
-    fetched = _supplement_holder_change(stock_code, context, fetched)
-    _retain_institution_block(run, fetched)
-    return fetched
-
-
-def _supplement_holder_change(stock_code: str, fundamental: Dict[str, Any], block: Dict[str, Any]) -> Dict[str, Any]:
-    """Reuse the current snapshot and fetch only the previous quarter within one budget."""
-    config = get_config()
-    if config.data_source_profile != "choice" or not getattr(config, "enable_ifind_mcp", False) or any(
-        record.get("rule_eligible") for record in (block.get("field_meta") or {}).values()
-    ):
-        return block
-    details = (fundamental.get("research") or {}).get("shareholder_details")
-    if not details:
-        return block
-    from datetime import timedelta
-    import json
-    from data_provider.ifind_fundamental_adapter import IfindShareholders, shareholder_concentration_change
-    from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
-    from src.agent.tools.data_tools import _get_fetcher_manager
-
-    try:
-        current = IfindShareholders.model_validate_json(json.dumps(details))
-        periods = {item.report_date for item in current.items}
-        if current.errors:
-            raise ValueError("current_top10_unavailable: " + "; ".join(current.errors))
-        if current.coverage != "complete" or len(periods) != 1:
-            raise ValueError("current_top10_incomplete")
-        period = next(iter(periods))
-        end = date.fromisoformat(period)
-        if end > date.today():
-            raise ValueError("holder_period_in_future")
-        if (end.month, end.day) not in {(3, 31), (6, 30), (9, 30), (12, 31)}:
-            raise ValueError("holder_period_not_quarter_end")
-        previous_period = (date(end.year, ((end.month - 1) // 3) * 3 + 1, 1) - timedelta(days=1)).isoformat()
-        run = current_research.get()
-        if run is not None:
-            run.check()
-        deadline = monotonic() + max(0.0, config.fundamental_fetch_timeout_seconds)
-        if run is not None:
-            deadline = min(deadline, run.deadline)
-        raw = _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=previous_period, deadline=deadline)
-        previous = IfindShareholders.model_validate_json(json.dumps(raw))
-        if previous.errors:
-            raise ValueError("previous_top10_unavailable: " + "; ".join(previous.errors))
-        if any(item.report_date != previous_period for item in previous.items):
-            raise ValueError("previous_holder_period_mismatch")
-        change, current_ratio, previous_ratio = shareholder_concentration_change(current, previous)
-        reading = AnchorReading("ifind", float(change), period=period, unit="percentage_point", source_family="ths", caliber="top10_shareholder_concentration")
-        record = {**adopted_field_record("top10_holder_change", reading, AnchorQuality(status="single_source"), selection_reason="computed_top10_concentration_change"),
-                  "previous_period": previous_period, "current_ratio": float(current_ratio), "previous_ratio": float(previous_ratio)}
-        result = {**block, "status": "partial", "data": {**(block.get("data") or {}), "top10_holder_change": float(change)},
-                  "field_meta": {**(block.get("field_meta") or {}), "top10_holder_change": record},
-                  "source_chain": [*(block.get("source_chain") or []), {"provider": "ifind", "result": "partial"}],
-                  "note": "仅比较两期各自前十大股东集中度；不是全体机构持仓变化或净买卖。披露日/原文未取得，不用于历史时点可得性判定。"}
-        if run is not None:
-            run.check()
-            fundamental["institution"] = result
-        return result
-    except (ValueError, SourceReadError) as exc:
-        return {**block, "errors": list(dict.fromkeys([*(block.get("errors") or []), f"iFinD两期股东集中度未取得：{exc}"]))}
 
 
 def _flow_unit_known(flow: Dict[str, Any]) -> bool:
@@ -741,11 +628,12 @@ def _flow_amount_text(flow: Dict[str, Any], key: str, label: str, unit: str) -> 
     return f"{label} {value}（单位 {unit or '未确认'}）"
 
 
-# 三个固定金额窗口：任务内展示与失败兜底 flow_summary 同一来源（issue #56）。
+# 三个固定金额窗口：任务内展示与 flow_summary 同一来源（issue #56）。
+# issue #64：单日窗口不再称「当日」——金额一律随实际截至日展示。
 _FLOW_WINDOWS: tuple[tuple[str, str], ...] = (
-    ("main_net_inflow", "当日"),
-    ("inflow_5d", "5交易日"),
-    ("inflow_10d", "10交易日"),
+    ("main_net_inflow", "单日"),
+    ("inflow_5d", "近5交易日"),
+    ("inflow_10d", "近10交易日"),
 )
 
 
@@ -755,8 +643,15 @@ def _flow_display_text(flow: Optional[Dict[str, Any]]) -> str:
         return ""
     record = (flow.get("field_meta") or {}).get("main_inflow") or {}
     unit = str(record.get("unit") or "")
+    as_of = str(flow.get("as_of_date") or flow.get("expected_date") or "")
+    pending = ((flow.get("coverage") or {}).get("pending_day") or {}).get("expected_date")
     amounts = "；".join(_flow_amount_text(flow, key, label, unit) for key, label in _FLOW_WINDOWS)
-    return f"主力净流入金额展示（代码按合格单位换算，直接引用，不自行换算）：{amounts}。\n"
+    if as_of:
+        pending_text = f"；{pending}资金窗口尚未完整，上述窗口均截至{as_of}" if pending else ""
+        prefix = f"资金数据截至{as_of}（最近完整交易日）{pending_text}"
+    else:
+        prefix = "资金窗口截至日未取得"
+    return f"{prefix}。主力净流入金额展示（代码按合格单位换算，直接引用，不自行换算）：{amounts}。\n"
 
 
 def _flow_gap_text(flow: Dict[str, Any]) -> str:
@@ -769,16 +664,6 @@ def _flow_gap_text(flow: Dict[str, Any]) -> str:
     if flow.get("main_net_inflow") is not None:
         return "主力净流入金额单位未确认，不推断资金金额与方向"
     return "资金流数据不可用"
-
-
-def _capital_gap_reason(flow_ready: bool, institution_eligible: bool, flow: Dict[str, Any], institution: Dict[str, Any]) -> str:
-    parts: list[str] = []
-    if not flow_ready:
-        parts.append(f"资金流不可用：{_flow_gap_text(flow)}")
-    if not institution_eligible:
-        status = institution.get("status")
-        parts.append("机构/股东资料无合格字段" + (f"（{status}）" if status else ""))
-    return "；".join(parts)
 
 
 def _market_cap_materials() -> Dict[str, Any]:
@@ -842,15 +727,21 @@ def _market_cap_materials() -> Dict[str, Any]:
     return material
 
 
-def _capital_task(stock_code: str, stock_name: str, flow: Optional[Dict[str, Any]], institution: Dict[str, Any], market_cap: Optional[Dict[str, Any]] = None) -> str:
-    """资金研究员任务文本：代码准备的固定资料注入，单轮无工具分析（issue #56）。"""
+def _capital_task(stock_code: str, stock_name: str, flow: Optional[Dict[str, Any]], market_cap: Optional[Dict[str, Any]] = None) -> str:
+    """资金研究员任务文本：代码准备的资金流与市值锚点注入，单轮无工具分析。
+
+    issue #64：机构/股东侧退役——任务不再注入机构资料，也不再要求机构评分
+    或合成总分输出；资金日期以资料中的实际截至日为准，禁止说成报告当天。
+    """
     import json
 
     if market_cap is not None:
         market_cap_text = (
             "\n3) 市值锚点（同报告估值资料，整条复用既有字段级资格记录，含来源/单位/币种/时点/"
             "财期/质量与拒绝原因；单源数据未独立核验，不当作跨源核验结论；资金量级判断可对照此"
-            "分母，禁止把已取得的市值说成缺失；gaps 中的原资格记录按其拒绝原因如实保留，"
+            "分母，禁止把已取得的市值说成缺失；市值时点与资金截至日是两个不同时钟——市值观测日"
+            "与资金 as_of_date 不同时，仅作量级背景对照，不得构成同日净流入/市值比值；"
+            "gaps 中的原资格记录按其拒绝原因如实保留，"
             "record 为 null 即无记录，不虚构市值数字）："
             + json.dumps(market_cap, ensure_ascii=False)
         )
@@ -858,64 +749,103 @@ def _capital_task(stock_code: str, stock_name: str, flow: Optional[Dict[str, Any
         market_cap_text = "\n3) 市值锚点：本报告未取得合格市值资料（按真实缺口说明，不虚构市值数字）。"
     return (
         f"请对 A 股 {stock_name}（{stock_code}）做资金面深度分析并直接输出 JSON。\n"
-        "解读方向：结合市值锚点说明资金流的相对量级含义；机构/股东部分说明既有口径"
-        "（field_meta 的 caliber/period/period_basis）实际能支持的结论范围。\n"
+        "解读方向：结合市值锚点说明资金流的相对量级含义。\n"
         "本次所需的固定资料已由代码全部准备完毕；你没有可用工具，也不要请求任何工具，仅基于以下事实完成分析：\n"
         "1) 资金流资料（已取得，权威；金额缺失、窗口不完整或单位未确认按缺口处理）："
         + json.dumps(flow, ensure_ascii=False)
         + ("\n" + flow_display if (flow_display := _flow_display_text(flow)) else "")
-        + "\n2) 机构/股东资料（institution 块，含来源与资格标注；股东户数不等于持仓量）："
-        + json.dumps(institution, ensure_ascii=False)
         + market_cap_text
-        + "\n4) 输出 JSON：flow_summary、flow_score(0-100 或 null)、institution_summary"
-        "（机构/大户持仓变动解读）、institution_score(0-100 或 null)、score(两项加权总分或 null，任一侧缺失不给合成总分)、"
-        "narrative(50-100 字结论：只引用资料中实际存在的硬数字——净流入金额/持仓变动比例/市值锚点等；"
+        + "\n4) 输出 JSON：flow_summary、flow_score(0-100 或 null)、"
+        "narrative(50-100 字结论：只引用资料中实际存在的硬数字——净流入金额/市值锚点等；"
         "可引用的数字不足时写足实际存在的并明确其余缺口，禁止为凑数量编造)。\n"
-        "金额缺失、窗口不完整或单位未确认时，flow_score、资金总分填 null，不推断资金金额、方向或交易行动；"
+        "金额缺失、窗口不完整或单位未确认时，flow_score 填 null，不推断资金金额、方向或交易行动；"
         "narrative 只说明已验证内容与真实缺口，不要求凑齐数字。"
-        "机构与股东资料按各自 field_meta/source_chain 引用；缺统计对象、日期或单位时只作线索，不给机构分数或方向结论；"
-        "top10_shareholder_concentration 仅表示两期各自十大股东集中度之差（百分点），"
-        "不代表全体机构增减仓、同一批股东净买卖或退出前十者清仓；机构评分在此仅作股东集中度参考。"
-        "某一侧缺失时保留另一侧的解释，禁止把局部缺项说成整套资料无效。"
+        "资金日期以资料中的 as_of_date/expected_date/coverage 为准：金额窗口截至最近已收盘交易日，"
+        "禁止把资金窗口写成报告当天「今日/当日」。"
     )
 
 
+def _flow_windows_complete(flow: Dict[str, Any]) -> bool:
+    """资金完成条件（issue #64）：三个窗口共同截至同一实际日期且全部合格。
+
+    仅凭单日有效金额不算合格——10/5 日窗口有洞时整组输入不完整，不得启动
+    模型，也不得把局部有效包装成整体结论。
+    """
+    coverage = flow.get("coverage") or {}
+    if not all((coverage.get(str(n)) or {}).get("complete") is True for n in (1, 5, 10)):
+        return False
+    return bool(flow.get("as_of_date") or flow.get("expected_date"))
+
+
 def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8) -> Dict[str, Any]:
-    """资金研究员：代码准备资金流与机构资料，单轮无工具结构化分析（issue #56）。"""
+    """资金研究员：代码准备资金流资料，单轮无工具结构化分析（issue #56/#64）。
+
+    issue #64：机构/股东侧退役——完成条件只看合格资金三窗口，不为退役字段
+    查询机构持仓、两期股东集中度或 iFinD 股东明细；机构/合成总分不得由模型
+    输出或旧字段复活。三窗口共同合格才启动模型；资金总分 = 合格 flow_score。
+    """
+    # issue #64：打包现行规则为强制项——缺失/为空时对齐既有 business 守卫显式
+    # 失败：不做供应商备料、不启动模型，不静默退回「宪法+试点边界」空规则。
+    if not load_dim_prompt("capital").strip():
+        return {"ok": False, "error": "资金研究员现行提示词缺失，无法执行研究"}
     flow = _capital_flow_material(stock_code)
-    institution = _institution_materials(stock_code)
     # 市值材料是同报告共享上下文的纯读取/留存（零新增出站），必须在门控早退
-    # 前执行：两侧无效不启动模型时，已知市值仍进 run.facts 供失败/取消留存。
+    # 前执行：资金无效不启动模型时，已知市值仍进 run.facts 供失败/取消留存。
     market_cap = _market_cap_materials()
-    institution_eligible = any(record.get("rule_eligible") for record in (institution.get("field_meta") or {}).values())
-    flow_ready = flow is not None and flow.get("main_net_inflow") is not None and _flow_unit_known(flow)
-    if not flow_ready and not institution_eligible:
-        flow_reason = _flow_gap_text(flow or {})
-        return {"ok": False, "error": f"无可解释的有效资金资料：资金流——{flow_reason}；机构/股东资料无合格字段，未启动模型"}
-    task = _capital_task(stock_code, stock_name, flow, institution, market_cap)
+    flow_ready = (
+        flow is not None
+        and flow.get("main_net_inflow") is not None
+        and _flow_unit_known(flow)
+        and _flow_windows_complete(flow)
+    )
+    if not flow_ready:
+        return {"ok": False, "error": f"无可解释的有效资金资料：资金流——{_flow_gap_text(flow or {})}，未启动模型"}
+    task = _capital_task(stock_code, stock_name, flow, market_cap)
     out = _run_explore("capital", set(), task, llm_adapter, progress_callback, max_steps=1)
     if not out.get("ok"):
         return out
     data = out["data"]
-    if not institution_eligible:
-        data["institution_score"] = None
-        data["institution_summary"] = "公开机构/股东资料仅作线索；统计对象、日期或单位未核实，不能据此判定持仓方向。"
-    if not flow_ready:
-        data["flow_score"] = None
-        data["flow_summary"] = _flow_gap_text(flow or {})
-    if not flow_ready or not institution_eligible:
-        # 单腿缺失时不给合成总分；另一侧已取得的解释保留在 narrative 与对应 summary。
-        data["score"] = None
+    # 退役字段不得由模型输出复活（issue #64）：机构评分/摘要与旧合成总分一律移除。
+    for retired in ("institution_score", "institution_summary", "score"):
+        data.pop(retired, None)
+    # 模型分析有效性（issue #64/R5/R11）：可用 flow_score + 模型分析正文缺一即真实
+    # 降级。flow_score 先沿既有研究员输入适配边界（coerce_value）归一（如嵌套
+    # {"score": 80}），不并行另造 raw 检查；无效/缺失/布尔与无分析仍降级，合法
+    # 零分保留；有效时资金总分 = flow_score（旧合成口径作废）。评分范围/非有限
+    # 由 CapitalDim Pydantic 契约约束。
+    from src.deep_research.researchers.base import coerce_value
+
+    flow_score = coerce_value("flow_score", data.get("flow_score"))
+    # 契约层 CapitalDim 的 lax float 本就接受数字字符串；适配边界同口径归一，
+    # 不比契约更窄——数字字符串是离线独立复现的既有解析器兼容形态（真实报告
+    # raw 响应未捕获，不据此归因）。非有限值（NaN/Inf 字符串）不归一，仍按
+    # 无效评分真实降级。
+    if isinstance(flow_score, str):
+        try:
+            converted = float(flow_score.strip())
+        except ValueError:
+            converted = None
+        if converted is not None and math.isfinite(converted):
+            flow_score = converted
+    data["flow_score"] = flow_score
+    model_analysis = str(data.get("narrative") or "").strip() or str(data.get("flow_summary") or "").strip()
+    if not isinstance(flow_score, (int, float)) or isinstance(flow_score, bool) or not model_analysis:
         data["status"] = "degraded"
-        data["degraded_reason"] = _capital_gap_reason(flow_ready, institution_eligible, flow or {}, institution)
-    if flow_ready:
-        assert flow is not None
-        record = (flow.get("field_meta") or {}).get("main_inflow") or {}
-        unit = str(record.get("unit") or "")
-        amounts = "；".join(_flow_amount_text(flow, key, label, unit) for key, label in _FLOW_WINDOWS)
-        source_label = "Choice 主力净流入" if flow.get("source") == "choice" else "主力净流入"
-        as_of_text = f"，截至{flow.get('expected_date')}已收盘交易日" if flow.get("expected_date") else ""
-        data["flow_summary"] = f"{source_label}{as_of_text}：{amounts}。单源数据，未独立核验。"
+        data["degraded_reason"] = "资金研究员模型分析未形成可用评分或分析内容；已取得的资金事实保留在固定说明。"
+    else:
+        data["score"] = float(flow_score)
+    assert flow is not None
+    record = (flow.get("field_meta") or {}).get("main_inflow") or {}
+    unit = str(record.get("unit") or "")
+    amounts = "；".join(_flow_amount_text(flow, key, label, unit) for key, label in _FLOW_WINDOWS)
+    source_label = "Choice 主力净流入" if flow.get("source") == "choice" else "主力净流入"
+    as_of = str(flow.get("as_of_date") or flow.get("expected_date") or "")
+    as_of_text = f"，截至{as_of}已收盘交易日" if as_of else ""
+    pending = ((flow.get("coverage") or {}).get("pending_day") or {}).get("expected_date")
+    pending_text = f"；{pending}资金窗口尚未完整" if pending else ""
+    data["flow_summary"] = f"{source_label}{as_of_text}：{amounts}{pending_text}。单源数据，未独立核验。"
+    data["as_of_date"] = as_of
+    data["expected_date"] = str(flow.get("expected_date") or "")
     return out
 
 
@@ -929,70 +859,6 @@ def run_sentiment_agent(stock_code, stock_name, llm_adapter, progress_callback=N
         "取不到数字就如实写「缺 XX 数据」，禁止只给分无论据)。"
     )
     return _run_explore("sentiment", _SENTIMENT_TOOLS, task, llm_adapter, progress_callback, max_steps)
-
-
-def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8, *, deadline: Optional[float] = None, research: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """股权高管研究员：实控人/十大股东/高管背景与变动（审计 A2：评分只作参考，不硬塞六维）。"""
-    task = (
-        f"请对 A 股 {stock_name}（{stock_code}）做股权架构与高管背景调查并直接输出 JSON：\n"
-        "1) search_knowledge_base 查已有资料，search_comprehensive_intel / search_stock_news "
-        "查实控人/股东/高管的公开信息（结构化资料优先，搜索为补）；\n"
-        "2) 输出 JSON：controller(实际控制人/控股股东，一句话)、top_holders(前十大股东要点数组)、"
-        "executives(核心高管：姓名/职务/背景一句，数组)、recent_changes(近一年增减持/任免/股权变动数组)、"
-        'data_gaps(未取得资料的字符串数组，如 ["近一年减持公告未取得"]，不得输出对象，禁止编造)、'
-        "core_data_gaps(核心缺口字符串数组：控制关系缺少可核实依据、前十大股东资料不足、"
-        "核心高管姓名/现任职务未核实必须列入；仅由股东排名推测实控人不能视为核实；"
-        "明确披露无实际控制人属于有效结论。三项核心证据均足够时显式输出 []。"
-        "完整履历、补充公告/变动、知识库或非股权接口缺项只列 data_gaps，不能单独作为核心缺口；"
-        "核心缺口也须列入 data_gaps；不要因存在补充缺口主动把 status 写为 degraded)、"
-        "score(治理结构健康度参考分 0-100，可 null)、narrative(调查结论一段)。"
-        "top_holders、executives、recent_changes 三个数组每条必须是对象（name 必填，附 source 来源标签，"
-        "detail 补充说明，变动条目尽量附 date），不要输出 JSON 字符串或 {items:[…]} 包装；"
-        "某列表无资料时输出空数组（空数组不代表没有发生变动），不得编造条目、日期或来源。所有事实带来源等级标签。"
-    )
-    if get_config().data_source_profile == "choice":
-        import json
-        from src.agent.tools.data_tools import _handle_get_stock_info
-        if research is None:
-            if run := current_research.get():
-                run.check()
-            info = _handle_get_stock_info(stock_code, deadline=deadline)
-            research = (info.get("fundamental_context") or {}).get("research") or {}
-        research = research or {}
-        if run := current_research.get():
-            run.retain_vendor("ownership", research)
-        if get_config().enable_ifind_mcp and not research.get("shareholder_details"):
-            from src.agent.tools.data_tools import _get_fetcher_manager
-            from data_provider.ifind_fundamental_adapter import confirmed_disclosed_period
-            if run := current_research.get():
-                run.check()
-            run_ctx = getattr(run, "context", None) if run else None
-            fundamental = getattr(run_ctx, "fundamental", {}) or {}
-            as_of = str(research.get("as_of") or getattr(run_ctx, "as_of", "") or "")
-            period = confirmed_disclosed_period(research, fundamental, as_of=as_of)
-            research = {**research, "shareholder_details": _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=period, deadline=deadline)}
-        task += "\n供应商公司资料（各字段来源以载荷标注为准，非独立双源核验）：" + json.dumps(research, ensure_ascii=False)
-    research = research or {}
-    details = research.get("shareholder_details")
-    if run := current_research.get():
-        run.retain_vendor("ownership", research)
-    out = _run_explore("ownership", _OWNERSHIP_TOOLS, task, llm_adapter, progress_callback, max_steps, deadline=deadline)
-    if not out.get("ok") and ((research.get("company") or {}).get("AHOLDER") or (research.get("holders") or {}).get("HOLDNAMER") or (details or {}).get("items")):
-        out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": str(out.get("error") or "研究模型未完成") + "；保留已取得股权资料", "data_gaps": ["研究模型未完成，高管与变动资料未核实"], "narrative": "以下为供应商结构化资料；模型研究未完成，不生成治理评分。"}}
-    if out.get("ok") and research:
-        company = research.get("company") or {}
-        if company.get("AHOLDER"):
-            out["data"]["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
-        holders = research.get("holders") or {}
-        names = holders.get("HOLDNAMER")
-        if isinstance(names, str) and names.strip():
-            out["data"]["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {holders.get('period')}"} for name in names.split(";") if name.strip()]
-    if out.get("ok"):
-        out["data"].pop("shareholder_details", None)
-        if details:
-            out["data"]["shareholder_details"] = details
-    out["vendor_research"] = research
-    return out
 
 
 def run_us_china_agent(stock_code, stock_name, llm_adapter, progress_callback=None, max_steps=8):
@@ -1063,5 +929,28 @@ def run_business_agent(
         out["data"]["product_segments"] = products
         if products.get("errors"):
             out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), *products["errors"]]))
+    # issue #64（规格 §1 保留项）：阶段0已取得的 Choice 公司原始事实（控制人、带
+    # 报告期的十大股东名单）随既有公司资料字段留存展示——不补查、不推断控制链、
+    # 不评分，仅按原来源与财期呈现。
+    company = research.get("company") or {}
+    holders = research.get("holders") or {}
+    fact_parts = []
+    if company.get("AHOLDER"):
+        fact_parts.append(
+            f"实际控制人（Choice 原始字段，截至 {research.get('as_of') or '未标注'}）：{company['AHOLDER']}"
+        )
+    holder_names = holders.get("HOLDNAMER")
+    if isinstance(holder_names, str) and holder_names.strip():
+        names = "；".join(name.strip() for name in holder_names.split(";") if name.strip())
+        fact_parts.append(
+            f"十大股东名单（Choice 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
+        )
+    if fact_parts and isinstance(out.get("data"), dict):
+        out["data"]["narrative"] = (
+            str(out["data"].get("narrative") or "").rstrip()
+            + "\n\n公司资料（Choice 原始字段留存，未核实控制链）："
+            + "；".join(fact_parts)
+            + "。"
+        )
     out["vendor_research"] = research
     return out

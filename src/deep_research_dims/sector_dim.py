@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from src.deep_research_dims.context import SharedContext
 from src.deep_research_dims.industry_base_rate import lookup_base_rate
@@ -17,10 +17,13 @@ def _score_policy_lean(lean: Optional[str]) -> Optional[float]:
 def build_sector_dim(
     ctx: SharedContext, position_text: Optional[str] = None
 ) -> SectorDim:
-    """F2：行业提示 → 政策倾向（industry_dna）+ 基率 + 板块排行（尽力而为）。
+    """F2：行业提示 → 政策倾向（industry_dna）+ 基率（规则装配）。
 
     position_text：产业链定位文本（含行业关键词，如"白酒酿造商"），用于行业提示
     缺失时提高基率/政策倾向命中率。
+
+    issue #64：行业资金榜退役——rankings 字段仅为历史报告解析保留，新报告不再
+    消费、不再产生"板块资金排行未取得"缺口提示。
     """
     hint = str(ctx.fundamental.get("industry_hint") or "")
     gaps: list[str] = []
@@ -43,10 +46,6 @@ def build_sector_dim(
         # 名称匹配失败时用定位文本单独再试一次（如"贵州茅台"→"白酒酿造商"）
         base_rate, basis = lookup_base_rate(str(position_text))
 
-    rankings: Dict[str, Any] = ctx.fundamental.get("sector_rankings") or {}
-    if not rankings:
-        gaps.append("板块资金排行未取得")
-
     score_parts = [_score_policy_lean(policy_lean)]
     if base_rate is not None:
         score_parts.append(round(30.0 + base_rate * 60.0, 2))  # 基率 0-1 → 30-90
@@ -60,7 +59,7 @@ def build_sector_dim(
         policy_lean=policy_lean,
         base_rate=base_rate,
         base_rate_basis=basis,
-        rankings=rankings,
+        rankings={},
         data_gaps=gaps,
         sector_score=sector_score,
         narrative=(

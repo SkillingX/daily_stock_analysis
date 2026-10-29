@@ -301,6 +301,7 @@
 {% endif %}
 {% if us_china.narrative %}{{ us_china.narrative }}{% endif %}
 
+{% if ownership %}
 ### 5.8 股权架构与高管
 
 {{ degraded_note(ownership) }}
@@ -331,6 +332,7 @@
 - 数据缺口：{{ ownership.data_gaps|join('、') }}（不编造）
 {% endif %}
 {% if ownership.narrative %}{{ ownership.narrative }}{% endif %}
+{% endif %}
 
 ---
 
