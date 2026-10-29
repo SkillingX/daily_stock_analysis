@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, DecimalException
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from icontract import ensure
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 from .cross_source_validator import SourceReadError, source_failure_reason, AnchorReading, caliber_from_label, normalize_anchor_value, observation_time_from_fields, reading_input_reasons, report_period_from_fields, select_report_period, normalize_report_period
@@ -331,6 +332,39 @@ class IfindShareholders(BaseModel):
     errors: list[str] = Field(default_factory=list)
     disclosed_at: str | None = None
     original_url: str | None = None
+
+
+@ensure(lambda result: result[0] == result[1] - result[2], "Concentration change is current minus previous in percentage points")
+def shareholder_concentration_change(current: IfindShareholders, previous: IfindShareholders) -> tuple[Decimal, Decimal, Decimal]:
+    """Compare each period's complete top ten, without matching exits to zero holdings."""
+    totals: list[Decimal] = []
+    periods: list[str] = []
+    for dataset in (current, previous):
+        if dataset.coverage != "complete" or dataset.errors or {item.rank for item in dataset.items} != set(range(1, 11)):
+            raise ValueError("top10_incomplete")
+        actual = {item.report_date for item in dataset.items}
+        if len(actual) != 1 or len({item.name for item in dataset.items}) != 10:
+            raise ValueError("holder_identity_or_period_mismatch")
+        period = next(iter(actual))
+        if normalize_report_period(period)[0] != period or period > date.today().isoformat():
+            raise ValueError("holder_period_invalid")
+        ratios: list[Decimal] = []
+        for item in dataset.items:
+            ratio = item.ratio
+            if ratio is None or ratio.unit != "percentage_point" or ratio.normalization_error or ratio.period != period:
+                raise ValueError("holder_ratio_unqualified")
+            value = Decimal(str(ratio.value))
+            if not value.is_finite() or not 0 <= value <= 100:
+                raise ValueError("holder_ratio_invalid")
+            ratios.append(value)
+        total = sum(ratios, Decimal(0))
+        if total > 100:
+            raise ValueError("top10_concentration_exceeds_100")
+        totals.append(total)
+        periods.append(period)
+    if periods[0] <= periods[1]:
+        raise ValueError("holder_period_not_increasing")
+    return totals[0] - totals[1], totals[0], totals[1]
 
 
 @dataclass(frozen=True)

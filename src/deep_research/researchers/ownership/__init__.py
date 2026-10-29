@@ -64,10 +64,10 @@ def _adapt_holder_list(value: Any, label: str) -> tuple[list[HolderInfo], list[s
     return valid, gaps
 
 
-def _adapt_data_gaps(value: object) -> list[str]:
+def _adapt_data_gaps(value: object) -> tuple[list[str], bool]:
     """只恢复明确的缺口文字；未知形状显式披露，不把对象字符串化。"""
     if not isinstance(value, list):
-        return ["资料缺口未解析：模型输出应为数组，需重新核实"]
+        return ["资料缺口未解析：模型输出应为数组，需重新核实"], True
     gaps: list[str] = []
     invalid = 0
     for entry in value:
@@ -82,13 +82,15 @@ def _adapt_data_gaps(value: object) -> list[str]:
             invalid += 1
     if invalid:
         gaps.append(f"资料缺口有 {invalid} 条记录无法识别，需重新核实")
-    return list(dict.fromkeys(gaps))
+    return list(dict.fromkeys(gaps)), bool(invalid)
 
 
 def parse(parsed: dict[str, Any], steps: int) -> tuple[OwnershipDim, int]:
     payload = dict(parsed)
     details = payload.pop("shareholder_details", None)
-    payload["data_gaps"] = _adapt_data_gaps(payload.get("data_gaps", []))
+    payload["data_gaps"], unparsed_gaps = _adapt_data_gaps(payload.get("data_gaps", []))
+    if payload.get("core_data_gaps") is not None:
+        payload["core_data_gaps"], _ = _adapt_data_gaps(payload["core_data_gaps"])
     adapted = {
         key: _adapt_holder_list(payload.get(key), label)
         for key, label in (("top_holders", "前十大股东"), ("executives", "核心高管"), ("recent_changes", "近一年股权变动"))
@@ -101,11 +103,18 @@ def parse(parsed: dict[str, Any], steps: int) -> tuple[OwnershipDim, int]:
     supplier_gaps: list[str] = []
     if dim.shareholder_details and (dim.shareholder_details.errors or dim.shareholder_details.coverage != "complete"):
         supplier_gaps = ["iFinD股东资料覆盖不完整", *dim.shareholder_details.errors]
-    # 股东/高管/变动的形状缺项只披露；核心资料、模型或供应商缺口才降级。
+    # 未分类的旧缺口保持保守处理；新研究明确区分核心缺口与补充资料。
     adapt_gaps = [gap for records, gaps in adapted.values() for gap in gaps]
-    missing = [label for label, value in (("实际控制人信息", dim.controller), ("十大股东", dim.top_holders or (dim.shareholder_details.items if dim.shareholder_details else [])), ("核心高管", dim.executives)) if not value]
-    if missing or dim.data_gaps or supplier_gaps:
-        dim = dim.model_copy(update={"status": "degraded", "score": None, "degraded_reason": dim.degraded_reason or "股权资料不足，已有内容仅供部分参考", "data_gaps": list(dict.fromkeys([*dim.data_gaps, *supplier_gaps, *missing, *adapt_gaps]))})
-    elif adapt_gaps:
-        dim = dim.model_copy(update={"data_gaps": adapt_gaps})
+    controller_known = dim.controller.strip() and dim.controller.strip() not in {"未知", "暂无", "待补充", "N/A", "缺失", "未披露", "—", "-", "资料缺失"}
+    missing = [label for label, value in (("实际控制人信息", controller_known), ("十大股东", dim.top_holders or (dim.shareholder_details.items if dim.shareholder_details else [])), ("核心高管", dim.executives)) if not value]
+    core_adapt_gaps = [gap for key in ("top_holders", "executives") for gap in adapted[key][1]]
+    core_gaps = list(dict.fromkeys([*(dim.core_data_gaps or []), *supplier_gaps, *missing, *core_adapt_gaps]))
+    gaps = list(dict.fromkeys([*dim.data_gaps, *core_gaps, *adapt_gaps]))
+    unclassified = dim.core_data_gaps is None and bool(dim.data_gaps)
+    updates: dict[str, Any] = {"data_gaps": gaps}
+    if dim.core_data_gaps is not None:
+        updates["core_data_gaps"] = core_gaps
+    if core_gaps or unclassified or unparsed_gaps or dim.status == "degraded":
+        updates.update(status="degraded", score=None, degraded_reason=dim.degraded_reason or "股权核心资料不足或未核实，已有内容仅供部分参考")
+    dim = dim.model_copy(update=updates)
     return dim, used

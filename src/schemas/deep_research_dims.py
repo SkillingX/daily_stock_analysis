@@ -444,12 +444,16 @@ class HolderInfo(BaseModel):
 class OwnershipDim(DimEnvelope):
     """股权高管研究员：实控人/十大股东/高管背景与变动（同花顺数据源）。"""
 
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+
     dim: Literal["ownership"] = "ownership"
     controller: str = ""
     top_holders: List[HolderInfo] = Field(default_factory=list)
     shareholder_details: IfindShareholders | None = None
     executives: List[HolderInfo] = Field(default_factory=list)
     recent_changes: List[HolderInfo] = Field(default_factory=list)
+    # None is an older/unclassified assessment; [] explicitly confirms core coverage.
+    core_data_gaps: list[Annotated[str, Field(min_length=1)]] | None = None
     data_gaps: List[str] = Field(default_factory=list)
     score: Optional[float] = Field(None, ge=0, le=100)
     narrative: str = ""

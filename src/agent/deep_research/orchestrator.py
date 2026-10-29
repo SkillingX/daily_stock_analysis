@@ -565,14 +565,6 @@ def _run_dual_track(
         if "phase" in selected:
             start_dim("phase")
             phase_dim = build_phase_dim(ctx)
-            if phase_dim.status == "ok" and not skip_narrations:
-                phase_dim = phase_dim.model_copy(
-                    update={
-                        "narrative": narrate(
-                            llm_adapter, "phase", phase_dim.model_dump(), phase_dim.narrative
-                        )
-                    }
-                )
             dims["phase"] = phase_dim
             emit_dim("phase", phase_dim.status)
         if "history" in selected:

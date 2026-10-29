@@ -4,6 +4,7 @@ from datetime import date
 import json
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -165,6 +166,32 @@ def test_failed_deep_research_keeps_vendor_details_through_saved_api(vendor_runt
         assert "validation error" not in download.text and "{'item':" not in download.text
     assert ("李水波" if dim_id == "ownership" else "无菌包材") in download.text
     assert "iFinD" in download.text and "2025-12-31" in download.text
+
+
+@pytest.mark.parametrize("core_gaps,expected", [([], "ok"), (["控制关系未核实"], "degraded")])
+def test_ownership_core_assessment_matches_saved_history_and_download(
+    vendor_runtime: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+    core_gaps: list[str], expected: str,
+) -> None:
+    runtime = vendor_runtime
+    payload = {"core_data_gaps": core_gaps, "data_gaps": ["完整履历未取得"], "score": 80,
+               "executives": [{"name": "高管甲", "detail": "董事长", "source": "任职公告"}],
+               "narrative": "已有可追溯股权资料，补充履历仍有缺口。"}
+    monkeypatch.setattr(runtime["explore"], "_run_explore", lambda *a, **kw: {"ok": True, "steps": 1, "data": deepcopy(payload)})
+    report = runtime["deep"].DeepResearchService().generate_report("300260", "新莱应材", dims=["ownership"], force_refresh=True)
+    ownership = report["dimensions"]["ownership"]
+    assert ownership["status"] == expected
+    assert ownership["core_data_gaps"] == core_gaps
+    assert ownership["score"] == (80 if expected == "ok" else None)
+    assert "完整履历未取得" in report["markdown"]
+    rid = report["report_id"]
+    with TestClient(runtime["app"]) as client:
+        detail = client.get(f"/api/v1/deep-research/reports/{rid}").json()["data"]
+        downloaded = client.get(f"/api/v1/deep-research/reports/{rid}/markdown")
+        history = client.get("/api/v1/deep-research/reports").json()["data"]
+    assert detail["dimensions"]["ownership"] == ownership
+    assert detail["markdown"] == downloaded.text == report["markdown"]
+    assert next(row for row in history if row["id"] == rid)["status"] == report["status"]
 
 
 @pytest.mark.parametrize("mode", ["bad_score", "model_error", "missing_prompt", "data_gaps"])

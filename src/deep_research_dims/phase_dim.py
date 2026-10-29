@@ -83,4 +83,7 @@ def build_phase_dim(ctx: SharedContext) -> PhaseDim:
         confidence_reason="交易日历与时段规则推导，无 LLM 参与",
         data_limitations=list(ctx.limitations) + limitations,
     )
-    return PhaseDim(phase=decision, trading_day=market_open)
+    return PhaseDim(
+        phase=decision, trading_day=market_open,
+        narrative=f"当前为{window}。{action}；下次检查：{next_check}。",
+    )

@@ -635,6 +635,7 @@ def _institution_materials(stock_code: str) -> Dict[str, Any]:
     fundamental = getattr(ctx, "fundamental", None) or {}
     block = fundamental.get("institution")
     if isinstance(block, dict):
+        block = _supplement_holder_change(stock_code, fundamental, block)
         _retain_institution_block(run, block)
         return block
     from src.agent.tools.data_tools import _get_fetcher_manager
@@ -653,8 +654,67 @@ def _institution_materials(stock_code: str) -> Dict[str, Any]:
     fetched = context.get("institution")
     if not isinstance(fetched, dict):
         return {"status": "failed", "data": {}, "field_meta": {}, "errors": ["机构资料块缺失"]}
+    fetched = _supplement_holder_change(stock_code, context, fetched)
     _retain_institution_block(run, fetched)
     return fetched
+
+
+def _supplement_holder_change(stock_code: str, fundamental: Dict[str, Any], block: Dict[str, Any]) -> Dict[str, Any]:
+    """Reuse the current snapshot and fetch only the previous quarter within one budget."""
+    config = get_config()
+    if config.data_source_profile != "choice" or not getattr(config, "enable_ifind_mcp", False) or any(
+        record.get("rule_eligible") for record in (block.get("field_meta") or {}).values()
+    ):
+        return block
+    details = (fundamental.get("research") or {}).get("shareholder_details")
+    if not details:
+        return block
+    from datetime import timedelta
+    import json
+    from data_provider.ifind_fundamental_adapter import IfindShareholders, shareholder_concentration_change
+    from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record
+    from src.agent.tools.data_tools import _get_fetcher_manager
+
+    try:
+        current = IfindShareholders.model_validate_json(json.dumps(details))
+        periods = {item.report_date for item in current.items}
+        if current.errors:
+            raise ValueError("current_top10_unavailable: " + "; ".join(current.errors))
+        if current.coverage != "complete" or len(periods) != 1:
+            raise ValueError("current_top10_incomplete")
+        period = next(iter(periods))
+        end = date.fromisoformat(period)
+        if end > date.today():
+            raise ValueError("holder_period_in_future")
+        if (end.month, end.day) not in {(3, 31), (6, 30), (9, 30), (12, 31)}:
+            raise ValueError("holder_period_not_quarter_end")
+        previous_period = (date(end.year, ((end.month - 1) // 3) * 3 + 1, 1) - timedelta(days=1)).isoformat()
+        run = current_research.get()
+        if run is not None:
+            run.check()
+        deadline = monotonic() + max(0.0, config.fundamental_fetch_timeout_seconds)
+        if run is not None:
+            deadline = min(deadline, run.deadline)
+        raw = _get_fetcher_manager().get_ifind_research_context(stock_code, "holders", period=previous_period, deadline=deadline)
+        previous = IfindShareholders.model_validate_json(json.dumps(raw))
+        if previous.errors:
+            raise ValueError("previous_top10_unavailable: " + "; ".join(previous.errors))
+        if any(item.report_date != previous_period for item in previous.items):
+            raise ValueError("previous_holder_period_mismatch")
+        change, current_ratio, previous_ratio = shareholder_concentration_change(current, previous)
+        reading = AnchorReading("ifind", float(change), period=period, unit="percentage_point", source_family="ths", caliber="top10_shareholder_concentration")
+        record = {**adopted_field_record("top10_holder_change", reading, AnchorQuality(status="single_source"), selection_reason="computed_top10_concentration_change"),
+                  "previous_period": previous_period, "current_ratio": float(current_ratio), "previous_ratio": float(previous_ratio)}
+        result = {**block, "status": "partial", "data": {**(block.get("data") or {}), "top10_holder_change": float(change)},
+                  "field_meta": {**(block.get("field_meta") or {}), "top10_holder_change": record},
+                  "source_chain": [*(block.get("source_chain") or []), {"provider": "ifind", "result": "partial"}],
+                  "note": "仅比较两期各自前十大股东集中度；不是全体机构持仓变化或净买卖。披露日/原文未取得，不用于历史时点可得性判定。"}
+        if run is not None:
+            run.check()
+            fundamental["institution"] = result
+        return result
+    except (ValueError, SourceReadError) as exc:
+        return {**block, "errors": list(dict.fromkeys([*(block.get("errors") or []), f"iFinD两期股东集中度未取得：{exc}"]))}
 
 
 def _flow_unit_known(flow: Dict[str, Any]) -> bool:
@@ -814,6 +874,8 @@ def _capital_task(stock_code: str, stock_name: str, flow: Optional[Dict[str, Any
         "金额缺失、窗口不完整或单位未确认时，flow_score、资金总分填 null，不推断资金金额、方向或交易行动；"
         "narrative 只说明已验证内容与真实缺口，不要求凑齐数字。"
         "机构与股东资料按各自 field_meta/source_chain 引用；缺统计对象、日期或单位时只作线索，不给机构分数或方向结论；"
+        "top10_shareholder_concentration 仅表示两期各自十大股东集中度之差（百分点），"
+        "不代表全体机构增减仓、同一批股东净买卖或退出前十者清仓；机构评分在此仅作股东集中度参考。"
         "某一侧缺失时保留另一侧的解释，禁止把局部缺项说成整套资料无效。"
     )
 
@@ -878,6 +940,11 @@ def run_ownership_agent(stock_code: str, stock_name: str, llm_adapter: Any, prog
         "2) 输出 JSON：controller(实际控制人/控股股东，一句话)、top_holders(前十大股东要点数组)、"
         "executives(核心高管：姓名/职务/背景一句，数组)、recent_changes(近一年增减持/任免/股权变动数组)、"
         'data_gaps(未取得资料的字符串数组，如 ["近一年减持公告未取得"]，不得输出对象，禁止编造)、'
+        "core_data_gaps(核心缺口字符串数组：控制关系缺少可核实依据、前十大股东资料不足、"
+        "核心高管姓名/现任职务未核实必须列入；仅由股东排名推测实控人不能视为核实；"
+        "明确披露无实际控制人属于有效结论。三项核心证据均足够时显式输出 []。"
+        "完整履历、补充公告/变动、知识库或非股权接口缺项只列 data_gaps，不能单独作为核心缺口；"
+        "核心缺口也须列入 data_gaps；不要因存在补充缺口主动把 status 写为 degraded)、"
         "score(治理结构健康度参考分 0-100，可 null)、narrative(调查结论一段)。"
         "top_holders、executives、recent_changes 三个数组每条必须是对象（name 必填，附 source 来源标签，"
         "detail 补充说明，变动条目尽量附 date），不要输出 JSON 字符串或 {items:[…]} 包装；"
