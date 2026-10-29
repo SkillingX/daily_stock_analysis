@@ -50,6 +50,41 @@ def scored_indicator(
     }
 
 
+def _weighted_dimension_results_valid(dimensions: List[Dict[str, Any]]) -> bool:
+    """分维聚合后置条件谓词（Layer 2 跨字段不变式，供 @ensure 挂载）。
+
+    数值守卫，只管归一聚合：每个维度得分必须等于其明细中非缺口指标按既有
+    权重的精确归一加权，并经既有的 ``round(·, 2)`` 输出语义（跟随当前 Decimal
+    上下文，不另定舍入模式）取整后精确相等；全部缺口的维度必须中性 50。
+    谓词以返回的明细为独立输入 Decimal 复算，不信任最终得分——归一错误
+    （如 80/60/40 被误算成 49）即使总分仍在 ``framework_total_v2`` 的范围
+    ensure 内也在此拒绝。
+    """
+    for dim in dimensions:
+        active = [entry for entry in dim["indicators"] if not entry["data_gap"]]
+        if active:
+            expected = (
+                sum(
+                    (
+                        Decimal(str(entry["score"])) * Decimal(str(entry["weight"]))
+                        for entry in active
+                    ),
+                    Decimal(0),
+                )
+                / sum((Decimal(str(entry["weight"])) for entry in active), Decimal(0))
+            )
+        else:
+            expected = Decimal(str(NEUTRAL_SCORE))
+        if Decimal(str(dim["score"])) != round(expected, 2):
+            return False
+    return True
+
+
+@ensure(
+    lambda result: _weighted_dimension_results_valid(result),
+    "分维得分 = 非缺口指标按既有权重的精确归一加权（round(·,2) 后精确相等），"
+    "全缺口维度中性 50（归一错误即使总分未越界也必须拒绝）",
+)
 def aggregate_v2_dimensions(
     indicator_results: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
 ) -> List[Dict[str, Any]]:

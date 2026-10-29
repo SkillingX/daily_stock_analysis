@@ -564,22 +564,20 @@ _NO_TARGET_RESEARCH_DIMS = sorted({
 })
 
 
-def test_no_target_real_orchestration_service_vertical(
+def _no_target_vertical_env(
     tmp_path, monkeypatch: pytest.MonkeyPatch, choice_transport: Any,
-) -> None:
-    """B5 验收证据（真实垂直链，仅外部边界受控，零网络零真实模型）。
+) -> Any:
+    """非估值垂直链公共环境（多页装配只做一次；正例/负例/T-1 变体共用）。
 
-    正例：Choice 目标价查询成功、契约有效且返回无覆盖（三个 RATINGTARGETPRICE
-    字段为 None），业务/情报研究经真实 agent 循环+Pydantic 解析完成，基本面/资金
-    经真实 manager 资格链完成，情景/结论/信号经真实构建+护栏+经理三波+渲染完成；
-    服务落盘 markdown/子报告/dims.json/SQLite，API detail/download/dims 一致。
-    断言 null 目标价/EV/价值区间、实际定性内容、醒目范围说明、观察/中性/低、
-    三项不再仅因无覆盖进入 missing_layers、无胜率猜值。
-    负例：目标价查询真实失败（quota_exhausted）时三项 degraded，并在持久化
-    结果中保持可见，不伪造完成。
+    装配双轨引擎 + 确定性研究替身（零网络零真实模型）+ SQLite/报告目录隔离
+    + 真实阶段0（基本面/资金/目标价经真实 manager 与 Choice 传输缝取得）+
+    确定性日线缝 + 目标价成功空覆盖传输缝（三个 RATINGTARGETPRICE 原生值置
+    None，其余合格财务/资金原生值原样保留）+ API SSE 受理可用。
+
+    返回 (service, database, app, no_target_transport)；database 由调用方
+    ``_engine.dispose()`` 收尾。
     """
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient
     from src.config import Config
     from src.storage import DatabaseManager
     from src.services import deep_research_service as service_module
@@ -590,6 +588,9 @@ def test_no_target_real_orchestration_service_vertical(
     cfg.deep_research_timeout_seconds = 60
     cfg.enable_ifind_mcp = False
     monkeypatch.setattr(Config, "_instance", cfg)
+    # API generate/stream 受理边界需要 agent 可用（无凭据环境的测试缝，
+    # 与 test_issue64_scope_compat 同一口径）。
+    monkeypatch.setattr(Config, "is_agent_available", lambda self: True)
     monkeypatch.setattr(service_module, "_get_dual_track_adapter", lambda: _DeterministicResearchAdapter())
     monkeypatch.setattr(service_module, "_DEEP_RESEARCH_DIR", tmp_path)
     monkeypatch.setattr(DatabaseManager, "_instance", None)
@@ -654,69 +655,185 @@ def test_no_target_real_orchestration_service_vertical(
         return raw
 
     monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(no_target_transport))
-    service = service_module.deep_research_service
+    app = FastAPI()
+    app.include_router(router)
+    return service_module.deep_research_service, database, app, no_target_transport
+
+
+def _sse_events(response: Any) -> List[Dict[str, Any]]:
+    """解析 SSE 响应全文为事件列表（自然 EOF 后 client.post 才返回）。"""
+    return [
+        json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")
+    ]
+
+
+def _assert_single_done_terminal(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """自然完成契约：accepted 起步、全程同一 run 身份、恰好一个 done 终态、
+    无 error、EOF 前最后一个事件即 done。"""
+    assert events, "SSE 流为空（未自然结束）"
+    assert events[0]["type"] == "accepted"
+    run_id = events[0]["run_id"]
+    assert run_id, "accepted 事件必须携带 run 身份"
+    assert all(event.get("run_id") == run_id for event in events), "全程同一 run 身份"
+    terminals = [event for event in events if event["type"] in {"done", "error"}]
+    assert len(terminals) == 1 and terminals[0]["type"] == "done", \
+        f"自然单终态（无 error/重复 done）: {[e['type'] for e in events]}"
+    done = terminals[0]
+    assert done["run_id"] == run_id
+    assert events[-1]["type"] == "done", "终态是流的最后一个事件（EOF 自然收尾）"
+    return done
+
+
+def test_no_target_real_orchestration_service_vertical(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, choice_transport: Any,
+) -> None:
+    """B5 验收证据（真实垂直链，仅外部边界受控，零网络零真实模型）。
+
+    正例：Choice 目标价查询成功、契约有效且返回无覆盖（三个 RATINGTARGETPRICE
+    字段为 None），业务/情报研究经真实 agent 循环+Pydantic 解析完成，基本面/资金
+    经真实 manager 资格链完成，情景/结论/信号经真实构建+护栏+经理三波+渲染完成；
+    服务落盘 markdown/子报告/dims.json/SQLite，API detail/download/dims 一致。
+    断言 null 目标价/EV/价值区间、实际定性内容、醒目范围说明、观察/中性/低、
+    三项不再仅因无覆盖进入 missing_layers、无胜率猜值。
+    本版补充（PR #65 评审缺口2）：真实 API SSE 新鲜交付（自然 done/单终态/EOF、
+    身份与落盘载荷一致）+ 缓存 SSE 同口径 + 真实惰性 PDF 导出文本断言
+    （范围标记/定性内容不隐藏、无编造目标价/EV/收益/胜率）。
+    负例：目标价查询真实失败（quota_exhausted）时三项 degraded，并在持久化
+    结果中保持可见，不伪造完成。
+    """
+    from fastapi.testclient import TestClient
+
+    service, database, app, no_target_transport = _no_target_vertical_env(
+        tmp_path, monkeypatch, choice_transport,
+    )
     try:
-        # —— 正例：成功空覆盖 + 真实完成的同报告研究 ——
-        result = service.generate_report("300398", "飞凯材料", dims=_NO_TARGET_RESEARCH_DIMS, force_refresh=True)
-        rid = result["report_id"]
-        assert rid
-        assert result["status"] == "success", (result["status"], result["error"])
-        assert not {"scenarios", "conclusion", "signal"} & set(result["missing_layers"]), result["missing_layers"]
-        dims = result["dimensions"]
-        scenarios = dims["scenarios"]
-        assert scenarios["status"] == "ok", scenarios["degraded_reason"]
-        assert scenarios["valuation_basis"] == "none"
-        assert scenarios["target_price"] is None and scenarios["expected_value"] is None
-        assert scenarios["analyst_target"] is None
-        assert scenarios["scenarios"]["scenarios"] == [], "无概率不创建结构化情景"
-        assert scenarios["scenarios"]["horizons"] == {"horizon_1y": None, "horizon_3y": None, "horizon_5y": None}
-        assert scenarios["scenarios"]["industry_space"], "证据包须来自真实完成的情报研究"
-        assert scenarios["scenarios"]["competitive_evolution"]
-        assert scenarios["scenarios"]["catalysts"] and scenarios["scenarios"]["risks"]
-        conclusion = dims["conclusion"]
-        assert conclusion["status"] == "ok", conclusion["degraded_reason"]
-        assert conclusion["conclusion"]["action"] == "观察", "缺估值时行动保持观察/条件跟踪"
-        assert conclusion["conclusion"]["value_range_1y"] is None
-        assert conclusion["conclusion"]["value_range_5y"] is None
-        signal = dims["signal"]
-        assert signal["status"] == "ok", signal["degraded_reason"]
-        assert signal["rating"] == "中性" and signal["confidence"] == "低"
-        assert signal["signal_type"] == "非估值观察"
-        assert signal["target_price"] is None and signal["expected_value"] is None
-        assert dims["six_dim"]["framework"]["dimensions"], "评分真实执行并产生维度明细"
-        bad_events = [e for e in result["guardrail_events"] if e["dim"] in {"scenarios", "conclusion", "signal"}]
-        assert not bad_events, "非估值模式不得触发概率/锚点类护栏误报"
-
-        markdown = result["markdown"]
-        assert "非估值分析" in markdown and "未取得可追溯目标价" in markdown, "范围说明醒目"
-        assert "股权架构与高管" not in markdown, "退役维度不得出现在新报告"
-        assert "无目标价下的资金观察" in markdown, "经理波A标题真实渲染"
-        assert "以订单落地与资金连续性作为主要验证事实" in markdown, "经理波B主干叙述不得隐藏"
-        assert "胜率 不提供" in markdown, "不请求/不输出胜率猜值"
-        assert "约50%" not in markdown
-        assert "最关键论据" in markdown, "终读结论真实渲染"
-        assert result["available_dim_reports"], "实际标记章节应落盘子报告"
-        for dim in result["available_dim_reports"]:
-            assert (tmp_path / f"{rid}_dim_{dim}.md").exists()
-
-        app = FastAPI()
-        app.include_router(router)
         with TestClient(app) as client:
-            detail = client.get(f"/reports/{rid}")
-            assert detail.status_code == 200
-            data = detail.json()["data"]
+            # —— 正例：经真实 API SSE 新鲜交付（缓存 SSE 不得替代新鲜交付）——
+            stream = client.post(
+                "/generate/stream",
+                json={
+                    "stock_code": "300398", "stock_name": "飞凯材料",
+                    "dims": _NO_TARGET_RESEARCH_DIMS, "force_refresh": True,
+                },
+            )
+            assert stream.status_code == 200, stream.text
+            assert stream.headers["content-type"].startswith("text/event-stream")
+            events = _sse_events(stream)
+            done = _assert_single_done_terminal(events)
+            run_id = events[0]["run_id"]
+            assert stream.headers["x-research-run-id"] == run_id, "传输身份与受理身份一致"
+            # done 载荷即正例结果（服务与 done 事件同一构造路径）
+            result = done
+            rid = result["report_id"]
+            assert rid
+            assert result["status"] == "success", (result["status"], result["error"])
+            assert not {"scenarios", "conclusion", "signal"} & set(result["missing_layers"]), result["missing_layers"]
+            dims = result["dimensions"]
+            scenarios = dims["scenarios"]
+            assert scenarios["status"] == "ok", scenarios["degraded_reason"]
+            assert scenarios["valuation_basis"] == "none"
+            assert scenarios["target_price"] is None and scenarios["expected_value"] is None
+            assert scenarios["analyst_target"] is None
+            assert scenarios["scenarios"]["scenarios"] == [], "无概率不创建结构化情景"
+            assert scenarios["scenarios"]["horizons"] == {"horizon_1y": None, "horizon_3y": None, "horizon_5y": None}
+            assert scenarios["scenarios"]["industry_space"], "证据包须来自真实完成的情报研究"
+            assert scenarios["scenarios"]["competitive_evolution"]
+            assert scenarios["scenarios"]["catalysts"] and scenarios["scenarios"]["risks"]
+            conclusion = dims["conclusion"]
+            assert conclusion["status"] == "ok", conclusion["degraded_reason"]
+            assert conclusion["conclusion"]["action"] == "观察", "缺估值时行动保持观察/条件跟踪"
+            assert conclusion["conclusion"]["value_range_1y"] is None
+            assert conclusion["conclusion"]["value_range_5y"] is None
+            signal = dims["signal"]
+            assert signal["status"] == "ok", signal["degraded_reason"]
+            assert signal["rating"] == "中性" and signal["confidence"] == "低"
+            assert signal["signal_type"] == "非估值观察"
+            assert signal["target_price"] is None and signal["expected_value"] is None
+            assert dims["six_dim"]["framework"]["dimensions"], "评分真实执行并产生维度明细"
+            bad_events = [e for e in result["guardrail_events"] if e["dim"] in {"scenarios", "conclusion", "signal"}]
+            assert not bad_events, "非估值模式不得触发概率/锚点类护栏误报"
+
+            markdown = result["markdown"]
+            assert "非估值分析" in markdown and "未取得可追溯目标价" in markdown, "范围说明醒目"
+            assert "股权架构与高管" not in markdown, "退役维度不得出现在新报告"
+            assert "无目标价下的资金观察" in markdown, "经理波A标题真实渲染"
+            assert "以订单落地与资金连续性作为主要验证事实" in markdown, "经理波B主干叙述不得隐藏"
+            assert "胜率 不提供" in markdown, "不请求/不输出胜率猜值"
+            assert "约50%" not in markdown
+            assert "最关键论据" in markdown, "终读结论真实渲染"
+            assert result["available_dim_reports"], "实际标记章节应落盘子报告"
+            for dim in result["available_dim_reports"]:
+                assert (tmp_path / f"{rid}_dim_{dim}.md").exists()
+
+            # done 载荷与落盘事实一致（完整维度/护栏逐字段相等，不只看状态）
+            data = client.get(f"/reports/{rid}").json()["data"]
             assert data["markdown"] == markdown
-            assert data["dimensions"]["scenarios"]["status"] == "ok"
-            assert data["dimensions"]["signal"]["status"] == "ok"
+            assert data["dimensions"] == dims, "流式 done 与历史详情维度完全一致"
+            assert data["guardrail_events"] == result["guardrail_events"]
             assert data["available_dim_reports"] == result["available_dim_reports"]
+            assert data["run_id"] == run_id, "落盘载荷归属同一运行"
             download = client.get(f"/reports/{rid}/markdown")
             assert download.status_code == 200
             assert download.text == markdown
             dims_api = client.get(f"/reports/{rid}/dims")
             assert dims_api.status_code == 200
-            assert dims_api.json()["data"]["dimensions"]["conclusion"]["status"] == "ok"
+            dims_api_data = dims_api.json()["data"]
+            assert dims_api_data["dimensions"] == dims, "维度产物与 done 完全一致"
+            assert dims_api_data["guardrail_events"] == result["guardrail_events"]
+            run_status = client.get(f"/runs/{run_id}")
+            assert run_status.status_code == 200
+            assert run_status.json()["status"] == "finished"
+            assert run_status.json()["report_id"] == rid, "运行账本身份与终态一致"
+
+            # —— 缓存 SSE 同口径（补充覆盖，不替代上面的新鲜交付）——
+            cached = client.post(
+                "/generate/stream",
+                json={
+                    "stock_code": "300398", "stock_name": "飞凯材料",
+                    "dims": _NO_TARGET_RESEARCH_DIMS, "force_refresh": False,
+                },
+            )
+            assert cached.status_code == 200, cached.text
+            cached_done = _assert_single_done_terminal(_sse_events(cached))
+            assert cached_done["cache_hit"] is True, "同日同子集经报告日缓存复用"
+            assert cached_done["report_id"] == rid
+            assert cached_done["markdown"] == markdown
+            assert cached_done["dimensions"] == dims, "缓存 SSE 与新鲜交付同一维度口径"
+
+            # —— 真实惰性 PDF 导出（不 mock 渲染器：WeasyPrint 真实渲染 + pypdf 提取）——
+            listing = client.get("/reports")
+            assert listing.status_code == 200
+            assert next(i for i in listing.json()["data"] if i["id"] == rid)["has_pdf"] is False, \
+                "PDF 惰性：未请求前报告无 PDF"
+            pdf = client.get(f"/reports/{rid}/pdf")
+            assert pdf.status_code == 200, pdf.text
+            assert pdf.content[:5] == b"%PDF-", "真实渲染字节"
+            assert pdf.headers["content-type"] == "application/pdf"
+            listing2 = client.get("/reports")
+            assert next(i for i in listing2.json()["data"] if i["id"] == rid)["has_pdf"] is True, \
+                "惰性生成落库可见"
+            import io
+
+            from pypdf import PdfReader
+
+            reader = PdfReader(io.BytesIO(pdf.content))
+            pdf_text = "".join(page.extract_text() or "" for page in reader.pages)
+            assert "未取得可追溯目标价" in pdf_text, "醒目范围说明进入 PDF"
+            assert "订单回暖" in pdf_text, "实际定性内容未在导出中隐藏"
+            assert "无目标价下的资金观察" in pdf_text, "经理终稿标题在 PDF 保留"
+            assert "最关键论据" in pdf_text, "终读结论在 PDF 保留"
+            assert "观察" in pdf_text and "中性" in pdf_text, "观察/中性口径一致"
+            assert "约50%" not in pdf_text
+            assert not re.search(r"目标价[：:]\s*\d", pdf_text), "PDF 不得出现编造目标价数值"
+            # money-path 胜率必须保持「不提供」；贝叶斯先验/后验胜率是既有机器
+            # 口径（规格保留 总分→贝叶斯先验 链），数值原样保留、不受本禁令约束。
+            assert "胜率 不提供" in pdf_text, "研究路径胜率不提供猜值"
+            assert not re.search(r"（胜率\s*(?:约)?[\d.]", pdf_text), "PDF 不得出现编造胜率估值"
+            assert "后验胜率" in pdf_text, "既有贝叶斯量化数值不被全局禁令误伤"
+            assert not re.search(r"预期收益空间[：:]?\s*[+-]?\d", pdf_text), "PDF 不得出现编造收益空间"
 
         # —— 负例：目标价查询真实失败 → 三项 degraded 且持久化可见 ——
+        from data_provider.choice_adapter import ChoiceAdapter
         from data_provider.cross_source_validator import SourceReadError
 
         def targets_denied(method: str, args: Any, options: Any, deadline: Any) -> Dict[str, Any]:
