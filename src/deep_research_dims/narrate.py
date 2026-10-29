@@ -14,27 +14,50 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
-_AGENTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "data",
-    "deep_research",
-    "agents",
-)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_AGENTS_DIR = os.path.join(_REPO_ROOT, "data", "deep_research", "agents")
+
+# issue #64：capital 现行退役边界/评分口径随研究员模块 SKILL.md 打包出库，属
+# 强制现行范围：本地 data/deep_research/agents/capital.md 不再替换（部署遗留的
+# 退役期覆盖不得复活机构持仓/行业资金榜要求）。其余维度维持本地覆盖优先语义。
+_MODULE_SKILL_PROMPTS = {
+    "capital": os.path.join(
+        _REPO_ROOT, "src", "deep_research", "researchers", "capital", "SKILL.md",
+    ),
+}
+
+
+def _read_prompt_file(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def _strip_skill_frontmatter(text: str) -> str:
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) == 3:
+            return parts[2].strip()
+    return text.strip()
 
 
 def load_dim_prompt(dim_id: str) -> str:
-    """Prefer local prompt overrides; ship mandatory business rules with the code."""
+    """Prefer local prompt overrides; ship mandatory business rules with the code.
+
+    capital（issue #64）改走打包模块 SKILL（强制现行范围，本地旧覆盖不替换）；
+    其余维度维持本地覆盖优先、business 缺省回退打包提示词的既有语义。
+    """
+    if dim_id in _MODULE_SKILL_PROMPTS:
+        return _strip_skill_frontmatter(_read_prompt_file(_MODULE_SKILL_PROMPTS[dim_id]))
     paths = [os.path.join(_AGENTS_DIR, f"{dim_id}.md")]
     if dim_id == "business":
         paths.append(os.path.join(os.path.dirname(__file__), "prompts", "business.md"))
     for path in paths:
-        try:
-            with open(path, encoding="utf-8") as fh:
-                prompt = fh.read()
-            if prompt.strip():
-                return prompt
-        except OSError:
-            continue
+        prompt = _read_prompt_file(path)
+        if prompt.strip():
+            return prompt
     return ""
 
 

@@ -91,6 +91,56 @@ def test_partial_research_preserves_evidence_and_matches_api_download(
         database._engine.dispose()
 
 
+def test_b4_return_dict_lists_actual_dim_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    provider: tuple[str, dict[str, int]], choice_transport: Any,
+) -> None:
+    """B4（issue #64）：fresh 生成返回载荷暴露实际落盘的维度子报告列表。"""
+    from src.config import Config
+    from src.storage import DatabaseManager
+    from src.search_service import SearchService, SearchResult, SearchResponse
+    from src.services import deep_research_service as service_module
+    base, observed = provider
+    observed["research_mode"] = 1
+    cfg = choice_transport
+    cfg.deep_research_timeout_seconds = 30
+    cfg.deep_research_engine = "dual_track"
+    cfg.litellm_model = "openai/fixture"
+    cfg.agent_litellm_model = "openai/fixture"
+    cfg.llm_model_list = [{"model_name": "openai/fixture", "litellm_params": {"model": "openai/fixture", "api_base": base, "api_key": "fixture-key"}}]
+    monkeypatch.setattr(Config, "_instance", cfg)
+    monkeypatch.setattr(service_module, "_dual_track_adapter", None)
+    monkeypatch.setattr(service_module, "_DEEP_RESEARCH_DIR", tmp_path)
+    monkeypatch.setattr(DatabaseManager, "_instance", None)
+    database = DatabaseManager(f"sqlite:///{tmp_path / 'reports.sqlite'}")
+    monkeypatch.setattr(service_module, "get_db", lambda: database)
+    from src.agent.deep_research import orchestrator
+    from src.deep_research_dims.context import SharedContext, _safe_fundamental
+    context = SharedContext("600519", "样本", "2026-10-15", quote={"price": 50.0})
+    context.fundamental = _safe_fundamental("600519", context)
+    monkeypatch.setattr(orchestrator, "build_shared_context", lambda *args, **kwargs: context)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setattr(SearchService, "is_available", property(lambda self: True))
+    monkeypatch.setattr(SearchService, "search_comprehensive_intel", lambda self, **kwargs: {
+        "business": SearchResponse(query="fixture", provider="fixture", results=[SearchResult(title="公司公告样本", snippet="已取得的业务资料样本", url="https://example.com/disclosure", source="公司公告", published_date="2026-10-01")])
+    })
+    try:
+        service = service_module.deep_research_service
+        result = service.generate_report("600519", "样本", dims=["business", "fundamental"], force_refresh=True)
+        report_id = result.get("report_id")
+        assert report_id
+        actual = sorted(
+            path.stem.split(f"{report_id}_dim_", 1)[1]
+            for path in service_module._DEEP_RESEARCH_DIR.glob(f"{report_id}_dim_*.md")
+        )
+        assert actual, "双轨 partial 报告应按实际章节落盘子报告"
+        assert result.get("available_dim_reports") == actual, "返回载荷必须与实际子文件一致（不伪造链接）"
+        for dim in actual:
+            assert (service_module._DEEP_RESEARCH_DIR / f"{report_id}_dim_{dim}.md").exists()
+    finally:
+        database._engine.dispose()
+
+
 def test_report_budget_bounds_real_stage_zero_source_http(monkeypatch: pytest.MonkeyPatch) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
@@ -137,7 +187,9 @@ def test_report_budget_bounds_real_stage_zero_source_http(monkeypatch: pytest.Mo
 
 @pytest.mark.parametrize('dim_id,payload,expected', [
     ('business', {'company': {'MAINBUSINESS': '有效主营资料'}}, '有效主营资料'),
-    ('ownership', {'company': {'AHOLDER': '已取得的实控人'}, 'holders': {'HOLDNAMER': '股东甲;股东乙', 'period': '2026-06-30'}}, '股东甲'),
+    # B6（issue #64 规格 §1）：只有控制人/带报告期股东名单的公司原始事实在中断
+    # 路径同样留存——同一最小投影，保持 degraded/partial、无治理评分。
+    ('business', {'company': {'AHOLDER': '已取得的实控人'}, 'holders': {'HOLDNAMER': '股东甲;股东乙', 'period': '2026-06-30'}}, '已取得的实控人'),
 ])
 def test_vendor_only_interruption_persists_a_partial_report(dim_id: str, payload: dict[str, Any], expected: str) -> None:
     from src.core.research_run import ResearchRun
@@ -230,7 +282,7 @@ def test_current_financial_amounts_are_useful_even_without_health_score_fields()
     assert '12.30 亿元' in result.markdown
 
 
-@pytest.mark.parametrize('dim_id', ['capital', 'business', 'ownership'])
+@pytest.mark.parametrize('dim_id', ['capital', 'business'])
 def test_cancel_between_direct_sources_stops_the_next_prefetch(monkeypatch: pytest.MonkeyPatch, dim_id: str) -> None:
     from src.agent.deep_research import explore_agents
     from src.agent.tools import data_tools

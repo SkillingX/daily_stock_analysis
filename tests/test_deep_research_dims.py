@@ -31,6 +31,7 @@ from src.deep_research_dims.scenarios_dim import (
 )
 from src.schemas.bayesian_framework import EvidenceItem
 from src.schemas.deep_research_dims import (
+    ACTIVE_DIM_IDS,
     BayesianDim,
     ConclusionDim,
     DataDim,
@@ -375,10 +376,14 @@ class TestGuardrailRules:
 
 class TestDimSubset:
     def test_expand_closure_full_when_none(self):
+        # issue #64：默认全量 = 当前 18 项有效维度（历史 19 项目录仅保留识别）
         from src.agent.deep_research.orchestrator import expand_dim_selection
+        from src.schemas.deep_research_dims import ACTIVE_DIM_IDS
 
-        assert expand_dim_selection(None) == set(DIM_IDS)
-        assert expand_dim_selection(set()) == set(DIM_IDS)
+        assert expand_dim_selection(None) == set(ACTIVE_DIM_IDS)
+        assert expand_dim_selection(set()) == set(ACTIVE_DIM_IDS)
+        # 混合传入历史 19 项时剔除退役 ID，闭包不复活退役维度
+        assert expand_dim_selection(set(DIM_IDS)) == set(ACTIVE_DIM_IDS)
 
     def test_expand_adds_dependencies(self):
         from src.agent.deep_research.orchestrator import expand_dim_selection
@@ -419,7 +424,9 @@ class TestDimSubset:
         assert result.dims["phase"].status == "ok"
         assert result.dims["history"].status == "ok"
         skipped = [d for d, m in result.dims.items() if m.status == "skipped"]
-        assert set(skipped) == set(DIM_IDS) - {"phase", "history"}
+        # issue #64：产物集合为当前 18 项——退役维度既不执行也不产生 skipped 占位
+        assert "ownership" not in result.dims
+        assert set(skipped) == set(ACTIVE_DIM_IDS) - {"phase", "history"}
         assert result.quality_score == 100  # 只统计执行维度
         assert "未选择生成" in result.markdown
 
@@ -524,6 +531,7 @@ class TestDimCache:
         assert loaded == payload
 
     def test_ttl_expiry(self, tmp_path, monkeypatch):
+        from src.config import get_config
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
@@ -533,7 +541,11 @@ class TestDimCache:
         import os
         from datetime import datetime, timedelta
 
-        path = os.path.join(str(tmp_path), "600519_data.json")
+        # 缓存文件名随 data_source_contract 后缀派生，批量运行时同进程 Config
+        # 可能已被其他测试改为 choice 契约；按当前契约动态定位实际文件。
+        contract = get_config().data_source_contract
+        suffix = "" if contract == "legacy" else f"_{contract}"
+        path = os.path.join(str(tmp_path), f"600519{suffix}_data.json")
         record = json.loads(open(path, encoding="utf-8").read())
         record["saved_at"] = (datetime.now() - timedelta(hours=25)).isoformat()
         open(path, "w", encoding="utf-8").write(json.dumps(record))
@@ -588,7 +600,7 @@ class TestSnapshotCache:
         monkeypatch.delenv("FUYAO_API_KEY", raising=False)
 
         class _Fund:
-            def get_fundamental_context(self, code, budget_seconds=None):
+            def get_fundamental_context(self, code, budget_seconds=None, **kwargs):
                 return {"valuation": {"data": {}}, "financial": {"data": {}}}
 
         monkeypatch.setattr(
@@ -605,11 +617,20 @@ class TestSnapshotCache:
     def test_fundamental_cache_hit_skips_fetch(self, monkeypatch, tmp_path):
         """命中快照时不得触碰 fetcher（monkeypatch 成抛异常即证）。"""
         from src.agent.tools import data_tools
+        from src.config import get_config
         from src.deep_research_dims import context as ctx_mod
         from src.deep_research_dims import dim_cache
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
-        dim_cache.save_snapshot(f"stage0_fund_legacy_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519", {
+        # 固定早返回前置条件（批量运行时同进程 Config 可能已被其他测试改动），
+        # 快照键按当前契约动态构造，与 _safe_fundamental 的键生成保持一致。
+        cfg = get_config()
+        monkeypatch.setattr(cfg, "deep_research_cross_validate", False)
+        key = (
+            f"stage0_fund_{cfg.data_source_contract}"
+            f"_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519"
+        )
+        dim_cache.save_snapshot(key, {
             "pe_ttm": 19.09, "pb": 2.0, "roe": 18.0, "gross_margin": 40.0,
             "revenue_growth": 10.0, "net_profit_yoy": 10.0, "market_cap": 10000.0,
         })

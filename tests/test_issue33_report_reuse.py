@@ -238,20 +238,9 @@ def test_explicit_period_reaches_ownership_chapter(ifind_transport):
     assert dim.shareholder_details.items[0].report_date == "2025-12-31"
 
 
-def test_ownership_query_uses_confirmed_disclosed_period(ifind_transport, monkeypatch):
-    from src.agent.deep_research import explore_agents
-
-    ifind_transport[1].clear()
-    ifind_transport[1].update(json.loads((Path("tests/fixtures/ifind_shareholders.json")).read_text()))
-    monkeypatch.setattr(explore_agents, "_run_explore", lambda *args, **kwargs: {"ok": True, "data": {"controller": "实控人甲"}})
-    explore_agents.run_ownership_agent(
-        "300260",
-        "新莱应材",
-        None,
-        research={"as_of": "2026-10-17", "holders": {"period": "2025-12-31", "disclosed_at": "2026-04-20"}},
-    )
-    assert any("报告期2025-12-31" in call[1] for call in ifind_transport[2])
-    assert not any("最新已披露财期" in call[1] for call in ifind_transport[2])
+def test_confirmed_disclosed_period_reuse_semantics(ifind_transport):
+    """issue #64 后 ownership 研究员退役；确认财期判定仍是 iFinD 共享适配层的
+    保留复用语义（issue #33）：查询用已确认披露财期，未确认不冒充最新。"""
     assert confirmed_disclosed_period({"as_of": "2026-10-17"}, as_of="2026-10-17") is None
     assert confirmed_disclosed_period(
         {"holders": {"period": "2026-06-30"}}, as_of="2026-10-17"
@@ -534,8 +523,13 @@ def test_empty_scenarios_do_not_claim_normalization():
 def test_missing_valuation_explains_cascade_without_clearing_limits():
     ctx = SharedContext("300209", "行云科技", "2026-10-17T22:55:20", fundamental={})
     scenarios = build_scenarios_dim(ctx, 18.5)
+    # issue #64/R7 后结论层区分两类降级：结构无效输入走"结构无效"分支；
+    # 本测试验证的是估值级联（六维/贝叶斯结构有效但缺估值依据）——给有效结构。
     conclusion = build_conclusion_dim(
-        ctx, {"framework": {"dimension_total": 80}}, {"bayesian": {"posterior_p": 0.8, "edge": 0.3}}, scenarios.model_dump()
+        ctx,
+        {"framework": {"dimension_total": 80, "dimensions": [{"dimension": "资金面"}]}},
+        {"bayesian": {"posterior_p": 0.8, "edge": 0.3}},
+        scenarios.model_dump(),
     )
     signal = build_signal_dim(ctx, conclusion.model_dump(), scenarios.model_dump())
     assert scenarios.status == conclusion.status == signal.status == "degraded"

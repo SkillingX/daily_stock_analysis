@@ -608,3 +608,117 @@ def test_rejected_candidates_remain_evidence_without_report_or_agent_adoption(if
     assert ctx.fundamental['cross_validation']['anchors']['revenue']['readings']
     info = data_tools._handle_get_stock_info('300260')
     assert all(info['fundamental_context']['growth']['data'].get(field) is None for field in ('revenue', 'net_profit', 'roe'))
+
+
+def test_stock_info_deep_scope_zero_ifind_shareholders_full_positive(ifind_transport, monkeypatch):
+    """B1（R9，iFinD 启用态口径）：get_stock_info 深研范围零 get_stock_shareholders
+    出站、full 范围保留正调用——替换 enable_ifind_mcp=False 下的空洞零断言。
+
+    iFinD 股东查询挂在 ifind-primary 聚合链（_ifind_research_omissions），
+    full 正调用以 financial_primary_source='ifind' 为前提；深研零断言在
+    include_holders=False 处强制，与配置无关地为真。"""
+    from src.agent.tools import data_tools
+    from src.core.research_run import ResearchRun, research_dimension
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", DataFetcherManager())
+    with ResearchRun(120).bind():
+        # 深研范围：零 iFinD 股东出站（iFinD 已启用且为主源，零是真实退役边界）
+        research_dimension.set("capital")
+        deep_info = data_tools._handle_get_stock_info("300260")
+        assert deep_info.get("code") == "300260"
+        assert [c for c in calls if c[0] == "get_stock_shareholders"] == [], "深研 scope 不得发起 iFinD 股东查询"
+        # full 范围（dimension 空）：股东查询正调用被保留（普通消费者能力不变）
+        research_dimension.set("")
+        full_info = data_tools._handle_get_stock_info("300260")
+        assert full_info.get("code") == "300260"
+        assert any(c[0] == "get_stock_shareholders" for c in calls), "full 范围保留 iFinD 股东正调用"
+
+
+def test_b1_lifecycle_stage0_stock_info_warm_force_parallel_scopes(ifind_transport, monkeypatch):
+    """B1 冻结 AC（真实缝，msg_0f5f341a5878）：深研 stage0 冷聚合写 scope 缓存 →
+    模型阶段 get_stock_info 热态命中（Choice CSD 出站零新增，证明真复用）；
+    financial_refresh 强刷绕过缓存真实重新聚合（CSD 计数上升）时退役操作仍零；
+    深研/普通两 scope 在同一 active ResearchRun 下经 copy_context 真实并行
+    single_fetch（full 侧股东正调用保留、深研侧零）。research_dimension
+    token/finally 恢复，不跨测试泄漏。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+
+    from data_provider.choice_adapter import ChoiceAdapter
+    from data_provider.mx_data_adapter import financial_refresh
+    from src.agent.tools import data_tools
+    from src.core.research_run import ResearchRun, research_dimension
+    from src.deep_research_dims.context import SharedContext, _safe_fundamental
+
+    config, response, calls = ifind_transport
+    config.financial_primary_source = 'ifind'
+    monkeypatch.setattr(data_tools, "_fetcher_manager_singleton", DataFetcherManager())
+    # Choice 原生 CSD 计数：证明 warm 真命中缓存、force 真重聚合（不只看 holders==0）。
+    wrapped_native = ChoiceAdapter._native_request
+    csd_calls = {"count": 0}
+
+    def counting_native(method, args, options, deadline):
+        if method == "csd":
+            csd_calls["count"] += 1
+        return wrapped_native(method, args, options, deadline)
+
+    monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(counting_native))
+
+    def holders_count() -> int:
+        return sum(1 for tool, _question in calls if tool == "get_stock_shareholders")
+
+    with ResearchRun(120).bind():
+        dimension_token = research_dimension.set("capital")
+        try:
+            # —— stage0 冷聚合（真实写深研 scope 缓存）——
+            ctx = SharedContext("300260", "样本", "2026-10-29")
+            ctx.fundamental = _safe_fundamental("300260", ctx)
+            holders_after_stage0 = holders_count()
+            assert holders_after_stage0 == 0, "深研 stage0 零股东出站"
+            csd_after_stage0 = csd_calls["count"]
+            assert csd_after_stage0 > 0, "stage0 冷聚合发生真实 Choice CSD 出站"
+            # —— 模型阶段 stock_info 热态：命中 stage0 深研 scope 缓存 ——
+            info = data_tools._handle_get_stock_info("300260")
+            assert info.get("code") == "300260"
+            assert holders_count() == holders_after_stage0, "stock_info 热态股东零新增"
+            assert csd_calls["count"] == csd_after_stage0, "热态命中深研 scope 缓存，Choice 零新增出站"
+            # —— financial_refresh 强刷：绕过缓存真实重新聚合，退役操作仍零 ——
+            refresh_token = financial_refresh.set(("300260", "force-b1"))
+            try:
+                forced = data_tools._handle_get_stock_info("300260")
+                assert forced.get("code") == "300260"
+                assert holders_count() == holders_after_stage0, "强刷重聚合深研 scope 仍零股东出站"
+                assert csd_calls["count"] > csd_after_stage0, "强刷确实绕过缓存重新聚合"
+            finally:
+                financial_refresh.reset(refresh_token)
+        finally:
+            research_dimension.reset(dimension_token)
+
+        # —— 双消费者真实并行（copy_context 携带 active ResearchRun 进线程，
+        # single_fetch 缝真实生效；deep/full run 键不同 → 各自聚合）——
+        def run_scope(deep: bool) -> str:
+            token = research_dimension.set("capital" if deep else "")
+            try:
+                assert current_research() is not None, "线程内经 copy_context 拿到 active ResearchRun"
+                result = data_tools._get_fetcher_manager().get_fundamental_context(
+                    "300260", include_sector_flows=not deep,
+                )
+                return str(result.get("market"))
+            finally:
+                research_dimension.reset(token)
+
+        def current_research():
+            from src.core.research_run import current_research as _current
+
+            return _current.get()
+
+        csd_before_parallel = csd_calls["count"]
+        holders_before_parallel = holders_count()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(copy_context().run, run_scope, deep) for deep in (True, False)]
+            markets = [future.result(timeout=60) for future in futures]
+    assert markets == ["cn", "cn"], "两 scope 并行各自真实聚合成功"
+    assert holders_count() == holders_before_parallel + 1, "并行后恰一次股东正调用（full 保留、深研零）"
+    assert csd_calls["count"] > csd_before_parallel, "并行两 scope 各走真实聚合（不共享 same-fetch/缓存）"

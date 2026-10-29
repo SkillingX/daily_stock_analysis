@@ -103,28 +103,6 @@ def test_holder_details_recovered_do_not_mark_research_complete() -> None:
     assert "实际控制人信息" in dim.data_gaps and "核心高管" in dim.data_gaps
 
 
-@pytest.mark.parametrize("coverage", ["complete", "partial"])
-def test_object_gaps_survive_runner_and_parser(
-    monkeypatch: pytest.MonkeyPatch, coverage: str
-) -> None:
-    from src.agent.deep_research import explore_agents
-
-    gaps = [{"item": f"缺少公开资料 {i}"} for i in range(8)]
-    payload = {**_CORE_PAYLOAD, "data_gaps": gaps, "score": 85, "narrative": "已有股权研究结论"}
-    monkeypatch.setattr(explore_agents, "get_config", lambda: SimpleNamespace(data_source_profile="legacy"))
-    monkeypatch.setattr(explore_agents, "_run_explore", lambda *a, **kw: {"ok": True, "data": payload})
-    details = {"coverage": coverage, "items": [{"name": "股东甲", "rank": 1, "report_date": "2026-06-30"}]}
-    out = explore_agents.run_ownership_agent("300260", "新莱应材", None, research={"shareholder_details": details})
-    dim, _ = parse_ownership(out["data"], steps=1)
-
-    assert dim.controller == _CORE_PAYLOAD["controller"]
-    assert dim.top_holders[0].name == "李水波" and dim.executives[0].name == "高管甲"
-    assert dim.shareholder_details is not None and dim.shareholder_details.items[0].name == "股东甲"
-    assert dim.narrative == "已有股权研究结论"
-    assert dim.data_gaps[:8] == [f"缺少公开资料 {i}" for i in range(8)]
-    assert ("iFinD股东资料覆盖不完整" in dim.data_gaps) == (coverage == "partial")
-    assert dim.status == "degraded" and dim.score is None
-
 
 @pytest.mark.parametrize("gaps,expected", [
     ([], []),
@@ -171,7 +149,7 @@ def test_all_obtained_with_failed_supplements_is_not_reported_as_incomplete(
 
     monkeypatch.setattr(
         data_tools, "_get_fetcher_manager",
-        lambda: SimpleNamespace(get_fundamental_context=lambda code, budget_seconds: dict(_FULL_COMPACT)),
+        lambda: SimpleNamespace(get_fundamental_context=lambda code, budget_seconds, **kwargs: dict(_FULL_COMPACT)),
     )
     ctx = SharedContext("300260", "新莱应材", "2026-10-20")
     ctx.fundamental = _safe_fundamental("300260", ctx)
@@ -181,19 +159,20 @@ def test_all_obtained_with_failed_supplements_is_not_reported_as_incomplete(
     assert "快照不缓存" not in notice
 
 
-def test_sector_funds_are_not_replaced_by_board_price_rankings(
+def test_sector_funds_are_no_longer_adopted_by_deep_research(
     fundamental_env: None, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """issue #64：行业资金榜退役——深研阶段 0 零采用（boards 涨幅榜也不补位）。"""
     from src.agent.tools import data_tools
     funds = {"top": [{"name": "资金流入板块", "net_inflow": 100.0}], "bottom": []}
     compact = {**_FULL_COMPACT,
                "boards": {"data": {"top": [{"name": "涨幅板块", "change_pct": 5.0}]}},
                "capital_flow": {"data": {"sector_rankings": funds}}}
     monkeypatch.setattr(data_tools, "_get_fetcher_manager", lambda: SimpleNamespace(
-        get_fundamental_context=lambda code, budget_seconds: compact,
+        get_fundamental_context=lambda code, budget_seconds, include_sector_flows=True: compact,
     ))
     ctx = SharedContext("300260", "样本", "2026-10-29")
-    assert _safe_fundamental("300260", ctx)["sector_rankings"] == funds
+    assert "sector_rankings" not in _safe_fundamental("300260", ctx), "行业资金榜不再是共享上下文输入"
 
 
 def test_partial_indicators_list_the_missing_fields(
@@ -204,7 +183,7 @@ def test_partial_indicators_list_the_missing_fields(
     compact = {**_FULL_COMPACT, "errors": [], "valuation": {"data": {"pb_ratio": 2.0, "total_mv": 1.0e10}}}
     monkeypatch.setattr(
         data_tools, "_get_fetcher_manager",
-        lambda: SimpleNamespace(get_fundamental_context=lambda code, budget_seconds: dict(compact)),
+        lambda: SimpleNamespace(get_fundamental_context=lambda code, budget_seconds, **kwargs: dict(compact)),
     )
     ctx = SharedContext("300260", "新莱应材", "2026-10-20")
     ctx.fundamental = _safe_fundamental("300260", ctx)

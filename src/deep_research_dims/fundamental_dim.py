@@ -115,14 +115,14 @@ def build_fundamental_dim(
     if np_score is None:
         gaps.append("净利增速")
 
-    inst = fund.get("institution_holding_change")
     balance = fund.get("balance_sheet") or {}
     assets, liabilities = balance.get("assets"), balance.get("liabilities")
     leverage = None
     if balance.get("source") == "choice" and balance.get("currency") == "CNY" and balance.get("unit") == "currency_base" and balance.get("period") and balance.get("disclosed_at") and isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)) and assets > 0 and liabilities >= 0:
         leverage = float(round(Decimal(str(liabilities)) / Decimal(str(assets)) * 100, 2))
+    # issue #64：机构持仓变化退役——新报告 financial_safety 不再产出该字段，
+    # 渲染不再出现「机构持仓变化：缺失」退役缺口（历史保存载荷兼容不变）。
     financial_safety = {
-        "institution_holding_change": inst,
         "leverage": leverage,
         "period": balance.get("period"),
         "source": balance.get("source"),

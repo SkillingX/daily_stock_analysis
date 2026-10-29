@@ -26,7 +26,7 @@ _CACHE_DIR = os.path.join(
     ".dim_cache",
 )
 
-# 维度 → TTL（小时）
+# 维度 → TTL（小时）。issue #64：ownership 研究退役，不再缓存该维度。
 DIM_TTL_HOURS: Dict[str, float] = {
     "intel": 4.0,
     "data": 24.0,
@@ -40,7 +40,6 @@ DIM_TTL_HOURS: Dict[str, float] = {
     "technical": 24.0,
     "capital": 24.0,
     "sentiment": 24.0,
-    "ownership": 24.0,  # 高管动态时效：审计 A4，不设 5d
     "us_china": 120.0,
     "business": 24.0,
 }
@@ -48,16 +47,18 @@ DIM_TTL_HOURS: Dict[str, float] = {
 # 契约结构变更（18 维研究员 payload）→ bump
 
 # 契约 schema 版本：维度 payload 结构变更必须 bump（审计 C4），载入版本不符即 miss
-SCHEMA_VERSION = 14  # 股权核心缺口分类与资金两期集中度口径；旧缓存重算，历史报告不改写
+# v15（issue #64）：18 维有效范围与 v2.2 评分口径；旧缓存（含旧机构/治理分、旧
+# 退役缺口）重算，历史报告不改写。
+SCHEMA_VERSION = 15
 # 本次来源提示已变、且编排器会读入新报告的维度。缺版本即 miss，不改 payload 正文。
 # 不 bump 全局 SCHEMA_VERSION / 基本面 mapping，context 维度本就不走这段缓存。
 SOURCE_LABEL_VERSION = 1
 _SOURCE_LABEL_DIMS = frozenset({
-    "business", "intel", "supply_chain", "sentiment", "ownership", "us_china",
+    "business", "intel", "supply_chain", "sentiment", "us_china",
 })
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 19  # issue #60：公共持仓错映射移除与辅助表适用记录选择语义
+FUNDAMENTAL_MAPPING_VERSION = 20  # issue #64：阶段0退役行业榜/机构侧后快照内容变化，旧快照重算
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 
 
@@ -67,6 +68,45 @@ def _cache_path(stock_code: str, dim: str) -> str:
     suffix = "" if contract == "legacy" else f"_{contract}"
     return os.path.join(_CACHE_DIR, f"{stock_code}{suffix}_{dim}.json")
 
+
+
+def capital_block_within_date_boundary(block: Any, *, now: Optional[Any] = None) -> bool:
+    """资金块日期采纳谓词（B2/R12 共享）：actual/expected 双日期保守判定。
+
+    输入可为 CapitalDim 载荷或含 ``data.stock_flow`` 的 manager 块；缺证据/乱序/
+    未来/跨收盘旧回退一律 False（正常 miss 刷新，规格允许）。不新增探测请求。
+    """
+    flow = block
+    if isinstance(block, dict) and isinstance(block.get("data"), dict):
+        flow = (block["data"].get("stock_flow") or {}) if "stock_flow" in block.get("data", {}) else block.get("data") or {}
+    if not isinstance(flow, dict):
+        return False
+    # CapitalDim 序列化后实际截至日字段名随 Pydantic 契约；兼容历史已保存载荷。
+    as_of = str(flow.get("as_of_date") or flow.get("as_of_date") or "")
+    expected = str(flow.get("expected_date") or "")
+    if not as_of or not expected:
+        return False
+    try:
+        from datetime import date as _date, datetime as _datetime
+
+        as_of_day = _date.fromisoformat(as_of[:10])
+        expected_day = _date.fromisoformat(expected[:10])
+    except (ValueError, TypeError):
+        return False
+    today = now if now is not None else _datetime.now().date()
+    if as_of_day > expected_day or expected_day > today:
+        return False
+    # 保存时证据仍"新鲜"（T_save ∈ {今天, 昨天}）才可无出站采信：T_now 相对
+    # T_save 最多前进一个收盘；跨收盘后（如 10/28 晚存的 10/27 证据在 10/29 读）
+    # 无法证明当前边界 → False（正常 miss 刷新）。
+    from datetime import timedelta as _timedelta
+
+    if expected_day not in (today, today - _timedelta(days=1)):
+        return False
+    if as_of_day == expected_day:
+        return True
+    # 保存时 T-1 回退采用：仅当证据日 == 今天（T_now 仍 == T_save，as_of 仍合法）
+    return expected_day == today
 
 
 def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
@@ -103,6 +143,12 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         except (ValueError, TypeError):
             return None
         if business.status != "ok":
+            return None
+    if dim == "capital":
+        # issue #64/R12/B2：资金缓存采用走共享日期采纳谓词（保存证据保守判定，
+        # 不用自然日常数替代交易日资格）；跨收盘旧回退等无法证明当前边界的情形
+        # 一律 miss，走既有刷新路径（规格允许必要刷新）。
+        if not capital_block_within_date_boundary(payload):
             return None
     try:
         saved_time = datetime.fromisoformat(saved_at)

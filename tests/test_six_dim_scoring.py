@@ -51,16 +51,20 @@ def _scores(dimensions: list[Any], dim_name: str) -> dict[str, tuple[float, bool
 
 
 class TestExistingScoresPreserved:
-    """80/76/72 反例：补充调用不可用/失败/空返回时已有合法评分保留。"""
+    """80/76/72 反例：补充调用不可用/失败/空返回时已有合法评分保留。
+
+    issue #64（v2.2）：股权高管（equity_mgmt）退休——治理评分不再进入基本面，
+    传入 ownership 载荷也不再改变任何指标。
+    """
 
     def test_adapter_unavailable_keeps_researcher_scores(self):
         ctx = _ctx()
         dim = six_dim.build_six_dim(
             ctx, {}, None,
-            ownership_payload={"status": "ok", "score": 80, "narrative": "已取得公告支持的有效研究评分"},
             sentiment_payload={"status": "ok", "institute_score": 76, "community_score": 72, "narrative": "已有机构与社区研究事实"},
         )
-        assert _scores(dim.framework.dimensions, "基本面")["股权架构与高管"] == (80.0, False)
+        basic = _scores(dim.framework.dimensions, "基本面")
+        assert "股权架构与高管" not in basic, "退休治理指标不得出现在基本面"
         sentiment = _scores(dim.framework.dimensions, "情绪面")
         assert sentiment["机构评价"] == (76.0, False)
         # issue #46：社区评价退休，不再出现在情绪面指标中（也不算缺口）
@@ -70,10 +74,9 @@ class TestExistingScoresPreserved:
         ctx = _ctx()
         dim = six_dim.build_six_dim(
             ctx, {}, ErrorAdapter(),
-            ownership_payload={"status": "ok", "score": 80, "narrative": "公告支持"},
             sentiment_payload={"status": "ok", "institute_score": 76, "community_score": 72, "narrative": "研究事实"},
         )
-        assert _scores(dim.framework.dimensions, "基本面")["股权架构与高管"] == (80.0, False)
+        assert "股权架构与高管" not in _scores(dim.framework.dimensions, "基本面")
         sentiment = _scores(dim.framework.dimensions, "情绪面")
         assert sentiment["机构评价"] == (76.0, False)
         assert "社区评价" not in sentiment
@@ -88,7 +91,6 @@ class TestExistingScoresPreserved:
         ctx = _ctx()
         dim = six_dim.build_six_dim(
             ctx, {}, EmptyAdapter(),
-            ownership_payload={"status": "ok", "score": 80, "narrative": "公告支持"},
             sentiment_payload={"status": "ok", "institute_score": 76, "community_score": 72, "narrative": "研究事实"},
         )
         assert _scores(dim.framework.dimensions, "情绪面")["机构评价"] == (76.0, False)
@@ -182,7 +184,7 @@ class TestScoringFactsJson:
         assert "fundamental.large_evidence" in user.split("```", 2)[2]
 
     def test_nested_research_keeps_short_evidence_for_missing_indicator(self):
-        """审查 P2：research 含大 financial_series 时，简短控制人/公告来源仍保留给股权补评。"""
+        """审查 P2：research 含大 financial_series 时，简短公司资料证据仍保留给补评。"""
         ctx = _ctx()
         ctx.fundamental = {
             "pe_ttm": 12.5,
@@ -193,10 +195,10 @@ class TestScoringFactsJson:
             },
         }
         adapter_cls, captured = self._captured_user_content()
-        # 只缺 equity_mgmt → research 按优先键最先进裁剪
+        # 只缺 risk_appetite → research 按优先键最先进裁剪
         results = six_dim._score_llm_indicators(
             ctx, "fixture", adapter_cls(), None,
-            existing={k: {"score": 60.0} for k in ("institute_view", "community_view", "liquidity", "risk_appetite")},
+            existing={k: {"score": 60.0} for k in ("institute_view", "liquidity")},
         )
         raw = captured[-1][-1]["content"].split("```json\n", 1)[1].split("\n```", 1)[0]
         parsed = json.loads(raw)

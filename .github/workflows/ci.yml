@@ -105,6 +105,9 @@ jobs:
           from api.app import app; print('api OK')
           from src.deep_research_dims.narrate import load_dim_prompt
           assert 'data_gaps' in load_dim_prompt('business'), 'Business prompt missing from image'
+          capital_prompt = load_dim_prompt('capital')
+          assert 'flow_score' in capital_prompt, 'Capital prompt missing from image'
+          assert '退役' in capital_prompt, 'Capital retirement rules missing from image'
           print('All Docker imports OK')
           "
 

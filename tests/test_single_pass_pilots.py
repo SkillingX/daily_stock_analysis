@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """issue #56 试点契约：技术与资金研究员代码备料、单轮无工具分析、失败隔离。
 
-覆盖验收反例：局部技术缺项仍解释、仅资金流有效、仅机构资料有效、
-两侧均无效不启动模型、金额单位不明不推断、同报告取数去重；
+覆盖验收反例：局部技术缺项仍解释、仅资金流合格即完成、资金不合格不启动模型、
+金额单位不明不推断、同报告取数去重（issue #64：机构/股东侧退役，机构不再是
+资金研究员的启动条件、解释来源或评分依据）；
 共享事实身份与既有 #42/#51 契约由各自测试文件继续保护。
 """
 
@@ -15,9 +16,6 @@ from src.agent.deep_research import explore_agents
 from src.config import Config
 from src.core.research_run import ResearchRun
 from src.deep_research_dims.context import SharedContext
-
-# 测试日历最新交易日（见 test_choice_capital_flow.DATES[0]）
-DATES_NEWEST = "2026-10-13"
 
 # 复用 Choice 原生资金流冻结夹具（真实交易日历与 NETINFLOW 传输）
 from tests.test_choice_capital_flow import native_flow  # noqa: E402
@@ -177,46 +175,18 @@ class TestCapitalSinglePass:
         monkeypatch.setattr(Config, "_instance", config)
         return ResearchRun(timeout_seconds=60.0)
 
-    def test_only_institution_valid_keeps_explanation(self, native_flow, monkeypatch):
-        """资金流缺失时机构解释保留，不被资金流缺口覆盖。"""
+    def test_only_flow_valid_starts_model_and_scores_from_flow(self, native_flow, monkeypatch):
+        """issue #64：机构侧退役——资金流三窗口合格即完成，资金总分 = 合格 flow_score。"""
         from src.agent.tools import data_tools
 
-        calls, dates = native_flow
-        dates.remove(DATES_NEWEST)  # 最新交易日无数据 → 金额 None
-        monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", lambda code, **k: {
-            "institution": {"status": "ok", "data": {"institution_holding_change": -1.25},
-                             "field_meta": {"institution_holding_change": {"rule_eligible": True, "period": "2026中报"}}}})
-        content = (
-            '{"flow_summary": "资金流窗口不完整", "flow_score": null,'
-            ' "institution_summary": "机构持仓变动 -1.25%（2026中报）", "institution_score": 55,'
-            ' "score": null, "narrative": "机构持仓变动 -1.25%（2026中报）；资金流窗口不完整。"}'
-        )
-        calls_model: list[dict[str, Any]] = []
-        monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model(content, calls_model))
-        result = explore_agents.run_capital_agent("300260", "新莱应材", object())
-        assert len(calls_model) == 1
-        assert calls_model[0]["max_steps"] == 1
-        assert calls_model[0]["tool_registry"].to_openai_tools() == []
-        assert result["ok"] is True
-        data = result["data"]
-        assert data["status"] == "degraded"
-        assert "资金流" in data["degraded_reason"]
-        # 机构解释保留，不被资金流缺口文案覆盖
-        assert data["narrative"].startswith("机构持仓变动")
-        assert data["institution_score"] == 55
-        assert data["flow_score"] is None and data["score"] is None
-        assert data["flow_summary"] != data["narrative"]
+        def no_institution(code, **kwargs):
+            raise AssertionError("机构块取数已退役，不得调用")
 
-    def test_only_flow_valid_keeps_flow_explanation(self, native_flow, monkeypatch):
-        """机构资料无合格字段时资金流解释保留，机构只作线索。"""
-        from src.agent.tools import data_tools
-
-        monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", lambda code, **k: {
-            "institution": {"status": "ok", "data": {}, "field_meta": {"institution_holding_change": {"rule_eligible": False}}}})
+        monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", no_institution)
         content = (
             '{"flow_summary": "主力净流入为正", "flow_score": 72,'
             ' "institution_summary": "暂无法判定", "institution_score": null,'
-            ' "score": null, "narrative": "当日主力净流入 0.00 万元；机构资料未核实。"}'
+            ' "score": null, "narrative": "主力净流入为正，机构资料未核实。"}'
         )
         calls_model: list[dict[str, Any]] = []
         monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model(content, calls_model))
@@ -224,16 +194,32 @@ class TestCapitalSinglePass:
         assert len(calls_model) == 1
         assert result["ok"] is True
         data = result["data"]
-        assert data["status"] == "degraded"
-        assert "机构" in data["degraded_reason"]
-        assert data["narrative"].startswith("当日主力净流入")  # 资金流解释保留
-        assert data["institution_score"] is None
-        assert "线索" in data["institution_summary"]
-        assert data["flow_score"] == 72 and data["score"] is None
+        assert data.get("status") != "degraded"
+        # 模型输出的机构/合成字段一律丢弃，不再构成降级原因或评分
+        assert data["flow_score"] == 72 and data["score"] == 72
+        assert data.get("institution_score") is None and data.get("institution_summary") is None
         assert "Choice 主力净流入" in data["flow_summary"]
 
+    @staticmethod
+    def _flow_stub(payload: dict[str, Any]):
+        """既有资金流入口替身：签名对齐当前接缝并锁零行业榜出站（issue #64）。"""
+        def flow(code: str, *, include_sector_flows: bool = True) -> dict[str, Any]:
+            assert include_sector_flows is False  # 深研资金路径零行业榜出站
+            return {"stock_code": code, **payload}
+        return flow
+
+    # 否则有效的完整三窗口基线：单位反例保持唯一缺口，门控不会因窗口/日期缺失
+    # 顺带关闭（根审查修正：单位反例必须被隔离）。
+    _COMPLETE_WINDOWS = {
+        "status": "ok",
+        "main_net_inflow": 100.0, "inflow_5d": 250.0, "inflow_10d": 250.0,
+        "expected_date": "2026-10-13", "as_of_date": "2026-10-13",
+        "coverage": {str(n): {"complete": True} for n in (1, 5, 10)},
+        "errors": [],
+    }
+
     def test_unknown_unit_never_infers_amounts(self, monkeypatch):
-        """金额存在但单位不明：不算有效资金资料，不推断金额与方向。"""
+        """三窗口/日期完整但单位不明：不算有效资金资料，不推断金额与方向。"""
         from src.agent.tools import data_tools
 
         config = Config(data_source_profile="choice", deep_research_cross_validate=False)
@@ -241,11 +227,8 @@ class TestCapitalSinglePass:
         monkeypatch.setattr(
             data_tools,
             "_handle_get_capital_flow",
-            lambda code: {"stock_code": code, "status": "ok", "main_net_inflow": 100.0,
-                           "inflow_5d": None, "inflow_10d": None, "errors": []},
+            self._flow_stub(dict(self._COMPLETE_WINDOWS, field_meta={})),
         )
-        monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", lambda code, **k: {
-            "institution": {"status": "ok", "data": {}, "field_meta": {}}})
         calls_model: list[dict[str, Any]] = []
         monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model("{}", calls_model))
         result = explore_agents.run_capital_agent("300260", "新莱应材", object())
@@ -262,14 +245,11 @@ class TestCapitalSinglePass:
         monkeypatch.setattr(
             data_tools,
             "_handle_get_capital_flow",
-            lambda code: {"stock_code": code, "status": "partial", "main_net_inflow": 100.0,
-                           "inflow_5d": None, "inflow_10d": None, "source_unit": "CNY",
-                           "errors": ["unit_conflict"],
-                           "field_meta": {"main_inflow": {"rule_eligible": False,
-                                                           "normalization_error": "unit_conflict"}}},
+            self._flow_stub(dict(self._COMPLETE_WINDOWS, status="partial", source_unit="CNY",
+                                 errors=["unit_conflict"],
+                                 field_meta={"main_inflow": {"rule_eligible": False,
+                                                             "normalization_error": "unit_conflict"}})),
         )
-        monkeypatch.setattr(data_tools._get_fetcher_manager(), "get_fundamental_context", lambda code, **k: {
-            "institution": {"status": "ok", "data": {}, "field_meta": {}}})
         calls_model: list[dict[str, Any]] = []
         monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model("{}", calls_model))
         result = explore_agents.run_capital_agent("300260", "新莱应材", object())
@@ -285,9 +265,10 @@ class TestCapitalSinglePass:
         handler_calls: list[str] = []
         real_handler = data_tools._handle_get_capital_flow
 
-        def counting(code: str):
+        def counting(code: str, **kwargs: Any):
             handler_calls.append(code)
-            return real_handler(code)
+            assert kwargs == {"include_sector_flows": False}  # 深研路径零行业榜出站
+            return real_handler(code, **kwargs)
 
         monkeypatch.setattr(data_tools, "_handle_get_capital_flow", counting)
         with run.bind():
@@ -393,7 +374,20 @@ class TestCapitalSinglePass:
         assert "共享宪法" in system_text  # 既有宪法注入不回退（来源/缺口纪律）
         assert "本轮职责边界" in system_text  # 试点分区边界真实组合出站
         assert "时点纪律" in system_text  # 时点职责真实出站：以给定时点/财期解读，不声称全局最新
+        # 打包 capital SKILL 现行规则真实到达实际 HTTP 出站（隔离源副本无本地
+        # capital 覆盖；真实报告曾因 prompt 缺失叙述「行业资金排名缺失」）。
+        assert "资金总分" in system_text
+        assert "机构/股东侧" in system_text and "退役" in system_text
         task_text = "\n".join(str(m.get("content") or "") for m in outbound[0].get("messages", []))
+        # 退役行业榜整键不在实际出站任务（真实报告曾注入空占位被模型叙述为缺失）
+        assert '"sector_rankings"' not in task_text
+        flow_section = task_text.split("1) 资金流资料", 1)[1].split("\n3) 市值锚点", 1)[0]
+        flow_payload = json.loads(flow_section[flow_section.index("{"):flow_section.rindex("}") + 1])
+        assert "sector_rankings" not in flow_payload
+        # 字段资格记录质量口径经投影后确切等值（single_source/single_family 不回退 unverified）
+        assert flow_payload["field_meta"]["main_inflow"]["quality"] == {
+            "status": "single_source", "reason_codes": ["single_family"],
+        }
         section = task_text.split("3) 市值锚点", 1)[1].split("\n4)", 1)[0]
         payload = json.loads(section[section.index("{"):])
         # 整条资格记录确切等值：总/流通市值各自到达实际请求，时点/口径/来源族/质量不丢
@@ -402,8 +396,9 @@ class TestCapitalSinglePass:
         assert "gaps" not in payload  # 两项均合格，无缺口包
         assert payload["anchors"]["total"]["record"]["quality"]["status"] == "single_source"  # single_source 不变
         assert fetch_calls == []  # 锚点全部来自共享上下文，同报告零新增取数
-        assert result["ok"] is True  # provider status=ok 经现有 parse 成功（不冒充模型质量分）
-        assert result["data"]["status"] == "ok"
+        assert result["ok"] is True  # provider status=ok 经现有 parse 成功
+        # issue #64：固定 provider 响应无 flow_score/分析正文——如实降级，不冒充模型质量分
+        assert result["data"]["status"] == "degraded"
 
     def test_market_cap_alias_entry_not_dropped(self, native_flow, monkeypatch):
         """合格记录用现有支持的别名键名（market_cap）时同样不得漏传。"""
@@ -454,7 +449,7 @@ class TestCapitalSinglePass:
         assert "总市值" in task_text and "流通市值" in task_text  # 两项均无记录按真实缺口说明
 
     def test_market_cap_alone_never_starts_capital_model(self, monkeypatch):
-        """两侧资料均无效时即使市值锚点合格也不启动资金模型（门控不变）。"""
+        """资金流无效时即使市值锚点合格也不启动资金模型（门控不变）。"""
         from src.agent.tools import data_tools
 
         config = Config(data_source_profile="choice", deep_research_cross_validate=False)
@@ -462,15 +457,14 @@ class TestCapitalSinglePass:
         monkeypatch.setattr(
             data_tools,
             "_handle_get_capital_flow",
-            lambda code: {"stock_code": code, "status": "ok", "main_net_inflow": None,
-                           "inflow_5d": None, "inflow_10d": None, "errors": []},
+            self._flow_stub({"status": "ok", "main_net_inflow": None,
+                             "inflow_5d": None, "inflow_10d": None, "errors": []}),
         )
         run = ResearchRun(timeout_seconds=60.0)
         run.context = SharedContext("600519", "贵州茅台", "2026-10-15T16:00:00")
         run.context.fundamental = {
             "market_cap": 2050000000000.0,
             "field_meta": {"total_mv": dict(self.QUALIFIED_CAP_META, field="total_mv")},
-            "institution": {"status": "missing", "data": {}, "field_meta": {}},
         }
         calls_model: list[dict[str, Any]] = []
         monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model("{}", calls_model))
@@ -566,8 +560,12 @@ class TestPreparedFactRetention:
         assert not labels & {"5日均线", "20日均线", "6日RSI", "MACD DIF", "缠论趋势", "缠论位置"}
         assert "最近交易日收盘" in labels  # 已取得的日线标量不因样本不足丢失
 
-    def test_capital_failure_retains_market_caps_institution_and_flow(self, native_flow, monkeypatch):
-        """模型失败后合格市值/机构/资金流标量全部留在留存中，资格标注完整。"""
+    def test_capital_failure_retains_market_caps_and_flow(self, native_flow, monkeypatch):
+        """模型失败后合格市值与资金流标量全部留在留存中，资格标注完整。
+
+        issue #64：机构侧退役——共享上下文中的合格机构记录是既有公司资料，
+        资金研究员不再读取，其字段不得进入资金留存事实。
+        """
         from src.core.research_run import research_dimension
 
         run = self._bound_run(monkeypatch)
@@ -593,15 +591,13 @@ class TestPreparedFactRetention:
             research_dimension.reset(token)
         assert result["ok"] is False
         facts = {fact["label"]: fact for fact in run.facts["capital"]}
-        assert {"总市值", "流通市值", "机构持仓变化", "当日主力净流入"} <= set(facts)
+        # issue #64：单日窗口不再称「当日」——三窗口按实际名称留存
+        assert {"总市值", "流通市值", "单日主力净流入", "5交易日主力净流入", "10交易日主力净流入"} <= set(facts)
         assert facts["总市值"]["value"] == "2050000000000.0"
         assert facts["总市值"]["unit"] == "currency_base / CNY"
         assert "single_source" in facts["总市值"]["qualification"]
-        assert facts["机构持仓变化"]["unit"] == "percentage_point"
-        assert facts["机构持仓变化"]["period"] == "2026中报"
-        # 统计对象（十大股东）与财期口径不丢失，失败报告可区分机构口径
-        assert "top10_shareholders" in facts["机构持仓变化"]["qualification"]
-        assert "YTD" in facts["机构持仓变化"]["qualification"]
+        # 共享上下文的合格机构记录不复活为资金留存事实
+        assert "机构持仓变化" not in facts
 
     def test_rejected_cap_record_retains_refusal_qualification(self, native_flow, monkeypatch):
         """拒绝记录留存不升级为可用数字：拒绝原因在扁平资格标注中可见。

@@ -16,7 +16,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.agent.tools.registry import ToolParameter, ToolDefinition
-from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
+from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_from_field_record
 from data_provider.capital_flow_provider import get_main_inflow_cumulative
 from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
 
@@ -659,6 +659,22 @@ def _concept_membership(stock_code: str, deadline: float) -> dict[str, Any]:
     }
 
 
+def _deep_research_scope_active() -> bool:
+    """当前上下文是否为深研范围（issue #64）：research_dimension 属深研研究员集合。
+
+    B1：get_stock_info 工具按此把同一深研范围（无行业榜/无 iFinD 股东）传给
+    fundamental 聚合，避免模型阶段经默认 full 范围复活退役出站、也保证能复用
+    阶段0深研 scope 的 manager 缓存；其他消费者保持默认 full。
+    """
+    from src.core.research_run import research_dimension
+
+    dim = research_dimension.get("")
+    return dim in {
+        "capital", "technical", "sentiment", "us_china", "business", "intel",
+        "supply_chain", "six_dim", "scenarios",
+    }
+
+
 def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None) -> dict[str, Any]:
     """Get stock fundamental information through unified fundamental context."""
     from src.core.market_policy import require_stock_market
@@ -669,6 +685,8 @@ def _handle_get_stock_info(stock_code: str, *, deadline: Optional[float] = None)
     deadline = deadline if deadline is not None else monotonic() + get_config().fundamental_stage_timeout_seconds
     try:
         budget = {"budget_seconds": max(0.0, deadline - monotonic())} if "budget_seconds" in signature(manager.get_fundamental_context).parameters else {}
+        if _deep_research_scope_active() and "include_sector_flows" in signature(manager.get_fundamental_context).parameters:
+            budget["include_sector_flows"] = False
         fundamental_context = manager.get_fundamental_context(stock_code, **budget)
     except Exception as e:
         logger.warning(
@@ -949,17 +967,23 @@ def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str,
 
     data = ctx.get("data", {})
     stock_flow = data.get("stock_flow") or {}
-    sector_rankings = data.get("sector_rankings") or {}
     errors = ctx.get("errors") or []
 
-    # failed（资金流源 stock_individual_fund_flow 走 push2his.eastmoney.com，代理/限流
-    # 环境下可能不可达且无 em 备份源）→ 加明确 note，避免 LLM 误判「数据缺失」而编造
+    # failed → 加明确 note，避免 LLM 误判「数据缺失」而编造。来源说明按当前
+    # 实际数据源（issue #64：Choice 部署已不走 push2his，不得再写东方财富）。
     note = None
     if status == "failed":
-        note = (
-            "资金流数据源暂不可用（push2his 接口不可达/超时），本报告暂缺资金流分析，"
-            "请结合成交量/换手率等技术指标判断主力动向。"
-        )
+        if get_config().data_source_profile == "choice":
+            reason = "; ".join(str(item) for item in errors if item) or "查询未完成"
+            note = (
+                f"资金流数据源（Choice）暂不可用或查询未完成（{reason}），本报告暂缺资金流分析，"
+                "请结合成交量/换手率等技术指标判断主力动向。恢复数据连接后可重新生成。"
+            )
+        else:
+            note = (
+                "资金流数据源暂不可用（接口不可达/超时），本报告暂缺资金流分析，"
+                "请结合成交量/换手率等技术指标判断主力动向。"
+            )
 
     result = {
         "stock_code": stock_code,
@@ -967,21 +991,53 @@ def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str,
         "main_net_inflow": stock_flow.get("main_net_inflow"),
         "inflow_5d": stock_flow.get("inflow_5d"),
         "inflow_10d": stock_flow.get("inflow_10d"),
-        "sector_rankings": {
-            "top_inflow_sectors": sector_rankings.get("top", [])[:3],
-            "top_outflow_sectors": sector_rankings.get("bottom", [])[:3],
-        },
         "errors": errors,
     }
+    # 行业榜只在源块真实携带该字段时投影（issue #64 深研范围整键缺席，不再为
+    # 退役字段合成空占位注入模型输入）；include_sector_flows=True 的既有公开
+    # 消费者输出形状不变。
+    if "sector_rankings" in data:
+        result["sector_rankings"] = {
+            "top_inflow_sectors": (data["sector_rankings"] or {}).get("top", [])[:3],
+            "top_outflow_sectors": (data["sector_rankings"] or {}).get("bottom", [])[:3],
+        }
     if get_config().data_source_profile == "choice":
-        result.update({key: stock_flow.get(key) for key in ("latest_date", "expected_date", "coverage", "source", "source_unit", "currency")})
-        result["note"] = "Choice 个股主力净流入金额单位：人民币元；按交易日历和最近已收盘日期计算日/5日/10日窗口，窗口缺数据时金额为空。单源数据，未做独立跨源核验。"
+        result.update({key: stock_flow.get(key) for key in ("latest_date", "expected_date", "as_of_date", "coverage", "source", "source_unit", "currency")})
+        as_of = stock_flow.get("as_of_date") or stock_flow.get("expected_date")
+        pending = ((stock_flow.get("coverage") or {}).get("pending_day") or {}).get("expected_date")
+        date_text = (
+            f"资金数据截至{as_of}（最近完整交易日）；{pending}资金窗口尚未完整，单日及近5/10交易日均截至{as_of}。"
+            if pending and as_of
+            else f"按交易日历和最近已收盘日期（{as_of}）计算日/5日/10日窗口，窗口缺数据时金额为空。" if as_of
+            else "按交易日历和最近已收盘日期计算日/5日/10日窗口，窗口缺数据时金额为空。"
+        )
+        result["note"] = (
+            f"Choice 个股主力净流入金额单位：人民币元；{date_text}单源数据，未做独立跨源核验。"
+        )
     if note:
         result["note"] = note
     records = dict(ctx.get("field_meta") or stock_flow.get("field_meta") or {})
     main = reading_from_field_record(result["main_net_inflow"], records.get("main_inflow"))
     if main is not None:
-        records["main_inflow"] = adopted_field_record("main_inflow", main, previous_record=records.get("main_inflow"))
+        previous = records.get("main_inflow")
+        # issue #64：源记录既有质量口径随投影保留（真实验收反例：single_source/
+        # single_family 曾被缺省重置为 unverified/空 reasons）。仅当记录仍对应
+        # 同一标量时透传其资格/拒绝口径（含 conflict 的拒绝 reasons——交叉验证
+        # 负证据不可抹）；missing 等缺省状态维持 adopted_field_record 自身保守
+        # 语义，标量失配不透传，否决路径不放宽。
+        prev_quality = (previous or {}).get("quality") or {}
+        quality = None
+        if (
+            (previous or {}).get("value") == result["main_net_inflow"]
+            and prev_quality.get("status") in {"single_source", "not_comparable", "verified", "conflict"}
+        ):
+            quality = AnchorQuality(
+                status=prev_quality["status"],
+                reason_codes=tuple(prev_quality.get("reason_codes") or ()),
+            )
+        records["main_inflow"] = adopted_field_record(
+            "main_inflow", main, quality=quality, previous_record=previous,
+        )
     result["field_meta"] = records
     return result
 
@@ -1013,8 +1069,11 @@ def _apply_capital_cross_validation(
     return result
 
 
-def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
-    """Get main-force capital flow data for a stock."""
+def _handle_get_capital_flow(stock_code: str, include_sector_flows: bool = True) -> dict[str, Any]:
+    """Get main-force capital flow data for a stock.
+
+    ``include_sector_flows=False``（issue #64 深研路径）：不取行业资金榜。
+    """
     from src.core.market_policy import require_stock_market
     require_stock_market(stock_code)
 
@@ -1022,7 +1081,10 @@ def _handle_get_capital_flow(stock_code: str) -> dict[str, Any]:
     deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
     manager = _get_fetcher_manager()
     try:
-        budget = {"budget_seconds": min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))} if "budget_seconds" in signature(manager.get_capital_flow_context).parameters else {}
+        params = signature(manager.get_capital_flow_context).parameters
+        budget = {"budget_seconds": min(get_config().fundamental_fetch_timeout_seconds, max(0.0, deadline - monotonic()))} if "budget_seconds" in params else {}
+        if "include_sector_flows" in params:
+            budget["include_sector_flows"] = include_sector_flows
         ctx = manager.get_capital_flow_context(stock_code, **budget)
     except Exception as exc:
         logger.warning("get_capital_flow failed for %s: %s", stock_code, exc)

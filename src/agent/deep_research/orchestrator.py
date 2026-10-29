@@ -24,7 +24,6 @@ from src.agent.deep_research.explore_agents import (  # noqa: F401
     run_business_agent,
     run_capital_agent,
     run_intel_agent,
-    run_ownership_agent,
     run_sentiment_agent,
     run_supply_chain_agent,
     run_technical_agent,
@@ -47,6 +46,7 @@ from src.deep_research_dims.signal_dim import build_signal_dim
 from src.deep_research_dims.six_dim import build_six_dim
 from src.schemas.bayesian_framework import EvidenceItem
 from src.schemas.deep_research_dims import (
+    ACTIVE_DIM_IDS,
     DIM_IDS,
     DIM_MODELS,
     DataDim,
@@ -81,13 +81,20 @@ _DIM_DEPENDENCIES: Dict[str, frozenset] = {
 }
 
 
-def expand_dim_selection(dims: Optional[set]) -> set:
-    """把用户选择的维度扩展为依赖闭包；None/空 = 全部 11 维度。"""
-    from src.schemas.deep_research_dims import DIM_IDS
+def expand_dim_selection(dims: Optional[set[str]]) -> set[str]:
+    """把用户选择的维度扩展为依赖闭包；None/空 = 当前全部 18 项（issue #64）。
 
-    if not dims:
-        return set(DIM_IDS)
-    selected = set(dims)
+    与 API/服务共用 ``resolve_dim_selection`` 同一解析语义：先校验未知 ID
+    （ValueError），再剔除退役 ID；仅退役请求按受理边界同语义拒绝，不得
+    静默转成默认全量或带着未知项启动取数。
+    """
+    from src.schemas.deep_research_dims import (
+        ACTIVE_DIM_IDS,
+        resolve_dim_selection,
+    )
+
+    resolved = resolve_dim_selection(set(dims) if dims else None)
+    selected = resolved if resolved is not None else set(ACTIVE_DIM_IDS)
     changed = True
     while changed:
         changed = False
@@ -482,7 +489,7 @@ def _run_dual_track(
 
     # 维度子集（省钱模式）：未选维度标 skipped，不执行、不入缓存
     selected = expand_dim_selection(dims_filter)
-    skipped_ids = [d for d in DIM_IDS if d not in selected]
+    skipped_ids = [d for d in ACTIVE_DIM_IDS if d not in selected]
     for _d in skipped_ids:
         _emit(progress_callback, {"type": "dim_done", "dim": _d, "status": "skipped"})
 
@@ -632,7 +639,7 @@ def _run_dual_track(
                 if run is not None:
                     run.check()
                 start_dim(dim_id)
-                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps, **({"research": ctx.fundamental.get("research")} if dim_id in {"business", "ownership"} else {}))
+                return runner(stock_code, stock_name, llm_adapter, progress_callback, explore_max_steps, **({"research": ctx.fundamental.get("research")} if dim_id == "business" else {}))
             finally:
                 research_dimension.reset(dim_token)
                 if token is not None:
@@ -740,7 +747,6 @@ def _run_dual_track(
                 (dims.get("technical").model_dump() if "technical" in dims else None),
                 (dims.get("capital").model_dump() if "capital" in dims else None),
                 (dims.get("sentiment").model_dump() if "sentiment" in dims else None),
-                (dims.get("ownership").model_dump() if "ownership" in dims else None),
             )
             store_cache("six_dim", six_dim)
             dims["six_dim"] = six_dim
@@ -790,10 +796,12 @@ def _run_dual_track(
         scenarios_dim = try_cache("scenarios")
         if scenarios_dim is None:
             start_dim("scenarios")
+            # issue #64 §2.2：接入同报告已有证据（规则装配），支撑合法非估值分支；
+            # 缓存/无证据时传 None 语义不变。
             scenarios_dim = build_scenarios_dim(
                 ctx,
                 float(current_price) if isinstance(current_price, (int, float)) else None,
-                None,
+                _qualitative_evidence_pack(dims),
                 llm_adapter,
             )
         else:
@@ -962,6 +970,58 @@ def _run_dual_track(
     return result
 
 
+def _qualitative_evidence_pack(dims: Dict[str, DimEnvelope]) -> Dict[str, Any]:
+    """非估值模式的同报告证据包（issue #64 §2.2，规则装配，零新增模型轮次）。
+
+    只从本报告**已完成（status=ok）**的维度提取实际内容（根因/业务画像/事件
+    日历/风险提示/资金与技术观察），承载进情景维度的现有 narrative/catalysts/
+    risks 字段；降级维度的残留载荷不作为合格证据。无可用研究时返回空包，
+    情景维度按真实缺口降级。
+    """
+    pack: Dict[str, Any] = {}
+    # 核心 gate（R7 最短收敛）：fundamental/capital 两个核心研究任一未正常完成
+    # 时，非估值证据不充分——返回空包，情景维度按真实缺口降级。
+    for core in ("fundamental", "capital"):
+        core_dim = dims.get(core)
+        if core_dim is None or core_dim.status != "ok":
+            return {}
+    intel = dims.get("intel")
+    intel_ok = intel is not None and intel.status == "ok"
+    root_cause = getattr(intel, "root_cause", None) if intel_ok else None
+    if root_cause is not None and str(getattr(root_cause, "event", "") or "").strip():
+        pack["industry_space"] = (
+            f"盘面根因：{getattr(root_cause, 'event', '') or '未提取'}；"
+            f"机制：{getattr(root_cause, 'mechanism', '') or '未提取'}；"
+            f"量级：{getattr(root_cause, 'magnitude', '') or '未评估'}"
+        )
+    business = dims.get("business")
+    if business is not None and business.status == "ok" and str(getattr(business, "narrative", "") or "").strip():
+        pack["competitive_evolution"] = str(business.narrative)[:400]
+    catalysts: List[str] = []
+    for item in ((getattr(intel, "event_calendar", None) or []) if intel_ok else [])[:5]:
+        label = str(getattr(item, "event", "") or "").strip()
+        if label:
+            catalysts.append(f"{label}（{getattr(item, 'date', '') or '日期未知'}）")
+    if catalysts:
+        pack["catalysts"] = catalysts
+    risks: List[str] = [
+        str(risk).strip()
+        for risk in (
+            (getattr(getattr(intel, "intelligence", None), "risk_alerts", None) or [])[:5]
+            if intel_ok
+            else []
+        )
+        if str(risk).strip()
+    ]
+    for dim_id, label in (("capital", "资金面"), ("technical", "技术面")):
+        dim = dims.get(dim_id)
+        if dim is not None and dim.status == "ok" and str(getattr(dim, "narrative", "") or "").strip():
+            risks.append(f"{label}观察：{str(dim.narrative)[:160]}")
+    if risks:
+        pack["risks"] = risks
+    return pack
+
+
 def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
     """Adopt a same-session history published during this run before dependent dims."""
     from src.deep_research_dims.context import (
@@ -995,9 +1055,13 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
         # 不抬升任何评分或投资结论；仅有错误码、无概念名不算可用数据。
         if getattr(getattr(dim, "concept_membership", None), "concepts", None):
             return True
-        if any(getattr(dim, field, None) for field in ("business_model", "main_products", "controller", "top_holders")):
+        if any(getattr(dim, field, None) for field in ("business_model", "main_products")):
             return True
-        if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments", "shareholder_details")):
+        if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments",)):
+            return True
+        # B6（规格 §1）：业务画像叙述中留存的 Choice 公司原始事实（控制人/带报告
+        # 期股东名单）是已取得事实——足以让部分报告成文留存，不抬升评分或结论。
+        if "公司资料（Choice 原始字段留存" in str(getattr(dim, "narrative", "") or ""):
             return True
     financial = dims.get("fundamental")
     if financial is None or financial.status == "skipped":
@@ -1011,9 +1075,14 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
 
 
 def restore_vendor_facts(dim_id: str, dim: DimEnvelope, research: dict[str, Any]) -> DimEnvelope:
-    """Restore only supplier fields after failed research, keeping strict validation."""
+    """Restore only supplier fields after failed research, keeping strict validation.
+
+    B6（规格 §1）：阶段0已取得的公司原始事实（控制人、带报告期十大股东名单）
+    在中断/失败路径同样随业务画像资料区留存——与正常路径同一最小投影，不新取
+    数、不推断控制链、不评分。
+    """
     from src.schemas.deep_research_dims import parse_dim
-    if dim_id not in {"business", "ownership"} or dim.status == "ok":
+    if dim_id != "business" or dim.status == "ok":
         return dim
     payload = dim.model_dump()
     company = research.get("company") or {}
@@ -1023,14 +1092,25 @@ def restore_vendor_facts(dim_id: str, dim: DimEnvelope, research: dict[str, Any]
                 payload[field] = {"value": company[key], "source": f"Choice {key}，截至 {research.get('as_of')}"}
         if research.get("product_segments"):
             payload["product_segments"] = research["product_segments"]
-    elif dim_id == "ownership":
+        fact_parts = []
         if company.get("AHOLDER"):
-            payload["controller"] = f"{company['AHOLDER']}（Choice，截至 {research.get('as_of')}）"
-        names = (research.get("holders") or {}).get("HOLDNAMER")
-        if isinstance(names, str) and names.strip():
-            payload["top_holders"] = [{"name": name.strip(), "source": f"Choice，报告期 {(research.get('holders') or {}).get('period')}"} for name in names.split(";") if name.strip()]
-        if research.get("shareholder_details"):
-            payload["shareholder_details"] = research["shareholder_details"]
+            fact_parts.append(
+                f"实际控制人（Choice 原始字段，截至 {research.get('as_of') or '未标注'}）：{company['AHOLDER']}"
+            )
+        holders = research.get("holders") or {}
+        holder_names = holders.get("HOLDNAMER")
+        if isinstance(holder_names, str) and holder_names.strip():
+            names = "；".join(name.strip() for name in holder_names.split(";") if name.strip())
+            fact_parts.append(
+                f"十大股东名单（Choice 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
+            )
+        if fact_parts:
+            payload["narrative"] = (
+                str(payload.get("narrative") or "").rstrip()
+                + "\n\n公司资料（Choice 原始字段留存，未核实控制链）："
+                + "；".join(fact_parts)
+                + "。"
+            )
     try:
         return parse_dim(dim_id, payload)
     except (ValidationError, ValueError, TypeError) as exc:
@@ -1058,7 +1138,7 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
             retained_facts=facts,
             concept_membership=adopt_concept_membership(ctx),
         )
-    for dim_id in DIM_IDS:
+    for dim_id in ACTIVE_DIM_IDS:
         if dim_id not in dims:
             dims[dim_id] = DIM_MODELS[dim_id](
                 status="degraded" if dim_id in selected else "skipped",
@@ -1075,7 +1155,7 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
                 *(fact for fact in run.facts.get(dim_id, []) if fact not in existing_facts),
             ][-30:]
             dims[dim_id] = parse_dim(dim_id, payload)
-    for dim_id in selected & {"business", "ownership"}:
+    for dim_id in selected & {"business"}:
         research = {**(ctx.fundamental.get("research") or {}), **run.vendor_research.get(dim_id, {})}
         dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
     events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})

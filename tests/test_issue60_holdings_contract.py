@@ -277,23 +277,32 @@ class TestPublicBundleContract:
 
 
 def _bind_run(monkeypatch: pytest.MonkeyPatch, institution_block: dict[str, Any]) -> Any:
-    """run_capital_agent 的离线环境：Choice 冻结资金流 + 注入 institution 块。
+    """run_capital_agent 的离线环境：Choice 冻结资金流 + 共享上下文既有机构块。
 
-    只替换 manager 的机构上下文入口，资金流继续走 native_flow 冻结传输。
+    issue #64：机构块只是阶段0既有公司资料——资金研究员不读取、不查询
+    （get_fundamental_context 保持零调用守卫）；资金流继续走 native_flow 冻结传输。
     """
     from src.config import Config
     from src.core.research_run import ResearchRun
+    from src.deep_research_dims.context import SharedContext
     from src.agent.tools import data_tools
 
     config = Config(data_source_profile="choice", deep_research_cross_validate=False)
     monkeypatch.setattr(Config, "_instance", config)
     manager = data_tools._get_fetcher_manager()
-    monkeypatch.setattr(manager, "get_fundamental_context", lambda code, **k: {"institution": institution_block})
-    return ResearchRun(timeout_seconds=60.0)
+
+    def no_institution(code: str, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("机构块取数已退役，不得调用 get_fundamental_context")
+
+    monkeypatch.setattr(manager, "get_fundamental_context", no_institution)
+    run = ResearchRun(timeout_seconds=60.0)
+    run.context = SharedContext("300260", "新莱应材", "2026-10-28")
+    run.context.fundamental = {"institution": institution_block}
+    return run
 
 
 class TestCapitalResearcherQuadrants:
-    """机构/资金四象限：资格由字段级证据决定，一侧缺失不丢另一侧解释。"""
+    """issue #64 资金面流专用：合格三窗口决定完成与评分，机构块不再参与。"""
 
     _QUALIFIED_INSTITUTION = {
         "status": "ok",
@@ -301,7 +310,8 @@ class TestCapitalResearcherQuadrants:
         "field_meta": {"institution_holding_change": {"rule_eligible": True, "period": "2026中报"}},
     }
 
-    def test_both_sides_valid_keep_composite_score(self, native_flow, monkeypatch) -> None:
+    def test_qualified_flow_completes_and_discards_institution_output(self, native_flow, monkeypatch) -> None:
+        """资金合格即完成：score = 合格 flow_score；模型输出的机构/合成字段一律丢弃。"""
         from src.agent.deep_research import explore_agents
 
         run = _bind_run(monkeypatch, dict(self._QUALIFIED_INSTITUTION))
@@ -313,10 +323,12 @@ class TestCapitalResearcherQuadrants:
             result = explore_agents.run_capital_agent("300260", "新莱应材", object())
         assert result["ok"] is True
         data = result["data"]
-        assert data.get("status") != "degraded"  # 两侧合格：不降级
-        assert data["flow_score"] == 72 and data["institution_score"] == 55 and data["score"] == 63
+        assert data.get("status") != "degraded"  # 资金合格：不降级
+        assert data["flow_score"] == 72 and data["score"] == 72  # 资金总分 = flow_score，旧合成 63 作废
+        assert data.get("institution_score") is None and data.get("institution_summary") is None
 
-    def test_both_sides_unqualified_start_no_model(self, native_flow, monkeypatch) -> None:
+    def test_flow_unqualified_starts_no_model(self, native_flow, monkeypatch) -> None:
+        """资金侧不合格即不启动模型；缺口只说资金，机构侧不再参与门控或文案。"""
         from src.agent.deep_research import explore_agents
 
         calls, dates = native_flow
@@ -331,13 +343,14 @@ class TestCapitalResearcherQuadrants:
         monkeypatch.setattr(explore_agents, "run_agent_loop", _success_model("{}", calls_model))
         with run.bind():
             result = explore_agents.run_capital_agent("300260", "新莱应材", object())
-        assert calls_model == []  # 两侧均无合格资料：不启动模型
+        assert calls_model == []  # 资金不合格：不启动模型
         assert result["ok"] is False
         assert "未启动模型" in result["error"]
-        assert "机构" in result["error"] and "资金" in result["error"]
+        assert "资金" in result["error"] and "机构" not in result["error"]
 
     def test_public_adapter_output_feeds_researcher_as_true_gap(self, native_flow, monkeypatch, tmp_path) -> None:
-        """真实公共 manager 聚合产物进入资金研究员：机构缺口如实，资金侧解释保留。
+        """真实公共 manager 聚合产物与资金研究员的边界：机构缺口块留在既有公司
+        资料里，不进入资金任务、评分或降级语义。
 
         阶段一用 legacy profile 的真实 DataFetcherManager.get_fundamental_context
         聚合公共传输（仅 mock 外部传输），阶段二把同一真实产物作为共享上下文
@@ -406,8 +419,10 @@ class TestCapitalResearcherQuadrants:
             result = explore_agents.run_capital_agent("300260", "新莱应材", object())
         assert result["ok"] is True
         data = result["data"]
-        assert data["status"] == "degraded"  # 机构侧缺口如实降级
-        assert data["flow_score"] == 72 and data["score"] is None  # 资金侧解释保留，不给合成总分
-        assert "线索" in data["institution_summary"]
+        # issue #64：机构缺口块不再牵连资金完成语义——资金合格即完成
+        assert data.get("status") != "degraded"
+        assert data["flow_score"] == 72 and data["score"] == 72  # 资金总分 = 合格 flow_score
+        assert data.get("institution_summary") is None and data.get("institution_score") is None
         task_text = calls_model[0]["messages"][-1]["content"]
         assert "-1323" not in task_text  # 户数增减不再作为持仓证据进入模型输入
+        assert "institution_holding_change" not in task_text  # 机构缺口块不进入资金任务

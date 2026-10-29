@@ -9,9 +9,12 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from src.scoring.weights_v2 import INDICATORS_V2
+from icontract import ensure
+
+from src.scoring.weights_v2 import DIMENSION_WEIGHTS_V2, INDICATORS_V2
 
 NEUTRAL_SCORE = 50.0
 
@@ -47,6 +50,41 @@ def scored_indicator(
     }
 
 
+def _weighted_dimension_results_valid(dimensions: List[Dict[str, Any]]) -> bool:
+    """分维聚合后置条件谓词（Layer 2 跨字段不变式，供 @ensure 挂载）。
+
+    数值守卫，只管归一聚合：每个维度得分必须等于其明细中非缺口指标按既有
+    权重的精确归一加权，并经既有的 ``round(·, 2)`` 输出语义（跟随当前 Decimal
+    上下文，不另定舍入模式）取整后精确相等；全部缺口的维度必须中性 50。
+    谓词以返回的明细为独立输入 Decimal 复算，不信任最终得分——归一错误
+    （如 80/60/40 被误算成 49）即使总分仍在 ``framework_total_v2`` 的范围
+    ensure 内也在此拒绝。
+    """
+    for dim in dimensions:
+        active = [entry for entry in dim["indicators"] if not entry["data_gap"]]
+        if active:
+            expected = (
+                sum(
+                    (
+                        Decimal(str(entry["score"])) * Decimal(str(entry["weight"]))
+                        for entry in active
+                    ),
+                    Decimal(0),
+                )
+                / sum((Decimal(str(entry["weight"])) for entry in active), Decimal(0))
+            )
+        else:
+            expected = Decimal(str(NEUTRAL_SCORE))
+        if Decimal(str(dim["score"])) != round(expected, 2):
+            return False
+    return True
+
+
+@ensure(
+    lambda result: _weighted_dimension_results_valid(result),
+    "分维得分 = 非缺口指标按既有权重的精确归一加权（round(·,2) 后精确相等），"
+    "全缺口维度中性 50（归一错误即使总分未越界也必须拒绝）",
+)
 def aggregate_v2_dimensions(
     indicator_results: Dict[str, Dict[str, Optional[Dict[str, Any]]]],
 ) -> List[Dict[str, Any]]:
@@ -75,16 +113,21 @@ def aggregate_v2_dimensions(
                 }
             )
         available = [i for i in indicators if not i["data_gap"]]
-        weight_sum = sum(i["weight"] for i in available)
+        # 金融计算纪律：加权求和用 Decimal（issue #64 权重 31.25/43.75/25 为
+        # 精确十进制分数，float 累积漂移不得进入评分）。
+        weight_sum = sum((Decimal(str(i["weight"])) for i in available), Decimal(0))
         if weight_sum > 0:
-            dim_score = sum(i["score"] * i["weight"] for i in available) / weight_sum
+            dim_score = sum(
+                (Decimal(str(i["score"])) * Decimal(str(i["weight"])) for i in available),
+                Decimal(0),
+            ) / weight_sum
         else:
-            dim_score = NEUTRAL_SCORE
+            dim_score = Decimal(str(NEUTRAL_SCORE))
         gaps = sum(1 for i in indicators if i["data_gap"])
         dimensions.append(
             {
                 "dimension": dim,
-                "score": round(dim_score, 2),
+                "score": float(round(dim_score, 2)),
                 "indicators": indicators,
                 "data_gaps": gaps,
             }
@@ -92,14 +135,28 @@ def aggregate_v2_dimensions(
     return dimensions
 
 
+@ensure(
+    lambda dimensions, result: result is not None
+    and (
+        not dimensions
+        or (
+            min(float(d["score"]) for d in dimensions) - 0.01
+            <= result
+            <= max(float(d["score"]) for d in dimensions) + 0.01
+        )
+    ),
+    "总分必须落在各维度得分范围内（跨字段不变式：加权不得越界）",
+)
 def framework_total_v2(dimensions: List[Dict[str, Any]]) -> float:
     """六维得分 × 维度权重 → 总分（单一评分源：段一评分 = 贝叶斯先验输入）。"""
-    from src.scoring.weights_v2 import DIMENSION_WEIGHTS_V2
-
-    total = 0.0
-    for d in dimensions:
-        total += float(d["score"]) * DIMENSION_WEIGHTS_V2[d["dimension"]]
-    return round(total, 2)
+    total = sum(
+        (
+            Decimal(str(d["score"])) * Decimal(str(DIMENSION_WEIGHTS_V2[d["dimension"]]))
+            for d in dimensions
+        ),
+        Decimal(0),
+    )
+    return float(round(total, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -136,27 +193,6 @@ def score_valuation(pe_ttm: Optional[float], pb: Optional[float]) -> Optional[Di
             "valuation", score, f"PE 不可用，PB {pb:.2f}x，{label}（亏损股口径）", "rule", "medium"
         )
     return None
-
-
-def score_institution_change(institution_holding_change: Optional[Any]) -> Optional[Dict[str, Any]]:
-    """机构/大户持仓变动（fundamental_context institution 块）。"""
-    if institution_holding_change is None:
-        return None
-    try:
-        change = float(institution_holding_change)
-    except (TypeError, ValueError):
-        return None
-    if change > 5:
-        score, label = 74.0, "机构显著增持"
-    elif change > 0:
-        score, label = 62.0, "机构小幅增持"
-    elif change > -5:
-        score, label = 46.0, "机构小幅减持"
-    else:
-        score, label = 34.0, "机构显著减持"
-    return scored_indicator(
-        "institution_change", score, f"{label}（变动 {change:+.1f}%）", "rule", "medium"
-    )
 
 
 def score_support_indicator(

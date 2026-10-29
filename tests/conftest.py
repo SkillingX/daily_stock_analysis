@@ -3,6 +3,15 @@
 
 from __future__ import annotations
 
+import os
+
+# litellm import 默认处于 DEV 模式并执行 load_dotenv()：本机开发 .env（含真实
+# 凭据与 choice profile）会被注入测试进程，绕过 ENV_FILE=empty.env 的确定性隔
+# 离，并使 data_source_contract 等配置语义在批量运行中漂移（同一测试单跑与组
+# 合跑结果不同）。测试进程停用该加载；仓库自身的 setup_env/ENV_FILE 加载路径
+# 不受影响。setdefault 尊重外部显式设置。
+os.environ.setdefault("LITELLM_MODE", "PRODUCTION")
+
 import asyncio
 import concurrent.futures
 import time

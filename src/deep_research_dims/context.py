@@ -107,6 +107,14 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     refresh = financial_refresh.get()
     financial_keys = ("pe_ttm", "pb", "roe", "gross_margin", "revenue_growth", "net_profit_yoy", "market_cap")
     if cached is not None and all(cached.get(key) is not None for key in financial_keys) and not config.deep_research_cross_validate and not (refresh and refresh[0] == code):
+        # issue #64/B2：快照读取边界同受共享资金日期谓词约束——跨收盘越界资金块
+        # 剥离（资金走既有有界补查），其余财务证据保留，零出站早返回不变。
+        flow_block = cached.get("capital_flow")
+        if flow_block is not None:
+            from src.deep_research_dims.dim_cache import capital_block_within_date_boundary
+
+            if not capital_block_within_date_boundary(flow_block):
+                cached = {key: value for key, value in cached.items() if key != "capital_flow"}
         return cached
     try:
         from src.agent.tools.data_tools import (
@@ -119,14 +127,16 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         # Verification needs its own share of the same stage budget, not leftover zero.
         verification_budget = 0.0 if config.data_source_profile == "choice" else min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else min(config.fundamental_fetch_timeout_seconds, remaining / 3) if config.enable_fuyao and config.fuyao_api_key else 0.0
         fetch_deadline = deadline - verification_budget
-        raw = manager.get_fundamental_context(code, budget_seconds=max(0.0, fetch_deadline - monotonic()))
+        # issue #64：深研阶段 0 零行业榜出站（include_sector_flows=False）；
+        # 其他基本面消费者默认不变。
+        raw = manager.get_fundamental_context(
+            code, budget_seconds=max(0.0, fetch_deadline - monotonic()), include_sector_flows=False,
+        )
         compact = _compact_fundamental_context(raw)
         for error in dict.fromkeys(compact.get("errors") or []):
             ctx.limitation(f"基本面取数: {error}")
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
-        institution_block = compact.get("institution") or {}
-        institution = institution_block.get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
         industry_hint = ""
         research = compact.get("research") or {}
@@ -155,17 +165,15 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
             ),
             "net_profit_yoy": financial.get("net_profit_yoy"),
             "gross_margin": financial.get("gross_margin"),
-            "institution_holding_change": institution.get("institution_holding_change"),
             "industry_hint": industry_hint,
             "research": research,
-            # issue #56：保留机构块（含 field_meta 资格标注），资金研究员直接消费，
-            # 不再为单一机构字段重跑整套基本面装配。
-            "institution": institution_block,
+            # issue #64：机构持仓/两期股东集中度退役——机构块与标量不再是新报告
+            # 共享上下文输入（历史保存载荷/原始事实留存展示兼容不变）。
             "balance_sheet": financial.get("balance_sheet") or {},
             # issue #58：保留本报告已取得的资金流块（status/窗口覆盖/来源、单位与
             # 字段资格原样），资金研究员优先复用，不再为同一需求重复出站。
             "capital_flow": compact.get("capital_flow") or {},
-            "sector_rankings": (((compact.get("capital_flow") or {}).get("data") or {}).get("sector_rankings") or {}),
+            # issue #64：行业资金榜退役——不再作为共享上下文输入装配。
             "stock_name": raw.get("stock_name"),
             "source": raw.get("source", "choice") if config.data_source_profile == "choice" else "fundamental_context",
             "errors": list(compact.get("errors") or []),

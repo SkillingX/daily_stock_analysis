@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import ClassVar, Annotated, Any, Dict, List, Literal, Optional
+from typing import ClassVar, Annotated, Any, Dict, Iterable, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_core import to_json
@@ -82,6 +82,46 @@ DIM_IDS: tuple[str, ...] = (
     "us_china",
     "business",
 )
+
+# issue #64：本版退役维度。DIM_IDS 保留完整历史目录（旧报告解析/子报告切分仍
+# 需要）；新报告的可执行范围是 ACTIVE_DIM_IDS（18 项），退役项不再执行、不产
+# 生 skipped 占位，也不进入完成分母。
+RETIRED_DIM_IDS: tuple[str, ...] = ("ownership",)
+
+ACTIVE_DIM_IDS: tuple[str, ...] = tuple(
+    dim for dim in DIM_IDS if dim not in RETIRED_DIM_IDS
+)
+
+
+class RetiredDimRequestError(ValueError):
+    """请求范围仅含本版已停用维度（受理/取数前拒绝，API 转 HTTP 400）。"""
+
+
+def resolve_dim_selection(dims: Optional[Iterable[str]]) -> Optional[set[str]]:
+    """API/服务/编排共用的维度范围解析（issue #64 冻结决策）。
+
+    - None/空 → None（默认全量 = 当前 18 项，由编排器展开）；
+    - 先校验未知 ID（ValueError → API 422），再剔除退役 ID；
+    - 仅含退役 ID → RetiredDimRequestError（API 转 HTTP 400），不得过滤为
+      空后按默认全量启动。
+
+    入参立即物化为列表：调用方可传任意可迭代（含一次性迭代器），本函数两次
+    遍历均安全。
+    """
+    if dims is None:
+        return None
+    items = list(dims)
+    if not items:
+        return None  # 空可迭代（含空生成器）与空列表同语义：默认全量
+    unknown = [dim for dim in items if dim not in DIM_IDS]
+    if unknown:
+        raise ValueError(f"未知分析维度：{', '.join(unknown)}")
+    kept = {dim for dim in items if dim not in RETIRED_DIM_IDS}
+    if not kept:
+        raise RetiredDimRequestError(
+            f"该研究项本版已停用：{', '.join(RETIRED_DIM_IDS)}"
+        )
+    return kept
 
 DimStatus = Literal["ok", "degraded", "skipped"]
 
@@ -389,7 +429,7 @@ class TechnicalDim(DimEnvelope):
 
 
 class CapitalDim(DimEnvelope):
-    """资金研究员：资金流向 + 机构/大户持仓变动（筹码成本已随 issue #46 退休）。"""
+    """资金研究员：资金流向（issue #64 起机构侧退役，资金流独立完成）。"""
 
     dim: Literal["capital"] = "capital"
     flow_summary: str = ""
@@ -397,6 +437,10 @@ class CapitalDim(DimEnvelope):
     institution_summary: str = ""
     institution_score: Optional[float] = Field(None, ge=0, le=100)
     score: Optional[float] = Field(None, ge=0, le=100)
+    # issue #64：三窗口实际共同截至日（允许范围内的 T-1 须展示真实日期）与保存
+    # 时的预期最新已收盘日，供缓存采用边界校验与展示口径一致。
+    as_of_date: Annotated[str, Field(max_length=10)] = ""
+    expected_date: Annotated[str, Field(max_length=10)] = ""
     narrative: str = ""
 
 
