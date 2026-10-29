@@ -418,9 +418,13 @@ def test_t_minus_one_vertical_report_api_md_pdf_sse_consistency(
             pdf_text = "".join(
                 page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf.content)).pages
             )
-            assert f"截至{as_of_t1}已收盘交易日" in pdf_text
-            assert f"{expected_t}资金窗口尚未完整" in pdf_text
-            assert f"资金数据截至{expected_t}" not in pdf_text, "PDF 同样不得用当日冒充前日"
-            assert "单日 1.10 万元" in pdf_text and "近10交易日 6.50 万元" in pdf_text
+            # PDF 提取文本可能插入排版空白：本地真实导出中 flow_summary 已观察到
+            # 短语在行尾被断行拆开。提取层先去空白再比对；标签+金额+单位仍整段
+            # 精确校验，not-in 同样收紧，不留排版空白造成的假阴性。
+            pdf_compact = "".join(pdf_text.split())
+            assert f"截至{as_of_t1}已收盘交易日" in pdf_compact
+            assert f"{expected_t}资金窗口尚未完整" in pdf_compact
+            assert f"资金数据截至{expected_t}" not in pdf_compact, "PDF 同样不得用当日冒充前日"
+            assert "单日1.10万元" in pdf_compact and "近10交易日6.50万元" in pdf_compact
     finally:
         database._engine.dispose()
