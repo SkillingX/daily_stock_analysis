@@ -6,13 +6,16 @@
 - 派生维度（贝叶斯/结论/计划/信号）**不缓存**——它们依赖其他维度产物，
   缓存会把过期依赖固化成"新结论"；纯规则维度（阶段/历史）毫秒级，不缓存；
 - 降级产物不入缓存（下次重算给修复机会）；
-- force_refresh 由编排器调用方传入，整体跳过读取。
+- force_refresh 由编排器调用方传入，整体跳过读取；
+- 情报（intel）缓存额外核对情报契约版本与本次已采用行情身份（issue #68）：
+  变价、跨观测时点、无行情与身份不足均 miss 重算，搜索资料缓存不受影响。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -56,6 +59,11 @@ SOURCE_LABEL_VERSION = 1
 _SOURCE_LABEL_DIMS = frozenset({
     "business", "intel", "supply_chain", "sentiment", "us_china",
 })
+
+# issue #68：情报契约收敛（行情依据 + 事件预案为研究核验动作）只影响 intel
+# 维度；旧 intel 缓存按本版本失效重算，其他维度缓存与搜索资料缓存不受影响。
+INTEL_CONTRACT_VERSION = 2
+_INTEL_CONTRACT_DIMS = frozenset({"intel"})
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 FUNDAMENTAL_MAPPING_VERSION = 20  # issue #64：阶段0退役行业榜/机构侧后快照内容变化，旧快照重算
@@ -109,8 +117,70 @@ def capital_block_within_date_boundary(block: Any, *, now: Optional[Any] = None)
     return expected_day == today
 
 
-def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
-    """命中且未过期返回维度 payload dict；否则 None（含一切异常）。"""
+def valid_quote_price(price: Any) -> bool:
+    """已采用现价标量的有效性边界（issue #68）：有限正数值，bool 不算数值。
+
+    情报消息、经理市场摘要、阶段 0 行情采纳与缓存身份共用同一边界——
+    0/负/NaN/Inf/bool/非数值一律不构成本报告已采用现价，消费方走
+    「无有效实时行情」披露分支，不注入权威现价。
+    """
+    return (
+        not isinstance(price, bool)
+        and isinstance(price, (int, float))
+        and math.isfinite(price)
+        and price > 0
+    )
+
+
+def quote_market_identity(quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """本报告已采用行情的缓存复用身份（issue #68）。
+
+    返回值三态：
+    - dict：有效身份，price+source+observed_at+unit+currency+资格齐备；
+    - ``{"absent": True}``：本报告明确无有效行情（缺价或标量无效——
+      0/负/NaN/Inf/bool 等经 ``valid_quote_price`` 拒绝；两次无行情会话状态
+      等价，可复用）；
+    - None：有有效价但身份不足——调用方不得写入缓存，读取时也无法与任何
+      记录相等（保守 miss），不伪造时点。
+
+    元数据解码复用既有 ``reading_from_field_record``：scalar 与 meta.value 不符
+    （借用旧来源/时点）、元数据无效一律身份不足；解码后 source=unknown 或缺
+    观测时点同样身份不足。只记录行情观测语义，不含报告装配时钟
+    （fetched_at/as_of）：同一有效身份不因报告生成时间不同而失去复用。
+    rule_eligible/input_reasons/quality_status 保留真实三态记录，未知不冒充 False。
+    """
+    if not isinstance(quote, dict) or not valid_quote_price(quote.get("price")):
+        return {"absent": True}
+    price = quote["price"]
+    from data_provider.cross_source_validator import reading_from_field_record
+
+    meta = (quote.get("field_meta") or {}).get("current_price") or {}
+    reading = reading_from_field_record(price, meta)
+    if reading is None or reading.normalization_error:
+        return None
+    if reading.source in ("", "unknown") or not reading.observed_at:
+        return None
+    return {
+        "price": float(reading.value),
+        "source": str(reading.source),
+        "observed_at": str(reading.observed_at),
+        "unit": str(reading.unit or ""),
+        "currency": str(reading.currency or ""),
+        "rule_eligible": meta.get("rule_eligible"),
+        "input_reasons": [str(reason) for reason in (meta.get("input_reasons") or [])],
+        "quality_status": str(((meta.get("quality") or {}).get("status")) or ""),
+    }
+
+
+def load_cached_dim(
+    stock_code: str, dim: str, quote_identity: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    """命中且未过期返回维度 payload dict；否则 None（含一切异常）。
+
+    issue #68：intel 维度额外校验情报契约版本与已采用行情身份——版本不符或
+    身份缺失/不一致（变价、跨观测时点、无行情混用）一律 miss 重算；身份不足
+    （quote_identity=None）不匹配任何记录。
+    """
     ttl = DIM_TTL_HOURS.get(dim)
     if ttl is None:
         return None
@@ -124,6 +194,18 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
         return None  # 旧契约 payload 不兼容（C4）：视为 miss，重算并覆盖
     if dim in _SOURCE_LABEL_DIMS and record.get("source_label_version") != SOURCE_LABEL_VERSION:
         return None  # 旧来源等级契约可能把 F10/社区标签带回新报告
+    if dim in _INTEL_CONTRACT_DIMS and record.get("intel_contract_version") != INTEL_CONTRACT_VERSION:
+        return None  # 旧情报契约（无行情依据/独立交易预案）重算
+    if dim in _INTEL_CONTRACT_DIMS:
+        record_identity = record.get("quote_identity")
+        # 双缺身份（记录缺字段或调用方身份不足）不得视为相等——不可证明相同
+        # 即保守 miss，避免无身份复用混入跨行情结论（issue #68 root 反例）。
+        if (
+            not isinstance(record_identity, dict)
+            or not isinstance(quote_identity, dict)
+            or record_identity != quote_identity
+        ):
+            return None
     if dim in _FUNDAMENTAL_MAPPING_DIMS and record.get("mapping_version") != FUNDAMENTAL_MAPPING_VERSION:
         return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
     if dim in _FUNDAMENTAL_MAPPING_DIMS:
@@ -159,9 +241,19 @@ def load_cached_dim(stock_code: str, dim: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-def save_cached_dim(stock_code: str, dim: str, payload: Dict[str, Any]) -> None:
-    """写缓存（降级产物请勿调用）。失败只记日志。"""
+def save_cached_dim(
+    stock_code: str, dim: str, payload: Dict[str, Any],
+    quote_identity: Optional[Dict[str, Any]] = None,
+) -> None:
+    """写缓存（降级产物请勿调用）。失败只记日志。
+
+    intel 维度必须携带 ``quote_market_identity`` 的结果；身份不足（None）的
+    情报不落盘（下次无法核验复用身份，宁重算不伪造）。
+    """
     if dim not in CACHEABLE_DIMS:
+        return
+    if dim in _INTEL_CONTRACT_DIMS and quote_identity is None:
+        logger.warning("[DimCache] 情报缓存跳过：行情身份不足，无法核验复用身份 %s", stock_code)
         return
     try:
         os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -178,6 +270,9 @@ def save_cached_dim(stock_code: str, dim: str, payload: Dict[str, Any]) -> None:
         }
         if dim in _SOURCE_LABEL_DIMS:
             record["source_label_version"] = SOURCE_LABEL_VERSION
+        if dim in _INTEL_CONTRACT_DIMS:
+            record["intel_contract_version"] = INTEL_CONTRACT_VERSION
+            record["quote_identity"] = quote_identity
         if dim in _FUNDAMENTAL_MAPPING_DIMS:
             record["mapping_version"] = FUNDAMENTAL_MAPPING_VERSION
             from src.config import get_config

@@ -758,23 +758,32 @@ class TestDimSubReports:
 
 
 class TestGuardrailEventPlans:
-    def test_gr11_flags_incomplete_plans(self):
+    def test_gr11_flags_only_missing_followups(self):
+        """issue #68：预案槽位为研究核验/跟踪动作——数量少于结果数是正常形态
+        （独立指令在采用边界被拒后核验动作变少不再报「覆盖不全」），只有完全
+        缺失核验动作才提示补研究。"""
         from src.deep_research_dims.guardrail import rule11_event_plan_completeness
 
         intel = {
             "event_calendar": [
-                {"event": "三季报", "outcomes": ["超预期", "平", "低于预期"], "plans": ["持有"]},
-                {"event": "解禁", "outcomes": ["平稳"], "plans": ["观望", "减仓"]},
+                {"event": "三季报", "outcomes": ["超预期", "平", "低于预期"], "plans": ["核验公告原文"]},
+                {"event": "解禁", "outcomes": ["平稳"], "plans": ["跟踪减持规模"]},
             ]
         }
-        events = rule11_event_plan_completeness(intel)
-        assert len(events) == 1 and events[0].rule_id == "GR11_event_plan_completeness"
+        assert rule11_event_plan_completeness(intel) == []
 
     def test_gr11_passes_full_coverage(self):
         from src.deep_research_dims.guardrail import rule11_event_plan_completeness
 
         intel = {"event_calendar": [{"event": "e", "outcomes": ["a"], "plans": ["p1"]}]}
         assert rule11_event_plan_completeness(intel) == []
+
+    def test_gr11_still_prompts_when_no_followup_at_all(self):
+        from src.deep_research_dims.guardrail import rule11_event_plan_completeness
+
+        intel = {"event_calendar": [{"event": "e", "outcomes": ["a", "b"], "plans": []}]}
+        events = rule11_event_plan_completeness(intel)
+        assert len(events) == 1 and events[0].rule_id == "GR11_event_plan_completeness"
 
 
 class TestChanlunFactsInjection:

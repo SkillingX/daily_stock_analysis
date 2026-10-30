@@ -258,21 +258,26 @@ def rule10_subjective_divergence(six_dim: Dict[str, Any]) -> List[GuardrailEvent
 
 
 def rule11_event_plan_completeness(intel: Dict[str, Any]) -> List[GuardrailEvent]:
-    """消息面②：每个未来事件的预案数必须覆盖结果数（预案缺失即披露）。"""
+    """消息面②：事件结果缺研究核验/跟踪动作时披露（issue #68 语义对齐）。
+
+    预案槽位已是研究核验/跟踪动作，不再要求「每结果一条」配对——独立交易
+    指令在采用边界被拒绝后，核验动作数量少于结果数是正常形态；只有完全
+    缺失核验动作才提示补研究，避免给出与新契约相反的补预案信号。
+    """
     events = []
     for item in (intel.get("event_calendar") or []):
         if not isinstance(item, dict):
             continue
         outcomes = item.get("outcomes") or []
         plans = item.get("plans") or []
-        if outcomes and len(plans) < len(outcomes):
+        if outcomes and not plans:
             events.append(
                 _event(
                     "GR11_event_plan_completeness",
                     "intel",
                     "rewrite",
-                    f"事件「{str(item.get('event') or '未知')[:30]}」有 {len(outcomes)} 种结果但只有 "
-                    f"{len(plans)} 条预案，预案覆盖不全",
+                    f"事件「{str(item.get('event') or '未知')[:30]}」有 {len(outcomes)} 种可能结果"
+                    "但无研究核验/跟踪动作，建议补研究",
                 )
             )
     return events

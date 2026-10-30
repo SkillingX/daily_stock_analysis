@@ -233,7 +233,11 @@ class RootCause(BaseModel):
 
 
 class EventPlan(BaseModel):
-    """未来事件 + 各结果交易预案（段三/段五消息面数据源）。"""
+    """未来事件 + 事实性可能结果与研究核验/跟踪动作（段三/段五消息面数据源）。
+
+    issue #68：plans 不再是交易预案——独立交易指令在采用边界拒绝，
+    plans 只保留研究核验/跟踪动作，操作条件以报告规则作战计划为准。
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -246,7 +250,8 @@ class EventPlan(BaseModel):
 class IntelDim(DimEnvelope):
     """S3 消息面（方案 v2.1 重定义）：探索型 Agent 三分区产出。
 
-    三分区：情报摘要（含证据候选，供 L2 消费）/ 盘面根因四要素 / 未来事件日历+预案。
+    三分区：情报摘要（含证据候选，供 L2 消费）/ 盘面根因四要素 /
+    未来事件日历（可能结果 + 研究核验/跟踪动作）。
     """
 
     dim: Literal["intel"] = "intel"

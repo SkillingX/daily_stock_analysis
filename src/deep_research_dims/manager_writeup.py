@@ -31,7 +31,10 @@ def manager_evidence_complete(dims: Mapping[str, Any]) -> bool:
                for key in ("fundamental", "capital", "scenarios", "conclusion", "signal"))
 
 
-_DIRECTIVE_WORDS = (
+# 交易动作词表（issue #39 经理指令拒绝；issue #68 情报事件预案槽位复用同一
+# 拒绝原则）。只用于动作槽位（经理字段、事件预案），不得用于自由叙述文本——
+# 引用「券商维持增持、目标价29.4」属合法研报引用。
+DIRECTIVE_WORDS = (
     "买", "卖", "建仓", "加仓", "补仓", "首批", "低吸", "接回", "挂单", "吸纳",
     "止损", "跌破", "止盈", "减仓", "兑现", "清仓", "入场", "进场", "离场", "平仓",
     "增持", "减持", "仓位", "退出",
@@ -85,7 +88,7 @@ def _prose_carries_directive(text: str) -> bool:
     操作只采用规则计划；即使是在转述计划或历史交易，也回退既有研究员正文。
     事实数字本身不触发拒绝，原始研究资料与规则表不会被此边界改写。
     """
-    return any(word in str(text or "") for word in _DIRECTIVE_WORDS)
+    return any(word in str(text or "") for word in DIRECTIVE_WORDS)
 
 
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
@@ -548,19 +551,74 @@ def _research_digest(dims: Dict[str, Any], keys: tuple[str, ...], narrative_limi
     return digest
 
 
+def _adopted_quote_provenance() -> tuple[Dict[str, Any], str, Optional[float]]:
+    """本报告已采用行情的依据与有效现价（来源/观测时点/资格），随市场摘要进各经理波。
+
+    现价与 provenance 同源：都取本次 ResearchRun 共享 quote（与情报/缓存同一
+    ``valid_quote_price`` 边界）；缺行情、无效标量（0/负/NaN/Inf/bool）或缺依据
+    字段时返回披露文案与 None 现价，不用报告装配时间冒充行情观测时点
+    （issue #68）。rule_eligible 保留真实三态，未知不冒充 False。
+    """
+    from src.core.research_run import current_research
+    from src.deep_research_dims.dim_cache import valid_quote_price
+
+    run = current_research.get()
+    quote = getattr(getattr(run, "context", None), "quote", None) or {}
+    raw_price = quote.get("price")
+    price: Optional[float] = raw_price if valid_quote_price(raw_price) else None
+    if price is None:
+        return {}, "本报告未取得有效实时行情，无已采用现价依据；摘录报价属文献，不得当作现价。", None
+    meta = (quote.get("field_meta") or {}).get("current_price") or {}
+    provenance: Dict[str, Any] = {
+        "source": str(meta.get("source") or "未记录"),
+        "observed_at": str(meta.get("observed_at") or "未记录"),
+        "rule_eligible": meta.get("rule_eligible"),
+        # 资格文案只投影资格本身；quality_status（如 verified/conflict）单独
+        # 随字段携带，不从 rule_eligible=True 推断「单源/未独立核验」。
+        "eligibility": (
+            "合格"
+            if meta.get("rule_eligible") is True
+            else "不合格" if meta.get("rule_eligible") is False else "未知"
+        ),
+    }
+    reasons = [str(reason) for reason in (meta.get("input_reasons") or [])]
+    if reasons:
+        provenance["input_reasons"] = reasons
+    quality_status = str(((meta.get("quality") or {}).get("status")) or "")
+    if quality_status:
+        provenance["quality_status"] = quality_status
+    return provenance, "", price
+
+
 def _market_digest(dims: Dict[str, Any]) -> Dict[str, Any]:
-    """盘面核心标量（现价/年线偏离/52周距离），供概括引用当前行情。"""
+    """盘面核心标量（现价/年线偏离/52周距离）+ 已采用行情依据，供各波同源引用。
+
+    现价与 provenance 同源（issue #68 P2）：都取本次 ResearchRun 共享 quote；
+    data 维度缺席时摘要仍携带已采用现价并如实披露维度缺失。DataDim 的现价锚
+    是其历史统计口径：锚与已采用行情不一致（历史回退收盘/缓存旧价）或缺行情
+    时，以其计算的年线偏离/52周距离与「现价」叙述不得冒充已采用现价口径随
+    摘要下发，一律置空——DataDim 自身历史计算不变。
+    """
     data = dims.get("data")
-    if data is None:
-        return {}
-    price_position = getattr(getattr(data, "perspective", None), "price_position", None)
+    provenance, quote_note, price = _adopted_quote_provenance()
+    data_price = getattr(
+        getattr(getattr(data, "perspective", None), "price_position", None),
+        "current_price", None,
+    )
+    matching = price is not None and price == data_price
     entry: Dict[str, Any] = {
         "status": getattr(data, "status", None),
-        "current_price": getattr(price_position, "current_price", None),
-        "ma250_deviation_pct": getattr(data, "ma250_deviation_pct", None),
-        "distance_from_52w_high_pct": getattr(data, "distance_from_52w_high_pct", None),
+        "current_price": price,
+        "ma250_deviation_pct": getattr(data, "ma250_deviation_pct", None) if matching else None,
+        "distance_from_52w_high_pct": getattr(data, "distance_from_52w_high_pct", None) if matching else None,
     }
-    if getattr(data, "narrative", ""):
+    if data is None:
+        entry["data_note"] = "数据维度缺失（无盘面统计与叙述）。"
+    if provenance:
+        entry["quote_provenance"] = provenance
+    if quote_note:
+        entry["quote_note"] = quote_note
+    if matching and getattr(data, "narrative", ""):
         entry["narrative"] = _bounded_text(data.narrative, 400)
     return entry
 
@@ -645,9 +703,14 @@ def _wave_b_facts(
 def _wave_c_facts(
     stock_name: str, stock_code: str, dims: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """维度节事实：每个待成文维度有界载荷；受保护维度不再重写。"""
+    """维度节事实：每个待成文维度有界载荷；受保护维度不再重写。
+
+    issue #68：维度节叙事与波 A/B 使用同一 `_market_digest` 市场依据——
+    终稿各波对已采用行情及依据同源，消息节不得沿用摘录报价口径。
+    """
     return {
         "stock": f"{stock_name}（{stock_code}）",
+        "completed_research": {"market": _market_digest(dims)},
         "dims": {
             k: _bounded_dim_payload(k, dims[k])
             for k in MANAGER_DIM_SECTION_KEYS
@@ -707,6 +770,13 @@ def generate_manager_writeup(
         + "\n\n你是卖方深度研报的主笔基金经理，正在为这只股票写报告终稿。"
         + _STYLE_RULES
         + nonvaluation_rule
+        # issue #68 P2：现价权威口径三波共有一处声明（波内不再重复）——
+        # completed_research.market 是唯一已采用现价；dims 携带的 DataDim
+        # 历史/缓存统计不得覆盖其现价或缺失披露。
+        + "\n\n【现价权威口径（所有波次必须遵守）】completed_research.market 是本报告"
+        "唯一已采用现价及依据（quote_provenance/quote_note）：涉及现价、涨跌或盘面"
+        "位置时只采用该口径；行情缺失或现价为空时如实说明，禁止用搜索摘录报价或"
+        " dims 中的历史/缓存统计（含回退收盘价、年线偏离、52周距离）覆盖或补造本次现价。"
     )
 
     # 波 A：标题定调 + 内容概括 + 经理所辖节标题（capital/technical 标题由规则给出）
@@ -714,7 +784,7 @@ def generate_manager_writeup(
         parsed = _call_wave(
             llm_adapter,
             base_system
-            + "\n\ncompleted_research 是各研究员已完成的结论（含状态、实际时点、核心字段与叙述）；"
+            + "\n\ncompleted_research 是各研究员已完成的结论（含状态、实际时点、核心字段与叙述），"
             "title_angle、executive_summary 与 dim_verdicts 必须与这些已完成事实一致，"
             "禁止对已完成维度声称「缺少数据/行情缺失」；capital/technical 两节的标题与小计由系统按规则给出，无需输出。"
             + "\n\n输出 JSON 契约：{\"title_angle\": \"…(≤25字定性短语)\", "

@@ -70,9 +70,19 @@ def _safe_quote(code: str, ctx: SharedContext) -> Dict[str, Any]:
             ctx.limitation("实时行情缺失")
             return {}
         from data_provider.realtime_types import quote_field_records
+        from src.deep_research_dims.dim_cache import valid_quote_price
+
+        price = getattr(quote, "price", None)
+        if not valid_quote_price(price):
+            # issue #68（spec 反例）：0/负/NaN/Inf/bool 等无效标量不得作为本报告
+            # 已采用现价流入任何消费方（情报/经理/技术消息、facts、派生维度、
+            # 保存 JSON）；字段解码层同样不会为其生成 current_price 记录。
+            # 其余有效字段（成交量/换手/名称等）保留。
+            ctx.limitation("实时行情现价无效（非有限正数），本次未采用现价")
+            price = None
         return {
             "field_meta": quote_field_records(quote),
-            "price": getattr(quote, "price", None),
+            "price": price,
             "change_pct": getattr(quote, "change_percent", None)
             or getattr(quote, "change_pct", None),
             "volume": getattr(quote, "volume", None),

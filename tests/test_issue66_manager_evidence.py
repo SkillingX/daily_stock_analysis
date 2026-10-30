@@ -108,6 +108,8 @@ def _minimal_wave_payloads() -> Dict[str, Dict[str, Any]]:
 def _oversized_dims() -> dict:
     """生产形态的超长资料：前部业务/情报携带大量参考资料摘录与结构化明细，
     资金/技术携带当前窗口事实（历史缺陷中被整体截掉的后部维度）。"""
+    from src.schemas.report_schema import DataPerspective, PricePosition
+
     dims = _base_dims()
     old_news = [
         RetainedEvidence(
@@ -124,6 +126,7 @@ def _oversized_dims() -> dict:
     ]
     dims["data"] = dims["data"].model_copy(update={
         "narrative": "现价 26.71 元，MA20 29.55 元，量比温和，日线截至 2026-10-29。",
+        "perspective": DataPerspective(price_position=PricePosition(current_price=26.71)),
     })
     dims["business"] = dims["business"].model_copy(update={
         "narrative": "公司深耕光通信涂覆材料，中端市场份额稳固，产品线向半导体材料延伸。",
@@ -267,10 +270,20 @@ def _assert_wave_message_contract(message: str, *, narrated_keys: List[str]) -> 
 
 class TestWaveMessageBounded:
     def test_wave_messages_are_complete_json_with_late_dims(self) -> None:
-        """超长业务/情报资料不再挤掉后部维度；资金/技术事实进入波 A/B 摘要。"""
+        """超长业务/情报资料不再挤掉后部维度；资金/技术事实进入波 A/B 摘要。
+
+        绑定与叙述现价锚一致的共享行情（issue #68）：出站 market 摘要叙述
+        在真实绑定报价下照常携带。
+        """
+        from src.core.research_run import ResearchRun
+        from src.deep_research_dims.context import SharedContext
+
         dims = _oversized_dims()
         llm = _MessageCaptureLLM(_minimal_wave_payloads())
-        out = generate_manager_writeup(llm, "飞凯材料", "300398", dims, [])
+        run = ResearchRun(600.0)
+        run.context = SharedContext("300398", "飞凯材料", "2026-10-30T15:00:00", quote={"price": 26.71})
+        with run.bind():
+            out = generate_manager_writeup(llm, "飞凯材料", "300398", dims, [])
         assert len(llm.user_messages) == 3
 
         wave_a = json.loads(llm.user_messages[0])
