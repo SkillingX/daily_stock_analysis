@@ -40,6 +40,19 @@ DIRECTIVE_WORDS = (
     "增持", "减持", "仓位", "退出",
 )
 
+# issue #68 字面术语反例：买方/卖方是研究主体指称（核对卖方一致预期、核验
+# 买方调研纪要），字面含单字 买/卖 但不构成交易指令；检测前只遮蔽这两个精确
+# 片段（原文保留用于采用与展示），同一文本其他位置照常接受词表与模式检测
+# ——术语出现不豁免整句，「核对卖方预测后在36元买入、仓位3%」仍拒绝。
+RESEARCH_ROLE_TERMS = ("买方", "卖方")
+
+
+def mask_research_role_terms(text: str) -> str:
+    """遮蔽检测视图中的字面术语片段，非术语文本原样返回；语义见上方注释。"""
+    for term in RESEARCH_ROLE_TERMS:
+        text = text.replace(term, "▢" * len(term))
+    return text
+
 
 def _rule_decision_matrix(plan: Any) -> List[Dict[str, str]]:
     """操作决策表由规则作战计划统一生成（issue #39 终局语义）。
@@ -87,8 +100,11 @@ def _prose_carries_directive(text: str) -> bool:
 
     操作只采用规则计划；即使是在转述计划或历史交易，也回退既有研究员正文。
     事实数字本身不触发拒绝，原始研究资料与规则表不会被此边界改写。
+    研究主体术语「买方/卖方」先行遮蔽（issue #68 反例）：字面含 买/卖 但属
+    研究指称，不构成交易指令；经理边界不继承情报侧评级引用豁免。
     """
-    return any(word in str(text or "") for word in DIRECTIVE_WORDS)
+    masked = mask_research_role_terms(str(text or ""))
+    return any(word in masked for word in DIRECTIVE_WORDS)
 
 
 def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) -> Dict[str, Any]:
