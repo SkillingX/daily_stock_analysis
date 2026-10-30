@@ -940,12 +940,14 @@ def test_string_form_plans_adopted_whole_and_trade_string_rejected(
         database._engine.dispose()
 
 
+@pytest.mark.parametrize("role_terms", [False, True])
 def test_intel_cache_honors_quote_identity_on_real_orchestration(
-    tmp_path, monkeypatch, choice_transport,
+    tmp_path, monkeypatch, choice_transport, role_terms: bool,
 ) -> None:
     """真实 try_cache/store_cache（绕过服务层报告日缓存，直接走编排器）：
     同身份第二次编排命中情报缓存不再研究；变价后保守 miss 重算。
-    fixture 行情带 field_meta 以形成有效身份。"""
+    fixture 行情带 field_meta 以形成有效身份。role_terms 分支改用合法术语
+    fixture：缓存命中读回的合法条目（含单字符串槽位形态）原文保留。"""
     from datetime import date
 
     import pandas as pd
@@ -953,7 +955,7 @@ def test_intel_cache_honors_quote_identity_on_real_orchestration(
     from src.deep_research_dims.context import SharedContext, _safe_fundamental
     from src.services import history_loader
 
-    adapter = _TradePlanIntelAdapter()
+    adapter = _RoleTermsIntelAdapter() if role_terms else _TradePlanIntelAdapter()
     today = date.today().isoformat()
 
     def _deterministic_history(
@@ -1002,9 +1004,20 @@ def test_intel_cache_honors_quote_identity_on_real_orchestration(
     # 变价前缓存写入身份 A（quote 有 field_meta，非身份不足）
     assert adapter.intel_user_messages and "现价 20.0" in adapter.intel_user_messages[0]
     first_plans = _intel_plans(first)
-    assert first_plans and all(
-        "披露后对照公告原文" in p or "维持\"买入\"评级" in p for p in first_plans
-    ), first_plans
+    if role_terms:
+        assert first_plans == [
+            "核验买方调研纪要的收入预测",
+            "核对卖方一致预期与公告净利区间",
+            "核对卖方一致预期与公告净利区间，并与三季报趋势交叉验证",
+        ], first_plans
+        assert [e.evidence for e in first.dims["intel"].evidence_items] == [
+            "核对卖方一致预期与公告净利区间，机构观点中性偏正面",
+            "核验买方调研纪要的收入预测，与公告订单口径一致",
+        ]
+    else:
+        assert first_plans and all(
+            "披露后对照公告原文" in p or "维持\"买入\"评级" in p for p in first_plans
+        ), first_plans
 
     # 同身份：情报维度缓存命中，不重新研究
     second = orchestrator.run_dual_track(
@@ -1014,6 +1027,9 @@ def test_intel_cache_honors_quote_identity_on_real_orchestration(
     assert second.status == "success", second.error
     assert adapter.intel_calls == 1, "同行情身份应命中情报缓存"
     assert _intel_plans(second) == first_plans
+    assert [e.evidence for e in second.dims["intel"].evidence_items] == (
+        [e.evidence for e in first.dims["intel"].evidence_items]
+    )
 
     # 变价：保守 miss，情报重算（真实研究路径，非全局关缓存）
     quote_state["value"] = {
@@ -1072,5 +1088,265 @@ def test_no_rule_plan_report_keeps_rejection_without_substitute_points(
             # 不给替代交易点位，也不暗示不存在的计划
             assert "未生成有效规则计划" in markdown
             assert "不含交易点位" in markdown
+    finally:
+        database._engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# issue #68 字面术语反例：买方/卖方是研究主体术语，不是交易指令
+# ---------------------------------------------------------------------------
+
+_ROLE_LEGAL_TERMS = (
+    "核对卖方一致预期与公告净利区间",
+    "核验买方调研纪要的收入预测",
+    "交叉比较买方与卖方的利润预测",
+)
+
+_ROLE_MIXED_COMMANDS = (
+    "核对卖方预测后在36元买入、仓位3%",
+    "核对买方纪要后32元卖出",
+    "先核对买方再买，继续比对卖方再卖",
+    "核对卖方观点；仓位3%",
+    "核对买方纪要；止损32元",
+)
+
+
+class TestResearchRoleTermsAreNotDirectives:
+    """字面术语只遮蔽检测视图：合法术语两个边界放行，混合指令照常拒绝，
+    评级引用例外与经理/情报的豁免差异语义不漂移。"""
+
+    @pytest.mark.parametrize("text", _ROLE_LEGAL_TERMS)
+    def test_legal_terms_pass_both_guards(self, text: str) -> None:
+        from src.agent.deep_research.orchestrator import _directive_hit
+        from src.deep_research_dims.manager_writeup import _prose_carries_directive
+
+        assert _directive_hit(text) == ""
+        assert _prose_carries_directive(text) is False
+
+    @pytest.mark.parametrize("text", _ROLE_MIXED_COMMANDS)
+    def test_mixed_commands_rejected_by_both_guards(self, text: str) -> None:
+        from src.agent.deep_research.orchestrator import _directive_hit
+        from src.deep_research_dims.manager_writeup import _prose_carries_directive
+
+        assert _directive_hit(text) != ""
+        assert _prose_carries_directive(text) is True
+
+    def test_rating_citation_exception_semantics_preserved(self) -> None:
+        """评级引用例外不漂移：intel 豁免紧邻评级语境的标签，经理保守拒绝。"""
+        from src.agent.deep_research.orchestrator import _directive_hit
+        from src.deep_research_dims.manager_writeup import _prose_carries_directive
+
+        citation = "核验券商维持买入评级、目标价29.4元的研报原文"
+        assert _directive_hit(citation) == "", "intel 评级引用豁免保留"
+        assert _prose_carries_directive(citation) is True, "经理边界无评级豁免，原语义不变"
+        mixed_citation = "核验券商维持买入评级后36元买入"
+        assert _directive_hit(mixed_citation) != ""
+        assert _prose_carries_directive(mixed_citation) is True
+
+    def test_parse_intel_adopts_role_terms_and_rejects_mixed(self) -> None:
+        """真实 _parse_intel：合法术语进 plans/outcomes/evidence_items 与
+        事件标题，混合指令拒绝并披露，不进入贝叶斯证据链。"""
+        from src.agent.deep_research.orchestrator import _parse_intel
+
+        payload: Dict[str, Any] = {
+            "sentiment_summary": "中性",
+            "evidence_items": [
+                {"evidence": text, "strength": "weak_positive", "lr": 1.2}
+                for text in (*_ROLE_LEGAL_TERMS, *_ROLE_MIXED_COMMANDS)
+            ],
+            "event_calendar": [{
+                "event": "买方调研会议纪要披露",
+                "date": "2027-01-31",
+                "plans": [*_ROLE_LEGAL_TERMS, *_ROLE_MIXED_COMMANDS],
+                "outcomes": ["净利超预期", *_ROLE_LEGAL_TERMS, *_ROLE_MIXED_COMMANDS],
+            }],
+        }
+        intel, _ = _parse_intel(payload, 1)
+        event = intel.event_calendar[0]
+        assert event.plans == list(_ROLE_LEGAL_TERMS), event.plans
+        assert event.outcomes == ["净利超预期", *_ROLE_LEGAL_TERMS], event.outcomes
+        assert [e.evidence for e in intel.evidence_items] == list(_ROLE_LEGAL_TERMS)
+        assert event.event == "买方调研会议纪要披露", "合法术语事件标题保留"
+        assert any("未采用" in note for note in intel.truncation_notes)
+
+    def test_qualified_manager_writeup_keeps_role_terms_rejects_commands(self) -> None:
+        """真实经理过滤入口：术语标题/概括/论点保留，指令论点整条回退。"""
+        from src.deep_research_dims.manager_writeup import qualified_manager_writeup
+
+        manager = {
+            "title_angle": "卖方观点分歧下的订单验证",
+            "executive_summary": "核对卖方一致预期与公告净利区间后，判断订单回暖尚未完全定价。" * 3,
+            "thesis_points": [
+                {
+                    "header": "买方调研显示订单回暖",
+                    "body": "核验买方调研纪要的收入预测，与公告口径一致但仍需持续跟踪验证。" * 2,
+                },
+                {
+                    "header": "回落后36元买入信号",
+                    "body": "确认净利达标后于36元买入并设置仓位3%，严格执行止损纪律的既定方案。" * 2,
+                },
+            ],
+            "section_narratives": {
+                "investment": "核对买方与卖方的利润预测后交叉验证订单趋势，" + "数字事实与定性判断保持同源。" * 10,
+            },
+        }
+        result = qualified_manager_writeup(manager, _manager_dims())
+        assert result["title_angle"] == "卖方观点分歧下的订单验证"
+        assert "核对卖方一致预期" in result["executive_summary"]
+        assert [p["header"] for p in result["thesis_points"]] == ["买方调研显示订单回暖"], (
+            "术语论点保留，混合指令论点整条回退"
+        )
+        assert "核对买方与卖方" in result["section_narratives"]["investment"]
+
+
+_FLYKET_INTEL_ROLE_TERMS = {
+    "sentiment_summary": "公告与行业新闻中性偏正面",
+    "earnings_outlook": "订单回暖",
+    "risk_alerts": ["原料价格波动"],
+    "positive_catalysts": ["下游补库"],
+    "latest_news": "披露订单回暖公告",
+    "unverified_count": 0,
+    "evidence_items": [
+        {
+            "evidence": "核对卖方一致预期与公告净利区间，机构观点中性偏正面",
+            "strength": "weak_positive", "lr": 1.2, "date": "2026-10-30",
+        },
+        {
+            "evidence": "核验买方调研纪要的收入预测，与公告订单口径一致",
+            "strength": "weak_positive", "lr": 1.2, "date": "2026-10-30",
+        },
+        {
+            "evidence": "核对卖方预测后在36元买入、仓位3%（news级二手）",
+            "strength": "weak_positive", "lr": 1.2, "date": "2026-10-30",
+        },
+    ],
+    "root_cause": {"event": "订单回暖", "mechanism": "下游补库", "magnitude": "正面利好", "persistence": "中期"},
+    "event_calendar": [
+        {
+            "event": "买方调研会议纪要披露",
+            "date": "2027-01-31",
+            "outcomes": [
+                "净利超预期",
+                "卖方下修盈利预测，核对公告原文",
+                "交叉比较买方与卖方的利润预测后止损32元",
+            ],
+            "plans": [
+                "核验买方调研纪要的收入预测",
+                "核对卖方一致预期与公告净利区间",
+                "核对卖方预测后在36元买入、仓位3%",
+                "核对买方纪要后32元卖出",
+            ],
+        },
+        {
+            "event": "卖方一致预期披露",
+            "date": "未知",
+            # 真实响应形态：整个槽位写成单个完整字符串，术语条目整条采用
+            "plans": "核对卖方一致预期与公告净利区间，并与三季报趋势交叉验证",
+            "outcomes": "卖方下修盈利预测，核对公告原文",
+        },
+    ],
+}
+
+
+class _RoleTermsIntelAdapter(_TradePlanIntelAdapter):
+    """情报研究返回合法买方/卖方术语与混合指令反例（issue #68 字面术语）。"""
+
+    def _explore_content(self, user: str) -> str:
+        if "情报收集" in user:
+            self.intel_calls += 1
+            return json.dumps(_FLYKET_INTEL_ROLE_TERMS, ensure_ascii=False)
+        return super()._explore_content(user)
+
+
+def test_role_terms_adopted_and_mixed_commands_rejected_across_vertical_chain(
+    tmp_path, monkeypatch, choice_transport,
+) -> None:
+    """合法买方/卖方术语经真实 _parse_intel 采用并贯通缓存/贝叶斯/保存/MD/PDF
+    （原文不损失）；混合指令在采用边界拒绝，可执行片段不出现在任何持久化产物。"""
+    import io
+    import re
+
+    from fastapi.testclient import TestClient
+    from pypdf import PdfReader
+    from src.services import deep_research_service as service_module
+
+    service, database, app, _transport = _no_target_vertical_env(
+        tmp_path, monkeypatch, choice_transport,
+    )
+    adapter = _RoleTermsIntelAdapter()
+    monkeypatch.setattr(service_module, "_get_dual_track_adapter", lambda: adapter)
+    try:
+        with TestClient(app) as client:
+            stream = client.post(
+                "/generate/stream",
+                json={
+                    "stock_code": "300398", "stock_name": "飞凯材料",
+                    "dims": _NO_TARGET_RESEARCH_DIMS, "force_refresh": True,
+                },
+            )
+            assert stream.status_code == 200, stream.text
+            done = _assert_single_done_terminal(_sse_events(stream))
+            rid = done["report_id"]
+            assert done["status"] == "success", (done.get("status"), done.get("error"))
+
+            intel = done["dimensions"]["intel"]
+            events = intel["event_calendar"]
+            assert len(events) == 2
+            # 合法术语条目按原文完整保留（采用/成文/保存视图同一原文）
+            assert events[0]["event"] == "买方调研会议纪要披露"
+            assert events[0]["plans"] == [
+                "核验买方调研纪要的收入预测",
+                "核对卖方一致预期与公告净利区间",
+            ], events[0]["plans"]
+            assert events[0]["outcomes"] == [
+                "净利超预期",
+                "卖方下修盈利预测，核对公告原文",
+            ], events[0]["outcomes"]
+            # 单字符串形态槽位（真实响应观察形态）：术语条目整条采用不拆散
+            assert events[1]["event"] == "卖方一致预期披露"
+            assert events[1]["plans"] == [
+                "核对卖方一致预期与公告净利区间，并与三季报趋势交叉验证"
+            ], events[1]["plans"]
+            assert events[1]["outcomes"] == ["卖方下修盈利预测，核对公告原文"]
+            assert [e["evidence"] for e in intel["evidence_items"]] == [
+                "核对卖方一致预期与公告净利区间，机构观点中性偏正面",
+                "核验买方调研纪要的收入预测，与公告订单口径一致",
+            ]
+            # 混合指令拒绝并披露；可执行片段不出现在任何情报产物
+            assert any("未采用" in note for note in intel["truncation_notes"])
+            payload_text = json.dumps(intel, ensure_ascii=False)
+            for fragment in ("36元买入", "32元卖出", "仓位3%", "止损32元"):
+                assert fragment not in payload_text, fragment
+            # 贝叶斯证据链只含合法术语证据（指令证据未进入）
+            bayesian_framework = done["dimensions"]["bayesian"]["bayesian"] or {}
+            bayesian_evidence = "".join(
+                e["evidence"] for e in bayesian_framework.get("evidence_log") or []
+            )
+            assert "买方调研纪要" in bayesian_evidence
+            assert "36元买入" not in bayesian_evidence
+
+            markdown = done["markdown"]
+            assert "核验买方调研纪要的收入预测" in markdown
+            assert "核对卖方一致预期与公告净利区间" in markdown
+            # 单字符串形态条目随事件表成文保留
+            assert "核对卖方一致预期与公告净利区间，并与三季报趋势交叉验证" in markdown
+            for fragment in ("36元买入", "32元卖出", "仓位3%", "止损32元"):
+                assert fragment not in markdown, fragment
+            assert "未采用" in markdown, "拒绝原因随内容限制披露可见"
+
+            data = client.get(f"/reports/{rid}").json()["data"]
+            saved_intel = data["dimensions"]["intel"]
+            assert saved_intel["event_calendar"] == intel["event_calendar"]
+            assert saved_intel["evidence_items"] == intel["evidence_items"]
+
+            pdf = client.get(f"/reports/{rid}/pdf")
+            assert pdf.status_code == 200, pdf.text
+            pdf_text = "".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(pdf.content)).pages)
+            # 正向断言：合法术语条目经 real-PDF 渲染可读（去空白防布局折行）
+            pdf_plain = re.sub(r"\s+", "", pdf_text)
+            assert "核对卖方一致预期与公告净利区间，并与三季报趋势交叉验证" in pdf_plain
+            for fragment in ("36元买入", "32元卖出", "仓位3%", "止损32元"):
+                assert fragment not in pdf_plain, fragment
+            assert "未采用" in pdf_text
     finally:
         database._engine.dispose()
