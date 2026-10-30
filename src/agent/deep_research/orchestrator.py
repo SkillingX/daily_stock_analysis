@@ -36,7 +36,7 @@ from src.deep_research_dims.context import SharedContext, build_shared_context
 from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
 from src.deep_research_dims.dim_cache import quote_market_identity
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim
-from src.deep_research_dims.manager_writeup import DIRECTIVE_WORDS
+from src.deep_research_dims.manager_writeup import DIRECTIVE_WORDS, mask_research_role_terms
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
 from src.deep_research_dims.history_dim import build_history_dim
@@ -242,13 +242,15 @@ def _directive_hit(text: Any) -> str:
     """返回条目命中的第一个独立交易指令标记；无命中返回空串。
 
     唯一引用例外：紧邻评级语境的评级标签（维持“买入”评级/维持买入评级/
-    维持"买入"评级）按评级引用豁免；其余全部文本（含引号内）走同一词表
-    与模式——引号不是交易指令通行证，不增加数字/语句变体解析规则。
+    维持"买入"评级）按评级引用豁免；研究主体术语「买方/卖方」（issue #68
+    反例）先行遮蔽——字面含 买/卖 但属研究指称，不构成交易指令。其余全部
+    文本（含引号内）走同一词表与模式——引号不是交易指令通行证，术语出现
+    不豁免整句，不增加数字/语句变体解析规则。
     """
     value = str(text or "")
     if not value:
         return ""
-    masked = _mask_rating_citations(value)
+    masked = mask_research_role_terms(_mask_rating_citations(value))
     for word in _PLAN_DIRECTIVE_WORDS:
         if word in masked:
             return word
