@@ -65,6 +65,24 @@ _PILOT_SCOPE = (
 )
 
 
+# 情报研究员在共享宪法之上的职责收敛（issue #68）：与 _PILOT_SCOPE 同模式，
+# 在同一 system 消息内置于宪法之后——宪法第 5 条 PM 七问与第 6 条评级/目标价/
+# 时间维度的报告级义务由既有规则与聚合层负责，不在情报研究员输出义务内；
+# 事件预案槽位为研究核验/跟踪动作。来源等级、缺口披露与禁止编造等既有纪律
+# 原样有效，仅收敛与本轮 schema 冲突的报告级投资决策义务。
+_INTEL_SCOPE = (
+    "【本轮职责边界（分区情报研究员，优先于上文通用要求中与本边界冲突的部分）】\n"
+    "投资评级（买入/增持/中性/减持等）、目标价、时间维度、交易行动词表与宪法第 5 条"
+    " PM 七问中的投资决策问项，由报告的既有规则与聚合层负责，不在本轮输出义务内；\n"
+    "引用券商/机构评级或目标价时保留原文并带来源等级，不得自行给出评级、目标价或买卖结论；\n"
+    "event_calendar.plans 只写研究核验/跟踪动作（披露后对照公告原文核验阈值、跟踪数据发布等），"
+    "不写买入/卖出/建仓/加仓/减仓/止损/止盈/仓位等交易指令，不使用 T1 买卖编号；"
+    "涉及操作条件时统一写「操作条件以本报告规则作战计划为准」；\n"
+    "价格依据：系统任务中注入的本报告已采用行情是唯一现价口径，搜索摘录报价属文献；\n"
+    "仍然有效的纪律：来源等级标签、数据日期/时点、真实缺口披露与禁止编造数字，全部按上文通用要求执行。"
+)
+
+
 def _build_registry(source_registry: Any, names: set[str]) -> Any:
     """从问股注册表复制工具子集到独立实例（不污染问股单例）。"""
     registry = ToolRegistry()
@@ -108,6 +126,7 @@ def _run_explore(
         + "\n\n"
         + prompt
         + ("\n\n" + _PILOT_SCOPE if dim_id in _PILOT_DIMS else "")
+        + ("\n\n" + _INTEL_SCOPE if dim_id == "intel" else "")
         + "\n\n最终回答必须是且仅是一个 JSON 对象（不要 Markdown 代码围栏外的任何文字）。"
     )
     if dim_id == "business":
@@ -205,6 +224,62 @@ def _extract_json(content: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _quote_eligibility_text(meta: Dict[str, Any]) -> str:
+    """行情字段资格的真实投影（issue #68）：拒绝/质量/限制原样传递，缺字段未知。
+
+    ``rule_eligible`` 三态区分（True 合格 / False 不合格 / 缺失未知）；资格文案
+    只投影资格本身，不从 True 推断「单源/未独立核验」——``quality.status``
+    （如 verified/conflict）与 ``input_reasons`` 单独如实携带，避免与已核验或
+    冲突元数据自相矛盾。
+    """
+    eligible = meta.get("rule_eligible")
+    if eligible is True:
+        text = "资格 合格"
+    elif eligible is False:
+        text = "资格 不合格"
+    else:
+        text = "资格 未知"
+    reasons = [str(reason) for reason in (meta.get("input_reasons") or [])]
+    if reasons:
+        text += f"；资格限制 {', '.join(reasons)}"
+    quality_status = str(((meta.get("quality") or {}).get("status")) or "")
+    if quality_status and quality_status != "unverified":
+        text += f"；质量状态 {quality_status}"
+    return text
+
+
+def _intel_market_context() -> str:
+    """本报告已采用行情依据（issue #68）：与报告其他维度同一标量与资格。
+
+    行情来自阶段 0 共享上下文（零新增出站）；无有效行情时如实披露缺失，
+    禁止用搜索摘录补造现价。文献摘录报价只能作为带来源/时点的引用。
+    无效标量（0/负/NaN/Inf/bool）与缺价同界：不构成已采用现价，不得以
+    权威口径注入（spec 反例）。
+    """
+    from src.deep_research_dims.dim_cache import valid_quote_price
+
+    run = current_research.get()
+    quote = getattr(getattr(run, "context", None), "quote", None) or {}
+    if not valid_quote_price(quote.get("price")):
+        return (
+            "【本报告行情依据（权威）】本次研究未取得有效实时行情：没有已采用的现价、涨跌幅或价格位置。"
+            "禁止把搜索摘录或新闻中的任何报价当作本次现价、当前涨跌，也不得据此推算相对目标空间或盘面位置；"
+            "引用文献报价必须写明属摘录并带来源，无行情时点就写「日期未知」。"
+        )
+    meta = (quote.get("field_meta") or {}).get("current_price") or {}
+    parts = [f"现价 {quote.get('price')}"]
+    parts.append(f"行情时点 {meta.get('observed_at') or '未记录'}")
+    parts.append(f"来源 {meta.get('source') or '未记录'}")
+    parts.append(_quote_eligibility_text(meta))
+    return (
+        "【本报告已采用行情（权威依据，你的盘面与价格分析必须与此一致，禁止矛盾或声称缺失）】"
+        + "；".join(parts)
+        + "。\n价格依据纪律：以上是本报告唯一已采用的现价；搜索工具返回内容中的任何报价/涨跌幅均为文献摘录，"
+        "不得当作本次现价或当前盘面涨跌；引用文献报价必须写明属摘录并带来源与日期（无日期如实写「日期未知」）；"
+        "禁止用摘录报价替换或覆盖上述已采用行情。"
+    )
+
+
 def run_intel_agent(
     stock_code: str,
     stock_name: str,
@@ -212,9 +287,15 @@ def run_intel_agent(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     max_steps: int = 8,
 ) -> Dict[str, Any]:
-    """S3 情报探索：新闻/公告/风险/催化剂 + 贝叶斯证据候选。"""
+    """S3 情报探索：新闻/公告/风险/催化剂 + 贝叶斯证据候选。
+
+    issue #68：输入携带本报告已采用行情及来源/时点/资格（system 层职责边界
+    见 _INTEL_SCOPE）；event_calendar.plans 只写研究核验/跟踪动作，操作条件
+    引用规则作战计划，不再要求独立交易指令或 T1 编号。
+    """
     task = (
         f"请对 A 股 {stock_name}（{stock_code}）执行情报收集并直接输出 JSON：\n"
+        f"0) {_intel_market_context()}\n"
         "1) 先用 search_stock_news 查个股新闻公告，search_comprehensive_intel 查宏观/行业情报，"
         "get_market_indices 取大盘环境；\n"
         "2) 输出 JSON 字段：sentiment_summary(字符串)、earnings_outlook(字符串)、"
@@ -222,16 +303,18 @@ def run_intel_agent(
         "unverified_count(整数)、"
         "evidence_items(数组，元素：{evidence,strength,lr,date}；strength 取 "
         "strong_positive/weak_positive/neutral/weak_negative/strong_negative 之一，"
-        "lr 为该证据似然比(正数)，date 为 YYYY-MM-DD；只收录近 90 天证据，最多 6 条)；\n"
+        "lr 为该证据似然比(正数)，date 为 YYYY-MM-DD；只收录近 90 天证据，最多 6 条；"
+        "引用券商/机构评级或目标价时保留原文并带来源等级)；\n"
         "3) root_cause(对象：{event, mechanism, magnitude, persistence})——"
         "当前盘面结构(涨/跌/震荡)的根因：发生了什么事件、通过什么机制影响股价、"
-        "影响量级(正面利好/负面利空/有限)、预计持续性；基于你搜到的情报作答，搜不到就留空；\n"
-        "4) event_calendar(数组，最多 6 项：{event, date, outcomes(2-4个可能结果), "
-        "plans(每个结果对应的一条交易预案)})——只收录当前时点之后尚未发生的事件"
-        "(财报/解禁/政策/行业会议等)，禁止列出已过去年份的事件；每个事件给出可能结果和对应预案；"
-        "不确定日期写\"未知\"。\n"
-        "事件预案编号联动：plans 每条预案开头引用操作编号——T1-L 左侧买入 ｜ T1-R 右侧确认买入 ｜ "
-        "T1-S1 减仓/止盈 ｜ T1-SL 止损。会导致无论价格无条件离场的事件，在预案末尾标注「一票否决」。\n"
+        "影响量级(正面利好/负面利空/有限)、预计持续性；价格水平与涨跌必须与上述已采用行情一致，"
+        "基于你搜到的情报作答，搜不到就留空；\n"
+        "4) event_calendar(数组，最多 6 项：{event, date, "
+        "outcomes(字符串数组，2-4 个可能结果), plans(字符串数组，研究核验/跟踪动作)}；"
+        "outcomes 与 plans 必须是字符串数组，每条动作/结果一个数组元素，"
+        "不要把多条内容并成一个字符串)——只收录当前时点之后尚未发生的事件"
+        "(财报/解禁/政策/行业会议等)，禁止列出已过去年份的事件；每个事件给出可能结果和对应的"
+        "研究核验/跟踪动作；不确定日期写\"未知\"；outcomes 只写事实性可能结果，不夹带交易指令。\n"
         "来源等级只使用 primary/news/industry/inferred/unverified，写在字符串内容里；F10 聚合页和二手引用不得标 primary，推断必须写明依据。不要求社区评价，也不要写固定品牌双源验证字样。"
     )
     return _run_explore(
@@ -325,7 +408,9 @@ def _shared_market_facts(ctx: Any, history: Optional[List[Dict[str, Any]]] = Non
     if not history_source:
         history_source = str(getattr(ctx, "history_source", "") or "")
     parts: list[str] = []
-    if ctx.quote and ctx.quote.get("price") is not None:
+    from src.deep_research_dims.dim_cache import valid_quote_price
+
+    if ctx.quote and valid_quote_price(ctx.quote.get("price")):
         parts.append(f"现价 {ctx.quote['price']}")
     if history:
         closes = [c for r in history if (c := r.get("close")) is not None]
@@ -524,7 +609,9 @@ def run_technical_agent(
     # 取消/预算中断后退化报告仍保留阶段 0 已取得的行情与日线，不重新取数。
     if run is not None:
         quote = getattr(shared_ctx, "quote", None) or {}
-        if quote.get("price") is not None:
+        from src.deep_research_dims.dim_cache import valid_quote_price
+
+        if valid_quote_price(quote.get("price")):
             run.retain_facts("get_realtime_quote", quote)
         if history:
             run.retain_facts("get_daily_history", {"data": [history[-1]], "source": history_source})
