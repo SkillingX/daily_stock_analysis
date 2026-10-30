@@ -204,9 +204,12 @@ class TestStaleLockRetry:
 
         release_task_lock(token1)
 
-    def test_inprocess_lock_recovers_after_timeout(self, mock_config):
-        """When the in-process guard has exceeded timeout, acquire_task_lock should
-        clean it up and acquire successfully."""
+    def test_inprocess_held_marker_blocks_even_when_aged_then_recovers_on_release(
+        self, mock_config
+    ):
+        """issue #66 真实所有权语义：进程内运行标记只在真实持锁期间为 True
+        （acquire/release 配对），超龄也不强制清理——清理会让同一任务在本进程内
+        重复执行；真实释放后立即恢复可获取（不永久卡住）。"""
         from src.core.scheduled_task_lock import (
             acquire_task_lock,
             release_task_lock,
@@ -214,40 +217,18 @@ class TestStaleLockRetry:
             _task_running_start,
         )
 
-        # _set_task_running records "now", so the guard is not actually old;
-        # backdate the start to make the claimed expired precondition real.
-        # _set_task_running 记录的是当前时刻，显式回拨才真正建立"旧开始时间"。
+        # _set_task_running 记录的是当前时刻，显式回拨建立"超龄持锁"前提
         _set_task_running("inproc_timeout_test", True)
         _task_running_start["inproc_timeout_test"] = time.time() - 3600.0
 
-        # acquire_task_lock with 0-second timeout should detect and recover
         token = acquire_task_lock(mock_config, "inproc_timeout_test", timeout_seconds=0)
-        assert token is not None, "should recover from timed-out in-process guard"
+        assert token is None, "存活持锁（即使超龄）不得被清理后重复获取"
+        _set_task_running("inproc_timeout_test", False)
+
+        # 真实释放（标记清除）后恢复可获取
+        token = acquire_task_lock(mock_config, "inproc_timeout_test", timeout_seconds=0)
+        assert token is not None, "释放后的标记不得永久卡住"
         release_task_lock(token)
-
-    def test_inprocess_lock_same_tick_start_still_blocks(self, mock_config, monkeypatch):
-        """A same-tick start (elapsed == 0) must not count as expired at
-        timeout_seconds=0: recovery requires elapsed > timeout. 本控制用模块
-        级受控常量时钟固定 elapsed==0 边界，相邻真实时钟调用会竞速。"""
-        import src.core.scheduled_task_lock as lock_module
-        from src.core.scheduled_task_lock import (
-            acquire_task_lock,
-            _set_task_running,
-        )
-
-        class _FrozenClock:
-            @staticmethod
-            def time() -> float:
-                return 1000.0
-
-        monkeypatch.setattr(lock_module, "time", _FrozenClock)
-        _set_task_running("inproc_zero_timeout_test", True)  # start = 1000.0
-        token = acquire_task_lock(
-            mock_config, "inproc_zero_timeout_test", timeout_seconds=0
-        )
-        assert token is None, "a same-tick start (elapsed == 0) must not count as expired"
-        # acquire_task_lock returned None, so the guard stays running.
-        _set_task_running("inproc_zero_timeout_test", False)
 
 
 class TestDifferentTaskNames:

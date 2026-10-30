@@ -49,6 +49,12 @@ from .realtime_types import CircuitBreaker
 # 配置日志
 logger = logging.getLogger(__name__)
 
+# issue #66：一次指数取数链（先行源 + 全部 fallback 候选，含候选内部多次
+# HTTP 请求）共享的任务级截止预算（秒）。复用既有 request_deadline 机制落实到
+# HTTP 连接/读取；模块常量而非配置项——与既有局部隔离契约一致，超时按候选
+# 隔离保留其他有效结果，不新增可配置面。
+INDEX_FETCH_BUDGET_SECONDS = 30.0
+
 
 # === 标准化列名定义 ===
 STANDARD_COLUMNS = [
@@ -2547,7 +2553,16 @@ class DataFetcherManager:
         if use_bulk:
             self.batch_get_stock_names(stock_codes)
             return
+        # issue #66：逐股票外查每次查询前读取所属调度停止 Event——首个查询期间
+        # 收到停止时，尚未开始的名称查询不再出站。
+        from src.scheduler import stop_requested
+
         for code in stock_codes:
+            if stop_requested():
+                logger.info(
+                    f"[股票名称] 收到停止信号，剩余 {len(stock_codes) - stock_codes.index(code)} 个名称不再查询"
+                )
+                return
             # Skip realtime lookup to avoid triggering expensive full-market quote
             # requests during the prefetch phase.
             self.get_stock_name(code, allow_realtime=False)
@@ -2614,7 +2629,16 @@ class DataFetcherManager:
                 continue
 
         # 3. 逐个获取剩余的
+        # issue #66：逐股票外查循环每次查询前读取所属调度停止 Event——首个名称
+        # 查询期间收到停止时，后续尚未开始的名称不再出站；已取得/已缓存结果保留。
+        from src.scheduler import stop_requested
+
         for code in list(missing_codes):
+            if stop_requested():
+                logger.info(
+                    f"[股票名称] 收到停止信号，剩余 {len(missing_codes)} 个名称不再查询（已缓存结果保留）"
+                )
+                break
             name = self.get_stock_name(code)
             if name:
                 result[code] = name
@@ -2624,7 +2648,38 @@ class DataFetcherManager:
         return result
 
     def get_main_indices(self, region: str = "cn") -> List[Dict[str, Any]]:
-        """获取主要指数实时行情（自动切换数据源）"""
+        """获取主要指数实时行情（自动切换数据源）
+
+        issue #66：本次取数链（先行数据源 + 全部 fallback 候选，含候选内部的
+        多次 HTTP 请求）共享一个任务级截止预算，经既有 `request_deadline` +
+        `eastmoney_patch` 落实到真正的 HTTP 连接/读取（无 timeout 的第三方
+        requests 调用由补丁注入剩余预算，慢速流式读取由 socket 读钩子终止）。
+        预算耗尽后按既有局部隔离契约跳过剩余候选，保留已取得的有效结果。
+        """
+        from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+        from src.core.research_run import current_research
+        from src.scheduler import stop_requested
+
+        run = current_research.get()
+        if run is not None:
+            run.check()
+        if stop_requested():
+            logger.warning("[指数行情] 收到停止信号，不再开始取数")
+            return []
+        eastmoney_patch(budget_only=True)
+        deadline = time.monotonic() + INDEX_FETCH_BUDGET_SECONDS
+        outer = request_deadline.get()
+        if outer is not None:
+            deadline = min(deadline, outer)
+        token = request_deadline.set(deadline)
+        try:
+            return self._get_main_indices_with_budget(region, deadline)
+        finally:
+            request_deadline.reset(token)
+
+    def _get_main_indices_with_budget(self, region: str, deadline: float) -> List[Dict[str, Any]]:
+        from src.scheduler import stop_requested
+
         if region == "cn":
             tickflow_fetcher = self._get_tickflow_fetcher()
             if tickflow_fetcher is not None:
@@ -2640,6 +2695,18 @@ class DataFetcherManager:
                     logger.warning(f"[TickFlowFetcher] 获取指数行情失败: {e}")
 
         for fetcher in self._fetchers:
+            # issue #66：下一候选前读取所属调度停止 Event（先行源期间收到停止
+            # 同样生效）；预算耗尽按既有局部隔离跳过剩余候选。
+            if stop_requested():
+                logger.warning(
+                    "[指数行情] 收到停止信号，跳过剩余数据源（局部隔离，不影响其他数据）"
+                )
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[指数行情] 共享预算已用尽，跳过剩余数据源（局部隔离，不影响其他数据）"
+                )
+                break
             try:
                 data = cast(
                     List[Dict[str, Any]], fetcher.get_main_indices(region=region)
@@ -2653,7 +2720,38 @@ class DataFetcherManager:
         return []
 
     def get_market_stats(self, *, purpose: str = "unspecified") -> Dict[str, Any]:
-        """获取市场涨跌统计（自动切换数据源）"""
+        """获取市场涨跌统计（自动切换数据源）
+
+        issue #66：与 get_main_indices 同一停止/I/O 契约——共享任务级截止预算
+        落实到真正的 HTTP 连接/读取；逐候选前读取所属调度停止 Event；预算耗尽
+        按既有局部隔离契约跳过剩余候选。
+        """
+        from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+        from src.core.research_run import current_research
+        from src.scheduler import stop_requested
+
+        run = current_research.get()
+        if run is not None:
+            run.check()
+        if stop_requested():
+            logger.warning(
+                "[MarketStats] component=market_stats action=stopped purpose=%s", purpose
+            )
+            return {}
+        eastmoney_patch(budget_only=True)
+        deadline = time.monotonic() + INDEX_FETCH_BUDGET_SECONDS
+        outer = request_deadline.get()
+        if outer is not None:
+            deadline = min(deadline, outer)
+        token = request_deadline.set(deadline)
+        try:
+            return self._get_market_stats_with_budget(purpose, deadline)
+        finally:
+            request_deadline.reset(token)
+
+    def _get_market_stats_with_budget(self, purpose: str, deadline: float) -> Dict[str, Any]:
+        from src.scheduler import stop_requested
+
         logger.info(
             "[MarketStats] component=market_stats action=start purpose=%s", purpose
         )
@@ -2688,6 +2786,20 @@ class DataFetcherManager:
                 )
 
         for fetcher in self._fetchers:
+            if stop_requested():
+                logger.warning(
+                    "[MarketStats] component=market_stats action=stopped_remaining "
+                    "purpose=%s detail=跳过剩余数据源（局部隔离，不影响其他数据）",
+                    purpose,
+                )
+                break
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[MarketStats] component=market_stats action=budget_exhausted "
+                    "purpose=%s detail=跳过剩余数据源（局部隔离，不影响其他数据）",
+                    purpose,
+                )
+                break
             started_at = time.monotonic()
             try:
                 data = cast(Dict[str, Any], fetcher.get_market_stats())
@@ -2818,7 +2930,17 @@ class DataFetcherManager:
         total_cost_ms = 0
         last_error: Optional[str] = None
 
+        from src.scheduler import stop_requested
+
         for _ in range(attempts):
+            # issue #66：下一候选/下一重试前读取所属调度停止 Event——在途有界
+            # 调用自然收尾，但停止后不再发起新的重试出站。
+            if stop_requested():
+                logger.warning(
+                    "[%s] 收到停止信号，剩余重试不再执行", task_name
+                )
+                last_error = last_error or "stopped"
+                break
             if remaining_seconds <= 0:
                 break
             result, err, cost_ms = self._run_with_timeout(

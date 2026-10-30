@@ -107,6 +107,11 @@ def _is_lock_expired(lock_path: Path, timeout_seconds: int) -> bool:
 
 
 def _is_stale_lock(lock_path: Path, timeout_seconds: int) -> bool:
+    """仅当 owner 进程已死（或元数据不可读且文件超龄）时锁才算过期。
+
+    issue #66：存活 owner 的锁不因运行时长被判过期——超时不等于所有权丢失，
+    清除活 owner 的锁路径会让同一任务在另一个锁 inode 上重复执行。
+    """
     metadata = _read_lock_metadata(lock_path)
     pid_raw = metadata.get("pid")
     if not pid_raw:
@@ -117,19 +122,8 @@ def _is_stale_lock(lock_path: Path, timeout_seconds: int) -> bool:
     except ValueError:
         return _is_lock_expired(lock_path, timeout_seconds)
 
-    if not _is_process_alive(pid):
-        return True
-
-    started_raw = metadata.get("started_at")
-    if not started_raw:
-        return False
-
-    try:
-        started_at = datetime.fromisoformat(started_raw)
-    except ValueError:
-        return True
-
-    return datetime.now() - started_at > timedelta(seconds=timeout_seconds)
+    # 存活 owner 一律视为持锁（无论运行多久）；已死 owner 的锁立即过期。
+    return not _is_process_alive(pid)
 
 
 def acquire_task_lock(
@@ -145,17 +139,15 @@ def acquire_task_lock(
 
     with lock_guard:
         if _get_task_running(task_name):
+            # issue #66：运行标记只在真实持锁期间为 True（acquire/release 配对），
+            # 超龄也不强制清理——清标记会让同一任务在本进程内重复执行。
             running_since = _task_running_start.get(task_name, 0)
-            if running_since and time.time() - running_since > timeout_seconds:
-                logger.warning(
-                    "进程内锁 [%s] 已超时（运行 %.1fs > %ds），强制清理",
-                    task_name,
-                    time.time() - running_since,
-                    timeout_seconds,
-                )
-                _set_task_running(task_name, False)
-            else:
-                return None
+            logger.info(
+                "进程内任务 [%s] 已在执行中（%.1fs），跳过本次触发。",
+                task_name,
+                time.time() - running_since if running_since else 0.0,
+            )
+            return None
 
         lock_path = task_lock_path(config, task_name)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
