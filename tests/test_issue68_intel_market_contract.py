@@ -282,13 +282,15 @@ def _manager_dims() -> dict:
 
 
 class _ManagerCapture:
-    """按经理波次返回最小完成 JSON，并捕获全部出站 user 消息。"""
+    """按经理波次返回最小完成 JSON，并捕获全部出站 system/user 消息。"""
 
     def __init__(self) -> None:
         self.sent: List[str] = []
+        self.system_messages: List[str] = []
 
     def call_text(self, messages: List[Dict[str, Any]], **kwargs: Any) -> LLMResponse:
         system = str(messages[0].get("content") or "")
+        self.system_messages.append(system)
         self.sent.append(str(messages[1].get("content") or ""))
         if '"title_angle"' in system:
             payload: Dict[str, Any] = {"title_angle": "观察", "executive_summary": "定性判断。" * 20}
@@ -362,6 +364,174 @@ class TestManagerWaveCMarketDigest:
         provenance = wave_a["completed_research"]["market"]["quote_provenance"]
         assert provenance["rule_eligible"] is None
         assert provenance["eligibility"] == "未知"
+
+
+# ---------------------------------------------------------------------------
+# spec-review P2 回归：经理市场摘要现价与已采用行情同源（真实 build_data_dim 链）
+# ---------------------------------------------------------------------------
+
+def _history_rows(count: int) -> List[Dict[str, Any]]:
+    """构造 OHLCV 历史行；date 只作标识，build_data_dim 不读日期。"""
+    return [
+        {
+            "date": f"2026-fixture-{i:04d}",
+            "open": 24.0,
+            "high": 25.0 + i * 0.05,
+            "low": 23.0,
+            "close": round(24.0 + i * 0.1, 2),
+            "volume": 1000,
+        }
+        for i in range(count)
+    ]
+
+
+class TestManagerDigestSameSourceAsSharedQuote:
+    """spec-review P2 反例回归：经理摘要现价不得与已采用行情分源。
+
+    两条真实可达反例经真实 ``build_data_dim`` → ``generate_manager_writeup``：
+    Repro1 报价有效但历史不足 20 条（data degraded 无 perspective）——三波与
+    情报同看到已采用现价；Repro2 缺报价但历史充足（DataDim 回退末日收盘）——
+    三波现价如实为 null，历史回退价不冒充已采用现价，与情报披露同语义。
+    """
+
+    @staticmethod
+    def _dims_with_real_data_dim(quote: Dict[str, Any], history: List[Dict[str, Any]]) -> dict:
+        from src.deep_research_dims.data_dim import build_data_dim
+
+        ctx = SharedContext("300398", "飞凯材料", "2026-10-30T15:00:00", quote=quote, history=history)
+        dims = {d: DIM_MODELS[d]() for d in ACTIVE_DIM_IDS}
+        dims["data"] = build_data_dim(ctx)
+        return dims
+
+    def test_valid_quote_short_history_keeps_adopted_price_in_all_waves(self) -> None:
+        """Repro1：报价 26.34 有效但历史 <20 条 → data degraded 无 perspective。"""
+        quote = _quote_with_meta(26.34)
+        dims = self._dims_with_real_data_dim(quote, _history_rows(10))
+        assert dims["data"].status == "degraded" and dims["data"].perspective is None, (
+            "真实链前提：历史不足 20 条时 DataDim 降级且无透视"
+        )
+
+        capture = _ManagerCapture()
+        run = ResearchRun(600.0)
+        run.context = SharedContext("300398", "飞凯材料", "2026-10-30T15:00:00", quote=quote)
+        with run.bind():
+            generate_manager_writeup(capture, "飞凯材料", "300398", dims, [])
+        assert len(capture.sent) == 3
+        for message in capture.sent:
+            market = json.loads(message)["completed_research"]["market"]
+            assert market["current_price"] == 26.34, "数据降级不丢失已采用现价"
+            assert market["status"] == "degraded", "真实降级状态保留"
+            assert market["quote_provenance"]["source"] == "eastmoney"
+            assert "quote_note" not in market
+        # 情报同语义：同一共享行情作为权威现价注入消息
+        assert "现价 26.34" in _run_intel_once(quote)[1]
+
+    def test_missing_quote_history_fallback_not_relabelled_adopted(self) -> None:
+        """Repro2：缺报价但历史充足 → DataDim 末日收盘价不冒充已采用现价。"""
+        dims = self._dims_with_real_data_dim({}, _history_rows(260))
+        data = dims["data"]
+        assert data.status == "ok"
+        assert data.perspective.price_position.current_price not in (None, 26.34), (
+            "真实链前提：缺报价时 DataDim 回退末日收盘价"
+        )
+
+        capture = _ManagerCapture()
+        run = ResearchRun(600.0)
+        run.context = SharedContext("300398", "飞凯材料", "2026-10-30T15:00:00", quote={})
+        with run.bind():
+            generate_manager_writeup(capture, "飞凯材料", "300398", dims, [])
+        assert len(capture.sent) == 3
+        for message in capture.sent:
+            market = json.loads(message)["completed_research"]["market"]
+            assert market["current_price"] is None, "历史回退收盘价不得冒充已采用现价"
+            assert "quote_provenance" not in market
+            assert "未取得有效实时行情" in market["quote_note"]
+            assert "narrative" not in market, "以「现价」锚定的叙述不随缺行情摘要携带"
+            # 以历史回退价计算的偏离指标不冒充已采用现价口径（DataDim 自身计算不变）
+            assert market["distance_from_52w_high_pct"] is None
+            assert market["ma250_deviation_pct"] is None
+        # 情报同语义：无有效行情走披露分支，不注入权威现价
+        assert "未取得有效实时行情" in _run_intel_once({})[1]
+
+    def test_stale_cached_data_dim_defers_to_shared_quote(self) -> None:
+        """缓存旧 DataDim 与本次共享行情不一致：现价以共享行情为准，
+        旧现价锚的叙述与派生偏离指标不随摘要携带（不把缓存旧价重新标记为
+        已采用现价口径）。"""
+        stale_dims = self._dims_with_real_data_dim({}, _history_rows(260))
+        assert stale_dims["data"].perspective.price_position.current_price != 26.34
+
+        from src.deep_research_dims.manager_writeup import _market_digest
+
+        run = ResearchRun(600.0)
+        run.context = SharedContext(
+            "300398", "飞凯材料", "2026-10-30T15:00:00", quote=_quote_with_meta(26.34)
+        )
+        with run.bind():
+            digest = _market_digest(stale_dims)
+        assert digest["current_price"] == 26.34
+        assert digest["quote_provenance"]["source"] == "eastmoney"
+        assert "narrative" not in digest
+        assert digest["distance_from_52w_high_pct"] is None
+        assert digest["ma250_deviation_pct"] is None
+
+    def test_matching_history_narrative_still_carried(self) -> None:
+        """既有 live 路径保持：行情与 DataDim 现价锚一致时叙述与派生指标照常携带。"""
+        quote = _quote_with_meta(26.34)
+        dims = self._dims_with_real_data_dim(quote, _history_rows(260))
+        data = dims["data"]
+        assert data.status == "ok"
+        assert data.perspective.price_position.current_price == 26.34
+        assert data.narrative, "真实链前提：叙述含现价锚"
+
+        from src.deep_research_dims.manager_writeup import _market_digest
+
+        run = ResearchRun(600.0)
+        run.context = SharedContext("300398", "飞凯材料", "2026-10-30T15:00:00", quote=quote)
+        with run.bind():
+            digest = _market_digest(dims)
+        assert digest["current_price"] == 26.34
+        assert digest["narrative"] == data.narrative
+        assert digest["distance_from_52w_high_pct"] == data.distance_from_52w_high_pct
+        assert digest["ma250_deviation_pct"] == data.ma250_deviation_pct
+
+    def test_data_dim_absent_keeps_adopted_quote_disclosed(self) -> None:
+        """data 维度缺席时摘要仍携带已采用现价并如实披露维度缺失，
+        有效共享行情不因维度缺失被丢弃。"""
+        dims = {d: DIM_MODELS[d]() for d in ACTIVE_DIM_IDS}
+        dims.pop("data")
+
+        from src.deep_research_dims.manager_writeup import _market_digest
+
+        run = ResearchRun(600.0)
+        run.context = SharedContext(
+            "300398", "飞凯材料", "2026-10-30T15:00:00", quote=_quote_with_meta(26.34)
+        )
+        with run.bind():
+            digest = _market_digest(dims)
+        assert digest["status"] is None
+        assert digest["current_price"] == 26.34
+        assert "数据维度缺失" in digest["data_note"]
+        assert digest["quote_provenance"]["source"] == "eastmoney"
+        assert digest["distance_from_52w_high_pct"] is None
+        assert digest["ma250_deviation_pct"] is None
+        assert "narrative" not in digest
+
+    def test_market_authority_instruction_shared_by_all_waves(self) -> None:
+        """现价权威口径在三波共有的 base_system 一处声明（波内不重复）：
+        dims 携带的历史/缓存统计不得覆盖 completed_research.market 的现价或缺失披露。"""
+        capture = _ManagerCapture()
+        run = ResearchRun(600.0)
+        run.context = SharedContext(
+            "300398", "飞凯材料", "2026-10-30T15:00:00", quote=_quote_with_meta(26.34)
+        )
+        with run.bind():
+            generate_manager_writeup(capture, "飞凯材料", "300398", _manager_dims(), [])
+        assert len(capture.system_messages) == 3
+        for system in capture.system_messages:
+            assert system.count("唯一已采用现价") == 1, "权威口径指令只在共有 base_system 一处"
+            assert "历史/缓存统计" in system and "覆盖或补造本次现价" in system
+            assert "其中 market 带本报告已采用行情及依据" not in system, "波 A 旧重复句已上移"
+            assert "与其他波次同源" not in system, "波 C 旧重复句已上移"
 
 
 # ---------------------------------------------------------------------------
