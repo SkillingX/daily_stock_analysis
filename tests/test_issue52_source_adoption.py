@@ -7,6 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from src.deep_research.researchers.business import parse as parse_business
 from src.deep_research.researchers.sentiment import parse as parse_sentiment
@@ -197,8 +198,17 @@ def test_affected_prompt_caches_miss_without_scrubbing_or_global_bump(tmp_path, 
     _write_record(dim_cache, "300260", "data", {"dim": "data", "status": "ok", "narrative": "筹码概念保留"}, version=None)
     assert dim_cache.load_cached_dim("300260", "data")["narrative"] == "筹码概念保留"
 
+    # issue #68：无身份的情报不落盘（宁重算不伪造），读取也不匹配任何记录；
+    # 有效热缓存情形需显式身份——本票无有效行情即真实的 absent 身份。
+    absent_identity = dim_cache.quote_market_identity({})
     dim_cache.save_cached_dim("300260", "intel", {"narrative": "股东减持见公告。芯片概念与社区讨论保留。", "status": "ok"})
-    hot = dim_cache.load_cached_dim("300260", "intel")
+    assert dim_cache.load_cached_dim("300260", "intel", quote_identity=absent_identity) is None
+    dim_cache.save_cached_dim(
+        "300260", "intel",
+        {"narrative": "股东减持见公告。芯片概念与社区讨论保留。", "status": "ok"},
+        quote_identity=absent_identity,
+    )
+    hot = dim_cache.load_cached_dim("300260", "intel", quote_identity=absent_identity)
     assert hot["narrative"] == "股东减持见公告。芯片概念与社区讨论保留。"
     assert "community_cn" not in hot["narrative"]
 
@@ -214,9 +224,11 @@ def test_force_refresh_skips_cache_read_and_old_intel_is_not_adopted(tmp_path, m
     calls: list[str] = []
     real_load = dim_cache.load_cached_dim
 
-    def spy(code: str, dim: str):
+    def spy(
+        code: str, dim: str, quote_identity: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         calls.append(dim)
-        return real_load(code, dim)
+        return real_load(code, dim, quote_identity=quote_identity)
 
     monkeypatch.setattr(dim_cache, "load_cached_dim", spy)
     monkeypatch.setattr(

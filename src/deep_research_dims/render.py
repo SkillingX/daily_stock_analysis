@@ -276,11 +276,24 @@ def _md_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
 
 
-def _event_plans_view(intel: Any) -> List[Dict[str, Any]]:
-    """事件日历视图（issue #40）：日期/事件/可能结果/应对预案四列表格素材。
+def _event_plan_follow_note(plan: Any) -> str:
+    """事件核验表尾注按规则计划实际可用性披露（issue #68）。
 
-    date 经清洗；结果与预案是独立清单，数量不等时不逐项配对，
-    各自按原顺序编号（模板见 event_plans.j2）。
+    plan 维度正常完成时引用规则作战计划；未选择/失败/降级时如实说明本次
+    未生成有效规则计划，不提供替代交易点位，也不暗示不存在的计划。
+    """
+    if getattr(plan, "status", None) == "ok":
+        return "操作条件以报告规则作战计划为准。"
+    return "本报告未生成有效规则计划：事件核验/跟踪动作不含交易点位，也不提供替代交易指令。"
+
+
+def _event_plans_view(intel: Any) -> List[Dict[str, Any]]:
+    """事件日历视图（issue #40；issue #68 语义收敛）：日期/事件/可能结果/
+    研究核验跟踪四列表格素材。
+
+    date 经清洗；结果与核验动作是独立清单，数量不等时不逐项配对，
+    各自按原顺序编号（模板见 event_plans.j2）；独立交易指令已在采用边界
+    （_parse_intel）拒绝并写入 truncation_notes，此层只排版。
     """
     out = []
     for ev in getattr(intel, "event_calendar", []) or []:
@@ -600,6 +613,7 @@ def build_view(
         "ev_sensitivity": _ev_sensitivity(scenarios),
         "fin_snapshot": _fin_snapshot(fundamental),
         "event_plans": _event_plans_view(intel),
+        "event_plan_follow_note": _event_plan_follow_note(plan),
         "section_title": lambda key: section_title(manager, key),
         "section_narrative": lambda key: str((manager.get("section_narratives") or {}).get(key) or ""),
         "history_rows": _dedup_history_rows(history),

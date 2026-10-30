@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
@@ -33,7 +34,9 @@ from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import SharedContext, build_shared_context
 from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
+from src.deep_research_dims.dim_cache import quote_market_identity
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+from src.deep_research_dims.manager_writeup import DIRECTIVE_WORDS
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
 from src.deep_research_dims.history_dim import build_history_dim
@@ -169,9 +172,141 @@ def _bounded(text: Any, limit: int) -> str:
     return value[:limit] + "（内容超长，已截断）"
 
 
+# issue #68：情报动作/结果字段只允许研究核验/跟踪动作与事实描述。该检测
+# 复用经理指令拒绝词表，并加 T1 买卖编号——它们是情报任务旧契约下独立交易
+# 预案的标记。只用于 plans/outcomes/evidence_items 结构化条目，不用于事件
+# 标题以外的自由叙述（「券商维持增持、目标价29.4」等合法研报引用必须保留）。
+# 经理词表中的「增持/减持」（评级引用/股东行为语境）、「跌破/兑现/首批/退出」
+# （核验动作常见业务语境）不生效；补充「半仓/满仓」仓位指令词。
+# 评级引用豁免与引号风格无关（spec/standards 反例）：评级标签紧邻「评级/
+# 评分/rating」语境（之间只允许至多 4 个引号/标点/空白字符）时按引用豁免——
+# 维持买入评级、“买入”评级、"买入"评级 语义相同。豁免只遮蔽标签本身：同一
+# 文本其他位置的指令（执行"36元买入、仓位3%"）、无评级语境的裸标签
+# （若业绩超预期则"买入"）与非评级交易命令原样接受检测。「核验/若…则」
+# 等前缀不豁免指令。英文评级词（buy/sell 等）不在中文指令词表内，无需豁免。
+_PLAN_MANAGER_ONLY_WORDS = frozenset({"增持", "减持", "跌破", "兑现", "首批", "退出"})
+_PLAN_DIRECTIVE_WORDS = (
+    *(word for word in DIRECTIVE_WORDS if word not in _PLAN_MANAGER_ONLY_WORDS),
+    "半仓", "满仓", "T1-L", "T1-R", "T1-S1", "T1-SL",
+)
+_DIRECTIVE_PATTERNS = (r"[增减]持\s*[至到]\s*\d",)
+_RATING_LABEL_RE = re.compile(
+    "买入|卖出|增持|减持|中性|持有|推荐|看多|看空|回避"
+)
+# 标签与评级语境之间允许的间隔字符：引号/标点/空白（不含其他文字）。
+_RATING_CONTEXT_GAP_CHARS = "\"'“”‘’「」『』()（）[]【】《》、，。；：！？,.;:!?\t \n\r—…·-"
+_RATING_CONTEXT_MAX_GAP = 4
+_MASKED_CHAR = "▢"
+
+
+def _near_rating_context(value: str, start: int, end: int) -> bool:
+    """评级标签出现位置是否紧邻真实评级语境（标签与语境词间只允许间隔字符）。"""
+    cut = end
+    skipped = 0
+    while cut < len(value) and skipped < _RATING_CONTEXT_MAX_GAP and value[cut] in _RATING_CONTEXT_GAP_CHARS:
+        cut += 1
+        skipped += 1
+    tail = value[cut:]
+    if tail.startswith(("评级", "评分")) or tail[:6].lower().startswith("rating"):
+        return True
+    cut = start
+    skipped = 0
+    while cut > 0 and skipped < _RATING_CONTEXT_MAX_GAP and value[cut - 1] in _RATING_CONTEXT_GAP_CHARS:
+        cut -= 1
+        skipped += 1
+    head = value[:cut]
+    return head.endswith(("评级", "评分")) or head[-6:].lower().endswith("rating")
+
+
+def _mask_rating_citations(value: str) -> str:
+    """遮蔽「评级标签紧邻评级语境」的引用字符，供指令检测跳过。
+
+    评级引用是合法研报引用，豁免与引号风格无关；引号本身不是通行证——
+    引号内的指令与无评级语境的裸标签不在豁免范围，原样接受词表与模式检测。
+    """
+    spans = [
+        match.span()
+        for match in _RATING_LABEL_RE.finditer(value)
+        if _near_rating_context(value, match.start(), match.end())
+    ]
+    if not spans:
+        return value
+    masked = list(value)
+    for start, end in spans:
+        for index in range(start, end):
+            masked[index] = _MASKED_CHAR
+    return "".join(masked)
+
+
+def _directive_hit(text: Any) -> str:
+    """返回条目命中的第一个独立交易指令标记；无命中返回空串。
+
+    唯一引用例外：紧邻评级语境的评级标签（维持“买入”评级/维持买入评级/
+    维持"买入"评级）按评级引用豁免；其余全部文本（含引号内）走同一词表
+    与模式——引号不是交易指令通行证，不增加数字/语句变体解析规则。
+    """
+    value = str(text or "")
+    if not value:
+        return ""
+    masked = _mask_rating_citations(value)
+    for word in _PLAN_DIRECTIVE_WORDS:
+        if word in masked:
+            return word
+    for pattern in _DIRECTIVE_PATTERNS:
+        match = re.search(pattern, masked)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _normalize_slot_items(
+    raw: Any, slot: str, event_label: str, truncation_notes: List[str]
+) -> List[Optional[str]]:
+    """归一化事件 outcomes/plans 槽位为条目序列，返回列表中 None 表示该位置
+    条目无效（位置计数与原始响应一致）。
+
+    issue #68 真实报告反例（2026-10-30 飞凯材料授权实跑）：槽位契约是字符串
+    数组，但真实响应把整个槽位写成单个完整字符串——按序列处理会被按字符
+    拆散成伪条目、伪造「超出上限」丢弃披露，指令检测也被字符化绕过。归一化：
+    单个字符串是一条完整条目；字符串数组保持原序与既有上限语义；缺失/空
+    一致为空；错误容器/标量与非字符串成员不清洗成研究内容、不静默消失，
+    拒绝并随截断披露可见，也不拖垮整个研究。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, (list, tuple)):
+        normalized: List[Optional[str]] = []
+        for index, member in enumerate(raw):
+            if isinstance(member, str):
+                normalized.append(member)
+            else:
+                truncation_notes.append(
+                    f"事件「{event_label}」第 {index + 1} 条{slot}非字符串"
+                    f"（{type(member).__name__}），未采用"
+                )
+                normalized.append(None)
+        return normalized
+    truncation_notes.append(
+        f"事件「{event_label}」{slot}字段不是字符串或字符串数组"
+        f"（{type(raw).__name__}），未采用"
+    )
+    return []
+
+
 def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
     evidence: List[EvidenceItem] = []
+    truncation_notes: List[str] = []
     for raw in parsed.get("evidence_items") or []:
+        hit = _directive_hit(raw.get("evidence") if isinstance(raw, dict) else raw)
+        if hit:
+            # issue #68：夹带独立交易指令的证据条目在贝叶斯消费前拒绝并披露，
+            # 合法研报引用（含评级引用，与引号风格无关）保留。
+            truncation_notes.append(
+                f"证据条目含独立交易指令（命中「{hit}」），未采用，不进入贝叶斯证据链"
+            )
+            continue
         try:
             evidence.append(
                 EvidenceItem(
@@ -201,7 +336,6 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
             "persistence": _bounded(rc_raw.get("persistence"), _ROOT_CAUSE_LIMIT),
         }
     calendar = []
-    truncation_notes: List[str] = []
     dropped_events = 0
     for item in parsed.get("event_calendar") or []:
         if not isinstance(item, dict):
@@ -209,29 +343,75 @@ def _parse_intel(parsed: Dict[str, Any], steps: int) -> tuple[IntelDim, int]:
         if len(calendar) >= _CALENDAR_MAX:
             dropped_events += 1
             continue
-        raw_outcomes = item.get("outcomes") or []
-        raw_plans = item.get("plans") or []
         event_label = str(item.get("event") or "未知")[:30]
-        if len(raw_outcomes) > _OUTCOMES_MAX:
+        # issue #68（root 反例）：事件标题夹带独立交易指令时整个事件条目拒绝，
+        # 不清洗标题伪装成合规事件；合法事件标题（披露/解禁/会议等）不受影响。
+        event_hit = _directive_hit(item.get("event"))
+        if event_hit:
             truncation_notes.append(
-                f"事件「{event_label}」可能结果超出 {_OUTCOMES_MAX} 条上限，丢弃 {len(raw_outcomes) - _OUTCOMES_MAX} 条"
+                f"事件「{event_label}」标题含独立交易指令（命中「{event_hit}」），整个事件未采用；"
+                "操作条件以本报告规则作战计划为准"
             )
-        if len(raw_plans) > _PLANS_MAX:
+            continue
+        # issue #68 真实报告反例：槽位先归一化（单字符串=一条完整条目），
+        # 再做超限计数与指令检测，避免按字符拆散伪条目与伪造超限披露。
+        slot_plans = _normalize_slot_items(
+            item.get("plans"), "应对预案", event_label, truncation_notes
+        )
+        slot_outcomes = _normalize_slot_items(
+            item.get("outcomes"), "可能结果", event_label, truncation_notes
+        )
+        if len(slot_outcomes) > _OUTCOMES_MAX:
             truncation_notes.append(
-                f"事件「{event_label}」应对预案超出 {_PLANS_MAX} 条上限，丢弃 {len(raw_plans) - _PLANS_MAX} 条"
+                f"事件「{event_label}」可能结果超出 {_OUTCOMES_MAX} 条上限，丢弃 {len(slot_outcomes) - _OUTCOMES_MAX} 条"
+            )
+        if len(slot_plans) > _PLANS_MAX:
+            truncation_notes.append(
+                f"事件「{event_label}」应对预案超出 {_PLANS_MAX} 条上限，丢弃 {len(slot_plans) - _PLANS_MAX} 条"
+            )
+        # issue #68：预案槽位只采用研究核验/跟踪动作；结果槽位只采用事实性
+        # 可能结果。含独立交易指令（含 T1 买卖编号、仓位/止损类，及「核验」
+        # 前缀不豁免的指令）的条目在采用、缓存与派生证据之前拒绝并披露，
+        # 不复制进任何可执行字段。有效事件、结果与合规跟踪动作保留。
+        plans: List[str] = []
+        rejected_plans = 0
+        for position, raw_plan in enumerate(slot_plans[:_PLANS_MAX], start=1):
+            if raw_plan is None:
+                continue
+            hit = _directive_hit(raw_plan)
+            if hit:
+                rejected_plans += 1
+                truncation_notes.append(
+                    f"事件「{event_label}」第 {position} 条预案含独立交易指令（命中「{hit}」），"
+                    "未采用；事件应对为研究核验/跟踪动作，操作条件以本报告规则作战计划为准"
+                )
+                continue
+            plans.append(_bounded(raw_plan, _EVENT_ITEM_LIMIT))
+        outcomes: List[str] = []
+        rejected_outcomes = 0
+        for position, raw_outcome in enumerate(slot_outcomes[:_OUTCOMES_MAX], start=1):
+            if raw_outcome is None:
+                continue
+            hit = _directive_hit(raw_outcome)
+            if hit:
+                rejected_outcomes += 1
+                truncation_notes.append(
+                    f"事件「{event_label}」第 {position} 条可能结果含独立交易指令"
+                    f"（命中「{hit}」），未采用；仅保留事实性可能结果"
+                )
+                continue
+            outcomes.append(_bounded(raw_outcome, _EVENT_ITEM_LIMIT))
+        if rejected_plans or rejected_outcomes:
+            logger.warning(
+                "[DualTrack] 事件「%s」拒绝 %d 条独立交易预案、%d 条指令式结果（issue #68 契约）",
+                event_label, rejected_plans, rejected_outcomes,
             )
         calendar.append(
             {
                 "event": _bounded(item.get("event"), _EVENT_TEXT_LIMIT),
                 "date": _bounded(item.get("date"), _EVENT_DATE_LIMIT),
-                "outcomes": [
-                    _bounded(x, _EVENT_ITEM_LIMIT)
-                    for x in raw_outcomes[:_OUTCOMES_MAX]
-                ],
-                "plans": [
-                    _bounded(x, _EVENT_ITEM_LIMIT)
-                    for x in raw_plans[:_PLANS_MAX]
-                ],
+                "outcomes": outcomes,
+                "plans": plans,
             }
         )
     if dropped_events:
@@ -511,10 +691,15 @@ def _run_dual_track(
     context_dims = {"data", "technical", "capital", "fundamental", "sector", "six_dim", "scenarios"}
 
     def try_cache(dim_id: str) -> Optional[DimEnvelope]:
-        """命中未过期缓存则直接载入该维度（force_refresh 时跳过）。"""
+        """命中未过期缓存则直接载入该维度（force_refresh 时跳过）。
+
+        issue #68：intel 缓存读取须与本次已采用行情身份核对，变价/跨观测时点/
+        无行情混用一律 miss 重算；身份不足（None）不匹配任何记录。
+        """
         if force_refresh or dim_id not in CACHEABLE_DIMS or dim_id in context_dims:
             return None
-        payload = load_cached_dim(stock_code, dim_id)
+        identity = quote_market_identity(ctx.quote) if dim_id == "intel" else None
+        payload = load_cached_dim(stock_code, dim_id, quote_identity=identity)
         if payload is None:
             return None
         try:
@@ -535,13 +720,21 @@ def _run_dual_track(
         cache_exclude：按维度排除——如批量场景跳过情景维度（其叙述为空，固化后
         web 端缓存命中会拿到无叙述 payload）；可复用探索资料允许写入，
         行情派生维度每次按当前快照计算。
+        issue #68：intel 保存携带本报告已采用行情身份；身份不足时不落盘
+        （下次无法核验复用身份，宁重算不伪造），无行情记 absent 身份。
         """
         if not write_cache or run is not None and (run.stop_reason is not None or run.remaining() <= 0):
             return
         if cache_exclude and dim_id in cache_exclude:
             return
         if dim.status == "ok" and dim_id in CACHEABLE_DIMS and dim_id not in context_dims:
-            save_cached_dim(stock_code, dim_id, dim.model_dump())
+            identity = quote_market_identity(ctx.quote) if dim_id == "intel" else None
+            if dim_id == "intel" and identity is None:
+                logger.warning(
+                    "[DualTrack] 情报维度不落缓存：行情身份不足（有价但缺来源/观测时点），无法核验复用身份"
+                )
+                return
+            save_cached_dim(stock_code, dim_id, dim.model_dump(), quote_identity=identity)
 
     # ---- 阶段 0 + 前置 S2 ----
     _emit(progress_callback, {"type": "thinking", "step": 0, "message": "装配共享数据快照（行情/日线/基本面/历史）..."})
