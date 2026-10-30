@@ -16,13 +16,15 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional, Tuple, Callable, cast
 
 import pandas as pd
 
 from src.config import FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT, get_config, Config
+from src.scheduler import stop_requested as pipeline_stopped
 from src.storage import get_db
 from data_provider import DataFetcherManager
 from data_provider.base import normalize_stock_code
@@ -1617,6 +1619,11 @@ class StockAnalysisPipeline:
         """
         if not market:
             return
+        # issue #66：同一调用者的连续取数都受停止契约约束——指数取数后若已收到
+        # 停止，不再进入下一个无界 stats 调用。
+        if pipeline_stopped():
+            logger.debug("[market_overview] 停止后跳过大盘指数/统计取数")
+            return
         try:
             indices = self.fetcher_manager.get_main_indices(market) or []
         except Exception as exc:  # noqa: BLE001
@@ -1626,6 +1633,9 @@ class StockAnalysisPipeline:
             indices = []
         if indices:
             target_context["main_indices"] = list(indices)
+        if pipeline_stopped():
+            logger.debug("[market_overview] 停止后跳过 market_stats 取数")
+            return
         try:
             stats = self.fetcher_manager.get_market_stats(purpose=f"stock:{market}")
         except Exception as exc:  # noqa: BLE001
@@ -2889,6 +2899,11 @@ class StockAnalysisPipeline:
         Returns:
             AnalysisResult 或 None
         """
+        # issue #66：调度停止后不再开始新股票的任何取数/分析工作。
+        if pipeline_stopped():
+            logger.info(f"[{code}] 收到停止信号，本股票任务不再开始")
+            return None
+
         from src.core.market_policy import require_stock_market
         require_stock_market(code, self.config.enabled_markets)
 
@@ -3013,7 +3028,9 @@ class StockAnalysisPipeline:
 
         # === 批量预取实时行情（优化：避免每只股票都触发全量拉取）===
         # 只有股票数量 >= 5 时才进行预取，少量股票直接逐个查询更高效
-        if len(stock_codes) >= 5:
+        # issue #66：停止已到时不再启动预取；上一个预取期间收到停止时，
+        # 后续预取不再继续启动。
+        if len(stock_codes) >= 5 and not pipeline_stopped():
             prefetch_count = self.fetcher_manager.prefetch_realtime_quotes(stock_codes)
             if prefetch_count > 0:
                 logger.info(
@@ -3022,7 +3039,7 @@ class StockAnalysisPipeline:
 
         # Issue #455: 预取股票名称，避免并发分析时显示「股票xxxxx」
         # dry_run 仅做数据拉取，不需要名称预取，避免额外网络开销
-        if not dry_run:
+        if not dry_run and not pipeline_stopped():
             self.fetcher_manager.prefetch_stock_names(stock_codes, use_bulk=False)
 
         # 单股推送模式（#55）：从配置读取
@@ -3049,9 +3066,19 @@ class StockAnalysisPipeline:
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交任务
-            future_to_code = {
-                executor.submit(
+            # 提交任务（issue #66：收到所属调度停止后不再提交尚未执行的股票；
+            # 已提交但尚未开始的排队 Future 在收集侧取消，运行中的 I/O 不中断）
+            future_to_code: Dict[Any, str] = {}
+            for code in stock_codes:
+                if pipeline_stopped():
+                    logger.warning(
+                        f"收到停止信号，剩余 {len(stock_codes) - len(future_to_code)} 只股票不再开始"
+                    )
+                    break
+                # copy_context：把调度停止上下文（ContextVar）带入 executor 工作线程
+                # （与 src/deep_research_dims/context.py 既有提交模式一致）
+                future_to_code[executor.submit(
+                    copy_context().run,
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,
@@ -3059,13 +3086,19 @@ class StockAnalysisPipeline:
                     report_type=report_type,  # Issue #119: 传递报告类型
                     analysis_query_id=uuid.uuid4().hex,
                     current_time=resume_reference_time,
-                ): code
-                for code in stock_codes
-            }
+                )] = code
 
             # 收集结果
             for idx, future in enumerate(as_completed(future_to_code)):
                 code = future_to_code[future]
+                if pipeline_stopped():
+                    # 仅取消尚未运行的排队 Future（cancel() 返回 True 才是已取消）；
+                    # 已开始的在途 I/O 沿既有有界调用自然结束，不掩盖存活工作。
+                    for pending, pending_code in future_to_code.items():
+                        if pending.cancel():
+                            logger.info(
+                                f"[{pending_code}] 已停止：排队任务取消，不再开始"
+                            )
                 try:
                     result = future.result()
                     if result and result.success:
@@ -3083,7 +3116,11 @@ class StockAnalysisPipeline:
                         )
 
                     # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
-                    if idx < len(stock_codes) - 1 and analysis_delay > 0:
+                    if (
+                        idx < len(stock_codes) - 1
+                        and analysis_delay > 0
+                        and not pipeline_stopped()
+                    ):
                         # 注意：此 sleep 发生在“主线程收集 future 的循环”中，
                         # 并不会阻止线程池中的任务同时发起网络请求。
                         # 因此它对降低并发请求峰值的效果有限；真正的峰值主要由 max_workers 决定。
@@ -3091,6 +3128,8 @@ class StockAnalysisPipeline:
                         logger.debug(f"等待 {analysis_delay} 秒后继续下一只股票...")
                         time.sleep(analysis_delay)
 
+                except CancelledError:
+                    logger.info(f"[{code}] 排队任务已因停止信号取消，未开始")
                 except Exception as e:
                     logger.error(f"[{code}] 任务执行失败: {e}")
 

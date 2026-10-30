@@ -1,6 +1,7 @@
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight, FileSearch } from 'lucide-react';
 import type { AnalysisReport } from '../../types/analysis';
+import { Tooltip } from '../common/Tooltip';
 import { cn } from '../../utils/cn';
 
 /**
@@ -65,13 +66,11 @@ export function LongtrackSummaryCard({ report }: { report: AnalysisReport }) {
       {framework.dimensions?.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {framework.dimensions.map((d) => (
-            <span
-              key={d.dimension}
-              className="rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-muted-text"
-              title={`权重 ${(d.weight * 100).toFixed(0)}%`}
-            >
-              {d.dimension} {d.score.toFixed(0)}
-            </span>
+            <Tooltip key={d.dimension} content={`权重 ${(d.weight * 100).toFixed(0)}%`}>
+              <span className="rounded border border-white/10 px-1.5 py-0.5 text-[10px] text-muted-text">
+                {d.dimension} {d.score.toFixed(0)}
+              </span>
+            </Tooltip>
           ))}
         </div>
       )}
