@@ -13,6 +13,7 @@ import pytest
 
 from src.deep_research_dims.manager_writeup import (
     DIM_SECTION_KEYS,
+    PROTECTED_RESEARCH_SECTIONS,
     SECTION_FALLBACK_TITLES,
     _clean_title,
     _extract_json,
@@ -73,7 +74,9 @@ def test_manager_execution_blocks_never_reenter_any_rendered_outlet(instruction:
         assert instruction not in rendered
         assert "规则技术事实" in rendered
     assert not manager["title_angle"] and not manager["scenario_triggers"] and not manager["dim_verdicts"]
-    assert "technical" not in manager["section_titles"]
+    # issue #66 A.2：technical 标题不再由经理输出（含指令文本）决定，规则标题强制
+    assert manager["section_titles"]["technical"] == DIM_SECTION_KEYS["technical"]
+    assert manager["section_narratives"]["technical"] == "规则技术事实：现价31.92，量比1.5。"
     assert view["decision_matrix"][0]["price_range"] == "30 / 28"
     for prompt in prompts:
         assert "跌破31.3" not in prompt
@@ -307,20 +310,25 @@ class TestGenerateManagerWriteup:
         llm = _WaveLLM(fail_waves={"C"})
         out = generate_manager_writeup(llm, "贵州茅台", "600519", _dims(), [])
         assert out["title_angle"]
-        assert set(out["section_narratives"]) == set(SECTION_FALLBACK_TITLES)
+        # 受保护的 capital/technical 由资格链强制注入（dim 默认 ok，叙述为空）
+        assert set(out["section_narratives"]) == set(SECTION_FALLBACK_TITLES) | set(PROTECTED_RESEARCH_SECTIONS)
 
     def test_llm_down_returns_empty(self):
         out = generate_manager_writeup(_WaveLLM(raise_all=True), "贵州茅台", "600519", _dims(), [])
         # 决策表由规则作战计划生成（观察行），不依赖模型输出
         assert out["decision_matrix"] and out["decision_matrix"][0]["action"] == "观察"
         assert out["decision_matrix"][0]["price_range"] == "—"
+        # issue #66 A.2：capital/technical 标题由规则给出、正文复用研究员叙述（此处为空）
         assert {
             k: v for k, v in out.items() if k != "decision_matrix"
         } == {
             "title_angle": "",
             "executive_summary": "",
-            "section_titles": {"market": "盘面解读", "valuation": "估值锚从哪里来"},
-            "section_narratives": {"market": "", "valuation": ""},
+            "section_titles": {
+                "market": "盘面解读", "valuation": "估值锚从哪里来",
+                "technical": DIM_SECTION_KEYS["technical"], "capital": DIM_SECTION_KEYS["capital"],
+            },
+            "section_narratives": {"market": "", "valuation": "", "technical": "", "capital": ""},
             "thesis_points": [],
             "risk_matrix": [],
             "money_paths": [],
@@ -387,6 +395,17 @@ class TestRenderV2:
         assert validate_structure(md) == []
         assert "### 业务画像与竞争地位" in md
         assert "## 内容概括" not in md
+
+    def test_protected_section_heading_not_duplicated_when_opinion_equals_label(self):
+        """issue #66 followup：受保护节规则标题与节名相同时渲染单标题，
+        与节名不同的经理标题仍保留。"""
+        md = render_markdown(self._view(_MANAGER))
+        assert md.count("### 资金面分析") == 1
+        assert md.count("### 技术面分析") == 1
+        assert "资金面分析｜资金面分析" not in md
+        assert "技术面分析｜技术面分析" not in md
+        # 与节名不同的经理标题照常并列，抑制不扩大化
+        assert "### 业务画像与竞争地位｜品牌护城河完好，但数据盲区扩大" in md
 
     def test_degraded_dim_sanitized_in_report(self):
         dims = _dims()
@@ -914,6 +933,11 @@ def test_prose_rejects_any_directive_price_including_reused_plan_levels():
     dims["plan"] = dims["plan"].model_copy(
         update={"sniper_points": SniperPoints(ideal_buy=30.0, secondary_buy=28.0, stop_loss=24.0, take_profit=35.0)}
     )
+    # issue #66 A.2：capital/technical 正文由研究员叙述强制给出；经理文本（含
+    # 干净叙述）不再进入这两节，指令拒绝与干净叙述保留语义改在研究员叙述上验证。
+    dims["capital"] = dims["capital"].model_copy(
+        update={"narrative": "资金面正常描述：主力净流入，量比 1.5，现价 31.92。"}
+    )
     manager = {
         "thesis_points": [
             {"header": "定性论点", "body": "赔率不足，按作战计划触发条件执行，等待量能确认。"},
@@ -939,8 +963,8 @@ def test_prose_rejects_any_directive_price_including_reused_plan_levels():
     assert "路径乙" not in rendered  # 反例路径丢弃
     assert "路径甲" in rendered  # 定性路径保留
     assert "按作战计划触发条件执行" in rendered  # 定性论点保留
-    assert "量比 1.5" in rendered  # 无指令叙事不受影响
-    assert "MACD 金叉" not in rendered  # 技术节含执行价位 → 整节回退
+    assert "量比 1.5" in rendered  # 研究员资金叙述（干净）照常渲染
+    assert "MACD 金叉" not in rendered  # 技术节由研究员叙述强制，经理文本不进入
 
 
 def test_price_recognition_edges():

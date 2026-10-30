@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { AppPage, Badge, Button, Card, Collapsible, EmptyState, Loading, PageHeader } from '../components/common';
+import { Tooltip } from '../components/common/Tooltip';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
 import { StockAutocomplete } from '../components/StockAutocomplete';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
@@ -630,7 +631,7 @@ export default function TrendCompassPage() {
               title={lang === 'en' ? 'Action rewrite · hard-constraint rules' : '动作改写 · 硬约束规则'}
             >
               {/* 规则表出处（§4.5.2）留在 tooltip，界面不显示文档编号；原始 reason code 也仅在 hover 时可见 */}
-              <div title={lang === 'en' ? 'Hard-constraint table: plan §4.5.2' : '规则表出处：设计文档 §4.5.2'}>
+              <Tooltip content={lang === 'en' ? 'Hard-constraint table: plan §4.5.2' : '规则表出处：设计文档 §4.5.2'} className="w-full">
                 <div className="flex flex-wrap items-center gap-2 text-sm">
                   <span className="text-secondary-text">{lang === 'en' ? 'Draft: ' : '初稿动作：'}</span>
                   <span className={cn('rounded-lg border px-3 py-1', ACTION_CLASS[result.rewrite.initial_action])}>
@@ -699,7 +700,7 @@ export default function TrendCompassPage() {
                     .map(([k, v]) => `${k}=${v}`)
                     .join(' · ')}
                 </p>
-              </div>
+              </Tooltip>
             </Card>
           ) : null}
 

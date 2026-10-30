@@ -60,7 +60,7 @@ describe('SidebarNav', () => {
     expect(await screen.findByRole('link', { name: '选股' })).toHaveAttribute('href', '/screening');
   });
 
-  it('places screening directly after chat when AlphaSift is enabled', async () => {
+  it('orders visible navigation items with screening after supply chain when AlphaSift is enabled', async () => {
     mockGetAlphaSiftStatus.mockResolvedValueOnce({ enabled: true, available: false, installSpecIsDefault: false });
 
     render(
@@ -71,15 +71,22 @@ describe('SidebarNav', () => {
 
     await screen.findByRole('link', { name: '选股' });
     const hrefs = screen.getAllByRole('link').map((link) => link.getAttribute('href'));
-    // 当前 NAV_ITEMS 顺序：home / deep-research / policy-minesweeper / knowledge-base /
-    // chat / chanlun / zhengxi / supply-chain / screening / portfolio / decision-signals /
-    // backtest / alerts / usage / settings
-    expect(hrefs.slice(0, 5)).toEqual([
+    // 当前 NAV_ITEMS 可见顺序（SidebarNav.tsx）：chat/portfolio/decision-signals/
+    // backtest/alerts/zhengxi 按需求隐藏（路由保留、菜单不出现）
+    expect(hrefs).toEqual([
       '/',
+      '/trend-compass',
       '/deep-research',
+      '/fundamentals',
+      '/financial-analysis',
+      '/sector-analysis',
       '/policy-minesweeper',
       '/knowledge-base',
-      '/chat',
+      '/chanlun',
+      '/supply-chain',
+      '/screening',
+      '/usage',
+      '/settings',
     ]);
   });
 
@@ -101,7 +108,9 @@ describe('SidebarNav', () => {
     await waitFor(() => expect(mockGetAlphaSiftStatus.mock.calls.length).toBeGreaterThanOrEqual(2));
   });
 
-  it('shows the shared completion badge only when chat completion is pending', () => {
+  it('keeps the hidden chat completion badge out of the menu even when completion is pending', () => {
+    // chat 菜单入口按需求隐藏（路由保留）：completionBadge 无论真伪，
+    // 菜单中不得出现徽标或「A股分析有新消息」标签。
     completionBadgeState.value = true;
 
     const { rerender } = render(
@@ -110,8 +119,10 @@ describe('SidebarNav', () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByTestId('chat-completion-badge')).toBeInTheDocument();
-    expect(screen.getByLabelText('A股分析有新消息')).toBeInTheDocument();
+    expect(screen.queryByTestId('chat-completion-badge')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('A股分析有新消息')).not.toBeInTheDocument();
+    // 直接处于隐藏路由时也不误现
+    expect(screen.queryByRole('link', { name: 'A股分析' })).not.toBeInTheDocument();
 
     completionBadgeState.value = false;
     rerender(
@@ -136,28 +147,32 @@ describe('SidebarNav', () => {
     expect(screen.getByRole('button', { name: '切换主题(折叠)' })).toBeInTheDocument();
   });
 
-  it('renders the alerts navigation item and marks it active', () => {
+  it('keeps the hidden alerts route out of the menu even on its own route', () => {
+    // 告警入口按需求隐藏（路由保留）：菜单不出现，直接访问也不误现
     render(
       <MemoryRouter initialEntries={['/alerts']}>
         <SidebarNav />
       </MemoryRouter>,
     );
 
-    const alertsLink = screen.getByRole('link', { name: '告警' });
-    expect(alertsLink).toHaveAttribute('href', '/alerts');
-    expect(alertsLink).toHaveClass('font-medium');
+    expect(screen.queryByRole('link', { name: '告警' })).not.toBeInTheDocument();
+    expect(
+      screen.queryAllByRole('link').some((link) => link.getAttribute('href') === '/alerts')
+    ).toBe(false);
   });
 
-  it('renders the AI signals navigation item and marks it active', () => {
+  it('keeps the hidden AI signals route out of the menu even on its own route', () => {
+    // AI 建议入口按需求隐藏（路由保留）：菜单不出现，直接访问也不误现
     render(
       <MemoryRouter initialEntries={['/decision-signals']}>
         <SidebarNav />
       </MemoryRouter>,
     );
 
-    const signalsLink = screen.getByRole('link', { name: 'AI 建议' });
-    expect(signalsLink).toHaveAttribute('href', '/decision-signals');
-    expect(signalsLink).toHaveClass('font-medium');
+    expect(screen.queryByRole('link', { name: 'AI 建议' })).not.toBeInTheDocument();
+    expect(
+      screen.queryAllByRole('link').some((link) => link.getAttribute('href') === '/decision-signals')
+    ).toBe(false);
   });
 
   it('opens the logout confirmation and confirms logout', async () => {

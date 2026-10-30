@@ -3,6 +3,7 @@
 
 from datetime import datetime
 import sys
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -57,8 +58,9 @@ class SchedulerBackgroundTaskTestCase(unittest.TestCase):
             fake_thread = MagicMock()
             fake_thread.is_alive.return_value = False
 
-            def _make_thread(target=None, **kwargs):
-                fake_thread.start.side_effect = target
+            def _make_thread(target=None, args=(), **kwargs):
+                # issue #66 契约：任务线程经 copy_context().run 携带上下文启动
+                fake_thread.start.side_effect = lambda: target(*args)
                 return fake_thread
 
             with patch("src.scheduler.threading.Thread", side_effect=_make_thread):

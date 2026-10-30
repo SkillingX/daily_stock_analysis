@@ -18,8 +18,11 @@ import logging
 import os
 import re
 import signal
+import sys
 import threading
 import time
+import traceback
+from contextvars import ContextVar, copy_context
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -27,6 +30,22 @@ from typing import Any, Callable, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 TASK_TIMEOUT_SECONDS = 7200  # 2 hours
+# 收到停止后在途任务收尾的观察预算（秒）：仅用于诚实诊断，不等于进程强杀；
+# 超预算时保留存活任务身份与线程栈，不伪称全部退出。
+SHUTDOWN_OBSERVE_SECONDS = 30.0
+
+# issue #66：停止意图属于当前 Scheduler 实例（Event 持有在 GracefulShutdown 上），
+# 经 ContextVar 随任务线程（copy_context）传入在途工作；独立 Scheduler 实例/API
+# 路径互不影响，新建实例也不会清除旧 worker 持有的旧 Event 引用。
+current_stop_event: ContextVar[Optional[threading.Event]] = ContextVar(
+    "scheduler_stop_event", default=None
+)
+
+
+def stop_requested() -> bool:
+    """当前工作上下文是否收到所属 Scheduler 的停止意图（无调度上下文时为 False）。"""
+    event = current_stop_event.get()
+    return bool(event is not None and event.is_set())
 
 
 class GracefulShutdown:
@@ -37,8 +56,7 @@ class GracefulShutdown:
     """
 
     def __init__(self) -> None:
-        self.shutdown_requested: bool = False
-        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
 
         # 注册信号处理器
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -46,16 +64,19 @@ class GracefulShutdown:
 
     def _signal_handler(self, signum: Any, frame: Any) -> None:
         """信号处理函数"""
-        with self._lock:
-            if not self.shutdown_requested:
-                logger.info(f"收到退出信号 ({signum})，等待当前任务完成...")
-                self.shutdown_requested = True
+        if not self._stop_event.is_set():
+            logger.info(f"收到退出信号 ({signum})，等待当前任务完成...")
+            self._stop_event.set()
 
     @property
     def should_shutdown(self) -> bool:
         """检查是否应该退出"""
-        with self._lock:
-            return self.shutdown_requested
+        return self._stop_event.is_set()
+
+    @property
+    def stop_event(self) -> threading.Event:
+        """本实例的停止 Event（随任务上下文传播）。"""
+        return self._stop_event
 
 
 class Scheduler:
@@ -104,6 +125,7 @@ class Scheduler:
         self._named_task_start_time: Dict[str, float] = {}
         self._single_task_running: bool = False
         self._single_task_start_time: float = 0.0
+        self._single_task_thread: Optional[threading.Thread] = None
         self._running = False
 
     def set_daily_task(
@@ -197,16 +219,33 @@ class Scheduler:
         """在后台线程中执行单任务模式，不阻塞调度器主循环。"""
         if self._task_callback is None:
             return
+        # issue #66：停止后不再派发新任务（run_pending 一批多个到点任务时，
+        # 第一个派发期间收到停止，后续回调不再进入）。
+        if self.shutdown_handler.should_shutdown:
+            logger.info("收到停止信号，跳过本次单任务派发。")
+            return
 
         if self._single_task_running:
             elapsed = time.time() - self._single_task_start_time
             if elapsed > TASK_TIMEOUT_SECONDS:
+                thread = self._single_task_thread
+                if thread is not None and thread.is_alive():
+                    # issue #66：超龄且线程仍存活时保留运行标记并跳过本次触发——
+                    # 不得因超龄清理守卫导致同一任务重复派发。
+                    logger.warning(
+                        "单任务已超时（运行 %.1fs > %ds），任务线程 %s 仍存活，跳过本次触发",
+                        elapsed,
+                        TASK_TIMEOUT_SECONDS,
+                        thread.name,
+                    )
+                    return
+                # 真正已结束（线程不存在/已结束）的遗留标记可恢复，不永久卡住。
                 logger.warning(
-                    "单任务已超时（运行 %.1fs > %ds），清理守卫后重新执行",
+                    "单任务运行标记已超时（%.1fs）且线程已结束，清理守卫后重新执行",
                     elapsed,
-                    TASK_TIMEOUT_SECONDS,
                 )
                 self._single_task_running = False
+                self._single_task_start_time = 0.0
             else:
                 logger.info("单任务已在执行中，跳过本次触发。")
                 return
@@ -222,6 +261,11 @@ class Scheduler:
             return
 
         def _wrapped() -> None:
+            # issue #66：任务线程显式绑定本实例停止 Event（不依赖派发线程上下文，
+            # 直接 Scheduler().set_daily_task(..., run_immediately=True) 等公开入口
+            # 同样生效）；其余上下文变量随 copy_context 原样保留。
+            token = current_stop_event.set(self.shutdown_handler.stop_event)
+            self._single_task_thread = threading.current_thread()
             try:
                 logger.info("=" * 50)
                 logger.info(
@@ -237,14 +281,17 @@ class Scheduler:
             except Exception as e:
                 logger.exception(f"定时任务执行失败: {e}")
             finally:
+                current_stop_event.reset(token)
                 self._single_task_running = False
                 self._single_task_start_time = 0.0
 
         thread = threading.Thread(
-            target=_wrapped,
+            target=copy_context().run,
+            args=(_wrapped,),
             daemon=True,
             name="scheduler-single-task",
         )
+        self._single_task_thread = thread
         thread.start()
 
     def add_daily_task(
@@ -310,15 +357,28 @@ class Scheduler:
         callback = self._daily_task_callbacks.get(name)
         if callback is None:
             return
+        # issue #66：停止后不再派发新任务（独立实例的 Event 不受影响）。
+        if self.shutdown_handler.should_shutdown:
+            logger.info("收到停止信号，跳过定时任务 [%s] 派发。", name)
+            return
 
         if name in self._running_named_tasks:
             elapsed = time.time() - self._named_task_start_time.get(name, 0)
             if elapsed > TASK_TIMEOUT_SECONDS:
+                # issue #66：超龄且线程仍存活时保留任务身份（不得重复派发同一任务）。
+                thread = self._named_task_threads.get(name)
+                if thread is not None and thread.is_alive():
+                    logger.warning(
+                        "定时任务 [%s] 已超时（运行 %.1fs > %ds），任务线程 %s 仍存活，跳过本次触发",
+                        name,
+                        elapsed,
+                        TASK_TIMEOUT_SECONDS,
+                        thread.name,
+                    )
+                    return
                 logger.warning(
-                    "定时任务 [%s] 已超时（运行 %.1fs > %ds），清理守卫后重新执行",
+                    "定时任务 [%s] 运行标记已超时且线程已结束，清理守卫后重新执行",
                     name,
-                    elapsed,
-                    TASK_TIMEOUT_SECONDS,
                 )
                 self._running_named_tasks.discard(name)
                 self._named_task_threads.pop(name, None)
@@ -331,6 +391,8 @@ class Scheduler:
         self._named_task_start_time[name] = time.time()
 
         def _wrapped() -> None:
+            # issue #66：显式绑定本实例停止 Event（公开入口直接触发同样生效）。
+            token = current_stop_event.set(self.shutdown_handler.stop_event)
             try:
                 logger.info("=" * 50)
                 logger.info(
@@ -350,12 +412,14 @@ class Scheduler:
             except Exception as e:
                 logger.exception("定时任务 [%s] 执行失败: %s", name, e)
             finally:
+                current_stop_event.reset(token)
                 self._running_named_tasks.discard(name)
                 self._named_task_threads.pop(name, None)
                 self._named_task_start_time.pop(name, None)
 
         thread = threading.Thread(
-            target=_wrapped,
+            target=copy_context().run,
+            args=(_wrapped,),
             daemon=True,
             name=f"scheduler-task-{name}",
         )
@@ -406,21 +470,31 @@ class Scheduler:
         worker = entry.get("thread")
         if worker is not None and worker.is_alive():
             return False
+        # issue #66：停止后不再派发后台任务（独立实例的 Event 不受影响）。
+        if self.shutdown_handler.should_shutdown:
+            logger.info(
+                "收到停止信号，跳过后台任务 [%s] 派发。", entry.get("name")
+            )
+            return False
 
         def _runner() -> None:
+            # issue #66：后台任务线程同样显式绑定本实例停止 Event。
+            token = current_stop_event.set(self.shutdown_handler.stop_event)
             try:
                 logger.info("后台任务开始执行: %s", entry["name"])
                 entry["task"]()
             except Exception as exc:
                 logger.exception("后台任务执行失败 [%s]: %s", entry["name"], exc)
             finally:
+                current_stop_event.reset(token)
                 entry["running"] = False
                 entry["thread"] = None
 
         entry["last_run"] = time.time()
         entry["running"] = True
         worker = threading.Thread(
-            target=_runner,
+            target=copy_context().run,
+            args=(_runner,),
             daemon=True,
             name=f"scheduler-bg-{entry['name']}",
         )
@@ -449,24 +523,107 @@ class Scheduler:
         """
         运行调度器主循环
 
-        阻塞运行，直到收到退出信号
+        阻塞运行，直到收到退出信号。退出时区分「调度循环结束」与「全部工作
+        结束」：在途任务沿其自身有界调用自然收尾（锁释放/终态由任务回调的
+        finally 完成），本方法只做有预算的观察与诚实诊断，不伪称全部退出。
         """
         self._running = True
         logger.info("调度器开始运行...")
         logger.info(f"下次执行时间: {self._get_next_run_time()}")
 
-        while self._running and not self.shutdown_handler.should_shutdown:
-            self._refresh_daily_schedule_if_needed()
-            self.schedule.run_pending()
-            self._run_background_tasks()
-            self._write_heartbeat()
-            time.sleep(30)  # 每30秒检查一次
+        token = current_stop_event.set(self.shutdown_handler.stop_event)
+        try:
+            while self._running and not self.shutdown_handler.should_shutdown:
+                self._refresh_daily_schedule_if_needed()
+                self.schedule.run_pending()
+                self._run_background_tasks()
+                self._write_heartbeat()
+                # Event.wait：停止信号即刻唤醒，替代切片 sleep（每30秒检查一次）
+                self.shutdown_handler.stop_event.wait(30.0)
 
-            # 每小时打印一次心跳
-            if datetime.now().minute == 0 and datetime.now().second < 30:
-                logger.info(f"调度器运行中... 下次执行: {self._get_next_run_time()}")
+                # 每小时打印一次心跳
+                if datetime.now().minute == 0 and datetime.now().second < 30:
+                    logger.info(f"调度器运行中... 下次执行: {self._get_next_run_time()}")
+        finally:
+            current_stop_event.reset(token)
 
-        logger.info("调度器已停止")
+        logger.info("调度器循环已结束，等待在途任务收尾...")
+        if self._drain_active_tasks(SHUTDOWN_OBSERVE_SECONDS):
+            # 本实例已登记任务（单/多任务、后台任务）均已结束；进程退出仍须确认
+            # （main 另有未登记的 fire-and-forget 线程，不在本实例句柄内）。
+            logger.info(
+                "调度器已停止：本实例已登记任务均已结束，进程退出仍须确认"
+            )
+        else:
+            logger.warning(
+                "调度器循环已结束，但观察预算（%.0fs）内仍有任务未收尾；"
+                "以下为存活任务身份与线程栈证据（不代表进程已退出，也不代表任务已终止）",
+                SHUTDOWN_OBSERVE_SECONDS,
+            )
+            self._log_surviving_tasks()
+
+    def _active_task_threads(self) -> List[threading.Thread]:
+        """当前在途任务线程快照（单任务/多任务/后台任务；仅本实例句柄）。"""
+        threads: List[threading.Thread] = []
+        single = self._single_task_thread
+        if single is not None and single.is_alive():
+            threads.append(single)
+        # 稳定快照：命名任务线程在收尾时由 wrapper 自行移除，这里只取当次快照
+        threads.extend(
+            thread for thread in list(self._named_task_threads.values())
+            if thread.is_alive()
+        )
+        for entry in self._background_tasks:
+            worker = entry.get("thread")
+            if worker is not None and worker.is_alive():
+                threads.append(worker)
+        return threads
+
+    def _drain_active_tasks(self, observe_seconds: float) -> bool:
+        """在观察预算内等待在途任务线程自然收尾；返回是否全部完成。
+
+        超时只产生诊断信息（见 run()），不中断线程、不清理运行标记、不伪称退出。
+        每次重新计算剩余预算与快照，线程结束后立即返回。
+        """
+        deadline = time.monotonic() + max(0.0, observe_seconds)
+        while True:
+            threads = self._active_task_threads()
+            if not threads:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            for thread in threads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=min(0.5, remaining))
+
+    def _log_surviving_tasks(self) -> None:
+        """记录未收尾任务的身份与线程栈（诚实诊断；不宣称进程/任务已退出）。"""
+        frames = sys._current_frames()
+        for thread in self._active_task_threads():
+            ident = thread.ident
+            if ident is None:
+                # 线程标识不可用（未启动/已结束）：如实说明，不伪造栈或身份。
+                logger.warning(
+                    "存活任务线程 name=%s ident=None daemon=%s（线程标识不可用，未获取到该线程栈）",
+                    thread.name, thread.daemon,
+                )
+                continue
+            frame = frames.get(ident)
+            if frame is None:
+                # 线程恰在本轮快照后结束：如实说明，不用调用者栈冒充 worker 栈。
+                logger.warning(
+                    "存活任务线程 name=%s ident=%s daemon=%s（未获取到该线程栈，状态已变化）",
+                    thread.name, ident, thread.daemon,
+                )
+                continue
+            stack = "".join(traceback.format_stack(frame)[:20])
+            logger.warning(
+                "存活任务线程 name=%s ident=%s daemon=%s\n%s",
+                thread.name, ident, thread.daemon, stack,
+            )
 
     def _write_heartbeat(self) -> None:
         """Write a heartbeat file so external monitors can detect liveness."""
@@ -504,8 +661,13 @@ class Scheduler:
         return "未设置"
 
     def stop(self) -> None:
-        """停止调度器"""
+        """停止调度器
+
+        issue #66：除退出循环外同步设置本实例停止 Event——在途协作工作可见
+        停止意图，主循环的 Event.wait 即刻唤醒。
+        """
         self._running = False
+        self.shutdown_handler._signal_handler("stop", None)
 
 
 def run_with_schedule(
@@ -541,6 +703,9 @@ def run_with_schedule(
         schedule_time_provider=schedule_time_provider,
         heartbeat_path=heartbeat_path,
     )
+    # issue #66：各任务 wrapper 在其工作线程内显式绑定本实例停止 Event（覆盖
+    # run_immediately 立即执行与公开入口），Scheduler.run() 为循环线程绑定同一
+    # Event——无需在此对外层线程整体绑定。
     for entry in background_tasks or []:
         scheduler.add_background_task(
             task=entry["task"],

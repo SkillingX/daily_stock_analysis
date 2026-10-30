@@ -126,6 +126,23 @@ def qualified_manager_writeup(manager: Dict[str, Any], dims: Mapping[str, Any]) 
         if evidence is not None:
             result["section_narratives"][section] = evidence.narrative
             result["section_titles"][section] = SECTION_FALLBACK_TITLES[section]
+    # issue #66 A.2：已完成单轮研究的维度正文/标题/小计不由经理输出决定。
+    # dim 非 ok 时沿用上方 status 过滤（研究员无叙述、经理文本本就不会通过），
+    # 不把真实缺失/degraded 改写成有效结论。
+    verdicts = result.setdefault("dim_verdicts", {})
+    for section in PROTECTED_RESEARCH_SECTIONS:
+        evidence = dims.get(section)
+        if evidence is None or getattr(evidence, "status", None) != "ok":
+            continue
+        result["section_narratives"][section] = evidence.narrative
+        result["section_titles"][section] = DIM_SECTION_KEYS[section]
+        verdict_key = _PROTECTED_VERDICT_KEYS[section]
+        verdict = _protected_dim_verdict(dims, verdict_key)
+        if verdict:
+            verdicts[verdict_key] = verdict
+        else:
+            # 六维框架缺席时不留经理旧小计（避免「缺数据」类旧定性残留）。
+            verdicts.pop(verdict_key, None)
     for key in ("title_angle", "executive_summary"):
         if _prose_carries_directive(result.get(key, "")):
             result[key] = ""
@@ -155,6 +172,22 @@ DIM_SECTION_KEYS: Dict[str, str] = {
 }
 
 ALL_SECTION_KEYS: List[str] = list(SECTION_FALLBACK_TITLES) + list(DIM_SECTION_KEYS)
+
+# issue #66 A.2：capital/technical 已由研究员完成单轮结构化研究，终稿不再要求
+# 经理重写这两节；正文直接复用研究员叙述、标题用规则标题、小计用六维框架规则
+# 摘要，fake/过期的经理字段（含旧段落、旧标题、旧小计）一律不覆盖。
+PROTECTED_RESEARCH_SECTIONS: tuple[str, ...] = ("capital", "technical")
+
+# 经理实际成文的节（受保护节不进波 A 标题契约与波 C 叙述契约）
+MANAGER_SECTION_KEYS: List[str] = [
+    key for key in ALL_SECTION_KEYS if key not in PROTECTED_RESEARCH_SECTIONS
+]
+MANAGER_DIM_SECTION_KEYS: List[str] = [
+    key for key in DIM_SECTION_KEYS if key not in PROTECTED_RESEARCH_SECTIONS
+]
+
+# 受保护节 → 评分表小计（dim_verdicts 键）与六维框架维度的对应关系
+_PROTECTED_VERDICT_KEYS: Dict[str, str] = {"technical": "技术面", "capital": "资金面"}
 
 _STYLE_RULES = (
     "写作规范（必须遵守）：\n"
@@ -189,8 +222,110 @@ _STYLE_RULES = (
 )
 
 
-def _dump(obj: Any, limit: int = 5000) -> str:
-    return json.dumps(obj, ensure_ascii=False, default=str)[:limit]
+# issue #66：终稿输入按字段感知投影组织，替代整个 JSON 硬截字符串。历史
+# `_dump` 对整个 JSON 取前 5000 字符：前部长业务资料（含旧新闻摘录）挤掉后部
+# 维度（资金/技术完全未发出），且截断点产生非法 JSON。
+#
+# 投影规则（不做递归字典/键顺序剪枝，核心字段保留不依赖键序）：
+# - 信封、全部标量字段（含 0/负数/False/None）与叙述完整保留；只有超长字符串
+#   限量并显式标注截断；
+# - retained_facts（可追溯工具事实）全部保留：生产者基数有限（research_run
+#   每维度封顶 30 条），条目整体保留全部身份键（tool/label/value/source/
+#   period/unit/qualification），不做条数或条内剪枝——核心保留不依赖条目顺序；
+# - retained_evidence（检索参考资料）作为辅助摘录单独限量：snippet 限量，
+#   tool/title/url/source/published_date 完整保留，省略如实标注；
+# - 其余结构化字段保留全部键；仅列表条数限量并按路径如实标注省略。
+# 最终消息由构造保证是完整合法 JSON，不设总长硬切、不设第二压缩档。
+_NARRATIVE_LIMIT = 1200          # 研究叙述（已完成单轮结论）
+_FIELD_STRING_LIMIT = 400        # 一般字段字符串
+_EVIDENCE_ITEMS = 3              # 参考资料摘录保留条数
+_EVIDENCE_SNIPPET_LIMIT = 200    # 参考资料摘录正文上限
+_LIST_ITEMS = 8                  # 一般列表字段保留条数
+
+
+def _bounded_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"…[输入截断，共{len(value)}字]"
+
+
+def _bounded_structured(
+    value: Any, omissions: Dict[str, str], path: str
+) -> Any:
+    """结构化字段投影：保留全部键与标量（含 0/False/None），仅长字符串限量、
+    列表条数限量并按路径如实标注省略；不按键序剪枝。"""
+    if isinstance(value, str):
+        return _bounded_text(value, _FIELD_STRING_LIMIT)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        if len(value) > _LIST_ITEMS:
+            omissions[path] = f"共{len(value)}条，仅保留前{_LIST_ITEMS}条，其余省略"
+        return [
+            _bounded_structured(item, omissions, path)
+            for item in value[:_LIST_ITEMS]
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _bounded_structured(
+                item, omissions, f"{path}.{key}" if path else key
+            )
+            for key, item in value.items()
+        }
+    return _bounded_text(str(value), _FIELD_STRING_LIMIT)
+
+
+def _bounded_evidence(records: List[Any]) -> tuple[List[Any], int]:
+    """检索参考资料（支撑摘录）单独限量：snippet 限量，其余身份键完整保留。"""
+    kept = []
+    for record in records[:_EVIDENCE_ITEMS]:
+        if isinstance(record, dict):
+            kept.append({
+                key: (
+                    _bounded_text(str(item), _EVIDENCE_SNIPPET_LIMIT)
+                    if key == "snippet"
+                    else item
+                )
+                for key, item in record.items()
+            })
+        else:
+            kept.append(_bounded_text(str(record), _EVIDENCE_SNIPPET_LIMIT))
+    return kept, max(0, len(records) - _EVIDENCE_ITEMS)
+
+
+def _bounded_dim_payload(dim_key: str, dim: Any) -> Dict[str, Any]:
+    """单维度有界载荷：信封+核心标量+叙述+可追溯事实完整，支撑摘录单独限量。"""
+    payload = dim.model_dump(mode="json") if hasattr(dim, "model_dump") else dict(dim)
+    omissions: Dict[str, str] = {}
+    entry: Dict[str, Any] = {}
+    for field, value in payload.items():
+        if field in ("retained_evidence", "retained_facts", "narrative"):
+            continue
+        entry[field] = _bounded_structured(value, omissions, field)
+    entry["narrative"] = _bounded_text(str(payload.get("narrative") or ""), _NARRATIVE_LIMIT)
+    facts = payload.get("retained_facts") or []
+    if facts:
+        # 可追溯事实全部保留（生产者基数有限且每条身份键完整；核心保留不依赖
+        # 条目顺序，晚位记录如支撑/阻力同样完整到达）。
+        entry["retained_facts"] = facts
+    evidence, evidence_omitted = _bounded_evidence(payload.get("retained_evidence") or [])
+    if evidence:
+        entry["retained_evidence"] = evidence
+    if evidence_omitted:
+        omissions["retained_evidence"] = f"共{evidence_omitted + _EVIDENCE_ITEMS}条，仅保留前{_EVIDENCE_ITEMS}条摘录，其余省略"
+    if omissions:
+        entry["_omissions"] = omissions
+    entry.setdefault("dim", dim_key)
+    return entry
+
+
+def _protected_dim_verdict(dims: Mapping[str, Any], verdict_key: str) -> str:
+    """受保护节的小计取六维框架同维度规则摘要（≤40字），与评分表引用同一事实。"""
+    framework = getattr(dims.get("six_dim"), "framework", None)
+    for dimension in (framework.dimensions if framework else []):
+        if getattr(dimension, "dimension", None) == verdict_key and dimension.indicators:
+            return _clean_dim_verdicts({verdict_key: dimension.indicators[0].summary}).get(verdict_key, "")
+    return ""
 
 
 _EXPERT_PERSONA_PATH = os.path.join(
@@ -352,11 +487,13 @@ def _call_wave(
 ) -> Dict[str, Any]:
     from src.llm.attempt import ENTRY_MANAGER_WRITEUP, attempt_scope
 
+    # issue #66：出站消息整体 json.dumps（各维度已在 facts 构建层有界），不再对
+    # 完整 JSON 做字符串硬截——历史上 [:5000] 会产生非法 JSON 并挤掉后部维度。
     with attempt_scope(ENTRY_MANAGER_WRITEUP, wave):
         resp = llm_adapter.call_text(
             [
                 {"role": "system", "content": system},
-                {"role": "user", "content": _dump(facts)},
+                {"role": "user", "content": json.dumps(facts, ensure_ascii=False, default=str)},
             ],
             temperature=0.4,
             timeout=timeout,
@@ -369,6 +506,63 @@ def _call_wave(
 
         refine_attempt_parse_error()
     return parsed
+
+
+def _research_digest(dims: Dict[str, Any], keys: tuple[str, ...], narrative_limit: int) -> Dict[str, Any]:
+    """已完成研究维度的有界摘要：状态、实际时点、全部标量、可追溯事实与叙述。
+
+    波 A/波 B 的标题、概括与主干解释引用同一份已完成事实（issue #66 A.2），
+    不能因缺少注入而声称已完成维度「缺少数据/行情缺失」。事实条目（含来源/
+    时点/单位/资格）全部保留，生产者基数有限，不做条数限量；嵌套
+    结构化明细（如分产品逐条）不进入摘要，仍由波 C 有界载荷携带。
+    """
+    digest: Dict[str, Any] = {}
+    for key in keys:
+        dim = dims.get(key)
+        if dim is None or getattr(dim, "status", None) != "ok":
+            continue
+        payload = dim.model_dump(mode="json") if hasattr(dim, "model_dump") else dict(dim)
+        entry: Dict[str, Any] = {
+            "status": payload.get("status"),
+            "as_of": payload.get("as_of_date") or payload.get("as_of"),
+        }
+        reserved = {
+            "dim", "status", "as_of", "degraded_reason",
+            "retained_evidence", "retained_facts", "narrative",
+        }
+        for field, value in payload.items():
+            if field in reserved:
+                continue
+            if isinstance(value, (bool, int, float)) or value is None:
+                entry[field] = value
+            elif isinstance(value, str):
+                entry[field] = _bounded_text(value, _FIELD_STRING_LIMIT)
+        facts = payload.get("retained_facts") or []
+        if facts:
+            # 完整身份元组全部保留（A/B 需要来源/时点/单位/资格，晚位记录不丢）。
+            entry["retained_facts"] = facts
+        narrative = str(payload.get("narrative") or "")
+        if narrative:
+            entry["narrative"] = _bounded_text(narrative, narrative_limit)
+        digest[key] = entry
+    return digest
+
+
+def _market_digest(dims: Dict[str, Any]) -> Dict[str, Any]:
+    """盘面核心标量（现价/年线偏离/52周距离），供概括引用当前行情。"""
+    data = dims.get("data")
+    if data is None:
+        return {}
+    price_position = getattr(getattr(data, "perspective", None), "price_position", None)
+    entry: Dict[str, Any] = {
+        "status": getattr(data, "status", None),
+        "current_price": getattr(price_position, "current_price", None),
+        "ma250_deviation_pct": getattr(data, "ma250_deviation_pct", None),
+        "distance_from_52w_high_pct": getattr(data, "distance_from_52w_high_pct", None),
+    }
+    if getattr(data, "narrative", ""):
+        entry["narrative"] = _bounded_text(data.narrative, 400)
+    return entry
 
 
 def _wave_a_facts(
@@ -410,6 +604,14 @@ def _wave_a_facts(
             "本报告无目标价，采用非估值分析：不给目标价/预期收益/胜率估计，"
             "不写估值驱动买卖建议；结论表述为观察与条件跟踪。" if nonvaluation else ""
         ),
+        # issue #66 A.2：已完成研究员结论（状态/时点/核心字段/叙述）注入波 A，
+        # 标题、概括与小计引用同一事实；capital/technical 标题由规则给出。
+        "completed_research": {
+            **_research_digest(
+                dims, tuple(DIM_SECTION_KEYS), narrative_limit=600
+            ),
+            "market": _market_digest(dims),
+        },
         "guardrail_count": len(guardrail_events),
         "guardrail_rules": [getattr(e, "rule_id", "") for e in guardrail_events],
     }
@@ -418,21 +620,39 @@ def _wave_a_facts(
 def _wave_b_facts(
     stock_name: str, stock_code: str, dims: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """主干四节：信号/结论/计划/情景/贝叶斯/数据/消息全量事实。"""
+    """主干四节：信号/结论/计划/情景/贝叶斯/数据/消息有界事实 + 受保护研究摘要。"""
     keys = ("signal", "conclusion", "plan", "scenarios", "bayesian", "data", "intel")
-    return {
+    facts: Dict[str, Any] = {
         "stock": f"{stock_name}（{stock_code}）",
-        "dims": {k: dims[k].model_dump() for k in keys if k in dims},
+        "dims": {
+            k: _bounded_dim_payload(k, dims[k])
+            for k in keys
+            if k in dims
+        },
     }
+    # 主干解释若引用技术/资金，必须与已完成研究同源（issue #66 A.2）。
+    protected = _research_digest(
+        dims, PROTECTED_RESEARCH_SECTIONS, narrative_limit=600
+    )
+    market = _market_digest(dims)
+    if market:
+        protected["market"] = market
+    if protected:
+        facts["completed_research"] = protected
+    return facts
 
 
 def _wave_c_facts(
     stock_name: str, stock_code: str, dims: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """七维度节：对应研究员维度事实。"""
+    """维度节事实：每个待成文维度有界载荷；受保护维度不再重写。"""
     return {
         "stock": f"{stock_name}（{stock_code}）",
-        "dims": {k: dims[k].model_dump() for k in DIM_SECTION_KEYS if k in dims},
+        "dims": {
+            k: _bounded_dim_payload(k, dims[k])
+            for k in MANAGER_DIM_SECTION_KEYS
+            if k in dims
+        },
     }
 
 
@@ -489,17 +709,20 @@ def generate_manager_writeup(
         + nonvaluation_rule
     )
 
-    # 波 A：标题定调 + 内容概括 + 全部节标题
+    # 波 A：标题定调 + 内容概括 + 经理所辖节标题（capital/technical 标题由规则给出）
     try:
         parsed = _call_wave(
             llm_adapter,
             base_system
+            + "\n\ncompleted_research 是各研究员已完成的结论（含状态、实际时点、核心字段与叙述）；"
+            "title_angle、executive_summary 与 dim_verdicts 必须与这些已完成事实一致，"
+            "禁止对已完成维度声称「缺少数据/行情缺失」；capital/technical 两节的标题与小计由系统按规则给出，无需输出。"
             + "\n\n输出 JSON 契约：{\"title_angle\": \"…(≤25字定性短语)\", "
             "\"executive_summary\": \"…(150-250字，按：定性→判断公式→成立条件→跟踪清单 四句式)\", "
             "\"section_titles\": {"
-            + ", ".join(f'\"{k}\": \"…\"' for k in ALL_SECTION_KEYS)
+            + ", ".join(f'\"{k}\": \"…\"' for k in MANAGER_SECTION_KEYS)
             + "}, \"dim_verdicts\": {"
-            "\"基本面\": \"…(≤30字小计定性)\", \"消息面\": \"…\", \"资金面\": \"…\", \"情绪面\": \"…\", \"技术面\": \"…\", \"宏观\": \"…\"}}",
+            "\"基本面\": \"…(≤30字小计定性)\", \"消息面\": \"…\", \"情绪面\": \"…\", \"宏观\": \"…\"}}",
             _wave_a_facts(stock_name, stock_code, dims, guardrail_events),
             wave="wave_a_title_summary",
         )
@@ -507,7 +730,7 @@ def generate_manager_writeup(
         out["executive_summary"] = _clean_narrative(parsed.get("executive_summary"))[:600]
         titles = parsed.get("section_titles")
         if isinstance(titles, dict):
-            for k in ALL_SECTION_KEYS:
+            for k in MANAGER_SECTION_KEYS:
                 t = _clean_title(titles.get(k))
                 if t:
                     out["section_titles"][k] = t
@@ -546,20 +769,20 @@ def generate_manager_writeup(
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DualTrack] 经理终稿波B失败: %s", exc)
 
-    # 波 C：七维度节叙事
+    # 波 C：维度节叙事（capital/technical 已完成研究，不再要求经理重写）
     try:
         parsed = _call_wave(
             llm_adapter,
             base_system
             + "\n\n输出 JSON 契约：{\"section_narratives\": {"
-            + ", ".join(f'\"{k}\": \"…(150-300字四段式论述)\"' for k in DIM_SECTION_KEYS)
+            + ", ".join(f'\"{k}\": \"…(150-300字四段式论述)\"' for k in MANAGER_DIM_SECTION_KEYS)
             + "}}",
             _wave_c_facts(stock_name, stock_code, dims),
             wave="wave_c_dim_sections",
         )
         narratives = parsed.get("section_narratives")
         if isinstance(narratives, dict):
-            for k in DIM_SECTION_KEYS:
+            for k in MANAGER_DIM_SECTION_KEYS:
                 n = _clean_narrative(narratives.get(k))
                 if len(n) >= 30:
                     out["section_narratives"][k] = n

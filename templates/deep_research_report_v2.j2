@@ -272,7 +272,7 @@
 {% for s in dim_sections %}
 <!-- dim:{{ s.id }} -->
 {% set opinion = manager.get('section_titles', {}).get(s.id) %}
-### {{ s.label }}{% if opinion %}｜{{ opinion }}{% endif %}
+### {{ s.label }}{% if opinion and opinion != s.label %}｜{{ opinion }}{% endif %}
 
 {{ dim_links(s.id) }}
 {% set narr = section_narrative(s.id) %}

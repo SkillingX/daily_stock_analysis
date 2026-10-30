@@ -1475,29 +1475,67 @@ def main() -> int:
                                     exc2,
                                 )
 
+                        from src.scheduler import stop_requested
+
                         if analysis_run:
                             _, analyzed_history_refs = analysis_run
-                            threads = []
+                            spawned = 0
                             for code, history_query_id in analyzed_history_refs:
+                                # issue #66：每次后台报告衍生前都检查停止意图；
+                                # 停止后不再产生新的后台工作。
+                                if stop_requested():
+                                    logger.warning(
+                                        "[SerenityAsync] 收到停止信号，剩余 %d 个后台报告不再派生",
+                                        len(analyzed_history_refs) - spawned,
+                                    )
+                                    break
                                 t = threading.Thread(
                                     target=_spawn_serenity_for_stock,
                                     args=(code, history_query_id),
                                     daemon=True,
                                 )
-                                threads.append(t)
                                 t.start()
-                            logger.info(
-                                "[SerenityAsync] 已启动 %d 个后台线程（主任务不等待）",
-                                len(threads),
-                            )
+                                spawned += 1
+                            if spawned:
+                                logger.info(
+                                    "[SerenityAsync] 已启动 %d 个后台线程（主任务不等待）",
+                                    spawned,
+                                )
 
-                        task_repo.save(
-                            task_name="watchlist_analysis",
-                            scheduled_at=scheduled_at,
-                            status="success",
-                            started_at=scheduled_at,
-                            finished_at=datetime.now(),
-                        )
+                        if stop_requested():
+                            # 真实终态：本轮被停止打断，不伪称全部成功。
+                            task_repo.save(
+                                task_name="watchlist_analysis",
+                                scheduled_at=scheduled_at,
+                                status="partial",
+                                started_at=scheduled_at,
+                                finished_at=datetime.now(),
+                                detail={
+                                    "stop_requested": True,
+                                    "note": "收到调度停止信号：未开始的股票与重试不再执行；在途工作已按有界调用收尾",
+                                },
+                            )
+                        elif analysis_run is None:
+                            # 真实终态（reader 要求）：无停止信号但整体执行失败
+                            # （run_full_analysis 返回 None）不得记为 success。
+                            task_repo.save(
+                                task_name="watchlist_analysis",
+                                scheduled_at=scheduled_at,
+                                status="failed",
+                                started_at=scheduled_at,
+                                finished_at=datetime.now(),
+                                detail={
+                                    "error": "run_full_analysis 未产出结果（详见运行日志）",
+                                },
+                            )
+                        else:
+                            task_repo.save(
+                                task_name="watchlist_analysis",
+                                scheduled_at=scheduled_at,
+                                status="success",
+                                started_at=scheduled_at,
+                                finished_at=datetime.now(),
+                            )
                     except Exception as exc:
                         logger.exception(
                             "watchlist_analysis 定时任务执行失败: %s", exc
