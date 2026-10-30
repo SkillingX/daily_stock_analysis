@@ -513,7 +513,7 @@ def _research_digest(dims: Dict[str, Any], keys: tuple[str, ...], narrative_limi
 
     波 A/波 B 的标题、概括与主干解释引用同一份已完成事实（issue #66 A.2），
     不能因缺少注入而声称已完成维度「缺少数据/行情缺失」。事实条目（含来源/
-    时点/单位/资格）整体保留全部身份键，仅按条数限量并如实标注省略；嵌套
+    时点/单位/资格）全部保留，生产者基数有限，不做条数限量；嵌套
     结构化明细（如分产品逐条）不进入摘要，仍由波 C 有界载荷携带。
     """
     digest: Dict[str, Any] = {}
@@ -722,7 +722,7 @@ def generate_manager_writeup(
             "\"section_titles\": {"
             + ", ".join(f'\"{k}\": \"…\"' for k in MANAGER_SECTION_KEYS)
             + "}, \"dim_verdicts\": {"
-            "\"基本面\": \"…(≤30字小计定性)\", \"消息面\": \"…\", \"资金面\": \"…\", \"情绪面\": \"…\", \"技术面\": \"…\", \"宏观\": \"…\"}}",
+            "\"基本面\": \"…(≤30字小计定性)\", \"消息面\": \"…\", \"情绪面\": \"…\", \"宏观\": \"…\"}}",
             _wave_a_facts(stock_name, stock_code, dims, guardrail_events),
             wave="wave_a_title_summary",
         )

@@ -2680,9 +2680,33 @@ class DataFetcherManager:
     def _get_main_indices_with_budget(self, region: str, deadline: float) -> List[Dict[str, Any]]:
         from src.scheduler import stop_requested
 
+        # issue #66 PR 复审 P2：先行 TickFlow 派发前同样受停止/预算门禁——继承的
+        # request_deadline 已过期时不得启动任何先行源（含 SDK 源）。
+        if stop_requested():
+            logger.warning(
+                "[指数行情] 收到停止信号，跳过全部数据源（局部隔离，不影响其他数据）"
+            )
+            return []
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[指数行情] 共享预算已用尽，跳过全部数据源（局部隔离，不影响其他数据）"
+            )
+            return []
+
         if region == "cn":
             tickflow_fetcher = self._get_tickflow_fetcher()
             if tickflow_fetcher is not None:
+                # 源选择（懒初始化）期间停止/预算可能变化：SDK 调用前复查。
+                if stop_requested():
+                    logger.warning(
+                        "[指数行情] 收到停止信号，跳过先行数据源（局部隔离，不影响其他数据）"
+                    )
+                    return []
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "[指数行情] 共享预算已用尽，跳过先行数据源（局部隔离，不影响其他数据）"
+                    )
+                    return []
                 try:
                     data = cast(
                         List[Dict[str, Any]],
@@ -2752,11 +2776,42 @@ class DataFetcherManager:
     def _get_market_stats_with_budget(self, purpose: str, deadline: float) -> Dict[str, Any]:
         from src.scheduler import stop_requested
 
+        # issue #66 PR 复审 P2：与 _get_main_indices_with_budget 相同——先行
+        # TickFlow 派发前受停止/预算门禁；源选择后、SDK 调用前复查。
+        if stop_requested():
+            logger.warning(
+                "[MarketStats] component=market_stats action=stopped purpose=%s "
+                "detail=停止后不启动先行源（局部隔离，不影响其他数据）",
+                purpose,
+            )
+            return {}
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "[MarketStats] component=market_stats action=budget_exhausted purpose=%s "
+                "detail=预算耗尽不启动先行源（局部隔离，不影响其他数据）",
+                purpose,
+            )
+            return {}
+
         logger.info(
             "[MarketStats] component=market_stats action=start purpose=%s", purpose
         )
         tickflow_fetcher = self._get_tickflow_fetcher()
         if tickflow_fetcher is not None:
+            if stop_requested():
+                logger.warning(
+                    "[MarketStats] component=market_stats action=stopped_leading "
+                    "purpose=%s detail=源选择期间收到停止，跳过先行源（局部隔离）",
+                    purpose,
+                )
+                return {}
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[MarketStats] component=market_stats action=budget_exhausted_leading "
+                    "purpose=%s detail=源选择期间预算耗尽，跳过先行源（局部隔离）",
+                    purpose,
+                )
+                return {}
             started_at = time.monotonic()
             try:
                 data = cast(Dict[str, Any], tickflow_fetcher.get_market_stats())

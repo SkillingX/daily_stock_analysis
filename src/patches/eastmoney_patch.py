@@ -34,6 +34,14 @@ class AuthCache:
 _cache = AuthCache()
 
 
+class ScheduledStopRequested(requests.RequestException):
+    """调度停止后拦截新出站请求时抛出（仅抑制新派发，不影响在途读取的既有预算）。
+
+    与研究取消（ResearchStopped）分类相互独立：所属调度上下文无停止 Event 时
+    不抛出，独立 API/非调度请求不受影响。
+    """
+
+
 class PatchSign:
     def __init__(self):
         self.patched = False
@@ -146,6 +154,9 @@ def _get_nid(user_agent):
             _cache.expire_at = int(now) + _cache.ttl
             return nid
         except requests.exceptions.RequestException as e:
+            if isinstance(e, ScheduledStopRequested):
+                # 任务停止不是供应商授权失败，不得写共享失败缓存。
+                raise
             logger.warning(f"请求东方财富授权接口失败: {e}")
             _cache.data = None
             # 该接口请求失败时，方案可能已失效，后续大概率会继续失败，因无法成功获取，下次会继续请求，设置较长过期时间，可避免频繁请求
@@ -198,6 +209,18 @@ def eastmoney_patch(*, budget_only: bool = False) -> None:
             run = current_research.get()
             if run is not None:
                 run.check()
+            # issue #66 PR 复审 P2：候选内部的新 HTTP 派发同样受所属调度停止
+            # Event 约束（在途请求不中断，沿既有有界读取收尾）。
+            from src.scheduler import stop_requested
+            if stop_requested():
+                logger.warning(
+                    "[HTTP边界] component=eastmoney_patch action=stop_suppressed "
+                    "method=%s detail=调度停止后不派发新出站请求",
+                    method,
+                )
+                raise ScheduledStopRequested(
+                    "scheduler stop requested; new HTTP dispatch suppressed"
+                )
             deadline = request_deadline.get()
             if deadline is not None and deadline <= time.monotonic():
                 raise requests.Timeout("fundamental request deadline exhausted")
@@ -225,6 +248,17 @@ def eastmoney_patch(*, budget_only: bool = False) -> None:
                     kwargs["timeout"] = min(float(configured), remaining) if isinstance(configured, (int, float)) else remaining
             if run is not None:
                 run.check()
+            # auth/throttle 之后、真正派发前的停止复查：auth 阶段（网络授权 +
+            # 随机暂停）期间到达的停止同样不得出站。
+            if stop_requested():
+                logger.warning(
+                    "[HTTP边界] component=eastmoney_patch action=stop_suppressed_after_auth "
+                    "method=%s detail=auth/throttle 后派发前复查停止意图",
+                    method,
+                )
+                raise ScheduledStopRequested(
+                    "scheduler stop requested; HTTP dispatch suppressed after auth/throttle"
+                )
             return request_before_patch(self, method, url, **kwargs)
 
         requests.Session.request = patched_request  # type: ignore[assignment]

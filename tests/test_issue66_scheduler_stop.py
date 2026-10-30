@@ -225,22 +225,23 @@ def test_index_budget_covers_fallback_chain_and_isolates(
 
 
 class _StopDuringCallFetcher(_LocalFetcher):
-    """首个候选执行期间收到停止并返回空结果（模拟 root_market_stop_probe 反例
-    形态）：stop Event 在先行源返回前被 set，且结果为空以进入 fallback 选择——
-    旧实现（仅预算检查）会继续请求下一候选，本回归以此击穿。"""
+    """首个候选 HTTP 已出站后、候选收尾前收到停止并返回空结果（模拟 root 反例
+    形态）：真实在途请求沿有界读取收尾，结果为空以进入 fallback 选择——停止后
+    的一切新派发（下一候选及候选内部请求）由共享边界/候选检查拦截，本回归以此
+    击穿旧实现（仅预算检查）。"""
 
     def __init__(self, name: str, path: str, stop_event: threading.Event):
         super().__init__(name, path)
         self._stop_event = stop_event
 
     def get_main_indices(self, region: str = "cn") -> Optional[List[dict]]:
-        self._stop_event.set()
-        super().get_main_indices(region)  # 真实 HTTP 出站后返回空 → 进入 fallback
+        super().get_main_indices(region)  # 真实 HTTP 出站（在途工作）后返回空
+        self._stop_event.set()  # 候选收尾前收到停止 → 进入 fallback 选择
         return None
 
     def get_market_stats(self) -> Optional[dict]:
-        self._stop_event.set()
         super().get_market_stats()
+        self._stop_event.set()
         return None
 
 
