@@ -1333,6 +1333,57 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
             retained_facts=facts,
             concept_membership=adopt_concept_membership(ctx),
         )
+    if "capital" in selected:
+        # issue #71：取消早于资金研究员启动时，阶段 0 早批已取得的合格资金块
+        # （manager 侧已登记进 ctx）同样随中断报告留存——零新增出站，只做既有
+        # tool-result 投影 + 标量抽取，不重跑资格门、不触发跨源验证。
+        # 已取得的合格市值标量（ctx.field_meta 既有 get_stock_info 记录）同理
+        # 留存：资格/来源/实际日期/单位币种原样随行，不因缺资金块或已有降级
+        # 资金维度而丢失；此处只做中断组装内的局部投影，不改冻结的 ctx/run。
+        from src.core.research_run import retained_tool_facts
+        fundamental = (getattr(ctx, "fundamental", None) or {})
+        same_security = getattr(ctx, "stock_code", None) == stock_code
+        capital_facts: list[dict[str, str]] = []
+        flow_block = fundamental.get("capital_flow")
+        if isinstance(flow_block, dict) and same_security and flow_block.get("data", {}).get("stock_flow"):
+            from src.agent.tools.data_tools import _capital_flow_tool_result
+            capital_facts = retained_tool_facts("get_capital_flow", _capital_flow_tool_result(stock_code, flow_block))
+        cap_meta = fundamental.get("field_meta") or {}
+        cap_records = {}
+        for key in ("total_mv", "circ_mv"):
+            record = cap_meta.get(key)
+            if isinstance(record, dict) and record.get("value") is not None \
+                    and record.get("rule_eligible") and not record.get("normalization_error"):
+                cap_records[key] = record
+        if cap_records and same_security:
+            capital_facts += retained_tool_facts(
+                "get_stock_info",
+                {**{key: record["value"] for key, record in cap_records.items()}, "field_meta": cap_records},
+            )
+        if capital_facts:
+            if "capital" not in dims:
+                dims["capital"] = DIM_MODELS["capital"](
+                    status="degraded",
+                    degraded_reason=run.reason_text,
+                    retained_facts=capital_facts,
+                )
+            else:
+                # 已有资金维度（研究员半程被停）：本地追加/去重同源事实，
+                # 不改动 run.dimensions 里的冻结模型实例。
+                payload = dims["capital"].model_dump()
+                existing_facts = payload.get("retained_facts") or []
+                payload["retained_facts"] = [
+                    *existing_facts,
+                    *(fact for fact in capital_facts if fact not in existing_facts),
+                ][-30:]
+                dims["capital"] = parse_dim("capital", payload)
+    if "sector" in selected and "sector" not in dims:
+        # issue #71：取消前已取得的正式 iFinD 行业随中断报告留存——复用既有纯
+        # sector 构建器投影（真实来源/级别/截止日期，分类版本未回显按未知），
+        # 仅状态改降级；无行业提示时维持 generic 降级，不编造行业或评分。
+        sector_dim = build_sector_dim(ctx)
+        if sector_dim.sector_hint:
+            dims["sector"] = sector_dim.model_copy(update={"status": "degraded", "degraded_reason": run.reason_text})
     for dim_id in ACTIVE_DIM_IDS:
         if dim_id not in dims:
             dims[dim_id] = DIM_MODELS[dim_id](

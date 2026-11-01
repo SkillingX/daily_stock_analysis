@@ -110,7 +110,7 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default_value": "false", "options": [], "validation": {}, "display_order": 14,
     },
     "FINANCIAL_PRIMARY_SOURCE": {
-        "title": "当前财务主数据源", "description": "仅六项当前财务快照。choice保持原主源；ifind需Choice策略和ENABLE_IFIND_MCP=true，最新有效财期内优先iFinD，Choice补缺/核验。年报、估值及资金仍用Choice。修改后重启进程。",
+        "title": "当前财务主数据源", "description": "当前财务快照（六字段+同财期资产负债）、当前估值/市值、正式申万行业与个股资金窗口按此主源取数；choice保持原主源，ifind需Choice策略和ENABLE_IFIND_MCP=true，合格iFinD优先、Choice补缺/兜底；四比率按已批准的P1语义以iFinD公布值参与单源财务分析（调整口径未知显式标注、未独立核验、不参与跨源核验/比较）。年报与机构目标价仍走Choice；资金窗口交易日历以本地严格交易日历为准，不以Choice登录兜底。Choice原生10001009后同一报告内不再重复登录。修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "select",
         "is_sensitive": False, "is_required": False, "is_editable": False,
         "default_value": "choice", "options": [{"value": "choice", "label": "Choice 优先"}, {"value": "ifind", "label": "iFinD 优先"}],

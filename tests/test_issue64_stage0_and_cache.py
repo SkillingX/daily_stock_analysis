@@ -74,7 +74,7 @@ def test_cache_version_bumped_to_15_and_ownership_uncacheable() -> None:
     )
 
     assert SCHEMA_VERSION == 15
-    assert FUNDAMENTAL_MAPPING_VERSION == 20
+    assert FUNDAMENTAL_MAPPING_VERSION == 21  # issue #71：同财期资产负债/iFinD 估值与行业进共享上下文
     assert "ownership" not in CACHEABLE_DIMS
 
 

@@ -1568,6 +1568,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             self._ensure_supply_chain_deep_dive_column()  # [v3 PR-C]
             self._ensure_supply_chain_trace_id_column()  # 方案 C：Serenity 报告关联分析 query_id
             self._ensure_news_intel_source_columns()  # P3
+            self._ensure_fundamental_snapshot_columns()  # issue #71：旧库缺 as_of_date 时读取必然失败
             self._ensure_schema_migration_record()
             self._ensure_knowledge_base_fts()
 
@@ -1853,6 +1854,58 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                     column,
                     exc,
                 )
+
+    def _ensure_fundamental_snapshot_columns(self) -> None:
+        """issue #71：兼容缺 ``as_of_date`` 列的旧 ``fundamental_snapshot`` 表。
+
+        部署库建表先于该列引入；ORM 全列 SELECT 因此 OperationalError，读取
+        fail-open。这里沿用既有 startup ensure-column 惯例：nullable 列 + 索引，
+        幂等；历史行 ``as_of`` 保持 NULL，禁止任何从 payload 文本或 created_at
+        推断历史财期的回填（scripts/migrate_fundamental_snapshot_as_of_20260708.py
+        的 main 含该启发式，不得在生产执行）。新装用户走 create_all 自动建列。
+        """
+        if not self._is_sqlite_engine or self._engine is None:
+            return
+        try:
+            inspector = inspect(self._engine)
+            existing_columns = {
+                column["name"] for column in inspector.get_columns("fundamental_snapshot")
+            }
+        except Exception as exc:
+            logger.warning(
+                "[FundamentalSnapshot] failed to inspect columns; "
+                "skipping best-effort as_of_date column backfill: %s",
+                exc,
+            )
+            return
+
+        if "as_of_date" not in existing_columns:
+            try:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "ALTER TABLE fundamental_snapshot ADD COLUMN as_of_date VARCHAR(10)"
+                    )
+                logger.info("[FundamentalSnapshot] best-effort ADD COLUMN as_of_date VARCHAR(10) OK")
+            except Exception as exc:
+                logger.warning(
+                    "[FundamentalSnapshot] best-effort ADD COLUMN as_of_date failed: %s",
+                    exc,
+                )
+        try:
+            existing_indexes = {
+                index["name"] for index in inspect(self._engine).get_indexes("fundamental_snapshot")
+            }
+            if "ix_fundamental_snapshot_as_of" not in existing_indexes:
+                with self._engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "CREATE INDEX IF NOT EXISTS ix_fundamental_snapshot_as_of "
+                        "ON fundamental_snapshot (as_of_date)"
+                    )
+        except Exception as exc:
+            logger.warning(
+                "[FundamentalSnapshot] best-effort ensure as_of_date index failed: %s",
+                exc,
+            )
 
     @classmethod
     def get_instance(cls) -> "DatabaseManager":

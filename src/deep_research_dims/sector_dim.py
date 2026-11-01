@@ -7,7 +7,7 @@ from typing import Optional
 
 from src.deep_research_dims.context import SharedContext
 from src.deep_research_dims.industry_base_rate import lookup_base_rate
-from src.schemas.deep_research_dims import SectorDim
+from src.schemas.deep_research_dims import RetainedFact, SectorDim
 
 
 def _score_policy_lean(lean: Optional[str]) -> Optional[float]:
@@ -52,6 +52,27 @@ def build_sector_dim(
     available = [s for s in score_parts if s is not None]
     sector_score = round(sum(available) / len(available), 2) if available else None
 
+    # issue #71：正式 iFinD 行业的来源/级别/截止日期溯源进入维度事实与叙述；
+    # 分类版本未回显按未知如实标注，不把请求文本中的版本写成返回事实。
+    industry_record = (ctx.fundamental.get("research") or {}).get("industry_ifind") or {}
+    retained_facts: list[RetainedFact] = []
+    provenance_note = ""
+    if (isinstance(industry_record, dict) and industry_record.get("name")
+            and hint == str(industry_record["name"]).strip() and not industry_record.get("errors")):
+        retained_facts.append(RetainedFact(
+            tool="industry_ifind",
+            label="正式申万行业",
+            value=f"{industry_record['name']}（级别 {industry_record.get('level') or '未知'}，代码 {industry_record.get('code') or '未回显'}）",
+            source="ifind",
+            period=str(industry_record.get("as_of") or ""),
+            qualification="单源事实；分类版本未回显，按未知处理；未独立核验",
+        ))
+        provenance_note = (
+            f"行业来源：iFinD 申万{industry_record.get('level') or '未知'}"
+            f"（截至 {industry_record.get('as_of') or '未知'}，分类版本未回显"
+            + ("，行业代码未回显）" if not industry_record.get("code") else "）；")
+        )
+
     return SectorDim(
         status="ok" if hint else "degraded",
         degraded_reason=None if hint else "所属行业未取得，不能用公司名代替板块",
@@ -62,8 +83,10 @@ def build_sector_dim(
         rankings={},
         data_gaps=gaps,
         sector_score=sector_score,
+        retained_facts=retained_facts,
         narrative=(
             f"板块「{hint or '未识别'}」：政策倾向 {policy_lean or '未知'}，行业基率 {base_rate}（{basis}）；"
             f"板块得分 {sector_score or '缺数据'}。"
+            + (f" {provenance_note}" if provenance_note else "")
         ),
     )

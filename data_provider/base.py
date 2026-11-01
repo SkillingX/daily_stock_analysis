@@ -639,27 +639,92 @@ _CHOICE_GROWTH_INDICATORS = {
     "net_profit_yoy": "YOYPNI",
 }
 
+# issue #71：合格 iFinD 估值覆盖主值后，对应 Choice 估值指标省去出站。
+_CHOICE_VALUATION_INDICATORS = {
+    "pe_ratio": "PETTM",
+    "pb_ratio": "PB",
+    "total_mv": "MV",
+}
+
+
+def _qualified_ifind_balance(balance_readings: Dict[str, Any], period: Optional[str]) -> Optional[Dict[str, Any]]:
+    """同财期、合并报表(调整)、同币种、单位/日期齐备的 iFinD 资产负债才装配。
+
+    资产与负债必须同时合格且币种一致；任一缺失或混币种保持缺口披露，
+    不拼半个资产负债结构，也不为装配结果虚构币种标签。
+    """
+    if not period:
+        return None
+    from data_provider.cross_source_validator import _CURRENCY_MARKERS, AnchorReading, reading_input_reasons
+
+    readings: list[AnchorReading] = []
+    for field in ("assets", "liabilities"):
+        reading = balance_readings.get(field)
+        if (reading is None or reading.period != period
+                or reading.statement_scope != "consolidated" or reading.adjustment != "restated"
+                or reading.unit != "currency_base" or reading.currency not in _CURRENCY_MARKERS
+                or reading_input_reasons(reading, field)):
+            return None
+        readings.append(reading)
+    assets, liabilities = readings
+    if assets.currency != liabilities.currency:
+        return None
+    disclosed = next((reading.disclosed_at for reading in readings if reading.disclosed_at), None)
+    return {"assets": assets.value, "liabilities": liabilities.value, "period": period,
+            "disclosed_at": disclosed, "source": "ifind", "currency": assets.currency, "unit": "currency_base",
+            "statement_scope": "consolidated", "adjustment": "restated"}
+
 
 def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ...]:
     """Omit each qualified iFinD growth field from Choice; unqualified fields stay.
 
     Uses the same qualification gate as snapshot selection, so a field omitted
     here can never later be dropped as unqualified by select_current_financials.
-    """
-    from data_provider.cross_source_validator import _eligible_current_financial
 
-    return tuple(
+    issue #71 P1：省查决定与选择保证一致——已批准的公布值比率仅在其财期等于
+    iFinD 全体合格（annual/YTD）读数的最大财期、且存在严格 protected 字段锚定
+    本次 Choice 快照（Choice 无法前移丢弃已省查的 P1）时才省去；无严格锚定时
+    保守保留 Choice 查询（更新期 Choice 必须保留其所需比率）。旧期 P1 候选不授
+    旧期保护例外。最大财期以同一资格谓词在 iFinD 侧就地取（不调用
+    ``select_current_financials``——该入口消费合并后的双侧读数，而省查时 Choice
+    读数尚未取得，时序上不可复用）；一致性由迁移测试的 manager/transport
+    矩阵锁定。
+    """
+    from data_provider.cross_source_validator import _eligible_current_financial, p1_single_source_eligible
+
+    omissions = tuple(
         indicator
         for field, indicator in _CHOICE_GROWTH_INDICATORS.items()
         if _eligible_current_financial(readings.get(field), field)
     )
+    p1_fields = ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")
+    # 当前财期投票者仅限实际合格读数（严格 OR 已批准 P1）——未合格/未来候选不得投票
+    eligible_periods = [reading.period for field, reading in readings.items()
+                        if reading is not None and reading.period is not None
+                        and (_eligible_current_financial(reading, field)
+                             or p1_single_source_eligible(reading, field))]
+    overall_period = max(eligible_periods) if eligible_periods else None
+    # 严格锚 = 任一严格合格字段（金额/比率均算）——锚存在时 Choice 无法前移丢弃已省查的 P1
+    has_strict_anchor = any(
+        _eligible_current_financial(readings.get(field), field) for field in _CHOICE_GROWTH_INDICATORS
+    )
+    if overall_period and has_strict_anchor:
+        omissions = omissions + tuple(
+            _CHOICE_GROWTH_INDICATORS[field] for field in p1_fields
+            if p1_single_source_eligible(readings.get(field), field)
+            and readings[field].period == overall_period
+        )
+    return omissions
 
 
 def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True) -> Dict[str, Any]:
     """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。
 
     失败不再静默：供应商、操作与原因记入 errors，随 research 一路保留
-    （issue #51），且不影响已取得的财务或概念结果。
+    （issue #51），且不影响已取得的财务或概念结果。取消/停止不是供应商
+    失败（issue #71）：可选查询抛出的 ResearchStopped 就地截停——已取得
+    的可选资料照常随块返回，停止后不再发起后续可选出站，聚合继续落位
+    已完成的估值/财务/行业/资金事实，停止原因由 run 自身状态真实承载。
     """
     from data_provider.cross_source_validator import SourceReadError
     from data_provider.ifind_fundamental_adapter import IfindFetcher
@@ -669,7 +734,13 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     omitted: list[str] = []
     payload: Dict[str, Any] = {}
     errors: list[str] = []
-    if time.monotonic() >= deadline:
+    run = current_research.get()
+
+    def _out_of_budget() -> bool:
+        """与调用点同一停止语义：过期或已停止都不再发起可选出站。"""
+        return time.monotonic() >= deadline or bool(run and (run.stop_reason or run.finalized))
+
+    if _out_of_budget():
         return {"omit": ()}
     try:
         products = fetcher.product_segments(code, period, deadline=deadline)
@@ -680,7 +751,9 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
             errors.append(f"ifind:products:{','.join(products.errors)}")
     except SourceReadError as exc:
         errors.append(f"ifind:products:{exc.reason_code}")
-    if time.monotonic() >= deadline:
+    except ResearchStopped:
+        pass
+    if _out_of_budget():
         payload["omit"] = tuple(omitted)
         if errors:
             payload["errors"] = errors
@@ -700,6 +773,8 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
             errors.append(f"ifind:holders:{','.join(holders.errors)}")
     except SourceReadError as exc:
         errors.append(f"ifind:holders:{exc.reason_code}")
+    except ResearchStopped:
+        pass
     payload["omit"] = tuple(omitted)
     if errors:
         payload["errors"] = errors
@@ -1084,6 +1159,7 @@ class DataFetcherManager:
         """生成基本面缓存 key（包含预算分桶以避免低预算结果污染高预算请求）。
 
         issue #64：范围位（sf）隔离深研（无行业榜/股东）与其他消费者的缓存。
+        财务主源策略已进入 ``data_source_contract``（-primary-ifind-v1），不在此重复。
         """
         normalized_code = normalize_stock_code(stock_code)
         if budget_seconds is None:
@@ -3094,7 +3170,13 @@ class DataFetcherManager:
                     reading = replace(reading, is_stale=True)
                 from data_provider.cross_source_validator import AnchorQuality
                 quality = AnchorQuality.model_validate_json(json.dumps(record.get("quality") or {}))
-                metadata[field] = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
+                rebuilt = adopted_field_record(field, reading, quality, selection_reason=record.get("selection_reason", "primary"))
+                if record.get("source_errors"):
+                    # issue #71/R10：字段级来源失败/拒绝证据（如 Choice 失败 + iFinD
+                    # 拒绝原因）是字段诊断的一部分，块重建不丢弃；值/资格/口径仍由
+                    # 重建记录承载，无该证据的记录行为不变。
+                    rebuilt["source_errors"] = list(record["source_errors"])
+                metadata[field] = rebuilt
         return {
             "status": status,
             "coverage": {"status": status},
@@ -4435,7 +4517,7 @@ class DataFetcherManager:
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
         key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}"
-        from data_provider.cross_source_validator import AnchorReading, SourceReadError
+        from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record, normalize_report_period, p1_single_source_eligible, reading_input_reasons
         prefer_ifind = config.financial_primary_source == "ifind"
         readings: dict[str, AnchorReading] = {}
         source_error = None
@@ -4449,18 +4531,133 @@ class DataFetcherManager:
             except ResearchStopped:
                 # Keep any completed sources; stopping research is not a vendor failure.
                 pass
+        # issue #71：同批资产负债独立装配（不在六字段财期选择内投票）；两字段
+        # 同财期且口径齐备才成为主值，否则保持既有缺口披露。
+        balance_readings: Dict[str, AnchorReading] = {
+            field: readings.pop(field) for field in ("assets", "liabilities") if field in readings
+        }
+        # issue #71：必要当前资料（估值/正式行业/个股资金）在可选 Choice/公共/
+        # 主营消费共享剩余预算之前，由 iFinD 主源独立取得并有界；后段消费者复用，
+        # 不为同一需求重复出站。单一供应商失败只隔离记录，不拖垮其余当前字段。
+        ifind_valuation: Dict[str, AnchorReading] = {}
+        valuation_records: Dict[str, Dict[str, Any]] = {}
+        valuation_rejections: Dict[str, tuple[str, ...]] = {}
+        ifind_industry: Dict[str, Any] = {}
+        ifind_capital_flow: Dict[str, Any] | None = None
+        ifind_info_error: str | None = None
+        research_omit: tuple[str, ...] = ()
+        if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+            from data_provider.cross_source_validator import AnchorQuality, adopted_field_record, reading_input_reasons
+            # issue #71：必要查询之间做简单剩余预算预留——估值/行业批次超时也
+            # 给资金窗口留有界机会；不重置全局截止时间，不加队列。
+            flow_budget = min(config.fundamental_fetch_timeout_seconds, budget / 3)
+            try:
+                info = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).current_info_snapshot(
+                    code, deadline=deadline - flow_budget,
+                )
+            except SourceReadError as exc:
+                ifind_info_error = f"ifind:current_info:{exc.reason_code}"
+            except ResearchStopped:
+                pass
+            else:
+                ifind_valuation = info.get("valuation") or {}
+                ifind_industry = info.get("industry") or {}
+            for field, reading in ifind_valuation.items():
+                reasons = reading_input_reasons(reading, field)
+                if reasons:
+                    # issue #71：具体拒绝原因（time_unknown/单位/口径等）经 field_meta
+                    # 契约保留到 manager/保存消费层，不得静默丢弃。
+                    valuation_rejections[field] = reasons
+                    continue
+                valuation_records[field] = adopted_field_record(
+                    field, reading, AnchorQuality(status="single_source", reason_codes=("single_family",)))
+            if ifind_industry.get("name") and not ifind_industry.get("errors"):
+                research_omit = ("HISSW2021",)
+            try:
+                ifind_capital_flow = self.get_capital_flow_context(
+                    code,
+                    budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())),
+                    include_sector_flows=include_sector_flows,
+                )
+            except ResearchStopped:
+                ifind_capital_flow = None
+            if isinstance(ifind_capital_flow, dict) and (ifind_capital_flow.get("data") or {}).get("stock_flow"):
+                # issue #71：早批资金块即时登记进本报告共享上下文——资金取得之后
+                # Choice 快照/可选研究任一点取消（ResearchStopped 传播出本聚合），
+                # ctx 已持有的资金事实不随后续退出丢失。登记沿既有 stop/finalized
+                # 语义：已停止的冻结 ctx 不接受晚到写入，证券归属不匹配不串写；
+                # 幂等，不覆盖既有块。
+                stage0_ctx = getattr(run, "context", None)
+                if (stage0_ctx is not None
+                        and getattr(stage0_ctx, "stock_code", None) == code
+                        and not run.stop_reason and not run.finalized
+                        and not stage0_ctx.fundamental.get("capital_flow")):
+                    stage0_ctx.fundamental["capital_flow"] = ifind_capital_flow
         verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
         omit = _qualified_ifind_choice_omissions(readings) if prefer_ifind else ()
+        # 估值仅在记录规则合格（含展示时效）时省去 Choice 出站；内在合格但时效
+        # 未达规则的字段仍走 Choice，合并层按来源优先覆盖。
+        omit = omit + tuple(indicator for field, indicator in _CHOICE_VALUATION_INDICATORS.items()
+                            if field in valuation_records and valuation_records[field]["rule_eligible"])
         # 必要 Choice 先执行；iFinD 主营/股东再决定可选 Choice 缺项。同一绝对截止时间不重置。
         choice_deadline = deadline - verification_budget
         adapter = ChoiceAdapter()
         snapshot = adapter.snapshot(code, deadline=choice_deadline, omit_indicators=omit, include_optional=False)
+        if prefer_ifind and valuation_records:
+            qualified = {field: record for field, record in valuation_records.items() if record["rule_eligible"]}
+            if all(indicator in omit for indicator in _CHOICE_VALUATION_INDICATORS.values()):
+                # 估值主值全部来自 iFinD：交易日随实际观测日期走（与 Choice 交易日语义
+                # 同形，ISO 日期），不因省去 Choice 估值查询丢失。
+                observed = [item
+                            for item in (normalize_report_period(ifind_valuation[field].observed_at)[0]
+                                         for field in qualified if ifind_valuation[field].observed_at)
+                            if item is not None]
+                snapshot["valuation"]["trade_date"] = max(observed) if observed else None
+                if snapshot.get("as_of") is None:
+                    snapshot["as_of"] = snapshot["valuation"].get("trade_date")
+            for field, record in qualified.items():
+                # 仅规则合格的 iFinD 值覆盖主值；不合格候选不得覆盖健康 Choice 值
+                snapshot["valuation"][field] = ifind_valuation[field].value
+                snapshot["field_meta"][field] = record
+        if prefer_ifind:
+            # issue #71/R10：iFinD 估值拒绝/不合格原因独立于是否有合格主值回填——
+            # 全部候选不合格时（valuation_records 为空）不得只剩 Choice 失败原因；
+            # 缺主值字段合并真实 ifind 原因与既有 Choice source_errors；健康
+            # Choice 主值保持值/来源/资格与 input_reasons 不被污染，但被拒 iFinD
+            # 候选的拒绝证据（source_errors）仍须随字段记录保留。
+            rejected_candidates: list[tuple[str, tuple[str, ...]]] = [
+                *valuation_rejections.items(),
+                *((field, tuple(record["input_reasons"])) for field, record in valuation_records.items()
+                  if not record["rule_eligible"]),
+            ]
+            for field, reasons in rejected_candidates:
+                merged = dict(snapshot["field_meta"].get(field) or {})
+                source_errors = list(merged.get("source_errors") or [])
+                source_errors.extend({"source": "ifind", "reason_code": reason} for reason in reasons)
+                if snapshot["valuation"].get(field) is not None:
+                    # 健康 Choice 主值：只追加拒绝证据，不动值/来源/资格/input_reasons
+                    merged["source_errors"] = source_errors
+                    snapshot["field_meta"][field] = merged
+                    continue
+                merged["input_reasons"] = list(reasons)
+                merged["source_errors"] = source_errors
+                merged.setdefault("quality", {"status": "missing", "reason_codes": ["no_eligible_current_value"]})
+                snapshot["field_meta"][field] = merged
+        if ifind_industry.get("name") and not ifind_industry.get("errors"):
+            snapshot.setdefault("research", {})["industry_ifind"] = ifind_industry
+        elif prefer_ifind and ifind_industry.get("errors"):
+            # 行业未合格的原因保留在诊断里，不因估值批次成功而静默丢弃
+            research_errors = snapshot.setdefault("research", {}).setdefault("errors", [])
+            reason = "ifind:industry:" + ",".join(str(item) for item in ifind_industry.get("errors") or ["unknown"])
+            if reason not in research_errors:
+                research_errors.append(reason)
+        if ifind_info_error:
+            snapshot.setdefault("errors", []).append(ifind_info_error)
         ifind_research: Dict[str, Any] = {}
-        research_omit: tuple[str, ...] = ()
         if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
             # issue #64：深研 scope（include_sector_flows=False）同时禁 iFinD 股东隐式出站。
             ifind_research = _ifind_research_omissions(code, readings, deadline, config, include_holders=include_sector_flows)
-            research_omit = tuple(ifind_research.pop("omit", ()))
+            research_omit = research_omit + tuple(ifind_research.pop("omit", ()))
         if time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
             adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
         if ifind_research:
@@ -4476,7 +4673,14 @@ class DataFetcherManager:
         if source_error:
             errors.append(f"ifind:{source_error}")
         # Only attempt licensed public supplements for holes, within the same deadline.
-        missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy") if snapshot["growth"].get(field) is None)
+        # issue #71 P1：iFinD 主源下同实际财期、仅缺调整口径的公布值比率候选不交给
+        # 公共补充，优先走单源采纳路径。
+        published_single_source_candidates = frozenset({
+            field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")
+            if prefer_ifind and p1_single_source_eligible(readings.get(field), field)
+        })
+        missing = tuple(field for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy")
+                        if snapshot["growth"].get(field) is None and field not in published_single_source_candidates)
         if missing and snapshot.get("report_date") and self._tushare_ifind_adapter.available and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
             try:
                 bundle, error, _ = self._run_with_timeout(
@@ -4531,15 +4735,26 @@ class DataFetcherManager:
                 snapshot["growth"]["disclosure_date"] = next((r.disclosed_at for r in primary.values() if r.disclosed_at), None)
                 if (snapshot["growth"].get("balance_sheet") or {}).get("period") != supplement_period:
                     snapshot["growth"].pop("balance_sheet", None)
+                # issue #71：同财期合格 iFinD 资产负债优先成为主值；缺口保持如实披露。
+                ifind_balance = _qualified_ifind_balance(balance_readings, supplement_period)
+                if ifind_balance is not None:
+                    snapshot["growth"]["balance_sheet"] = ifind_balance
                 for field in fetcher.financial_fields:
                     selected = primary.get(field)
                     snapshot["growth"][field] = selected.value if selected is not None else None
+                    if selected is not None and selected.source == "ifind" and selected.adjustment is None and selected.normalization_error == "adjustment_unknown":
+                        # issue #71 P1：经共享窄谓词进入选择层的公布值——保留未知口径标注
+                        snapshot["field_meta"][field] = adopted_field_record(
+                            field, selected, AnchorQuality(status="single_source", reason_codes=("single_family",)),
+                            selection_reason="ifind_published_single_source")
+                        continue
                     snapshot["field_meta"][field] = adopted_field_record(field, selected, selection_reason="primary" if selected.source == "ifind" else "choice_supplement") if selected is not None else {"quality": {"status": "missing", "reason_codes": ["no_eligible_current_value"]}}
                 # Keep rejected periods as evidence; they cannot become automatic main values.
                 for dataset in (readings, choice_readings):
                     for field, reading in dataset.items():
                         if reading.period != supplement_period or supplement_period is None:
                             dataset[field] = replace(reading, normalization_error=reading.normalization_error or "period_mismatch")
+
             groups: dict[str, list[str]] = {}
             for field in fetcher.financial_fields:
                 source = primary[field].source if field in primary else "missing"
@@ -4565,7 +4780,10 @@ class DataFetcherManager:
                 for field, anchor in anchors.items():
                     record = field_record_from_validation(field, anchor)
                     selected = snapshot["field_meta"].get(field) or {}
-                    if record is not None and record["value"] == snapshot["growth"].get(field) and record["source"] == selected.get("source"):
+                    if (record is not None and record["value"] == snapshot["growth"].get(field)
+                            and record["source"] == selected.get("source")
+                            and selected.get("selection_reason") != "ifind_published_single_source"):
+                        # issue #71 P1：单源公布值采纳记录的未知口径标注不被核验候选覆盖
                         snapshot["field_meta"][field] = record
         result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.data_source_contract,
                                   "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
@@ -4573,7 +4791,13 @@ class DataFetcherManager:
             result["cross_validation"] = cross_validation
         for block, fields in {"valuation": ("pe_ratio", "pb_ratio", "total_mv"), "growth": ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")}.items():
             payload = dict(snapshot[block])
-            payload["field_meta"] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["missing"]}}) for field in fields}
+            meta: Dict[str, Any] = {field: snapshot["field_meta"].get(field, {"quality": {"status": "missing", "reason_codes": ["missing"]}}) for field in fields}
+            if block == "valuation" and snapshot["field_meta"].get("circ_mv") is not None:
+                # issue #71：可选流通市值的既有字段记录（来源/单位/时点/资格）随块
+                # 投影，市值锚点消费可得；缺记录不合成占位，三必填 status 口径不变
+                # （Choice 既有快照不因可选 circ_mv 缺失降级）。
+                meta["circ_mv"] = snapshot["field_meta"]["circ_mv"]
+            payload["field_meta"] = meta
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
             providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if block == "growth" and prefer_ifind else "choice"]
             chain = [{"provider": provider, "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)} for provider in providers]
@@ -4581,6 +4805,11 @@ class DataFetcherManager:
             result["source_chain"].extend(chain)
         adopted_sources = {item["provider"] for item in result["source_chain"]}
         result["source"] = next(iter(adopted_sources)) if len(adopted_sources) == 1 else "mixed"
+        # issue #71：早批已取得的 iFinD 资金块先落位再进入可选公共详情/板块工作，
+        # 期间 ResearchStopped 不得以空部分块替换已取得的三窗口资料；未取得时才
+        # 在可选路径内有界补查。
+        if ifind_capital_flow is not None:
+            result["capital_flow"] = ifind_capital_flow
         try:
             if run is not None:
                 run.check()
@@ -4604,7 +4833,8 @@ class DataFetcherManager:
                 errors.extend(result[block].get("errors") or [])
             if run is not None:
                 run.check()
-            result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()), include_sector_flows=include_sector_flows)
+            if "capital_flow" not in result:
+                result["capital_flow"] = self.get_capital_flow_context(code, budget_seconds=max(0.0, deadline-time.monotonic()), include_sector_flows=include_sector_flows)
             errors.extend(result["capital_flow"].get("errors") or [])
         except ResearchStopped:
             pass
@@ -4656,7 +4886,7 @@ class DataFetcherManager:
 
     def get_capital_flow_context(
         self, stock_code: str, budget_seconds: Optional[float] = None,
-        include_sector_flows: bool = True,
+        include_sector_flows: bool = True, current_time: Any = None,
     ) -> Dict[str, Any]:
         """资金流向块（fail-open）。
 
@@ -4702,14 +4932,14 @@ class DataFetcherManager:
         if config.data_source_profile == "choice":
             from data_provider.capital_flow_provider import get_main_inflow_cumulative
             deadline = time.monotonic() + timeout
-            stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline)
+            stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline, current_time=current_time)
             if not include_sector_flows:
                 # issue #64：行业资金榜退役路径——零 sector 出站，状态只看个股资金；
                 # 退役字段整键缺席（真实报告反例：{} 空占位曾进入模型输入）。
                 return self._build_fundamental_block(
                     "ok" if stock_flow["status"] == "ok" else "partial",
                     {"stock_flow": stock_flow},
-                    [{"provider": "choice", "result": stock_flow["status"], "duration_ms": 0}],
+                    [{"provider": str(stock_flow.get("source") or "choice"), "result": stock_flow["status"], "duration_ms": 0}],
                     stock_flow["errors"],
                 )
             # Sector flows have their own definition; retain their public path.
@@ -4720,7 +4950,7 @@ class DataFetcherManager:
             sector = sector if isinstance(sector, dict) else {}
             return self._build_fundamental_block(
                 "ok" if stock_flow["status"] == "ok" and not sector_error and not sector.get("errors") else "partial", {"stock_flow": stock_flow, "sector_rankings": sector.get("sector_rankings", {})},
-                [{"provider": "choice", "result": stock_flow["status"], "duration_ms": cost_ms}],
+                [{"provider": str(stock_flow.get("source") or "choice"), "result": stock_flow["status"], "duration_ms": cost_ms}],
                 stock_flow["errors"] + sector.get("errors", []) + ([sector_error] if sector_error else []),
             )
         payload, err, cost_ms = self._run_with_retry(

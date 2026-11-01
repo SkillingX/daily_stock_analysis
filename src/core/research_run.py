@@ -90,6 +90,9 @@ class ResearchRun:
     # Same-report single-flight results (issue #51): key -> completed-or-running
     # future. Failures are retained too; nothing here outlives this run.
     _fetches: dict[str, Future[Any]] = field(default_factory=dict, repr=False)
+    # issue #71：Choice 原生 10001009（登录次数达上限）后，本报告内不再重复尝试
+    # Choice 登录；字段随 run 生命周期，下一次报告照常尝试，不构成跨报告熔断。
+    choice_login_limited: bool = False
 
     def __post_init__(self) -> None:
         self.deadline = monotonic() + self.timeout_seconds

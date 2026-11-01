@@ -225,8 +225,13 @@ def test_new_period_unknown_ratios_are_not_filled_with_older_choice_values(ifind
     growth = result['growth']
     assert growth['data']['report_date'] == '2026-06-30'
     assert growth['field_meta']['revenue']['source'] == 'ifind'
-    assert growth['data']['roe'] is None
-    assert growth['data']['gross_margin'] is None
+    # issue #71 P1（用户已批准）：同财期 iFinD 公布值比率单源采用——不是用旧期
+    # Choice 值填充；调整口径未知标注保留、质量不伪装 verified
+    assert growth['data']['roe'] == 4.56
+    assert growth['data']['gross_margin'] == 23.4196
+    assert growth['field_meta']['roe']['selection_reason'] == 'ifind_published_single_source'
+    assert 'adjustment_unknown' in growth['field_meta']['roe']['input_reasons']
+    assert growth['field_meta']['roe']['quality']['status'] != 'verified'
     assert 'balance_sheet' not in growth['data']
     assert result['cross_validation']['anchors']['roe']['readings']
 

@@ -36,7 +36,7 @@ MODE_DIRECTION = "direction"  # 方向+量级比对（主力净流入；两源�
 PeriodBasis = Literal["annual", "YTD", "single_quarter", "unknown"]
 FINANCIAL_ANCHORS = frozenset({"revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy"})
 PERCENTAGE_ANCHORS = frozenset({"roe", "gross_margin", "revenue_yoy", "net_profit_yoy", "top10_holder_change"})
-MONEY_ANCHORS = frozenset({"current_price", "total_mv", "circ_mv", "revenue", "net_profit", "main_inflow", "margin_balance"})
+MONEY_ANCHORS = frozenset({"current_price", "total_mv", "circ_mv", "revenue", "net_profit", "main_inflow", "margin_balance", "assets", "liabilities"})
 Unit = Literal["currency_base", "percentage_point", "multiple", "shares"]
 _CURRENCY_MARKERS = {
     "CNY": ("CNY", "RMB", "人民币"), "USD": ("USD", "美元"),
@@ -46,6 +46,45 @@ _CURRENCY_MARKERS = {
     "CAD": ("CAD", "加元"), "CHF": ("CHF", "瑞士法郎"),
 }
 _SOURCE_FAMILIES = {"choice": "eastmoney", "mx": "eastmoney", "mx_mcp": "eastmoney", "ifind": "ths", "fuyao": "ths", "efinance": "eastmoney", "akshare:stock_financial_abstract": "sina"}
+# issue #71 P1（用户已批准）：iFinD 公布值单源采纳的唯一选择原因标识。
+# rule_eligible 与 quality（独立核验）分离：该标识下的记录可参与单源规则分析，
+# input_reasons 保留 adjustment_unknown 披露标签，跨源可比较性不放宽。
+P1_SINGLE_SOURCE_SELECTION_REASON = "ifind_published_single_source"
+_P1_APPROVED_RATIO_FIELDS = frozenset({"roe", "gross_margin", "revenue_yoy", "net_profit_yoy"})
+
+
+def p1_single_source_eligible(reading: AnchorReading, field: str) -> bool:
+    """issue #71 P1 窄资格谓词：iFinD 四比率公布值单源采纳的唯一资格入口。
+
+    仅当字段在批准集、来源 ifind、合并报表、期间存在且 basis 为 annual/YTD
+    （不含单季/未来期），披露日期不晚于今日，且剥除已批准的 adjustment_unknown
+    标签后其余资格理由为空（单位/币种/定义等全部独立通过）。标记只是溯源，
+    不能复活任何其他无效输入——metadata_invalid/period_mismatch/stale/NaN/
+    错误来源/字段一律拒绝。选择层/公共补充跳过/采纳/记录重建共用本谓词，
+    保证同财期语义一致。
+    """
+    from dataclasses import replace as _replace
+    if (reading is None or field not in _P1_APPROVED_RATIO_FIELDS
+            or reading.source != "ifind"
+            or reading.statement_scope != "consolidated"
+            or reading.period is None or reading.period_basis not in {"annual", "YTD"}):
+        return False
+    if reading.adjustment is not None:
+        # P1 仅适用 adjustment=None 的公布值；带已知口径（含 restated）的读数
+        # 属资格选择层管辖，被 P1 标记时按矛盾拒绝
+        return False
+    today = date.today().isoformat()
+    if reading.period > today:
+        return False
+    disclosed = normalize_report_period(reading.disclosed_at)[0]
+    if disclosed is not None and disclosed > today:
+        return False
+    if reading.normalization_error not in (None, "adjustment_unknown"):
+        return False
+    # reading_input_reasons 会在 normalization_error 上短路——剥除且仅剥除已批准
+    # 的未知口径标签后重跑，确保单位/币种/定义等其余约束全部独立通过。
+    stripped = _replace(reading, normalization_error=None) if reading.normalization_error == "adjustment_unknown" else reading
+    return reading_input_reasons(stripped, field) == ()
 QualityStatus = Literal["missing", "unverified", "single_source", "not_comparable", "verified", "conflict"]
 
 
@@ -286,6 +325,9 @@ def caliber_from_label(field: str, label: str) -> Optional[str]:
         return "weighted_roe" if re.fullmatch(r"(?:净资产收益率(?:roe)?|roe)(?:加权(?:平均)?|weighted)|(?:加权(?:平均)?|weighted)(?:净资产收益率(?:roe)?|roe)|weighted_roe", text) else None
     if field == "gross_margin":
         return "gross_margin" if re.fullmatch(r"(?:销售)?毛利率|gross_margin", text) else None
+    if field in {"assets", "liabilities"}:
+        stems = r"资产(?:总计|合计)|总资产" if field == "assets" else r"负债(?:合计|总计)|总负债"
+        return "balance_sheet_total" if re.fullmatch(stems, text) else None
     if field in {"revenue", "revenue_yoy"}:
         if re.fullmatch(r"(?:营业总收入|营业收入|营收)" + suffix, text):
             stem = "total_operating_revenue" if text.startswith("营业总收入") else "operating_revenue"
@@ -498,10 +540,19 @@ def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str,
     drop a qualified iFinD field Choice did not also return for the newer period.
     A field whose qualified iFinD reading was omitted from the Choice query stays
     adopted at its own period instead of turning into a gap.
+
+    issue #71 P1（用户已批准）：同财期 iFinD 公布值比率参与同期选择且优先于同期
+    Choice（主源优先）；P1 读数不授予旧期保护例外——旧期 P1 候选不阻止更新期
+    合格 Choice 前移，也不得成为旧期主值。
     """
     protected = {field: reading for field, reading in ifind.items()
                  if reading.period is not None and _eligible_current_financial(reading, field)}
-    protected_period = max((reading.period for reading in protected.values() if reading.period is not None), default=None)
+    p1_current = {field: reading for field, reading in ifind.items()
+                  if field not in protected and p1_single_source_eligible(reading, field)}
+    # issue #71：前移基线锚须包含最新有效 P1 财期——旧严格金额读数不得错误阻止
+    # 更新期 iFinD P1 的同期选择（P1 本身不授旧期保护，仅参与基线与同期选择）。
+    protected_period = max((reading.period for reading in (*protected.values(), *p1_current.values())
+                            if reading.period is not None), default=None)
 
     def choice_can_advance_to(candidate: Optional[str]) -> bool:
         if candidate is None or protected_period is None or candidate <= protected_period:
@@ -514,8 +565,14 @@ def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str,
                 return False
         return True
 
+    def _selectable(reading: Optional[AnchorReading], field: str) -> bool:
+        """财期投票与同期选择共用资格：严格合格，或已批准的 iFinD 公布值单源候选。"""
+        if reading is None:
+            return False
+        return _eligible_current_financial(reading, field) or (field in p1_current and reading is p1_current[field])
+
     periods = [reading.period for field, reading in (*ifind.items(), *choice.items())
-               if reading.period is not None and _eligible_current_financial(reading, field)
+               if reading.period is not None and _selectable(reading, field)
                and choice_can_advance_to(reading.period)]
     period = max(periods) if periods else None
     selected: dict[str, AnchorReading] = {}
@@ -525,7 +582,7 @@ def select_current_financials(ifind: dict[str, AnchorReading], choice: dict[str,
             selected[field] = protected[field]
             continue
         for reading in (ifind.get(field), choice.get(field)):
-            if reading is not None and _eligible_current_financial(reading, field) and reading.period == period:
+            if _selectable(reading, field) and reading.period == period:
                 selected[field] = reading
                 break
     return period, selected
@@ -625,7 +682,13 @@ def reading_from_field_record(value: object, record: Optional[Dict[str, Any]] = 
 
 
 def adopted_field_record(field: str, reading: AnchorReading, quality: Optional[AnchorQuality] = None, selection_reason: str = "primary", *, previous_record: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """One field record projects its scalar and consumer eligibility from existing evidence."""
+    """One field record projects its scalar and consumer eligibility from existing evidence.
+
+    issue #71 P1（用户已批准）：selection_reason 为 ``ifind_published_single_source``
+    的 iFinD 公布值采纳记录，规则可用性与独立核验状态分离——用户批准其单源规则
+    使用（rule_eligible=True），input_reasons 保留 adjustment_unknown 作为披露标签，
+    quality 仍由独立核验证据单独承载（不得伪装 verified），跨源可比较性不变。
+    """
     previous = previous_record or {}
     current_conflict = previous.get("value") == reading.value and (previous.get("quality") or {}).get("status") == "conflict"
     quality = quality or AnchorQuality(status="conflict" if current_conflict else "unverified")
@@ -634,9 +697,11 @@ def adopted_field_record(field: str, reading: AnchorReading, quality: Optional[A
         from src.config import get_config
         limits = _comparison_reasons(reading, ANCHOR_SPECS[field], None, get_config().realtime_cache_ttl)
         reasons += tuple(reason for reason in limits if reason in {"stale", "time_in_future"} and reason not in reasons)
+    policy_rule_use = selection_reason == P1_SINGLE_SOURCE_SELECTION_REASON and p1_single_source_eligible(reading, field)
     return {
         "field": field, **asdict(reading), "quality": quality.model_dump(mode="json"),
-        "input_reasons": list(reasons), "rule_eligible": not reasons and quality.status != "conflict",
+        "input_reasons": list(reasons),
+        "rule_eligible": (not reasons or policy_rule_use) and quality.status != "conflict",
         "selection_reason": selection_reason,
     }
 

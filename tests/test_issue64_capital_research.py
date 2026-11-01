@@ -499,9 +499,8 @@ def test_numeric_string_flow_score_not_degraded_by_boundary(flow_fixture, monkey
 
 
 def test_non_numeric_string_flow_score_still_degrades(flow_fixture, monkeypatch) -> None:
-    """非数字字符串不构成评分：边界真实降级；契约层拒绝既有路径不变（不静默吞掉）。"""
-    from pydantic import ValidationError
-
+    """非数字字符串不构成评分：边界真实降级（issue #71 R5 收敛：无效形状原始值
+    在采纳边界归 None，维度经真实 parse 保存白名单证据，不再在契约边界丢证据）。"""
     captured: List[str] = []
     generate = _model_output('{"flow_score": "abc", "narrative": "观察。"}', captured)
     monkeypatch.setattr(explore_agents, "run_agent_loop", generate)
@@ -509,14 +508,15 @@ def test_non_numeric_string_flow_score_still_degrades(flow_fixture, monkeypatch)
     assert result["ok"] is True
     assert result["data"]["status"] == "degraded"
     assert "score" not in result["data"], "无效字符串评分不得派生资金总分"
-    with pytest.raises(ValidationError):
-        parse(result["data"], 1)
+    dim, _ = parse(result["data"], 1)
+    assert dim.status == "degraded" and dim.score is None and dim.flow_score is None
+    assert dim.adoption_evidence is not None and dim.adoption_evidence.outcome == "score_invalid"
+    assert "abc" not in (dim.degraded_reason or ""), "降级原因不得携带原始无效值"
 
 
 def test_non_finite_string_flow_score_degrades(flow_fixture, monkeypatch) -> None:
-    """NaN/Inf 字符串不归一为有效评分（float 可解析但非有限）：真实降级不冒充数值。"""
-    from pydantic import ValidationError
-
+    """NaN/Inf 字符串不归一为有效评分（float 可解析但非有限）：真实降级不冒充数值；
+    R5 收敛后证据随降级维度实际保存，原始值不持久化。"""
     captured: List[str] = []
     generate = _model_output('{"flow_score": "NaN", "narrative": "观察。"}', captured)
     monkeypatch.setattr(explore_agents, "run_agent_loop", generate)
@@ -524,5 +524,7 @@ def test_non_finite_string_flow_score_degrades(flow_fixture, monkeypatch) -> Non
     assert result["ok"] is True
     assert result["data"]["status"] == "degraded"
     assert "score" not in result["data"], "非有限字符串评分不得派生资金总分"
-    with pytest.raises(ValidationError):
-        parse(result["data"], 1)
+    dim, _ = parse(result["data"], 1)
+    assert dim.status == "degraded" and dim.score is None and dim.flow_score is None
+    assert dim.adoption_evidence is not None and dim.adoption_evidence.outcome == "score_invalid"
+    assert "NaN" not in (dim.degraded_reason or ""), "降级原因不得携带原始无效值"

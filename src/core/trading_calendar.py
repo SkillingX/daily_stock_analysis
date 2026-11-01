@@ -182,6 +182,44 @@ def get_market_now(
     return current_time.astimezone(tz)
 
 
+def recent_completed_trading_sessions(
+    market: str, count: int, *, current_time: Optional[datetime] = None
+) -> Optional[List[date]]:
+    """
+    Strictly resolve the last ``count`` completed trading sessions, newest first.
+
+    Unlike the fail-open filters above, this returns ``None`` when exchange
+    calendars are unavailable or the requested range is out of bounds: capital
+    windows must never be qualified from natural/weekday fallback dates
+    (issue #71). Completion mirrors :func:`get_effective_trading_date` — a
+    session that has not closed yet does not count as completed.
+    """
+    if count <= 0 or market not in MARKET_EXCHANGE or market not in MARKET_TIMEZONE:
+        return None
+    if not _XCALS_AVAILABLE:
+        return None
+    tz_name = MARKET_TIMEZONE[market]
+    market_now = get_market_now(market, current_time=current_time)
+    try:
+        cal = xcals.get_calendar(MARKET_EXCHANGE[market])  # type: ignore[union-attr]
+        local_date = market_now.date()
+        session = cal.date_to_session(local_date, direction="previous")
+        if cal.is_session(local_date):
+            session_close = cal.session_close(session)
+            close_local = _as_market_datetime(session_close, tz_name)
+            if close_local is not None and market_now < close_local:
+                session = cal.previous_session(session)
+        sessions = [session]
+        while len(sessions) < count:
+            sessions.append(cal.previous_session(sessions[-1]))
+        return [item.date() for item in sessions]
+    except Exception as exc:
+        # Out-of-range or broken calendar data must surface as "unknown", not
+        # as a weekday approximation that could qualify a financial window.
+        logger.warning("trading_calendar.recent_completed_trading_sessions unavailable: %s", exc)
+        return None
+
+
 def get_effective_trading_date(
     market: Optional[str], current_time: Optional[datetime] = None
 ) -> date:

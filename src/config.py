@@ -794,7 +794,7 @@ class Config:
     data_source_profile: str = "legacy"
     mx_apikey: Optional[str] = None  # 东财妙想 API key（MX_APIKEY）
     enable_ifind_mcp: bool = False  # Choice profile: supplement + default financial verification
-    financial_primary_source: str = "choice"  # Current six-field snapshot only; annual reports remain Choice.
+    financial_primary_source: str = "choice"  # Current snapshot (six fields + same-period balance), valuation, SW industry and per-stock flow; annual reports/targets remain Choice.
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
     ifind_mcp_timeout_seconds: float = 30.0  # iFinD MCP 调用超时
