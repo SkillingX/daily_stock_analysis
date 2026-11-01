@@ -968,22 +968,21 @@ def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str,
     data = ctx.get("data", {})
     stock_flow = data.get("stock_flow") or {}
     errors = ctx.get("errors") or []
+    # issue #71：来源标签一律取块内实际 source（iFinD 主源成功/失败/回退 Choice
+    # 都可能出现在同一部署下），不得按部署 profile 推断后错写。
+    flow_source = str(stock_flow.get("source") or "").strip()
+    source_label = {"choice": "Choice", "ifind": "iFinD"}.get(flow_source, "")
 
     # failed → 加明确 note，避免 LLM 误判「数据缺失」而编造。来源说明按当前
     # 实际数据源（issue #64：Choice 部署已不走 push2his，不得再写东方财富）。
     note = None
     if status == "failed":
-        if get_config().data_source_profile == "choice":
-            reason = "; ".join(str(item) for item in errors if item) or "查询未完成"
-            note = (
-                f"资金流数据源（Choice）暂不可用或查询未完成（{reason}），本报告暂缺资金流分析，"
-                "请结合成交量/换手率等技术指标判断主力动向。恢复数据连接后可重新生成。"
-            )
-        else:
-            note = (
-                "资金流数据源暂不可用（接口不可达/超时），本报告暂缺资金流分析，"
-                "请结合成交量/换手率等技术指标判断主力动向。"
-            )
+        reason = "; ".join(str(item) for item in errors if item) or "查询未完成"
+        source_text = f"资金流数据源（{source_label}）" if source_label else "资金流数据源"
+        note = (
+            f"{source_text}暂不可用或查询未完成（{reason}），本报告暂缺资金流分析，"
+            "请结合成交量/换手率等技术指标判断主力动向。恢复数据连接后可重新生成。"
+        )
 
     result = {
         "stock_code": stock_code,
@@ -1012,7 +1011,7 @@ def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str,
             else "按交易日历和最近已收盘日期计算日/5日/10日窗口，窗口缺数据时金额为空。"
         )
         result["note"] = (
-            f"Choice 个股主力净流入金额单位：人民币元；{date_text}单源数据，未做独立跨源核验。"
+            f"{source_label or '个股'}主力净流入金额单位：人民币元；{date_text}单源数据，未做独立跨源核验。"
         )
     if note:
         result["note"] = note

@@ -329,6 +329,7 @@
 {% for cp in supply_chain.supply_chain.chokepoints %}
 - 卡点 [{{ cp.type }}/{{ cp.confidence }}]：{{ cp.description }}
 {% endfor %}
+
 {% endif %}
 {% endif %}
 {% elif s.id == 'intel' %}
@@ -479,3 +480,8 @@
 {% endfor %}
 
 *本报告由 AI 生成，所引数据以「数据截至」时点为准；操作指令为模拟盘研究记录，不构成投资建议。*
+{% set industry_facts = sector.retained_facts | selectattr('tool', 'equalto', 'industry_ifind') | list %}
+{% if industry_facts %}
+
+- 行业来源：{{ industry_facts[0].source }} ｜ {{ industry_facts[0].label }}：{{ industry_facts[0].value }} ｜ 截至 {{ industry_facts[0].period or '未知' }} ｜ {{ industry_facts[0].qualification }}
+{% endif %}

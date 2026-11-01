@@ -95,6 +95,30 @@ def _safe_quote(code: str, ctx: SharedContext) -> Dict[str, Any]:
         return {}
 
 
+def industry_hint_from_research(research: Dict[str, Any], boards: Any) -> str:
+    """共享上下文的行业提示：正式 iFinD 申万行业 > Choice HISSW2021 > 板块兜底。
+
+    issue #71：iFinD 行业要求名称齐备且无错误；供应商未回显分类版本，提示只
+    用名称文本，不把请求里的版本写成返回事实；boards 兜底语义不变。
+    """
+    hint = ""
+    choice_industry = (research or {}).get("industry") or {}
+    choice_hint = choice_industry.get("HISSW2021") if isinstance(choice_industry, dict) else None
+    if isinstance(choice_hint, str):
+        hint = choice_hint.strip()
+    ifind_industry = (research or {}).get("industry_ifind") or {}
+    if (isinstance(ifind_industry, dict) and ifind_industry.get("name")
+            and not ifind_industry.get("errors")):
+        hint = str(ifind_industry["name"]).strip()
+    if isinstance(boards, dict):
+        for key in ("industry", "industry_name", "sw_industry", "sector"):
+            value = boards.get(key)
+            if not hint and isinstance(value, str) and value.strip():
+                hint = value.strip()
+                break
+    return hint
+
+
 def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     """基本面快照：日内不变，走 24h 快照缓存（实测抓取 25s，为阶段 0 最慢一路）。
 
@@ -148,17 +172,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         valuation = (compact.get("valuation") or {}).get("data") or {}
         financial = (compact.get("growth") or {}).get("data") or {}
         boards = (compact.get("boards") or {}).get("data") or {}
-        industry_hint = ""
+        industry_hint = industry_hint_from_research(compact.get("research") or {}, boards)
         research = compact.get("research") or {}
-        choice_industry = (research.get("industry") or {}).get("HISSW2021")
-        if isinstance(choice_industry, str):
-            industry_hint = choice_industry.strip()
-        if isinstance(boards, dict):
-            for key in ("industry", "industry_name", "sw_industry", "sector"):
-                value = boards.get(key)
-                if not industry_hint and isinstance(value, str) and value.strip():
-                    industry_hint = value.strip()
-                    break
         result: Dict[str, Any] = {
             "pe_ttm": next(
                 (valuation[k] for k in ("pe_ratio", "pe_ttm") if valuation.get(k) is not None), None

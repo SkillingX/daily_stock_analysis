@@ -37,6 +37,9 @@ choice_call_id: ContextVar[str] = ContextVar("choice_call_id", default="")
 _EVIDENCE_TEXT_LIMIT = 300
 _EVIDENCE_CHAIN_LIMIT = 4
 _PROGRESS_INTERVAL_SECONDS = 1.0
+# Choice 原生 10001009＝登录次数已达上限。该错误后本报告内不再重复尝试登录
+# （同一次 ResearchRun 有界止损）；其他认证错误不做同报告熔断，后续报告照常。
+_LOGIN_COUNT_LIMIT_NATIVE_CODE = 10001009
 
 
 def _known_secrets() -> tuple[str, ...]:
@@ -262,6 +265,15 @@ def _native_error(code: int, message: str) -> str:
     return "business_error"
 
 
+def _mark_login_limit(payload: object) -> None:
+    """收到原生 10001009 时在持锁上下文内立即标记，等锁的同报告请求才能止损。"""
+    if (isinstance(payload, dict) and payload.get("error") == "authentication_failed"
+            and payload.get("native_code") == _LOGIN_COUNT_LIMIT_NATIVE_CODE):
+        from src.core.research_run import current_research
+        if (run := current_research.get()) is not None:
+            run.choice_login_limited = True
+
+
 def _serve_native(connection: Connection) -> None:
     with open(os.devnull, "w") as quiet:
         os.dup2(quiet.fileno(), 1)
@@ -409,6 +421,10 @@ class ChoiceAdapter:
             try:
                 if run is not None:
                     run.check()
+                # issue #71：同报告 10001009 止损标记可能在本请求通过外层检查之后
+                # 才被持锁请求写入——获锁后复检，等锁者不再触发新登录。
+                if run is not None and getattr(run, "choice_login_limited", False):
+                    _fail("authentication_failed", "not_dispatched")
                 if deadline <= monotonic():
                     _fail("lock_wait_timeout", "lock_wait_timeout")
                 if cls._process is None or not cls._process.is_alive():
@@ -449,6 +465,7 @@ class ChoiceAdapter:
                             continue
                         if isinstance(payload, dict) and payload.get("error") == "authentication_failed":
                             cls.close()
+                        _mark_login_limit(payload)
                         return payload
                 while cls._connection.poll(0):
                     pending: object = cls._connection.recv()
@@ -456,6 +473,7 @@ class ChoiceAdapter:
                         stage = str(pending["stage"])
                         _remember(stage, observed=stage)
                     elif isinstance(pending, dict):
+                        _mark_login_limit(pending)
                         return pending
                 if stage == "waiting_login":
                     reason, terminal = "login_timeout", "waiting_login"
@@ -499,6 +517,11 @@ class ChoiceAdapter:
             )
             if run := current_research.get():
                 run.check()
+                if getattr(run, "choice_login_limited", False):
+                    # issue #71：10001009 后本报告不再重复尝试 Choice 登录；诊断按
+                    # 未分派如实记录，下一次报告照常尝试，不做跨报告熔断。
+                    _remember("not_dispatched", "authentication_failed", dispatched=False)
+                    raise SourceReadError(self.name, "authentication_failed")
             remaining = int(deadline - monotonic())
             if remaining < 1:
                 _remember("not_dispatched", "budget_exhausted", dispatched=False)
@@ -516,6 +539,8 @@ class ChoiceAdapter:
                     "error_text": reply.error_text,
                     "exception_chain": reply.exception_chain,
                 }, dispatched=True)
+                if reply.native_code == _LOGIN_COUNT_LIMIT_NATIVE_CODE and (run := current_research.get()) is not None:
+                    run.choice_login_limited = True
                 raise SourceReadError(self.name, reply.error)
             if not _defer_terminal.get():
                 _remember("completed", "ok", dispatched=True)
@@ -683,19 +708,24 @@ class ChoiceAdapter:
                         out["errors"].append("choice:balance_sheet:disclosure_unknown")
                 except SourceReadError as exc:
                     out["errors"].append(f"choice:balance_sheet:{exc.reason_code}")
-            try:
-                end = self.completed_day()
-                dates = self.trading_dates(end - timedelta(days=14), end, deadline=deadline)
-                if not dates:
-                    raise SourceReadError(self.name, "calendar_unavailable")
-                trade_day = dates[-1]
-                fields = self.css(code, "PETTM,PB,MV", f"TradeDate={trade_day},EndDate={trade_day},type=8,AdjustFlag=1", deadline=deadline)
-                for field, indicator, caliber in (("pe_ratio", "PETTM", "TTM"), ("pb_ratio", "PB", "MRQ"), ("total_mv", "MV", "total_market_cap")):
-                    self._adopt(out, "valuation", field, fields.get(indicator), "currency_base" if field == "total_mv" else "multiple", caliber, None, trade_day, "unadjusted", indicator)
-                out["valuation"]["trade_date"] = trade_day
-            except SourceReadError as exc:
-                self._record_failure(out, "valuation", exc)
-                field_errors["valuation"] = exc.reason_code
+            # issue #71：估值指标全部由合格 iFinD 值覆盖时，整块省去（含交易日历），
+            # 不为已覆盖字段登录 Choice；部分覆盖仍按整批查询作为兜底。
+            if {"PETTM", "PB", "MV"} <= omitted:
+                pass
+            else:
+                try:
+                    end = self.completed_day()
+                    dates = self.trading_dates(end - timedelta(days=14), end, deadline=deadline)
+                    if not dates:
+                        raise SourceReadError(self.name, "calendar_unavailable")
+                    trade_day = dates[-1]
+                    fields = self.css(code, "PETTM,PB,MV", f"TradeDate={trade_day},EndDate={trade_day},type=8,AdjustFlag=1", deadline=deadline)
+                    for field, indicator, caliber in (("pe_ratio", "PETTM", "TTM"), ("pb_ratio", "PB", "MRQ"), ("total_mv", "MV", "total_market_cap")):
+                        self._adopt(out, "valuation", field, fields.get(indicator), "currency_base" if field == "total_mv" else "multiple", caliber, None, trade_day, "unadjusted", indicator)
+                    out["valuation"]["trade_date"] = trade_day
+                except SourceReadError as exc:
+                    self._record_failure(out, "valuation", exc)
+                    field_errors["valuation"] = exc.reason_code
             out["research"] = {"source": "choice", "as_of": today.isoformat(), "errors": [], "target_window_days": 180}
             try:
                 out["research"]["targets"] = self.css(code, "RATINGTARGETPRICE,RATINGTARGETPRICEMIN,RATINGTARGETPRICEMAX", f"EndDate={today},Cycle=180", deadline=deadline)
@@ -731,6 +761,9 @@ class ChoiceAdapter:
                 ("industry", "HISSW2021", f"EndDate={today},ClassiFication=1"),
                 ("company", ",".join(name for name in ("MAINBUSINESS", "MAINPRODUCT", "COMPROFILE", "AHOLDER", "AHOLDERTYPE") if name not in omitted), f"EndDate={today}"),
             ):
+                if name == "industry" and "HISSW2021" in omitted:
+                    # issue #71：正式行业已由合格 iFinD 结果覆盖时省去 Choice 出站。
+                    continue
                 if not indicators:
                     continue
                 try:

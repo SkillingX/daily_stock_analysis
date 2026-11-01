@@ -115,6 +115,14 @@ _PERIOD_FIELDS = {
     "gross_margin",
     "revenue_yoy",
     "net_profit_yoy",
+    # issue #71：资产负债与六项财务同一锚点解析/资格层；期间与单季列语义一致。
+    "assets",
+    "liabilities",
+}
+# issue #71：资产负债列关键词，与六项财务共用 _parse_ifind_response 单列解析。
+_BALANCE_FIELD_KEYWORDS: Dict[str, List[str]] = {
+    "assets": ["资产总计（单位：元）", "资产总计"],
+    "liabilities": ["负债合计（单位：元）", "负债合计"],
 }
 # ------------------------------------------------------------------
 # 解析（纯函数，100% 可单测）
@@ -170,54 +178,6 @@ def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keyword
         rows = [row for row in rows if _extract_ifind_value(row, keywords, field=field)[0] is not None]
     selected = select_report_period([report_period_from_fields(row) for row in rows], period)
     return rows[selected if selected is not None else 0] if rows else {}
-
-
-def _parse_ifind_markdown_series(
-    text: str, value_kw: str, date_kw: str = "日期"
-) -> List[Tuple[str, float]]:
-    """解析 iFinD 多行 Markdown 表，收集 ``(日期, 值)`` 序列（最新在前）。
-
-    与 :func:`_parse_ifind_markdown_table`（只取首行）互补，用于多日时序
-    （如实测 ``"近5日主力净流入额"`` → 6 行每日金额）。``value_kw`` 定位金额列
-    （传 ``主力净流入额`` 以避开 ``主力净流入量(单位:股)``——额外排除含「量/股」的列），
-    ``date_kw`` 定位日期列。无表 / 无匹配列 / 全行不可解析 → ``[]``。
-    """
-    lines = (text or "").strip().splitlines()
-    if not lines:
-        return []
-    sep_idx = -1
-    for i, line in enumerate(lines):
-        if re.match(r"^\|[\s\-:|]+\|$", line) or re.match(r"^\|[\s\-]+", line):
-            sep_idx = i
-            break
-    if sep_idx < 0:
-        return []
-    headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-    val_idx = next(
-        (
-            i
-            for i, h in enumerate(headers)
-            if value_kw in h and "量" not in h and "股" not in h
-        ),
-        None,
-    )
-    date_idx = next((i for i, h in enumerate(headers) if date_kw in h), None)
-    if val_idx is None or date_idx is None:
-        return []
-    series: List[Tuple[str, float]] = []
-    for row in lines[sep_idx + 1 :]:
-        cells = [c.strip() for c in row.split("|") if c.strip()]
-        if (
-            not cells
-            or cells[0].startswith("#")
-            or len(cells) <= max(val_idx, date_idx)
-        ):
-            continue
-        val = _safe_float(cells[val_idx])
-        if val is None:
-            continue
-        series.append((cells[date_idx], val))
-    return series
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -639,6 +599,66 @@ def _parse_ifind_response(raw_text: str, keywords: List[str], field: str, period
     return reading
 
 
+def _parse_industry(data: IfindData, code: str) -> Dict[str, Any]:
+    """正式申万行业：系统/级别/代码/名称/截止日期/来源全保留。
+
+    只消费 所属申万行业/所属申万行业代码 列（不把 所属同花顺行业 或概念当
+    行业）；供应商未回显分类版本，``classification_version`` 保持 None，
+    不把请求文本里的版本写成返回事实。
+    """
+    errors: list[str] = []
+    saw_security_column = False
+    matched = False
+    field_present = False
+    candidates: list[Dict[str, Any]] = []
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if "证券代码" in row:
+                saw_security_column = True
+            if not _same_security(row.get("证券代码"), code):
+                continue
+            matched = True
+            name = str(row.get("所属申万行业", "")).strip()
+            if not name:
+                continue
+            field_present = True
+            name_params = data.indicators_params.get("所属申万行业", {})
+            code_column = str(row.get("所属申万行业代码", "")).strip()
+            code_params = data.indicators_params.get("所属申万行业代码", {})
+            level = str(name_params.get("行业级别") or code_params.get("行业级别") or "").strip() or None
+            name_date = normalize_report_period(name_params.get("截止日期"))[0]
+            code_date = normalize_report_period(code_params.get("截止日期"))[0]
+            if name_date and code_date and name_date != code_date:
+                # 名称列与代码列声明互相矛盾的生效日期：整行不可采信
+                errors.append("industry_metadata_conflict")
+                continue
+            candidates.append({"name": name, "code": code_column or None,
+                               "level": level, "as_of": name_date or code_date})
+    if not candidates:
+        if not saw_security_column:
+            errors.append("field_error")
+        elif not matched:
+            errors.append("security_mismatch")
+        elif not field_present:
+            errors.append("no_sw_industry")
+        else:
+            errors.append("industry_metadata_conflict")
+        return {"source": "ifind", "system": "sw", "classification_version": None,
+                "level": None, "code": None, "name": None, "as_of": None, "errors": errors}
+    identities = {(item["name"], item["code"], item["level"], item["as_of"]) for item in candidates}
+    if len(identities) > 1:
+        # 同一证券同批返回互相矛盾的正式行业：整批拒绝，不取第一个当主值
+        return {"source": "ifind", "system": "sw", "classification_version": None,
+                "level": None, "code": None, "name": None, "as_of": None,
+                "errors": ["duplicate_industry_conflict"]}
+    found = candidates[0]
+    if not found["level"] or not found["as_of"]:
+        errors.append("industry_metadata_missing")
+    return {"source": "ifind", "system": "sw", "classification_version": None,
+            "level": found["level"], "code": found["code"], "name": found["name"],
+            "as_of": found["as_of"], "errors": errors}
+
+
 class ConceptMembership(BaseModel):
     """个股最新概念归属（iFinD，issue #45）。
 
@@ -801,17 +821,79 @@ class IfindFetcher:
         from data_provider.choice_adapter import ChoiceAdapter
         today = date.today()
         target = f"报告期{period}" if period else f"查询{date(today.year - 1, today.month, 1)}至{today}每个报告期"
-        query = f"{ChoiceAdapter.stock_code(code)} {target}的营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率，合并报表（调整）。结果每行列出证券代码、实际报告期，未披露期不输出；同时查询各期定期报告实际披露日期。明确单位、币种、报表类型、调整口径；无数据请保留空值，不推算。"
+        query = f"{ChoiceAdapter.stock_code(code)} {target}的营业收入、归属于母公司所有者净利润、加权ROE、销售毛利率、营业收入同比增长率、归母净利润同比增长率、资产总计、负债合计，合并报表（调整）。结果每行列出证券代码、实际报告期，未披露期不输出；同时查询各期定期报告实际披露日期。明确单位、币种、报表类型、调整口径；无数据请保留空值，不推算。"
         data = self.query("get_stock_financials", query, deadline=deadline)
         raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
         readings = {}
-        for field in self.financial_fields:
-            reading = _parse_ifind_response(raw, _IFIND_ANCHOR_QUERIES[field][2], field, period, code=code, a_share_contract=True)
+        for field in (*self.financial_fields, "assets", "liabilities"):
+            keywords = _IFIND_ANCHOR_QUERIES[field][2] if field in _IFIND_ANCHOR_QUERIES else _BALANCE_FIELD_KEYWORDS[field]
+            reading = _parse_ifind_response(raw, keywords, field, period, code=code, a_share_contract=True)
             if reading is not None:
                 readings[field] = reading
         if not readings:
             raise SourceReadError("ifind", "invalid_response")
         return readings
+
+    def current_info_snapshot(self, code: str, *, deadline: float | None = None, current_time: Any = None) -> Dict[str, Any]:
+        """一次 get_stock_info 批次：实际交易日估值/市值与正式申万行业（issue #71）。
+
+        请求日期来自本地严格交易日历的最近已完成交易日（不用 Choice 登录、不
+        用服务器 UTC 或自然日兜底；日历不可用即不发批）；供应商仍须回显实际
+        日期（行日期/交易日期参数），请求日期本身不替代返回事实。
+        估值复用既有锚点解析；PB 仅在表头确为“最新”且该列参数 ``基准日=
+        报表截止日期`` 同时成立时按供应商证据认定为 MRQ（root 批准的 P2 范围，
+        不做全局“最新→MRQ”词表映射）；其他缺失口径如实保持未知。
+        行业仅消费 所属申万行业 列，分类版本未回显则保持 None，代码列缺席
+        时不补造。
+        """
+        from src.core.trading_calendar import recent_completed_trading_sessions
+        from data_provider.choice_adapter import ChoiceAdapter
+        sessions = recent_completed_trading_sessions("cn", 2, current_time=current_time)
+        if not sessions:
+            # 无法证明最近已完成交易日时不得用「最新交易日」措辞发批：
+            # 实测供应商会回显字面「最新」，估值观测日期不可证明。
+            raise SourceReadError("ifind", "calendar_unavailable")
+        as_of = sessions[0].isoformat()
+        session_window = {session.isoformat() for session in sessions}
+        question = (f"{ChoiceAdapter.stock_code(code)} 截至{as_of}的市盈率PE(TTM)、市净率PB(最新)、总市值、流通市值，"
+                    "以及所属申万行业（一级行业）名称与代码。每项注明实际交易日期、单位、币种和统计口径；"
+                    "行业注明行业级别与截止日期。总市值与流通市值以人民币元返回；无数据请留空，不推算。")
+        data = self.query("get_stock_info", question, deadline=deadline)
+        raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
+        valuation: Dict[str, AnchorReading] = {}
+        for field in ("pe_ratio", "pb_ratio", "total_mv", "circ_mv"):
+            reading = _parse_ifind_response(raw, _IFIND_ANCHOR_QUERIES[field][2], field, None, code=code, a_share_contract=True)
+            if reading is None:
+                continue
+            if field == "pb_ratio" and reading.caliber is None and "最新" in (reading.raw_label or ""):
+                bare = re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", reading.raw_label).strip()
+                basis = str(data.indicators_params.get(bare, {}).get("基准日") or "").strip()
+                if basis == "报表截止日期":
+                    reading = replace(reading, caliber="MRQ")
+            # issue #71：供应商只回显字面「最新」等不可证明观测时间时，在源读数上
+            # 持久标记 time_unknown（保留 raw observed_at）——所有消费层经同一
+            # reading_input_reasons 得到一致资格结论，不依赖任何合并层补丁。
+            # issue #71：本批估值的实际观测日期必须落在最近已完成交易日截至窗口
+            # （严格日历 T / T-1 会话集合）内：缺失/非法/字面「最新」→ time_unknown，
+            # 晚于截至日 → time_in_future，早于窗口 → stale；实际 observed_at 保留，
+            # 请求日期不回填。所有消费层经同一 reading_input_reasons 得到一致结论。
+            observed = normalize_report_period(reading.observed_at)[0]
+            if not observed:
+                reading = replace(reading, normalization_error=reading.normalization_error or "time_unknown")
+            elif observed not in session_window:
+                reading = replace(reading, normalization_error=reading.normalization_error or
+                                  ("time_in_future" if observed > as_of else "stale"))
+            valuation[field] = reading
+        industry = _parse_industry(data, code)
+        # issue #71：行业截止日期晚于严格日历请求截至日 = 供应商返回了未来日期，
+        # 不可作为当前行业采用：保留实际返回日期，记明确拒绝原因（不填请求日期、
+        # 不补造分类/版本），后续消费层经既有 errors 检查回落健康 Choice 补充。
+        industry_as_of = str(industry.get("as_of") or "")
+        if industry_as_of and industry_as_of > as_of:
+            industry = {**industry, "errors": [*(industry.get("errors") or []), "industry_time_in_future"]}
+        if not valuation and not industry.get("name"):
+            raise SourceReadError("ifind", "invalid_response")
+        return {"valuation": valuation, "industry": industry, "requested_date": as_of}
 
     def product_segments(self, code: str, period: str | None = None, *, deadline: float | None = None) -> ProductSegments:
         target = period or f"{date.today().year - 1}-12-31"
@@ -889,8 +971,75 @@ class IfindFetcher:
     def fetch_main_inflow_series(self, code: str, days: int = 12, *, deadline: float | None = None) -> Optional[List[Tuple[str, float]]]:
         if not self.available:
             return None
-        data = self.query("get_stock_performance", f"{code} 近{days}个交易日主力净流入额", deadline=deadline)
-        return _parse_ifind_markdown_series(data.answer, "主力净流入额")
+        # 问句与已验证的逐日契约同语义（root 真实探针）：每个交易日逐行 + 元单位
+        # + 不要累计/估算/填充；严格解析层另行强制证券身份与单日字段身份。
+        question = (f"{code} 近{days}个交易日内每个交易日的主力净流入额，按交易日期逐行列出；"
+                    "明确真实证券代码、实际交易日期、人民币元金额单位与统计口径；"
+                    "不要累计值，不要估算或前向填充。")
+        data = self.query("get_stock_performance", question, deadline=deadline)
+        return _parse_main_inflow_series(data, code)
+
+
+def _parse_main_inflow_series(data: IfindData, code: str) -> List[Tuple[str, float]]:
+    """严格逐日主力净流入序列：证券身份、金额单位、日期与冲突校验后才返回。
+
+    只接受 证券代码+日期+主力净流入额（单位：元） 形态的行；返回证券与请求
+    证券不符、金额列缺失单位或带量/股、行级币种与人民币冲突、同日金额冲突
+    一律按无效响应拒绝，不静默降级（issue #71 root 反例边界）。周末空白行
+    不产生数据行；金额倍率（万/亿）经既有归一化只换算一次。
+    """
+    series: List[Tuple[str, float]] = []
+    seen: Dict[str, float] = {}
+    matched = False
+    rejected_other_security = False
+    # issue #71：逐日金额字段按正向身份确认——去单位注解/空白后的实际 bare 必须
+    # 精确等于已确认的单日字段「主力净流入额」；近N日/累计等任何其他口径列因此
+    # 天然不匹配（root 反例：近5日/近20日主力净流入额曾进入逐日窗口合计），
+    # 不维护禁词清单。
+    daily_field_identity = "主力净流入额"
+    for table in _ifind_tables(data.answer):
+        if not table:
+            continue
+        headers = list(table[0].keys())
+        if "证券代码" not in headers:
+            # 无证券身份列的表不能证明行归属：整体拒绝，不挑行采用
+            raise SourceReadError("ifind", "invalid_response")
+        value_column = next((h for h in headers
+                             if re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", h).strip() == daily_field_identity), None)
+        date_column = next((h for h in headers if h.strip() == "日期"), None)
+        if value_column is None or date_column is None:
+            continue
+        annotation = re.search(r"单位[：:]\s*([^）)；|]+)", value_column)
+        column_unit = annotation[1].strip() if annotation else None
+        bare = re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", value_column).strip()
+        declared = (str(data.indicators_params.get(bare, {}).get("单位") or "").strip() or column_unit or "").strip()
+        if declared != "元":
+            # 无法证明金额单位（缺单位、量/股、外币计价列）一律拒绝
+            raise SourceReadError("ifind", "invalid_response")
+        currency_raw = str(data.indicators_params.get(bare, {}).get("币种") or "").strip()
+        if currency_raw and currency_raw not in {"人民币", "人民币元", "CNY", "RMB"}:
+            raise SourceReadError("ifind", "invalid_response")
+        for row in table:
+            if not _same_security(row.get("证券代码"), code):
+                rejected_other_security = True
+                continue
+            row_currency = str(row.get("currency") or "").strip()
+            if row_currency and row_currency not in {"人民币", "人民币元", "CNY", "RMB"}:
+                raise SourceReadError("ifind", "invalid_response")
+            raw_date = normalize_report_period(row.get(date_column))[0]
+            if raw_date is None or not str(row.get(value_column, "")).strip():
+                continue
+            value, _unit, _currency, error = _ifind_number(str(row[value_column]), value_column, declared, "main_inflow")
+            if value is None or error:
+                raise SourceReadError("ifind", "invalid_response")
+            if raw_date in seen and seen[raw_date] != value:
+                raise SourceReadError("ifind", "invalid_response")
+            matched = True
+            seen[raw_date] = value
+            series.append((raw_date, value))
+    if not matched or (rejected_other_security and not series):
+        raise SourceReadError("ifind", "invalid_response")
+    return series
 
 
 class IfindSource:

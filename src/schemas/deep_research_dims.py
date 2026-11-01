@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import ClassVar, Annotated, Any, Dict, Iterable, List, Literal, Optional
 
@@ -433,6 +434,41 @@ class TechnicalDim(DimEnvelope):
     narrative: str = ""
 
 
+class CapitalAdoptionEvidence(BaseModel):
+    """资金评分采纳边界的最小脱敏证据（issue #71）。
+
+    仅形状级事实：字段存在性、JSON 产物的声明类型白名单（归一覆写前捕获）、
+    归一后评分的有限性与采纳门裁决枚举。不含原始模型回复/prompt/分值内容，
+    无动态键转储（模型不可借输出键注入证据字段）；strict + frozen + 字段封闭，
+    未知键与可矫正类型（如 1/"yes" 冒充布尔）在边界被拒。判定顺序与
+    explore_agents 采纳分支严格对应：缺失/布尔/类型错/非有限 → 无分析正文；
+    评分范围不作重复校验（CapitalDim 契约为唯一范围权威，越界载荷走既有
+    契约硬拒绝路径，本证据不扩大失败持久化）。``contract_rejected`` 仅由
+    capital 解析窄边界在契约硬拒绝后回写（证据不得在维度被契约拒绝时仍宣称
+    adopted），采纳门本身不产出该值。
+    """
+
+    model_config = ConfigDict(
+        strict=True, frozen=True, validate_assignment=True, extra="forbid"
+    )
+    outcome: Literal[
+        "adopted",
+        "score_missing",
+        "score_bool",
+        "score_invalid",
+        "score_nonfinite",
+        "analysis_empty",
+        "contract_rejected",
+    ]
+    flow_score_present: bool
+    flow_score_declared_type: Literal[
+        "absent", "NoneType", "bool", "int", "float", "str", "dict", "list", "other"
+    ]
+    flow_score_finite: Optional[bool] = None
+    analysis_present: bool
+    analysis_source: Optional[Literal["narrative", "flow_summary"]] = None
+
+
 class CapitalDim(DimEnvelope):
     """资金研究员：资金流向（issue #64 起机构侧退役，资金流独立完成）。"""
 
@@ -447,6 +483,24 @@ class CapitalDim(DimEnvelope):
     as_of_date: Annotated[str, Field(max_length=10)] = ""
     expected_date: Annotated[str, Field(max_length=10)] = ""
     narrative: str = ""
+    # issue #71：模型分析未形成可用评分/正文时的最小脱敏证据（存在性/声明类型/
+    # 有限性/裁决枚举；不含原始回复文本，无动态键转储），随 typed dim 保存/历史
+    # 链路持久化，供失败定位与回放；不改变完成门。历史载荷缺该字段解析为 None。
+    adoption_evidence: Optional[CapitalAdoptionEvidence] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _parse_adoption_evidence_json(cls, value: Any) -> Any:
+        """把既有适配边界序列化成字符串的采纳证据在契约边界解析回 dict。"""
+        # 解析失败原样保留，交字段校验拒绝。
+        if isinstance(value, dict):
+            raw = value.get("adoption_evidence")
+            if isinstance(raw, str):
+                try:
+                    return {**value, "adoption_evidence": json.loads(raw)}
+                except ValueError:
+                    return value
+        return value
 
 
 class SentimentDim(DimEnvelope):
