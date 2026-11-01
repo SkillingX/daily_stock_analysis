@@ -19,12 +19,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from data_provider.cross_source_validator import AnchorReading  # noqa: E402
 from data_provider.ifind_fundamental_adapter import (  # noqa: E402
+    IfindData,
     IfindFetcher,
     IfindSource,
     _extract_ifind_value,
-    _parse_ifind_markdown_series,
     _parse_ifind_markdown_table,
     _parse_ifind_response,
+    _parse_main_inflow_series,
     _safe_float,
 )
 
@@ -280,88 +281,70 @@ class TestIfindGrowthAnchors(unittest.TestCase):
         self.assertEqual(r.requested_period, "2024年报")
 
 
-class TestParseIfindMarkdownSeries(unittest.TestCase):
-    """_parse_ifind_markdown_series：多行序列解析（capital_flow_provider 的输入）。
+class TestParseMainInflowSeries(unittest.TestCase):
+    """_parse_main_inflow_series：证券身份/金额单位/日期冲突严格校验（issue #71）。
 
-    与 _parse_ifind_markdown_table（只取首行）互补——收集全部数据行，
-    按「主力净流入额」定位金额列（避开「主力净流入量（股）」），按「日期」定位日期列。
+    资金窗口合格性依赖序列边界本身可证明：返回证券须匹配请求证券，金额列须
+    带「单位：元」证据（量/股列拒绝），同日金额冲突整批拒绝，周末空行不成行。
     """
 
-    # 实测样式的多行表（近10个交易日→多行）：「主力净流入额（单位：元）」列，
-    # 单位在值内（万/元），另含「证券简称」等无关列。参数信息段应被跳过。
-    _SERIES = (
+    def _env(self, answer: str, params=None) -> IfindData:
+        return IfindData(answer=answer, indicators_params=params if params is not None else {"主力净流入额": {"单位": " 元", "交易日期": "最新"}})
+
+    _TABLE = (
         "|证券代码|证券简称|日期|主力净流入额（单位：元）|\n"
         "|---|---|---|---|\n"
         "|688486.SH|龙迅股份|20260625|245.4733万|\n"
         "|688486.SH|龙迅股份|20260624|-8481311.6|\n"
-        "|688486.SH|龙迅股份|20260623|1463.0539万|\n"
-        "|688486.SH|龙迅股份|20260622|-3361255.0|\n"
-        "|688486.SH|龙迅股份|20260618|3071.3108万|\n"
-        "|688486.SH|龙迅股份|20260617|-12806358.8|\n"
-        "\n"
-        "# 指标参数信息\n```json\n{\"主力净流入额\":{\"unit\":\"元\"}}\n```\n"
     )
 
-    def test_parses_all_rows_newest_first(self):
-        series = _parse_ifind_markdown_series(self._SERIES, "主力净流入额")
-        self.assertEqual(len(series), 6)  # 参数信息段被跳过，仅 6 行数据
-        # 最新在前：第一行 = 20260625
-        self.assertEqual(series[0][0], "20260625")
-        self.assertAlmostEqual(series[0][1], 245.4733 * 1e4)  # 值内「万」→ 元
-        self.assertEqual(series[-1][0], "20260617")
+    def test_parses_rows_with_units_scaled_once(self):
+        series = _parse_main_inflow_series(self._env(self._TABLE), "688486")
+        self.assertEqual([d for d, _v in series], ["2026-06-25", "2026-06-24"])
+        self.assertAlmostEqual(dict(series)["2026-06-25"], 245.4733e4)  # 万只换算一次
+        self.assertAlmostEqual(dict(series)["2026-06-24"], -8481311.6)
 
-    def test_avoids_param_section_rows(self):
-        # 参数信息段（# 指标参数信息 / json 块）不应混入序列
-        series = _parse_ifind_markdown_series(self._SERIES, "主力净流入额")
-        dates = [d for d, _v in series]
-        self.assertNotIn("# 指标参数信息", dates)
-        self.assertEqual(len(dates), 6)
+    def test_wrong_security_rejected_not_adopted(self):
+        text = self._TABLE.replace("688486.SH", "600519.SH")
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(text), "688486")
 
-    def test_mixed_unit_conversion(self):
-        series = _parse_ifind_markdown_series(self._SERIES, "主力净流入额")
-        by_date = dict(series)
-        self.assertAlmostEqual(by_date["20260625"], 245.4733e4)   # 万（正值）
-        self.assertAlmostEqual(by_date["20260624"], -8481311.6)   # 纯数值 = 元
-        self.assertAlmostEqual(by_date["20260623"], 1463.0539e4)  # 万（正值）
-        self.assertAlmostEqual(by_date["20260622"], -3361255.0)   # 纯数值 = 元
+    def test_missing_unit_evidence_rejected(self):
+        text = self._TABLE.replace("主力净流入额（单位：元）", "主力净流入额")
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(text, params={}), "688486")
 
-    def test_empty_text_returns_empty(self):
-        self.assertEqual(_parse_ifind_markdown_series("", "主力净流入额"), [])
-        self.assertEqual(_parse_ifind_markdown_series(None, "主力净流入额"), [])
+    def test_shares_column_rejected(self):
+        text = self._TABLE.replace("主力净流入额（单位：元）", "主力净流入量（单位：股）")
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(text), "688486")
 
-    def test_no_separator_returns_empty(self):
-        self.assertEqual(
-            _parse_ifind_markdown_series("no table here", "主力净流入额"), []
-        )
+    def test_foreign_currency_conflict_rejected(self):
+        params = {"主力净流入额": {"单位": " 元", "币种": "USD"}}
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(self._TABLE, params), "688486")
 
-    def test_no_value_column_returns_empty(self):
-        # 表存在但无「主力净流入额」列 → []
-        text = "|日期|收盘价|\n|---|---|\n|20260625|1200|\n"
-        self.assertEqual(_parse_ifind_markdown_series(text, "主力净流入额"), [])
+    def test_conflicting_duplicate_date_rejected(self):
+        text = self._TABLE + "|688486.SH|龙迅股份|20260624|-1.0|\n"
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(text), "688486")
 
-    def test_no_date_column_returns_empty(self):
-        text = "|主力净流入额|\n|---|---|\n|25.71|\n"
-        self.assertEqual(_parse_ifind_markdown_series(text, "主力净流入额"), [])
+    def test_weekend_blank_rows_produce_no_rows(self):
+        text = self._TABLE + "|688486.SH|龙迅股份|20260621|\t|\n"
+        series = _parse_main_inflow_series(self._env(text), "688486")
+        self.assertEqual(len(series), 2)
 
     def test_avoids_quantity_shares_column(self):
-        # 防御：表同时含「主力净流入额」与「主力净流入量（单位：股）」→ 取额不取量
         text = (
-            "|日期|主力净流入额（单位：元）|主力净流入量（单位：股）|\n|---|---|---|\n"
-            "|20260625|245.4733万|37631|\n|20260624|-100.0|-180000|\n"
+            "|证券代码|日期|主力净流入额（单位：元）|主力净流入量（单位：股）|\n|---|---|---|---|\n"
+            "|688486.SH|20260625|245.4733万|37631|\n"
         )
-        series = _parse_ifind_markdown_series(text, "主力净流入额")
-        self.assertEqual(len(series), 2)
-        self.assertAlmostEqual(dict(series)["20260625"], 245.4733e4)  # 额，非股数 37631
+        series = _parse_main_inflow_series(self._env(text), "688486")
+        self.assertEqual(dict(series)["2026-06-25"], 245.4733e4)  # 额，非股数
 
-    def test_skips_unparseable_rows(self):
-        # 金额不可解析的行被跳过，其余正常收集
-        text = (
-            "|日期|主力净流入额（单位：万元）|\n|---|---|\n"
-            "|20260625|25.71|\n|20260624|--|\n|20260623|88.4|\n"
-        )
-        series = _parse_ifind_markdown_series(text, "主力净流入额")
-        self.assertEqual(len(series), 2)
-        self.assertEqual([d for d, _v in series], ["20260625", "20260623"])
+    def test_empty_answer_rejected(self):
+        with self.assertRaises(SourceReadError):
+            _parse_main_inflow_series(self._env(""), "688486")
 
 
 class TestIfindFetcherSeries(unittest.TestCase):

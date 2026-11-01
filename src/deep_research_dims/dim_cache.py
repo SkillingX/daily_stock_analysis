@@ -66,8 +66,25 @@ INTEL_CONTRACT_VERSION = 2
 _INTEL_CONTRACT_DIMS = frozenset({"intel"})
 
 CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
-FUNDAMENTAL_MAPPING_VERSION = 20  # issue #64：阶段0退役行业榜/机构侧后快照内容变化，旧快照重算
+# issue #71：当前数据映射变化（同财期资产负债、iFinD 估值/行业进共享上下文）
+# → 旧映射快照重算一次；主源策略身份已含在 data_source_contract，不设第二全局
+# 版本层，choice/legacy 旧缓存的键形状与命中不受影响。
+FUNDAMENTAL_MAPPING_VERSION = 21
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
+# issue #71：这些维度同样消费本次迁移的共享事实（估值/行业/资金/业务研究输入），
+# mapping 版本检查仅适用 ifind 主源策略（legacy/choice 旧缓存命中不变）；
+# _FUNDAMENTAL_MAPPING_DIMS 原有的「开核验即不缓存」行为范围保持不变，不并入本集合。
+_MAPPING_VERSION_DIMS = frozenset({*_FUNDAMENTAL_MAPPING_DIMS, "sector", "capital", "business"})
+
+
+def _mapping_version_scoped(dim: str) -> bool:
+    """mapping 版本失效仅作用于 ifind 主源策略下的扩展维度（issue #71）。"""
+    if dim in _FUNDAMENTAL_MAPPING_DIMS:
+        return True
+    from src.config import get_config
+    config = get_config()
+    return (dim in _MAPPING_VERSION_DIMS and config.data_source_profile == "choice"
+            and config.enable_ifind_mcp and config.financial_primary_source == "ifind")
 
 
 def _cache_path(stock_code: str, dim: str) -> str:
@@ -206,8 +223,8 @@ def load_cached_dim(
             or record_identity != quote_identity
         ):
             return None
-    if dim in _FUNDAMENTAL_MAPPING_DIMS and record.get("mapping_version") != FUNDAMENTAL_MAPPING_VERSION:
-        return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值
+    if _mapping_version_scoped(dim) and record.get("mapping_version") != FUNDAMENTAL_MAPPING_VERSION:
+        return None  # 基本面及依赖维度的旧载荷可能含已丢失的零值/市值；本次迁移前载荷缺同财期资产负债/行业，重算
     if dim in _FUNDAMENTAL_MAPPING_DIMS:
         from src.config import get_config
         if get_config().deep_research_cross_validate or (get_config().data_source_profile == "choice" and get_config().enable_ifind_mcp):
@@ -273,8 +290,9 @@ def save_cached_dim(
         if dim in _INTEL_CONTRACT_DIMS:
             record["intel_contract_version"] = INTEL_CONTRACT_VERSION
             record["quote_identity"] = quote_identity
-        if dim in _FUNDAMENTAL_MAPPING_DIMS:
+        if _mapping_version_scoped(dim):
             record["mapping_version"] = FUNDAMENTAL_MAPPING_VERSION
+        if dim in _FUNDAMENTAL_MAPPING_DIMS:
             from src.config import get_config
             record["cross_validation_enabled"] = bool(get_config().deep_research_cross_validate)
         with open(_cache_path(stock_code, dim), "w", encoding="utf-8") as fh:

@@ -14,7 +14,11 @@
 | 指标 | 采用值 | 来源 | 实际期间 | 口径 / 单位 / 币种 | 核验状态 | 规则可用 |
 | --- | ---: | --- | --- | --- | --- | --- |
 {% for name, field in quality.fields.items() %}
-| {{ {'pe_ratio':'PE','pb_ratio':'PB','roe':'ROE','gross_margin':'毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name, name) }} | {{ display.value(field.reading) }} | {{ field.reading.source if field.reading else '未知' }} | {{ (field.reading.period or '期间未知') if field.reading else '未知' }}{% if field.reading %} / {{ display.label(field.reading.period_basis) }}{% endif %} | {% if field.reading %}{{ display.label(field.reading.caliber or '未知') }} / {{ display.label(field.reading.unit or '未知') }} / {{ display.label(field.reading.currency or '不适用或未知') }}{% else %}未知{% endif %} | {{ display.label(field.quality.status) }}{% if field.source_errors %}；{% for error in field.source_errors %}{{ display.failure(error) }}{{ '；' if not loop.last else '' }}{% endfor %}{% elif field.quality.reason_codes %} / {{ display.reasons(field.quality.reason_codes) }}{% endif %} | {{ '是' if field.rule_eligible else '否' }}{% if field.input_reasons %}：{{ display.reasons(field.input_reasons) }}{% endif %} |
+{% set reading = field.reading %}
+{% set raw_obs = (reading.observed_at or '') if reading else '' %}
+{% set observed_cell = (raw_obs[:4] ~ '-' ~ raw_obs[4:6] ~ '-' ~ raw_obs[6:8]) if (raw_obs | length == 8 and raw_obs.isdigit()) else raw_obs %}
+{% set period_cell = (reading.period or ((observed_cell ~ '（观察时点）') if observed_cell else '期间未知')) if reading else '未知' %}
+| {{ {'pe_ratio':'PE','pb_ratio':'PB','roe':'ROE','gross_margin':'毛利率','revenue_yoy':'营收同比','net_profit_yoy':'归母净利同比'}.get(name, name) }} | {{ display.value(reading) }} | {{ reading.source if reading else '未知' }} | {{ period_cell }}{% if reading %} / {{ display.label(reading.period_basis) }}{% endif %} | {% if reading %}{{ display.label(reading.caliber or '未知') }} / {{ display.label(reading.unit or '未知') }} / {{ display.label(reading.currency or '不适用或未知') }}{% else %}未知{% endif %} | {{ display.label(field.quality.status) }}{% if field.source_errors %}；{% for error in field.source_errors %}{{ display.failure(error) }}{{ '；' if not loop.last else '' }}{% endfor %}{% elif field.quality.reason_codes %} / {{ display.reasons(field.quality.reason_codes) }}{% endif %} | {{ '是' if field.rule_eligible else '否' }}{% if field.input_reasons %}：{{ display.reasons(field.input_reasons) }}{% endif %} |
 {% endfor %}
 
 {% else %}

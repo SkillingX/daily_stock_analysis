@@ -864,6 +864,65 @@ def _flow_windows_complete(flow: Dict[str, Any]) -> bool:
     return bool(flow.get("as_of_date") or flow.get("expected_date"))
 
 
+_CAPITAL_EVIDENCE_ABSENT = object()
+
+
+def _capital_declared_kind(raw: Any) -> str:
+    """证据观测：JSON 产物的声明类型白名单（模型不可注入其他取值）。"""
+    if raw is _CAPITAL_EVIDENCE_ABSENT:
+        return "absent"
+    if raw is None:
+        return "NoneType"
+    if isinstance(raw, bool):
+        return "bool"
+    if isinstance(raw, int):
+        return "int"
+    if isinstance(raw, float):
+        return "float"
+    if isinstance(raw, str):
+        return "str"
+    if isinstance(raw, dict):
+        return "dict"
+    if isinstance(raw, list):
+        return "list"
+    return "other"
+
+
+def _capital_score_finite(flow_score: Any) -> Optional[bool]:
+    """归一后评分的有限性；非数值（含布尔）无定义，返回 None。"""
+    if isinstance(flow_score, bool) or not isinstance(flow_score, (int, float)):
+        return None
+    return math.isfinite(flow_score)
+
+
+def _capital_declared_text(value: Any) -> str:
+    """模型分析正文的字符串形态判定（issue #71）：只有真正的字符串才可能是分析。
+
+    布尔/数字/列表/字典等非字符串不 str 强转成「分析」（``str(True)`` 之类
+    不得构成 narrative/flow_summary 采纳正文）；字符串按两端空白裁切。
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _capital_adoption_outcome(flow_score: Any, model_analysis: str) -> str:
+    """采纳门裁决枚举，判定顺序与采纳分支严格对应：缺失/布尔/类型错/非有限 →
+    无分析正文。分数范围不作重复校验——CapitalDim 契约是唯一范围权威
+    （AGENTS 三层防御 L3），越界载荷由既有契约硬拒绝路径处置，本证据不
+    扩大失败持久化。
+    """
+    if flow_score is None:
+        return "score_missing"
+    if isinstance(flow_score, bool):
+        return "score_bool"
+    if not isinstance(flow_score, (int, float)):
+        return "score_invalid"
+    if not math.isfinite(flow_score):
+        return "score_nonfinite"
+    if not model_analysis:
+        return "analysis_empty"
+    return "adopted"
+
+
 def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None, max_steps: int = 8) -> Dict[str, Any]:
     """资金研究员：代码准备资金流资料，单轮无工具结构化分析（issue #56/#64）。
 
@@ -914,11 +973,49 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
             converted = None
         if converted is not None and math.isfinite(converted):
             flow_score = converted
+    # issue #71：声明类型必须在归一覆写前捕获——覆写后只能读到适配后的类型，
+    # 无法记录模型声明的原始形状（如嵌套 {"score": 87} 会被记成 float）。
+    raw_score = data.get("flow_score", _CAPITAL_EVIDENCE_ABSENT)
+    declared_type = _capital_declared_kind(raw_score)
     data["flow_score"] = flow_score
-    model_analysis = str(data.get("narrative") or "").strip() or str(data.get("flow_summary") or "").strip()
-    if not isinstance(flow_score, (int, float)) or isinstance(flow_score, bool) or not model_analysis:
+    # issue #71：分析正文只认真正的字符串——布尔/数字/容器经 str() 变成的
+    # 「True」/「55」等不构成模型分析，不得伪装成已完成的解读。
+    narrative_text = _capital_declared_text(data.get("narrative"))
+    summary_text = _capital_declared_text(data.get("flow_summary"))
+    model_analysis = narrative_text or summary_text
+    # issue #71：采纳边界留存最小脱敏证据（存在性/声明类型/有限性/裁决枚举），
+    # 采纳与拒绝两条路径都留证据；不落原始回复/prompt/分值内容，无动态顶层键
+    # 转储（model_output_keys 等模型可借输出键注入任意内容，禁止）；不据此自动
+    # 重试或补造评分；原报告无原始回复时仍如实降级。
+    evidence = {
+        "outcome": _capital_adoption_outcome(flow_score, model_analysis),
+        "flow_score_present": raw_score is not _CAPITAL_EVIDENCE_ABSENT and raw_score is not None,
+        "flow_score_declared_type": declared_type,
+        "flow_score_finite": _capital_score_finite(flow_score),
+        "analysis_present": bool(model_analysis),
+        "analysis_source": (
+            "narrative" if narrative_text else "flow_summary" if summary_text else None
+        ),
+    }
+    data["adoption_evidence"] = evidence
+    # issue #71：非字符串 narrative 形状不进契约解析（CapitalDim narrative 为
+    # str）——形状证据已在 adoption_evidence，原始布尔/数字/容器不得借
+    # dim/save/API 或解析异常文本持久化。
+    if not isinstance(data.get("narrative"), str):
+        data["narrative"] = ""
+    score_usable = (
+        isinstance(flow_score, (int, float))
+        and not isinstance(flow_score, bool)
+        and math.isfinite(flow_score)
+    )
+    if not score_usable or not model_analysis:
         data["status"] = "degraded"
         data["degraded_reason"] = "资金研究员模型分析未形成可用评分或分析内容；已取得的资金事实保留在固定说明。"
+        if not score_usable:
+            # issue #71：无效评分形状不进契约解析——形状证据已在 adoption_evidence，
+            # 原始值（布尔/无效字符串/非有限数）不得借 dim/save/API 或解析异常
+            # 文本持久化（spec「资金失败采用记录最小脱敏字段与原因」）。
+            data["flow_score"] = None
     else:
         data["score"] = float(flow_score)
     assert flow is not None
@@ -930,6 +1027,12 @@ def run_capital_agent(stock_code: str, stock_name: str, llm_adapter: Any, progre
     as_of_text = f"，截至{as_of}已收盘交易日" if as_of else ""
     pending = ((flow.get("coverage") or {}).get("pending_day") or {}).get("expected_date")
     pending_text = f"；{pending}资金窗口尚未完整" if pending else ""
+    if not narrative_text and summary_text:
+        # issue #71/R4：采纳正文选中 flow_summary 时，真实模型分析在固定资金
+        # 事实覆写 flow_summary 之前落 narrative——最终 CapitalDim 保存/展示的
+        # 是模型真实分析而非只有固定事实；只写选中的非空字符串，非字符串原值
+        # 不转成正文。
+        data["narrative"] = summary_text
     data["flow_summary"] = f"{source_label}{as_of_text}：{amounts}{pending_text}。单源数据，未独立核验。"
     data["as_of_date"] = as_of
     data["expected_date"] = str(flow.get("expected_date") or "")

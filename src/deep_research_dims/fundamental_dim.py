@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -61,6 +62,8 @@ def build_fundamental_dim(
     fund = ctx.fundamental
     gaps: list[str] = []
     fields = {field: financial_field_quality(fund, field) for field in _FUNDAMENTAL_FIELDS}
+    # issue #71 P1：单源公布值采纳的规则可用性由统一契约（adopted_field_record 的
+    # selection_reason 识别）承载，这里不再有本地可用性例外。
     usable = {field: evidence.reading.value if evidence.rule_eligible and evidence.reading is not None else None for field, evidence in fields.items()}
     obtained = {field: evidence.reading.value if evidence.reading is not None else None for field, evidence in fields.items()}
 
@@ -98,8 +101,22 @@ def build_fundamental_dim(
         [(30, 80.0, "高增长"), (10, 65.0, "稳健"), (0, 50.0, "微增"), (-100, 35.0, "下滑")],
     )
     scissors = None
-    rev_reading, np_reading = fields["revenue_yoy"].reading, fields["net_profit_yoy"].reading
-    if rev_score is not None and np_score is not None and rev_reading is not None and np_reading is not None and rev_reading.period is not None and rev_reading.period == np_reading.period and rev_reading.period_basis != "unknown" and rev_reading.period_basis == np_reading.period_basis:
+    rev_evidence, np_evidence = fields["revenue_yoy"], fields["net_profit_yoy"]
+    rev_reading, np_reading = rev_evidence.reading, np_evidence.reading
+    # issue #71：来源/口径约束仅当任一腿为 P1 单源公布值时适用——两腿须同为
+    # iFinD 同批公布值（未知口径）；非 P1 旧对保持原 period/basis 条件不变
+    # （跨源 restated 同期对旧行为保留，不被收敛误伤）。
+    p1_involved = (rev_evidence.selection_reason == "ifind_published_single_source"
+                   or np_evidence.selection_reason == "ifind_published_single_source")
+    same_caliber_pair = (
+        rev_reading is not None and np_reading is not None
+        and (not p1_involved
+             or (rev_reading.source == np_reading.source == "ifind"
+                 and rev_reading.adjustment is None and np_reading.adjustment is None
+                 and rev_evidence.selection_reason == "ifind_published_single_source"
+                 and np_evidence.selection_reason == "ifind_published_single_source"))
+    )
+    if rev_score is not None and np_score is not None and same_caliber_pair and rev_reading.period is not None and rev_reading.period == np_reading.period and rev_reading.period_basis != "unknown" and rev_reading.period_basis == np_reading.period_basis:
         scissors = float(round(Decimal(str(np_reading.value)) - Decimal(str(rev_reading.value)), 2))
     if rev is not None and rev_score is None:
         rev_label = "不可用于规则"
@@ -118,7 +135,19 @@ def build_fundamental_dim(
     balance = fund.get("balance_sheet") or {}
     assets, liabilities = balance.get("assets"), balance.get("liabilities")
     leverage = None
+    # issue #71：资产负债结构最小扩展——iFinD 同源同财期、合并报表(调整)、币种/
+    # 单位确证、金额有效即可计算当前 leverage。披露日期：已知未来日期拒绝；
+    # 未知（None）按「当前分析可用、非历史时点可得」如实标注（不编造日期）。
+    ifind_balance_current = (
+        balance.get("source") == "ifind"
+        and balance.get("statement_scope") == "consolidated"
+        and balance.get("adjustment") == "restated"
+        and balance.get("currency") == "CNY" and balance.get("unit") == "currency_base"
+        and (balance.get("disclosed_at") is None or balance.get("disclosed_at") <= date.today().isoformat())
+    )
     if balance.get("source") == "choice" and balance.get("currency") == "CNY" and balance.get("unit") == "currency_base" and balance.get("period") and balance.get("disclosed_at") and isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)) and assets > 0 and liabilities >= 0:
+        leverage = float(round(Decimal(str(liabilities)) / Decimal(str(assets)) * 100, 2))
+    elif ifind_balance_current and isinstance(assets, (int, float)) and isinstance(liabilities, (int, float)) and assets > 0 and liabilities >= 0:
         leverage = float(round(Decimal(str(liabilities)) / Decimal(str(assets)) * 100, 2))
     # issue #64：机构持仓变化退役——新报告 financial_safety 不再产出该字段，
     # 渲染不再出现「机构持仓变化：缺失」退役缺口（历史保存载荷兼容不变）。
@@ -126,6 +155,10 @@ def build_fundamental_dim(
         "leverage": leverage,
         "period": balance.get("period"),
         "source": balance.get("source"),
+        # issue #71：沿用既有 note 键（渲染层已映射为「说明」），不新增内部键
+        # 泄漏到报告；缺失披露/非历史时点的解释文本原样保留。
+        **({"note": "披露日期未提供：仅用于当前分析，非历史时点可得"}
+           if leverage is not None and balance.get("source") == "ifind" and not balance.get("disclosed_at") else {}),
     }
     if leverage is None:
         gaps.append("资产负债结构")
@@ -152,6 +185,10 @@ def build_fundamental_dim(
     warnings = list(dict.fromkeys(fund.get("errors") or [])) + ["各字段仅按自身证据使用，组件完整不代表同期财报。", "规则评分置信度与跨源核验状态分别解释。"]
     if not all(evidence.quality.status == "verified" for evidence in fields.values()):
         warnings.append("财务字段尚未全部独立核验；未核验、单源、不可比或冲突限制详见字段证据。")
+    p1_used = [field for field, evidence in fields.items()
+               if evidence.selection_reason == "ifind_published_single_source"]
+    if p1_used:
+        warnings.append("ROE/毛利率/营收同比/归母净利同比按 iFinD 公布值单源采用（调整口径未知、未独立核验，不与其他来源混算）。")
     if not complete:
         warnings.append("当前仅可进行获准指标的局部评估，不能作为完整财务健康结论。")
     quality = FinancialDataQuality(state="none" if n == 0 else "complete" if n == 6 else "partial", obtained_count=n, rule_usable_count=m, health_components=len(scores), fields=fields, warnings=tuple(warnings))
