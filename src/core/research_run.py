@@ -23,6 +23,24 @@ def supplier_need_key(supplier: str, contract: str, need: str, qualifier: str, r
     return f"{supplier}|{contract}|{need}|{qualifier}|{refresh}"
 
 
+def vendor_source_label(research: dict[str, Any] | None) -> str:
+    """research 块实际来源的展示标签（issue #73）：不硬编码 Choice。
+
+    iFinD 主源深研的公司/研究事实按块内真实 ``source`` 标注（iFinD）；历史
+    Choice 载荷保持 Choice 标签不变；未知来源回退为供应商中性词，不冒认。
+    """
+    source = str((research or {}).get("source") or "")
+    return {"choice": "Choice", "ifind": "iFinD"}.get(source, source or "供应商")
+
+
+def research_field_date(research: dict[str, Any] | None, company: dict[str, Any] | None, indicator: str) -> str:
+    """公司事实的截止日期：优先该列供应商自身日期（实际列元数据），无则回退
+    块 as_of（历史 Choice 载荷形状）；两者都缺为「未标注」——iFinD 缺字段日期
+    不得从请求日期或无关块推断。"""
+    field_dates = (company or {}).get("field_dates") or {}
+    return str(field_dates.get(indicator) or (research or {}).get("as_of") or "未标注")
+
+
 def _isolated_copy(result: _T) -> _T:
     import copy
 

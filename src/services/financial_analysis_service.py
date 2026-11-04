@@ -434,6 +434,8 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None, force_refresh
         refresh_token = financial_refresh.set((code, uuid4().hex))
         if get_config().data_source_profile == "choice":
             ctx = SharedContext(code, name, datetime.now().isoformat())
+            # issue #73：财务专项报告无深研 run——聚合层按真实深研身份判定后保持
+            # 既有完整聚合（Choice 补充/目标价/公司）与原 false-scope 副作用不变。
             ctx.fundamental = _safe_fundamental(code, ctx)
             if name == code:
                 name = str(ctx.fundamental.get("stock_name") or code)

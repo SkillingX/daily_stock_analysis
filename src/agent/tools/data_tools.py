@@ -1042,7 +1042,8 @@ def _capital_flow_tool_result(stock_code: str, ctx: dict[str, Any]) -> dict[str,
 
 
 def _apply_capital_cross_validation(
-    stock_code: str, result: dict[str, Any], ctx: dict[str, Any], deadline: float
+    stock_code: str, result: dict[str, Any], ctx: dict[str, Any], deadline: float,
+    *, allow_choice_fallback: bool = True,
 ) -> dict[str, Any]:
     """Apply the existing opt-in cross-source qualification to a capital result.
 
@@ -1051,6 +1052,8 @@ def _apply_capital_cross_validation(
     primary block is not refetched — only the independent second source runs,
     exactly as the bounded fetch always did. iFinD 多日累计（稳定源）：
     akshare push2his 不可达 → 主力净流入/5d/10d 回填。
+    ``allow_choice_fallback=False``（issue #73 iFinD 主源深研 scope）：回填窗口
+    同样不回退 Choice 出站。
     """
     records = result["field_meta"]
     main = reading_from_field_record(result["main_net_inflow"], records.get("main_inflow"))
@@ -1062,7 +1065,7 @@ def _apply_capital_cross_validation(
             if record is not None:
                 records[field] = record
         result = _backfill_capital_flow(
-            result, _cv, get_main_inflow_cumulative(stock_code, deadline=deadline) if deadline > monotonic() else {}
+            result, _cv, get_main_inflow_cumulative(stock_code, deadline=deadline, allow_choice_fallback=allow_choice_fallback) if deadline > monotonic() else {}
         )
         result["cross_validation"] = _cv
     return result
@@ -1071,7 +1074,8 @@ def _apply_capital_cross_validation(
 def _handle_get_capital_flow(stock_code: str, include_sector_flows: bool = True) -> dict[str, Any]:
     """Get main-force capital flow data for a stock.
 
-    ``include_sector_flows=False``（issue #64 深研路径）：不取行业资金榜。
+    ``include_sector_flows=False``（issue #64 深研路径）：不取行业资金榜；
+    issue #73：iFinD 主源下该深研 scope 同样禁资金失败回退 Choice。
     """
     from src.core.market_policy import require_stock_market
     require_stock_market(stock_code)
@@ -1096,7 +1100,9 @@ def _handle_get_capital_flow(stock_code: str, include_sector_flows: bool = True)
     result = _capital_flow_tool_result(stock_code, ctx)
     if result.get("status") in ("not_supported", "error"):
         return result
-    return _apply_capital_cross_validation(stock_code, result, ctx, deadline)
+    from data_provider.base import ifind_deep_research_scope_active
+    allow_choice_fallback = not ifind_deep_research_scope_active(include_sector_flows)
+    return _apply_capital_cross_validation(stock_code, result, ctx, deadline, allow_choice_fallback=allow_choice_fallback)
 
 
 get_capital_flow_tool = ToolDefinition(

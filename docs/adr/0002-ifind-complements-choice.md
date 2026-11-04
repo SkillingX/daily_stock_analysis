@@ -4,6 +4,8 @@ status: superseded-in-part
 
 # iFinD 与 Choice 的有限双源协作
 
+2026-11-02 修订（[Issue #73](https://github.com/SkillingX/daily_stock_analysis/issues/73)）：iFinD 主源深度投研在深研身份（深研 run 上下文 + 深研 scope 开关）内实现零 Choice 出站——Choice header/六字段/资产负债/估值/目标价/公司补查/独立核验与资金失败回退全部不再发起，公司事实与公司名称由 iFinD 提供，目标价以「未查询」语义走获准的非估值分析；非深研消费者与 `choice` 主源的 Choice 补充/目标价/公司行为不变。语义与边界详见[接入说明](../ifind-mcp-integration.md) issue #73 一节。
+
 2026-11-01 修订（[Issue #71](https://github.com/SkillingX/daily_stock_analysis/issues/71)）：`FINANCIAL_PRIMARY_SOURCE=ifind` 时，当前财务快照（六字段+同财期资产负债）、当前估值/市值、正式申万一级行业与个股资金 1/5/10 日窗口迁移至 iFinD 主源，Choice 降为有界补充；完整年报与机构目标价仍由 Choice 提供，交易日历以本地严格日历为准（不以 Choice 登录兜底）。语义与边界详见[接入说明](../ifind-mcp-integration.md) issue #71 一节。
 
 2026-10-15 修订：用户确认当前六项财务可显式选择 iFinD 优先，Choice 同期补值/核验；主营和个人股东明细优先保留 iFinD。完整年报、估值、资金与机构目标价仍由 Choice 提供，行情沿用原渠道。以最新有效实际财期建快照，在同一期按主源优先；未知调整口径不放宽，旧期不能填新期。复用现有共享上下文、核验和缓存，不建设供应商框架。配置与回退见[接入说明](../ifind-mcp-integration.md)，新工作状态见 [Issue #23](https://github.com/SkillingX/daily_stock_analysis/issues/23)。下文保留原决策背景，其主源顺序由本次修订替代。

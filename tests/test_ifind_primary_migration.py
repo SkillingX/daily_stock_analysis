@@ -1559,11 +1559,12 @@ def test_interrupted_report_keeps_official_industry_in_selected_sector(probe_tra
     run = ResearchRun(120)
     run.context = SharedContext("688183", "生益电子", "2026-11-01T10:00:00")
 
-    def stopping_native(method, args, options, deadline):
+    # issue #73：深研 scope 零 Choice 出站——真实停止 seam 用可选 iFinD 主营批次。
+    def stopping_products(self, code, period=None, *, deadline=None):
         run.stop("cancelled")
         raise ResearchStopped(run.reason_text)
 
-    monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(stopping_native))
+    monkeypatch.setattr(IfindFetcher, "product_segments", stopping_products)
     with run.bind():
         fundamental = DataFetcherManager().get_fundamental_context("688183", budget_seconds=60, include_sector_flows=False)
     from src.agent.tools.data_tools import _compact_fundamental_context
@@ -1575,7 +1576,7 @@ def test_interrupted_report_keeps_official_industry_in_selected_sector(probe_tra
         "research": compact.get("research") or {},
         "capital_flow": compact.get("capital_flow") or {},
     }
-    assert run.stop_reason, "原生停止必须已真实发生"
+    assert run.stop_reason, "真实可选批次停止必须已发生"
     result = _interrupted_result(run, "688183", "生益电子", {"sector"}, None)
     sector = result.dims["sector"]
     assert sector.status == "degraded" and sector.sector_hint == "电子"
@@ -1586,7 +1587,7 @@ def test_interrupted_report_keeps_official_industry_in_selected_sector(probe_tra
     assert "电子" in result.markdown
 
 
-@pytest.mark.parametrize("stop_at", ("choice_snapshot", "optional_products"))
+@pytest.mark.parametrize("stop_at", ("optional_products",))
 def test_cancelled_service_keeps_selected_dims_facts(probe_transport, provider, tmp_path, monkeypatch, stop_at):
     """受控服务取消（真实可选 seam）：fundamental+sector+capital 三所选维度保持
     降级/取消口径且已取得事实经保存/API/Markdown 同链路留存；模型零调用，
@@ -1626,9 +1627,10 @@ def test_cancelled_service_keeps_selected_dims_facts(probe_transport, provider, 
         run.stop("cancelled")
         raise ResearchStopped(run.reason_text)
 
-    if stop_at == "choice_snapshot":
-        monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(stop_after_early_flow))
-    else:
+    # issue #73：深研 scope 零 Choice 出站（Choice 快照停止 seam 见
+    # test_cancel_at_choice_snapshot_*），且股东隐式出站按 issue #64 已禁——
+    # 真实停止 seam 为资金落位之后的主营可选批次。
+    if stop_at == "optional_products":
         monkeypatch.setattr(IfindFetcher, "product_segments", stop_after_early_flow)
     try:
         result = module.deep_research_service.generate_report(
@@ -1726,7 +1728,9 @@ def test_capital_tool_note_labels_actual_ifind_source(probe_transport):
 
 
 def test_failed_flow_note_keeps_original_reason_and_fallback_source(choice_transport, monkeypatch):
-    """iFinD 失败回退 Choice：失败 note 标实际回退来源，iFinD 原始失败原因保留。"""
+    """iFinD 失败回退 Choice（issue #73 后仅限非深研 scope）：失败 note 标实际
+    回退来源，iFinD 原始失败原因保留；深研 scope（include_sector_flows=False）
+    不再回退 Choice，按缺口如实披露（零 Choice 出站）。"""
     from data_provider.cross_source_validator import SourceReadError
     from src.agent.tools.data_tools import _handle_get_capital_flow
 
@@ -1754,7 +1758,16 @@ def test_failed_flow_note_keeps_original_reason_and_fallback_source(choice_trans
                 "data": {args[0]: [values]}}
 
     monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(native))
-    result = _handle_get_capital_flow("300398", include_sector_flows=False)
+    # 深研身份（run + false-scope 开关，issue #73）：零 Choice 出站，iFinD 失败
+    # 如实披露（块 partial + 原始失败原因随块保留，不回退 Choice 补窗）。
+    from src.core.research_run import ResearchRun as _FlowRun
+    with _FlowRun(120).bind():
+        deep_result = _handle_get_capital_flow("300398", include_sector_flows=False)
+    assert deep_result["source"] == "ifind"
+    assert deep_result["status"] == "partial"
+    assert any("timeout" in str(item) for item in deep_result.get("errors", [])), "iFinD 原始失败原因必须随块保留"
+    # 非深研消费者（无 run）：既有有界回退保持原行为
+    result = _handle_get_capital_flow("300398", include_sector_flows=True)
     assert result["source"] == "choice", "回退块的来源标签必须是实际 Choice"
     note = result.get("note") or ""
     assert "Choice" in note

@@ -1,5 +1,8 @@
 {% import 'financial_display.j2' as display %}
-{% if financial.financial_snapshot %}
+{# issue #73：已采纳事实投影不再依赖核验块——有任一实际读数即渲染快照表
+（单源事实照常展示，不伪装核验）；全部字段无读数时不重复渲染空表，
+字段级证据仍由下方质量表承载。 #}
+{% if financial.financial_snapshot and financial.financial_snapshot.values() | selectattr('reading') | list %}
 {% set snapshot = financial.financial_snapshot %}
 {% include "financial_snapshot.j2" %}
 {% endif %}

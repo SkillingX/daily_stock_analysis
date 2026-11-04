@@ -69,7 +69,15 @@ CACHEABLE_DIMS = frozenset(DIM_TTL_HOURS)
 # issue #71：当前数据映射变化（同财期资产负债、iFinD 估值/行业进共享上下文）
 # → 旧映射快照重算一次；主源策略身份已含在 data_source_contract，不设第二全局
 # 版本层，choice/legacy 旧缓存的键形状与命中不受影响。
-FUNDAMENTAL_MAPPING_VERSION = 21
+# issue #73：深研 scope 零 Choice 映射变化（research 来源标注/核验块缺席/
+# financial_snapshot 无条件投影）→ iFinD 主源旧快照按版本失效重算一次。
+# issue #73 v5：主营分产品正常空覆盖分类+历史候选回查进入共享 research →
+# 旧快照按版本再失效一次（无覆盖/较早财期参考状态不串旧载荷）。
+# issue #73 v6：产品失败状态亦随 research 共享（timeout 等不旁路 latest_
+# annual）、候选实际财期资格与结构资格收紧 → 再失效一次。
+# issue #73 v7：初查四出口实际期资格/较早参考、失败共享收窄深研身份、
+# 结构同 rank 关联 → 再失效一次。
+FUNDAMENTAL_MAPPING_VERSION = 25
 _FUNDAMENTAL_MAPPING_DIMS = frozenset({"fundamental", "six_dim", "scenarios"})
 # issue #71：这些维度同样消费本次迁移的共享事实（估值/行业/资金/业务研究输入），
 # mapping 版本检查仅适用 ifind 主源策略（legacy/choice 旧缓存命中不变）；
@@ -189,6 +197,18 @@ def quote_market_identity(quote: Optional[Dict[str, Any]]) -> Optional[Dict[str,
     }
 
 
+def _business_carries_product_failure(payload: Dict[str, Any]) -> bool:
+    """issue #73 v8：business 载荷是否携带报告内产品失败/不合格拒绝状态。
+
+    只认结构化 ``product_segments.errors``（初查 timeout/权限/invalid/资格
+    错误/period_mismatch，及 v8 起传播的候选失败 ``prior:*`` 原因）；健康
+    products/合格历史参考/有证据正常空覆盖（errors 为空）不触发。不从模型
+    自由文案或 regex 猜测缓存资格。
+    """
+    products = payload.get("product_segments")
+    return isinstance(products, dict) and bool(products.get("errors"))
+
+
 def load_cached_dim(
     stock_code: str, dim: str, quote_identity: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
@@ -243,6 +263,12 @@ def load_cached_dim(
             return None
         if business.status != "ok":
             return None
+        if _mapping_version_scoped("business") and _business_carries_product_failure(payload):
+            # issue #73 v8：报告内产品失败不得跨报告复用——含 v8 前已写入的
+            # 旧坏记录（读守卫同样 miss，不靠版本递增清史），下一报告有真实
+            # 重取/恢复机会；健康产品/合格历史参考/正常空覆盖照常命中。适用
+            # 策略复用映射分域三配置判定（深研与独立专项共享缓存统一收紧）。
+            return None
     if dim == "capital":
         # issue #64/R12/B2：资金缓存采用走共享日期采纳谓词（保存证据保守判定，
         # 不用自然日常数替代交易日资格）；跨收盘旧回退等无法证明当前边界的情形
@@ -268,6 +294,12 @@ def save_cached_dim(
     情报不落盘（下次无法核验复用身份，宁重算不伪造）。
     """
     if dim not in CACHEABLE_DIMS:
+        return
+    if dim == "business" and _mapping_version_scoped("business") and _business_carries_product_failure(payload):
+        # issue #73 v8：携带产品失败/候选拒绝状态的 business 结果不落维度
+        # 缓存（失败仅报告内复用，无跨报告负缓存）；business.status 本身与
+        # 有效公司/财务/资金资料不受影响，新 run/强刷走真实重取。
+        logger.info("[DimCache] business 缓存跳过：报告内产品失败状态不跨报告固化 %s", stock_code)
         return
     if dim in _INTEL_CONTRACT_DIMS and quote_identity is None:
         logger.warning("[DimCache] 情报缓存跳过：行情身份不足，无法核验复用身份 %s", stock_code)

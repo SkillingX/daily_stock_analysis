@@ -54,8 +54,11 @@ def compute_cumulative(
 
 def get_main_inflow_cumulative(
     code: str, days: int = _DEFAULT_FETCH_DAYS, *, deadline: float | None = None,
-    current_time: Any = None,
+    current_time: Any = None, allow_choice_fallback: bool = True,
 ) -> dict[str, Any]:
+    """``allow_choice_fallback=False``（issue #73 iFinD 主源深研 scope）：iFinD
+    供应商失败按缺口如实披露，不登录 Choice 补窗；其余消费者默认 True 保持
+    既有有界回退。"""
     from src.config import get_config
     if get_config().data_source_profile == "choice":
         if get_config().financial_primary_source == "ifind":
@@ -64,6 +67,9 @@ def get_main_inflow_cumulative(
             # 按缺口如实披露；其余 iFinD 供应商失败时 Choice 仍是有界补充
             # （10001009 后由同报告止损约束）。窗口不完整（partial）不算失败。
             if result.get("status") != "failed" or "ifind:calendar_unavailable" in result.get("errors", []):
+                return result
+            if not allow_choice_fallback:
+                # issue #73：深研 scope 零 Choice 出站——失败原因已随 result 保留。
                 return result
             fallback = _choice_main_inflow_cumulative(code, days, deadline=deadline)
             # 回退不静默：iFinD 失败原因随结果保留，来源标签仍如实
