@@ -127,7 +127,19 @@ def build_scenarios_dim(
     reference = None
     reason = "缺少可追溯的目标价与估值计算依据，仅保留定性情景"
     qualitative_no_coverage = False
-    if research.get("source") == "choice":
+    if research.get("source") == "ifind":
+        # issue #73：iFinD 主源深研 scope 不发起目标价出站（聚合层零 Choice 契约，
+        # research 无 targets 键）。「未查询」是设计语义，不是供应商失败也不是已
+        # 确认的无覆盖：与 Choice 成功空覆盖一样，配合充分的同报告非估值证据可走
+        # 合法非估值分支；证据不足仍按缺口降级。真实失败语义保留在 research.errors。
+        qualitative_no_coverage = has_substantive_qualitative_content(llm_scenarios)
+        if qualitative_no_coverage:
+            reason = (
+                f"{NON_VALUATION_SCOPE}iFinD 主源深度研究不查询机构目标价"
+                + (f"（截至 {research.get('as_of')}）" if research.get("as_of") else "")
+                + "；以下为基于已完成研究的定性情景与观察条件。"
+            )
+    elif research.get("source") == "choice":
         reason = "Choice 在截至日期的近180日窗口未提供机构目标价；不以现价倍数或模型猜测补齐"
         # 已知查询错误优先披露真实原因（超时/额度/未发出等）：供应商真实失败
         # 不得被泛化的契约异常文案掩盖，也不得转换为"无覆盖"。注意生产适配器

@@ -74,7 +74,7 @@ def test_cache_version_bumped_to_15_and_ownership_uncacheable() -> None:
     )
 
     assert SCHEMA_VERSION == 15
-    assert FUNDAMENTAL_MAPPING_VERSION == 21  # issue #71：同财期资产负债/iFinD 估值与行业进共享上下文
+    assert FUNDAMENTAL_MAPPING_VERSION == 25  # issue #73 v7：初查四出口资格+失败共享收窄深研身份+同rank关联
     assert "ownership" not in CACHEABLE_DIMS
 
 
@@ -183,7 +183,7 @@ def test_stage_zero_capital_reuse_rejects_cross_close_block(tmp_path, monkeypatc
     # 冻结谓词时钟到声明的读取日（10/29），跨收盘拒绝不依赖测试执行日期。
     _freeze_capital_clock(monkeypatch, "2026-10-29")
     cfg = get_config()
-    key = f"stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_300260"
+    key = f"stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_300260"
     dim_cache.save_snapshot(key, {
         "pe_ttm": 40.0, "pb": 3.0, "roe": 18.0, "gross_margin": 40.0,
         "revenue_growth": 10.0, "net_profit_yoy": 10.0, "market_cap": 10000.0,
@@ -434,7 +434,7 @@ def test_safe_fundamental_snapshot_drops_stale_capital_keeps_finance(tmp_path, m
     }
 
     def _seed(code: str, block: Dict[str, Any]) -> str:
-        key = f"stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_{code}"
+        key = f"stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_{code}"
         dim_cache.save_snapshot(key, {**finance, "capital_flow": block})
         return key
 
@@ -476,8 +476,10 @@ def test_manager_choice_cache_drops_stale_capital_keeps_finance(stage0_env, monk
         "capital_flow": stale,
         "errors": [],
     }
-    deep_key = f"{cfg.data_source_contract}|{manager._get_fundamental_cache_key('300260', None, include_sector_flows=False)}"
-    normal_key = f"{cfg.data_source_contract}|{manager._get_fundamental_cache_key('300261', None, include_sector_flows=True)}"
+    # issue #73（v3）：manager 缓存键含深研身份段——choice 主源下 deep=False（|d0），
+    # seed 键与读取键保持一致。
+    deep_key = f"{cfg.data_source_contract}|{manager._get_fundamental_cache_key('300260', None, include_sector_flows=False)}|d0"
+    normal_key = f"{cfg.data_source_contract}|{manager._get_fundamental_cache_key('300261', None, include_sector_flows=True)}|d0"
     with manager._fundamental_cache_lock:
         manager._fundamental_cache[deep_key] = {"ts": _time.time(), "context": dict(context)}
         manager._fundamental_cache[normal_key] = {"ts": _time.time(), "context": dict(context)}

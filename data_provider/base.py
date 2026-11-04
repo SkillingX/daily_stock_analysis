@@ -26,8 +26,8 @@ from contextvars import copy_context
 from threading import BoundedSemaphore, RLock, Thread
 from abc import ABC, abstractmethod
 from dataclasses import replace
-from datetime import datetime, timezone
-from typing import Literal, Callable, Optional, List, Tuple, Dict, Any, cast
+from datetime import date as _date_cls, datetime, timezone
+from typing import TYPE_CHECKING, Literal, Callable, Optional, List, Tuple, Dict, Any, cast
 
 import pandas as pd
 import numpy as np
@@ -35,6 +35,9 @@ from icontract import require, ensure
 from src.data.stock_index_loader import get_index_stock_name
 from src.data.stock_mapping import STOCK_NAME_MAP, is_meaningful_stock_name
 from src.core.research_run import current_research, ResearchStopped
+
+if TYPE_CHECKING:
+    from data_provider.ifind_fundamental_adapter import ProductSegments
 from src.services.run_diagnostics import (
     record_provider_run,
     record_provider_run_started,
@@ -647,6 +650,23 @@ _CHOICE_VALUATION_INDICATORS = {
 }
 
 
+def ifind_deep_research_scope_active(include_sector_flows: bool = False) -> bool:
+    """issue #73：获准的 iFinD 主源深研身份——零 Choice 收敛的唯一判定。
+
+    深研编排（``run_dual_track``/深研服务及其研究员、工具线程经 copy_context）
+    全程持有 active ``ResearchRun``，且深研路径沿 issue #64 语义传
+    ``include_sector_flows=False``；两者同时成立且财务主源为 ifind 才进入收敛。
+    基本面/板块/财务专项等独立服务共用 false-scope 入口但无深研 run——保持其
+    既有完整聚合（Choice 补充/目标价/公司）与原 false-scope 副作用（无行业榜/
+    股东）逐字不变；仅 ``include_sector_flows=False`` 本身不构成深研身份。
+    """
+    from src.config import get_config
+    from src.core.research_run import current_research
+    if get_config().financial_primary_source != "ifind" or include_sector_flows:
+        return False
+    return current_research.get() is not None
+
+
 def _qualified_ifind_balance(balance_readings: Dict[str, Any], period: Optional[str]) -> Optional[Dict[str, Any]]:
     """同财期、合并报表(调整)、同币种、单位/日期齐备的 iFinD 资产负债才装配。
 
@@ -717,8 +737,96 @@ def _qualified_ifind_choice_omissions(readings: Dict[str, Any]) -> tuple[str, ..
     return omissions
 
 
-def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True) -> Dict[str, Any]:
+def _prior_product_period_candidate(period: str) -> Optional[str]:
+    """本期正常无产品明细时的唯一历史候选财期（issue #73 v5，严格更早）：
+
+    Q3→同年H1、Q1→上年年报、H1→上年年报、年报→同年H1；非规范报告期/
+    未知日期不猜测，不循环遍历多年，不取未来期（含当日之后）。候选只是
+    尝试日期，是否已披露以供应商实际返回为准。
+    """
+    from data_provider.cross_source_validator import normalize_report_period
+    canonical = normalize_report_period(period)[0]
+    if canonical is None:
+        return None
+    year, month, day = int(canonical[:4]), int(canonical[5:7]), int(canonical[8:10])
+    candidate = {
+        (9, 30): f"{year}-06-30",
+        (3, 31): f"{year - 1}-12-31",
+        (6, 30): f"{year - 1}-12-31",
+        (12, 31): f"{year}-06-30",
+    }.get((month, day))
+    if candidate is None or candidate >= canonical:
+        return None
+    if candidate > _date_cls.today().isoformat():
+        return None
+    return candidate
+
+
+@ensure(lambda products, research_period, result: result[0] is None or result[1] is None,
+        "Adoption and rejection are mutually exclusive")
+@ensure(lambda products, research_period, result: result[0] is None or len({item.report_date for item in result[0].items}) == 1,
+        "Adopted initial products must carry a single actual period")
+def _initial_products_selection(products: "ProductSegments", research_period: Optional[str]) -> tuple[Optional["ProductSegments"], Optional[str]]:
+    """深研初查产品选择（issue #73 v7 四出口之一：初查 items）。
+
+    items 实际期必须单一、非未来：等于研究期正常采用（earlier=False）；严格
+    早于研究期可零额外出站直接复用为较早财期参考（earlier=True、保留真实期，
+    不在 ``no_data_periods`` 伪造本期无覆盖）；晚于研究期/未来/混期拒绝并返回
+    准确原因（initial_period_after_research / initial_period_future /
+    initial_period_mixed）。研究期缺失时不猜同期/历史关系，按真实实际期原样
+    采用（earlier=False，关系未知）。非 items/含错误输入非本助手职责。
+    """
+    item_periods = {item.report_date for item in products.items}
+    if len(item_periods) != 1:
+        return None, "initial_period_mixed"
+    actual = next(iter(item_periods))
+    if actual > _date_cls.today().isoformat():
+        return None, "initial_period_future"
+    if research_period is not None:
+        if actual > research_period:
+            return None, "initial_period_after_research"
+        if actual < research_period:
+            return products.model_copy(update={"earlier_period_reference": True}), None
+    return products, None
+
+
+@ensure(lambda prior, current_period, result: result is not None or (
+    len({item.report_date for item in prior.items}) == 1
+    and next(iter({item.report_date for item in prior.items})) < current_period),
+    "Qualified prior products must be a single period strictly earlier than the research period")
+def _prior_products_period_disqualified(prior: "ProductSegments", current_period: str) -> Optional[str]:
+    """历史候选实际财期资格（issue #73 v6 跨字段不变式）。
+
+    采纳为「较早财期主营结构参考」前校验全部 items 的**实际**返回财期：一致、
+    严格早于本次研究期、非未来；请求的候选日期不替代回显日期。返回不合格
+    原因码（candidate_period_mixed / candidate_period_future /
+    candidate_period_not_earlier），合格返回 None。
+    """
+    from data_provider.ifind_fundamental_adapter import ProductSegments  # noqa: F401  运行时类型契约
+    assert isinstance(prior, ProductSegments)
+    item_periods = {item.report_date for item in prior.items}
+    if len(item_periods) != 1:
+        return "candidate_period_mixed"
+    actual = next(iter(item_periods))
+    if actual > _date_cls.today().isoformat():
+        return "candidate_period_future"
+    if actual >= current_period:
+        return "candidate_period_not_earlier"
+    return None
+
+
+def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True, include_company: bool = False, deep_identity: bool = False) -> Dict[str, Any]:
     """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。
+
+    ``include_company``（issue #73，深研 scope）：公司事实改由 iFinD 提供
+    （真实字段/自身日期），替代被收敛的 Choice 公司补查；非深研路径保持
+    False（公司资料仍走 Choice 可选补查，基线行为不变）。
+    ``deep_identity``（issue #73 v5-v7，仅 iFinD 主源深研身份）：承载本轮全部
+    新增自动选择语义——初查产品实际期资格/较早参考零额外采用、本期正常无
+    覆盖后至多 1 个严格更早候选回查（公司查询之后、同一绝对 deadline）、
+    产品失败/已尝试状态的报告内共享（阻断 business 的 latest_annual 旁路）。
+    非深研消费者（普通显式期入口/Choice 主源/股东/独立服务）保持既有重试
+    资格与失败语义，不被本函数新增策略改变。
 
     失败不再静默：供应商、操作与原因记入 errors，随 research 一路保留
     （issue #51），且不影响已取得的财务或概念结果。取消/停止不是供应商
@@ -726,8 +834,8 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     的可选资料照常随块返回，停止后不再发起后续可选出站，聚合继续落位
     已完成的估值/财务/行业/资金事实，停止原因由 run 自身状态真实承载。
     """
-    from data_provider.cross_source_validator import SourceReadError
-    from data_provider.ifind_fundamental_adapter import IfindFetcher
+    from data_provider.cross_source_validator import SourceReadError, normalize_report_period
+    from data_provider.ifind_fundamental_adapter import IfindFetcher, ProductSegments
 
     period = next((reading.period for reading in readings.values() if getattr(reading, "period", None)), None)
     fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
@@ -742,17 +850,148 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
 
     if _out_of_budget():
         return {"omit": ()}
+    # issue #73（v7）四出口状态矩阵（仅 deep_identity 启用新增自动选择语义）：
+    #   初查 items  —— 实际期单一/非未来：=研究期正常采用；<研究期零额外出站
+    #                  作较早参考（earlier=True，不伪造本期无覆盖）；>研究期/
+    #                  未来/混期拒绝并共享准确原因（_initial_products_selection）。
+    #   初查 no_data—— 回显期与请求研究期一致才认定本期正常空覆盖，否则
+    #                  period_mismatch 拒绝、不回查（不抹其他事实）。
+    #   候选 items  —— 实际期单一/严格早于研究期/非未来才作历史参考
+    #                  （_prior_products_period_disqualified，v6 已修保持）。
+    #   候选 no_data—— 实际回显期必须匹配该次候选查询，否则
+    #                  candidate period_mismatch、不合并、不发下一候选。
+    # 失败/已尝试状态共享（阻断 business 的 latest_annual 旁路）同样仅 deep
+    # 身份；非深研消费者维持既有失败语义与重试资格。
+    products_no_data: tuple[str, ...] = ()
+    requested_period = normalize_report_period(period)[0] if period else None
     try:
         products = fetcher.product_segments(code, period, deadline=deadline)
         if products.items and not products.errors:
-            omitted.extend(["MAINBUSINESS", "MAINPRODUCT"])
-            payload["product_segments"] = products.model_dump(mode="json")
+            adopted, initial_reason = (None, None) if not deep_identity else _initial_products_selection(products, requested_period)
+            if initial_reason is not None:
+                errors.append(f"ifind:products:{initial_reason}")
+                payload["product_segments"] = products.model_copy(
+                    update={"items": [], "no_data_periods": (), "errors": [initial_reason]},
+                ).model_dump(mode="json")
+            else:
+                omitted.extend(["MAINBUSINESS", "MAINPRODUCT"])
+                payload["product_segments"] = (products if adopted is None else adopted).model_dump(mode="json")
+        elif not products.errors and products.no_data_periods:
+            # issue #73（v5）：正常无覆盖分类是公共解析语义（两类身份均可见）；
+            # 回显期与研究期一致性（v6/v7）与回查触发（v5）仅 deep 身份。
+            evidenced = products.no_data_periods[0]
+            if deep_identity and requested_period is not None and evidenced != requested_period:
+                errors.append("ifind:products:period_mismatch")
+                payload["product_segments"] = products.model_copy(
+                    update={"no_data_periods": (), "errors": ["period_mismatch"]},
+                ).model_dump(mode="json")
+            else:
+                products_no_data = tuple(products.no_data_periods)
+                payload["product_segments"] = products.model_dump(mode="json")
         elif products.errors:
             errors.append(f"ifind:products:{','.join(products.errors)}")
+            if deep_identity:
+                # v6/v7：资格失败状态随 research 共享（business 不因缺键另查
+                # 默认年报；含错误的聚合不写缓存，无跨报告负缓存）。
+                payload["product_segments"] = products.model_dump(mode="json")
     except SourceReadError as exc:
         errors.append(f"ifind:products:{exc.reason_code}")
+        if deep_identity:
+            # v6/v7：供应商失败（timeout/权限/额度/认证/invalid_response）状态
+            # 随 research 共享并保留真实原因——business 复用失败，不再旁路
+            # latest_annual；报告内复用（错误聚合不缓存），新 run/强刷可恢复。
+            payload["product_segments"] = ProductSegments(items=[], errors=[exc.reason_code]).model_dump(mode="json")
     except ResearchStopped:
         pass
+    if _out_of_budget():
+        payload["omit"] = tuple(omitted)
+        if errors:
+            payload["errors"] = errors
+        return payload
+    if include_company:
+        # issue #73：深研 scope 的公司事实由 iFinD 提供真实字段与自身日期
+        # （替代被收敛的 Choice 公司补查）；置于必要财务/估值/资金之后同一
+        # deadline 内的有界可选出站，失败/取消照常保留证据，不重试。
+        try:
+            profile = fetcher.company_profile(code, deadline=deadline)
+            company_payload: Dict[str, Any] = {}
+            for key, indicator in (("profile", "COMPROFILE"), ("main_business", "MAINBUSINESS"),
+                                   ("main_products", "MAINPRODUCT"), ("controller", "AHOLDER"),
+                                   ("controller_type", "AHOLDERTYPE")):
+                fact = profile.facts.get(key)
+                if fact is not None and fact.value:
+                    company_payload[indicator] = fact.value
+                    if fact.observed_at:
+                        company_payload.setdefault("field_dates", {})[indicator] = fact.observed_at
+            name_fact = profile.facts.get("name")
+            if name_fact is not None and name_fact.value:
+                company_payload["NAME"] = name_fact.value
+                if name_fact.observed_at:
+                    company_payload.setdefault("field_dates", {})["NAME"] = name_fact.observed_at
+            if company_payload:
+                payload["company"] = company_payload
+        except SourceReadError as exc:
+            errors.append(f"ifind:company:{exc.reason_code}")
+        except ResearchStopped:
+            pass
+    if products_no_data and deep_identity and not _out_of_budget():
+        # issue #73（v5）：本期正常无覆盖时的唯一历史候选回查——置于公司查询
+        # 之后（不挤占已验证可用的公司资料机会）、同一绝对 deadline 内、
+        # candidate 出站经 IfindFetcher.query 既有 single_fetch 按问句每报告
+        # 共享（含已知失败），无重试框架；取消/预算耗尽不发派并保留本期无覆盖
+        # 事实，回查失败/无覆盖与本期事实分别披露，不包装为完整明细。
+        candidate = _prior_product_period_candidate(products_no_data[0])
+        if candidate is not None:
+            def _mark_prior_failure(reasons: tuple[str, ...]) -> None:
+                """v8：候选失败经既有结构化产品结果传播同一产品失败资格。
+
+                保留本期合法 no_data 事实，同时把候选真实失败原因记入
+                product_segments.errors（``prior:<原因>``）——business/维度缓存
+                据结构化 errors 识别不可跨报告固化的状态，不从文案猜测。
+                """
+                current_products = payload.get("product_segments") or {}
+                merged = tuple(dict.fromkeys((*current_products.get("errors", []), *(f"prior:{r}" for r in reasons))))
+                payload["product_segments"] = {**current_products, "errors": list(merged)}
+
+            try:
+                prior = fetcher.product_segments(code, candidate, deadline=deadline)
+            except SourceReadError as exc:
+                errors.append(f"ifind:products_prior:{exc.reason_code}")
+                _mark_prior_failure((exc.reason_code,))
+            except ResearchStopped:
+                # 停止不是供应商失败：保留已完成资料与本期无覆盖事实，不再出站；
+                # 取消不与供应商失败混记，不写入失败资格标记。
+                pass
+            else:
+                combined = tuple(dict.fromkeys((*products_no_data, *prior.no_data_periods)))
+                if prior.items and not prior.errors:
+                    # v6：采纳前校验**实际**返回财期——全部 items 一致、严格早于
+                    # 本次研究期、非未来；请求的候选日期不替代回显日期。不合格
+                    # 保留本期无覆盖与已取得公司/财务/资金，记录准确原因，不把
+                    # 同本期/未来/混期明细伪装成历史参考。
+                    disqualified = _prior_products_period_disqualified(prior, products_no_data[0])
+                    if disqualified is None:
+                        payload["product_segments"] = prior.model_copy(update={
+                            "no_data_periods": combined,
+                            "earlier_period_reference": True,
+                        }).model_dump(mode="json")
+                    else:
+                        errors.append(f"ifind:products_prior:{disqualified}")
+                        _mark_prior_failure((disqualified,))
+                elif not prior.errors and prior.no_data_periods:
+                    if prior.no_data_periods[0] != candidate:
+                        # v7：候选回执的实际回显期不是它声称被验证的那次候选
+                        # 查询（请求 H1 却回 Q3 空）——不得静默合并冒充候选正常，
+                        # 保留原 Q3 空事实并记录准确拒绝，不发下一候选。
+                        errors.append("ifind:products_prior:period_mismatch")
+                        _mark_prior_failure(("period_mismatch",))
+                    else:
+                        payload["product_segments"] = prior.model_copy(update={
+                            "no_data_periods": combined,
+                        }).model_dump(mode="json")
+                else:
+                    errors.append(f"ifind:products_prior:{','.join(prior.errors)}")
+                    _mark_prior_failure(tuple(prior.errors))
     if _out_of_budget():
         payload["omit"] = tuple(omitted)
         if errors:
@@ -4485,7 +4724,11 @@ class DataFetcherManager:
         run = current_research.get()
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}"
+        # issue #73（v3 返修）：深研身份进入 manager 缓存读写与 single_fetch 键——
+        # 非深研 false-scope（独立专项服务，完整聚合含 Choice）与深研 false-scope
+        # （零 Choice）在同一 contract/budget/sf 下不得互串缓存或共享出站结果。
+        deep_scope_key = ifind_deep_research_scope_active(include_sector_flows)
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(deep_scope_key)}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         if not (refresh and refresh[0] == code):
@@ -4503,7 +4746,10 @@ class DataFetcherManager:
             # (stage zero) owns the outbound; concurrent researchers share its
             # outcome — success or known failure — instead of re-running the
             # whole aggregation. Run-scoped: nothing is revived across runs.
-            run_key = supplier_need_key("choice", config.data_source_contract, "fundamental_full" if include_sector_flows else "fundamental_full:no_sector", code, refresh[1] if refresh else "")
+            need = "fundamental_full" if include_sector_flows else "fundamental_full:no_sector"
+            if deep_scope_key:
+                need = f"{need}:deep"
+            run_key = supplier_need_key("choice", config.data_source_contract, need, code, refresh[1] if refresh else "")
             return run.single_fetch(run_key, lambda: self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows), timeout=max(0.0, budget))
         return self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows)
 
@@ -4516,7 +4762,9 @@ class DataFetcherManager:
         config = get_config()
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}"
+        # issue #73（v3 返修）：写入键与读取键同一深研身份段（两处必须一致，
+        # 否则深研/非深研结果互串）。
+        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(ifind_deep_research_scope_active(include_sector_flows))}"
         from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record, normalize_report_period, p1_single_source_eligible, reading_input_reasons
         prefer_ifind = config.financial_primary_source == "ifind"
         readings: dict[str, AnchorReading] = {}
@@ -4562,6 +4810,11 @@ class DataFetcherManager:
             else:
                 ifind_valuation = info.get("valuation") or {}
                 ifind_industry = info.get("industry") or {}
+                # issue #73（返修）：批次未取得合格 PB 时的真实原因（已知中证/%
+                # 误映射变体 → wrong_indicator_variant；否则 no_qualified_reading）
+                # 随字段证据保留，不再静默继续。
+                if info.get("pb_rejection"):
+                    valuation_rejections["pb_ratio"] = tuple(info["pb_rejection"])
             for field, reading in ifind_valuation.items():
                 reasons = reading_input_reasons(reading, field)
                 if reasons:
@@ -4594,6 +4847,48 @@ class DataFetcherManager:
                         and not stage0_ctx.fundamental.get("capital_flow")):
                     stage0_ctx.fundamental["capital_flow"] = ifind_capital_flow
         verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
+        # issue #73：零 Choice 收敛只在获准的 iFinD 主源深研身份内生效（深研 run
+        # 上下文 + issue #64 的 false-scope 开关同时成立）；独立专项服务等非深研
+        # 调用者走同一 false-scope 入口时保持既有完整聚合（Choice 补充/目标价/
+        # 公司）与原副作用（无行业榜/股东）不变。
+        deep_scope = prefer_ifind and ifind_deep_research_scope_active(include_sector_flows)
+        if deep_scope and "pb_ratio" not in valuation_records and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+            # issue #73（返修）：聚合批次未取得合格 PB（含已知中证/% 误映射变体）
+            # 时，用 root 已捕获验证过的单指标定向问句做每报告至多一次有界补全：
+            # 同绝对预算（不新增预算，deadline 内既有 single_fetch 共享——同报告
+            # 同键含已知失败，无重试框架），不覆盖健康合格值，不放宽任何解析
+            # 资格；资金窗口预算已在此前预留落位，本可选补查不得侵占。补查仍
+            # 不合格/失败保持缺失并保留真实拒绝原因。
+            from data_provider.mx_data_adapter import financial_refresh as _pb_refresh
+            from src.core.research_run import supplier_need_key as _pb_supplier_need_key
+            _refresh = _pb_refresh.get()
+            pb_key = _pb_supplier_need_key("ifind", config.data_source_contract, "directed_pb", code, _refresh[1] if _refresh else "")
+
+            def _directed_pb() -> Dict[str, Any]:
+                return IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).directed_pb_snapshot(code, deadline=deadline)
+
+            pb_out: Dict[str, Any] = {}
+            # 深研身份本身要求 active run——无 run 的 fallback 是不可达死代码（Ponytail）。
+            try:
+                pb_out = run.single_fetch(pb_key, _directed_pb, timeout=max(0.0, deadline - time.monotonic())) or {}
+            except SourceReadError as exc:
+                prior_pb_rejections = valuation_rejections.get("pb_ratio") or ()
+                valuation_rejections["pb_ratio"] = tuple(dict.fromkeys((*prior_pb_rejections, f"directed_pb:{exc.reason_code}")))
+                pb_out = {}
+            except ResearchStopped:
+                # issue #73（v3 返修）：取消不是供应商失败——可选补查未完成按缺失
+                # 处理，不写任何拒绝原因；已完成的财务/估值/行业/资金事实沿既有
+                # 聚合装配照常保留，停止后不再发起新出站，停止原因由 run 自身状态
+                # 真实承载（与既有可选查询取消保留边界同语义）。
+                pb_out = {}
+            pb_reading: AnchorReading | None = pb_out.get("pb_ratio") if isinstance(pb_out, dict) else None
+            pb_rejection: tuple[str, ...] = tuple(str(item) for item in (pb_out.get("rejection") or ())) if isinstance(pb_out, dict) else ()
+            if pb_reading is not None and not reading_input_reasons(pb_reading, "pb_ratio"):
+                ifind_valuation["pb_ratio"] = pb_reading
+                valuation_records["pb_ratio"] = adopted_field_record("pb_ratio", pb_reading, AnchorQuality(status="single_source", reason_codes=("single_family",)))
+            elif pb_rejection:
+                prior_pb_rejections: tuple[str, ...] = valuation_rejections.get("pb_ratio") or ()
+                valuation_rejections["pb_ratio"] = tuple(dict.fromkeys((*prior_pb_rejections, *(f"directed_pb:{item}" for item in pb_rejection))))
         omit = _qualified_ifind_choice_omissions(readings) if prefer_ifind else ()
         # 估值仅在记录规则合格（含展示时效）时省去 Choice 出站；内在合格但时效
         # 未达规则的字段仍走 Choice，合并层按来源优先覆盖。
@@ -4602,7 +4897,16 @@ class DataFetcherManager:
         # 必要 Choice 先执行；iFinD 主营/股东再决定可选 Choice 缺项。同一绝对截止时间不重置。
         choice_deadline = deadline - verification_budget
         adapter = ChoiceAdapter()
-        snapshot = adapter.snapshot(code, deadline=choice_deadline, omit_indicators=omit, include_optional=False)
+        if deep_scope:
+            # 等价空骨架保持后续合并/投影结构（字段键与非深研 snapshot 同形，
+            # 消费层 .get 语义一致）；不再向 Choice 发起任何原生请求。
+            snapshot: Dict[str, Any] = {
+                "growth": {field: None for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")},
+                "valuation": {field: None for field in ("pe_ratio", "pb_ratio", "total_mv")},
+                "field_meta": {}, "errors": [], "contract": adapter.contract_version,
+            }
+        else:
+            snapshot = adapter.snapshot(code, deadline=choice_deadline, omit_indicators=omit, include_optional=False)
         if prefer_ifind and valuation_records:
             qualified = {field: record for field, record in valuation_records.items() if record["rule_eligible"]}
             if all(indicator in omit for indicator in _CHOICE_VALUATION_INDICATORS.values()):
@@ -4630,6 +4934,17 @@ class DataFetcherManager:
                 *((field, tuple(record["input_reasons"])) for field, record in valuation_records.items()
                   if not record["rule_eligible"]),
             ]
+            if deep_scope and ifind_info_error:
+                # issue #73（返修）：当前资料批次实际失败（超时/无效响应等）时，
+                # 深研 scope 缺失的估值字段随字段证据保留真实 iFinD 失败原因——
+                # 不得让未调用的 Choice 以默认来源身份顶替实际尝试源；已有拒绝
+                # 原因的字段合并（如定向补查拒绝与批次超时并存），不去重语义。
+                info_reason = ifind_info_error.split(":", 2)[-1]
+                deferred_rejections: Dict[str, tuple[str, ...]] = dict(rejected_candidates)
+                for field in ("pe_ratio", "pb_ratio", "total_mv"):
+                    if snapshot["valuation"].get(field) is None:
+                        deferred_rejections[field] = tuple(dict.fromkeys((*(deferred_rejections.get(field) or ()), info_reason)))
+                rejected_candidates = list(deferred_rejections.items())
             for field, reasons in rejected_candidates:
                 merged = dict(snapshot["field_meta"].get(field) or {})
                 source_errors = list(merged.get("source_errors") or [])
@@ -4655,11 +4970,20 @@ class DataFetcherManager:
             snapshot.setdefault("errors", []).append(ifind_info_error)
         ifind_research: Dict[str, Any] = {}
         if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
-            # issue #64：深研 scope（include_sector_flows=False）同时禁 iFinD 股东隐式出站。
-            ifind_research = _ifind_research_omissions(code, readings, deadline, config, include_holders=include_sector_flows)
+            # issue #64：深研 scope（include_sector_flows=False）同时禁 iFinD 股东隐式出站；
+            # issue #73：深研身份内公司事实改由 iFinD 提供（include_company），非深研
+            # false-scope 调用者保持 Choice 公司补查（基线行为）。
+            ifind_research = _ifind_research_omissions(code, readings, deadline, config, include_holders=include_sector_flows, include_company=deep_scope, deep_identity=deep_scope)
             research_omit = research_omit + tuple(ifind_research.pop("omit", ()))
-        if time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
+        if not deep_scope and time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
             adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
+        if deep_scope:
+            # issue #73：深研 scope 不发起 Choice 目标价/公司补查——research 块按
+            # 实际来源标注 ifind（未查询目标价是设计语义，不是供应商失败）；
+            # 消费层据 source 区分未查询与 Choice 失败/无覆盖，不伪造 targets 键。
+            research_block = snapshot.setdefault("research", {})
+            research_block.setdefault("source", "ifind")
+            research_block.setdefault("errors", [])
         if ifind_research:
             # Merge, never overwrite: optional iFinD research failures are kept
             # as evidence next to Choice's own research errors.
@@ -4669,6 +4993,12 @@ class DataFetcherManager:
                 if research_error not in research_errors:
                     research_errors.append(research_error)
             research_block.update(ifind_research)
+        if deep_scope and not snapshot.get("stock_name"):
+            # issue #73（返修）：零 Choice header 后公司名称由 iFinD 公司资料的真实
+            # 「公司中文名称」列承载；未取得时保持空（不从请求日期/概念标签补造）。
+            ifind_company = (snapshot.get("research") or {}).get("company") or {}
+            if ifind_company.get("NAME"):
+                snapshot["stock_name"] = str(ifind_company["NAME"])
         errors = snapshot["errors"] + (snapshot.get("research") or {}).get("errors", [])
         if source_error:
             errors.append(f"ifind:{source_error}")
@@ -4685,7 +5015,10 @@ class DataFetcherManager:
             try:
                 bundle, error, _ = self._run_with_timeout(
                     lambda: self._tushare_ifind_adapter.get_fundamental_bundle(code, snapshot["report_date"], fields=missing, include_institution=False, deadline=deadline),
-                    min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_supplement",
+                    # issue #73（v4）：公共补充 helper（tushare/ifind 公共数据）的中性
+                    # 阶段名——与同路径 selection_reason=public_supplement 一致；不是
+                    # Choice 原生出站，超时证据不得带 choice_ 前缀误导。
+                    min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "public_supplement",
                 )
                 if error:
                     errors.append(error)
@@ -4748,6 +5081,13 @@ class DataFetcherManager:
                             field, selected, AnchorQuality(status="single_source", reason_codes=("single_family",)),
                             selection_reason="ifind_published_single_source")
                         continue
+                    if deep_scope and selected is not None and selected.source == "ifind":
+                        # issue #73：深研 scope 不构造核验块——单源 iFinD 事实按实际
+                        # 单源标注（不伪装 verified），质量语义与核验层单源结论同形。
+                        snapshot["field_meta"][field] = adopted_field_record(
+                            field, selected, AnchorQuality(status="single_source", reason_codes=("single_family",)),
+                            selection_reason="primary")
+                        continue
                     snapshot["field_meta"][field] = adopted_field_record(field, selected, selection_reason="primary" if selected.source == "ifind" else "choice_supplement") if selected is not None else {"quality": {"status": "missing", "reason_codes": ["no_eligible_current_value"]}}
                 # Keep rejected periods as evidence; they cannot become automatic main values.
                 for dataset in (readings, choice_readings):
@@ -4760,20 +5100,24 @@ class DataFetcherManager:
                 source = primary[field].source if field in primary else "missing"
                 groups.setdefault(source, []).append(field)
             anchors = {}
-            for source, fields in groups.items():
-                sources = []
-                if source != "ifind":
-                    sources.append(SnapshotSource("ifind", readings, source_error))
-                if prefer_ifind and source in {"ifind", "missing"}:
-                    choice_error = next((e.rsplit(":", 1)[-1] for e in snapshot["errors"] if e.startswith("choice:")), None) if not choice_readings else None
-                    sources.append(SnapshotSource("choice", choice_readings, choice_error))
-                validator = CrossSourceValidator(sources)
-                try:
-                    block = build_cross_validation_block(code, fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
-                    if block:
-                        anchors.update(block["anchors"])
-                finally:
-                    validator.close()
+            # issue #73：深研 scope 无 Choice 独立源——不构造核验块（单源事实
+            # 经 field_meta 原样投影，不合成 verified 记录），已采纳财务事实
+            # 不因核验块缺席丢失（fundamental_dim 投影不依赖 cross_validation）。
+            if not deep_scope:
+                for source, fields in groups.items():
+                    sources = []
+                    if source != "ifind":
+                        sources.append(SnapshotSource("ifind", readings, source_error))
+                    if prefer_ifind and source in {"ifind", "missing"}:
+                        choice_error = next((e.rsplit(":", 1)[-1] for e in snapshot["errors"] if e.startswith("choice:")), None) if not choice_readings else None
+                        sources.append(SnapshotSource("choice", choice_readings, choice_error))
+                    validator = CrossSourceValidator(sources)
+                    try:
+                        block = build_cross_validation_block(code, fields, period=supplement_period, primary_readings=primary, validator=validator, deadline=deadline)
+                        if block:
+                            anchors.update(block["anchors"])
+                    finally:
+                        validator.close()
             if anchors:
                 agreed = sum(anchor["quality"]["status"] == "verified" for anchor in anchors.values())
                 cross_validation = {"enabled": True, "anchors": anchors, "summary": f"{agreed}/{len(fetcher.financial_fields)} 锚点取得独立来源佐证"}
@@ -4799,7 +5143,10 @@ class DataFetcherManager:
                 meta["circ_mv"] = snapshot["field_meta"]["circ_mv"]
             payload["field_meta"] = meta
             status = "ok" if all(payload.get(field) is not None for field in fields) else "partial"
-            providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if block == "growth" and prefer_ifind else "choice"]
+            # issue #73（返修）：来源链默认值按实际尝试源——深研 scope 零 Choice，
+            # 估值/财务块缺记录时默认 ifind（本票实际发起的批次），不再把未调用
+            # 的 Choice 填为来源；非深研路径默认不变。
+            providers = list(dict.fromkeys(record.get("source", "choice") for record in payload["field_meta"].values() if record.get("source"))) or ["ifind" if (block == "growth" or deep_scope) and prefer_ifind else "choice"]
             chain = [{"provider": provider, "result": status, "duration_ms": int((budget - max(0.0, deadline - time.monotonic())) * 1000)} for provider in providers]
             result[block] = self._build_fundamental_block(status, payload, chain, errors)
             result["source_chain"].extend(chain)
@@ -4816,7 +5163,11 @@ class DataFetcherManager:
             seed = {"growth": {}, "valuation": {}, "earnings": {}, "institution": {}, "errors": [], "source_chain": []}
             auxiliary, auxiliary_error, cost_ms = self._run_with_timeout(
                 lambda: self._fundamental_adapter.get_fundamental_bundle(code, financials=seed),
-                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "choice_public_details",
+                # issue #73（v4）：公共详情 helper（公开数据适配器）的中性阶段名——
+                # 与下方 source_chain 兜底名 public_details 一致；不是 Choice 原生
+                # 出站，零 Choice 深研报告的超时证据不得带 choice_ 前缀误导
+                # （2026-11-04 唯一 600176 实报发现 MD/警告误显 choice_public_details）。
+                min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline - time.monotonic())), "public_details",
             )
             auxiliary = auxiliary if isinstance(auxiliary, dict) else {}
             auxiliary_errors = auxiliary.get("errors", []) + ([auxiliary_error] if auxiliary_error else [])
@@ -4932,7 +5283,12 @@ class DataFetcherManager:
         if config.data_source_profile == "choice":
             from data_provider.capital_flow_provider import get_main_inflow_cumulative
             deadline = time.monotonic() + timeout
-            stock_flow = get_main_inflow_cumulative(stock_code, deadline=deadline, current_time=current_time)
+            # issue #73：仅 iFinD 主源深研身份内资金失败零 Choice 回退（如实披露
+            # 缺口）；非深研 false-scope 消费者保持既有有界回退，不被误收敛。
+            stock_flow = get_main_inflow_cumulative(
+                stock_code, deadline=deadline, current_time=current_time,
+                allow_choice_fallback=not ifind_deep_research_scope_active(include_sector_flows),
+            )
             if not include_sector_flows:
                 # issue #64：行业资金榜退役路径——零 sector 出站，状态只看个股资金；
                 # 退役字段整键缺席（真实报告反例：{} 空占位曾进入模型输入）。

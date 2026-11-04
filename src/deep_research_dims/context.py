@@ -124,6 +124,12 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
 
     行情/日线/筹码刻意不缓存（价格数据必须新鲜）；基本面缓存失败不缓存，
     保留下次重试机会。
+    issue #64：深研阶段 0 与独立专项服务共用本 false-scope 入口（无行业榜/
+    股东副作用）；issue #73：零 Choice 收敛由聚合层按真实深研身份
+    （active ``ResearchRun`` + iFinD 主源，见
+    ``ifind_deep_research_scope_active``）判定——深研 run 内零 Choice，
+    独立服务保持既有完整聚合（Choice 补充/目标价/公司）不变，快照缓存
+    按深研身份分段互不串用。
     """
     from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
     from src.config import get_config
@@ -135,7 +141,11 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     outer_deadline = request_deadline.get()
     if outer_deadline is not None:
         deadline = min(deadline, outer_deadline)
-    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_{code}"
+    # issue #73：深研身份进入缓存身份——深研 run（零 Choice）与独立专项服务的
+    # 完整聚合快照互不串用，不把完整聚合的 Choice 证据经缓存带进深研报告。
+    from data_provider.base import ifind_deep_research_scope_active
+    deep_scope_cached = ifind_deep_research_scope_active(include_sector_flows=False)
+    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_d{int(deep_scope_cached)}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
     refresh = financial_refresh.get()
@@ -161,8 +171,8 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         # Verification needs its own share of the same stage budget, not leftover zero.
         verification_budget = 0.0 if config.data_source_profile == "choice" else min(config.fundamental_fetch_timeout_seconds, remaining / 2) if config.deep_research_cross_validate else min(config.fundamental_fetch_timeout_seconds, remaining / 3) if config.enable_fuyao and config.fuyao_api_key else 0.0
         fetch_deadline = deadline - verification_budget
-        # issue #64：深研阶段 0 零行业榜出站（include_sector_flows=False）；
-        # 其他基本面消费者默认不变。
+        # issue #64：深研阶段 0 与独立专项服务共用 false-scope 入口（无行业榜/
+        # 股东副作用）；issue #73：零 Choice 收敛由聚合层按真实深研身份判定。
         raw = manager.get_fundamental_context(
             code, budget_seconds=max(0.0, fetch_deadline - monotonic()), include_sector_flows=False,
         )

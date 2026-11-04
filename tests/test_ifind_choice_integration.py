@@ -248,6 +248,9 @@ def test_future_row_cannot_hide_valid_latest_period_in_same_batch(ifind_transpor
 
 
 def test_future_disclosure_cannot_verify_current_choice_value(ifind_transport, monkeypatch):
+    """完整聚合路径（独立专项消费者，issue #73 后保持 Choice 补充/核验）：iFinD
+    披露日期在未来的候选不得核验或替换健康 Choice 主值。深研 scope（默认
+    ``_safe_fundamental``）零 Choice 出站，无此回落路径，见 issue73 测试。"""
     from src.agent.tools import data_tools
     from src.deep_research_dims.context import SharedContext, _safe_fundamental
     from src.deep_research_dims.fundamental_dim import build_fundamental_dim
@@ -674,28 +677,40 @@ def test_b1_lifecycle_stage0_stock_info_warm_force_parallel_scopes(ifind_transpo
     def holders_count() -> int:
         return sum(1 for tool, _question in calls if tool == "get_stock_shareholders")
 
+    def main_batch_count() -> int:
+        """主数据批次（财务/当前资料/资金）计数；概念等独立轻量需求不计入
+        （概念与估值共用 get_stock_info tool 名，按问句区分）。"""
+        return sum(1 for tool, question in calls
+                   if tool in {"get_stock_financials", "get_stock_info", "get_stock_performance"}
+                   and "所属概念" not in question)
+
     with ResearchRun(120).bind():
         dimension_token = research_dimension.set("capital")
         try:
             # —— stage0 冷聚合（真实写深研 scope 缓存）——
+            # issue #73：iFinD 主源深研 stage0 零 Choice 出站（含 CSD），聚合
+            # 走 iFinD 主源批次。
             ctx = SharedContext("300260", "样本", "2026-10-29")
             ctx.fundamental = _safe_fundamental("300260", ctx)
             holders_after_stage0 = holders_count()
             assert holders_after_stage0 == 0, "深研 stage0 零股东出站"
-            csd_after_stage0 = csd_calls["count"]
-            assert csd_after_stage0 > 0, "stage0 冷聚合发生真实 Choice CSD 出站"
+            assert csd_calls["count"] == 0, "深研 stage0 冷聚合零 Choice CSD 出站"
+            ifind_after_stage0 = main_batch_count()
+            assert ifind_after_stage0 > 0, "stage0 冷聚合走真实 iFinD 主源出站"
             # —— 模型阶段 stock_info 热态：命中 stage0 深研 scope 缓存 ——
             info = data_tools._handle_get_stock_info("300260")
             assert info.get("code") == "300260"
             assert holders_count() == holders_after_stage0, "stock_info 热态股东零新增"
-            assert csd_calls["count"] == csd_after_stage0, "热态命中深研 scope 缓存，Choice 零新增出站"
+            assert csd_calls["count"] == 0, "热态命中深研 scope 缓存，Choice 零新增出站"
+            assert main_batch_count() == ifind_after_stage0, "热态命中深研 scope 缓存，主数据批次零新增出站"
             # —— financial_refresh 强刷：绕过缓存真实重新聚合，退役操作仍零 ——
             refresh_token = financial_refresh.set(("300260", "force-b1"))
             try:
                 forced = data_tools._handle_get_stock_info("300260")
                 assert forced.get("code") == "300260"
                 assert holders_count() == holders_after_stage0, "强刷重聚合深研 scope 仍零股东出站"
-                assert csd_calls["count"] > csd_after_stage0, "强刷确实绕过缓存重新聚合"
+                assert csd_calls["count"] == 0, "强刷重聚合深研 scope 仍零 Choice 出站"
+                assert main_batch_count() > ifind_after_stage0, "强刷确实绕过缓存重新聚合"
             finally:
                 financial_refresh.reset(refresh_token)
         finally:

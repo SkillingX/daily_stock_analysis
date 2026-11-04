@@ -252,7 +252,7 @@ class TestGetCapitalFlowBackfillE2E(unittest.TestCase):
     def test_failed_backfilled_when_cv_on(self):
         captured = {}
 
-        def fake_cum(code, *, deadline=None):
+        def fake_cum(code, *, deadline=None, **kwargs):
             captured["cum_code"] = code
             return {
                 "main_net_inflow": 3.0e8,

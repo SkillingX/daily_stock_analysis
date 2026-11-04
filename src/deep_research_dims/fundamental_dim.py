@@ -41,6 +41,37 @@ def eligible_financial_value(fund: Dict[str, Any], field: str) -> Optional[float
     return evidence.reading.value if evidence.rule_eligible and evidence.reading is not None else None
 
 
+# issue #73：data_gaps 中属于 PE/PB 估值输入的缺口条目——F1 非估值豁免只容忍这些。
+_VALUATION_GAP_LABELS = frozenset({"估值", "市盈率PE(TTM)", "市净率PB"})
+
+
+def nonvaluation_financial_inputs_ok(dim: "FundamentalDim") -> bool:
+    """F1 整维 status gate 的非估值豁免谓词（issue #73，reader 澄清口径）。
+
+    仅当 F1 完整，或 F1 的不完整**只**来自 PE/PB 估值输入——四个非估值财务评分
+    输入（ROE、毛利率、营收同比、归母净利同比）均为**实际 iFinD** reading 且
+    rule_eligible（沿用既有 adopted_field_record 的证券/财期/单位资格），且
+    data_gaps 中不含任何非估值缺口（如资产负债结构、核心评分字段）时成立。
+    核心/非 iFinD 字段缺失或不合格、资金或研究缺口一律不放行；F1 自身的
+    status/degraded_reason 不被改变。策略/上下文边界（仅获准 iFinD 主源深研
+    启用）由调用点（orchestrator 证据包装配）判定，本谓词只认字段证据本身。
+    """
+    if dim is None:
+        return False
+    if dim.status == "ok":
+        return True
+    quality = dim.data_quality
+    if quality is None:
+        return False
+    fields = quality.fields
+    for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        evidence = fields.get(field)
+        if (evidence is None or evidence.reading is None
+                or not evidence.rule_eligible or evidence.reading.source != "ifind"):
+            return False
+    return not any(gap not in _VALUATION_GAP_LABELS for gap in dim.data_gaps)
+
+
 def _band(value: Optional[float], bands: list[tuple[float, float, str]]) -> tuple[Optional[float], str]:
     """分档打分：(分数, 标签)；无数据 → (None, '数据缺失')。"""
     if value is None:
@@ -176,6 +207,14 @@ def build_fundamental_dim(
     }
     if valuation is None:
         gaps.append("估值")
+    # issue #73：字段级真实缺口——PE 有效时估值组件有分（score_valuation 走 PE
+    # 口径），但六字段完整性仍要求 PB 合格；缺哪个必填字段如实列名，不再出现
+    # 「财务未完整而缺口 0 项」假象。完整门槛不变（仍要求六字段 rule_eligible）。
+    if fields["pe_ratio"].reading is None or not fields["pe_ratio"].rule_eligible:
+        gaps.append("市盈率PE(TTM)")
+    if fields["pb_ratio"].reading is None or not fields["pb_ratio"].rule_eligible:
+        gaps.append("市净率PB")
+    gaps[:] = list(dict.fromkeys(gaps))
 
     scores = [s for s in (roe_score, gm_score, rev_score, np_score, valuation["score"] if valuation else None) if s is not None]
     health = float(round(sum(Decimal(str(score)) for score in scores) / Decimal(len(scores)), 2)) if scores else None
@@ -197,7 +236,10 @@ def build_fundamental_dim(
         status="ok" if complete else "degraded",
         degraded_reason=None if complete else "财务指标缺失或存在不可用于规则的输入",
         data_quality=quality,
-        financial_snapshot={field: financial_field_quality(fund, field) for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")} if fund.get("cross_validation") else {},
+        # issue #73：已采纳事实投影不再依赖 cross_validation 块存在——iFinD 主源
+        # 深研零 Choice 出站后不再产生核验块，六项财务事实及其来源/期间/资格记录
+        # 照常进入保存/API/报告（单源资格如实保留，不合成 verified 记录）。
+        financial_snapshot={field: financial_field_quality(fund, field) for field in ("revenue", "net_profit", "roe", "gross_margin", "revenue_yoy", "net_profit_yoy")},
         profitability=profitability,
         growth_quality=growth_quality,
         financial_safety=financial_safety,

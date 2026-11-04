@@ -4,6 +4,11 @@
 > 部分覆盖，仅列已取得且身份可关联的产品；不作分项求和，不作为公司整体毛利率。A股标为“元”的金额按本部署人民币约定处理。披露日 {{ products.disclosed_at or '未提供' }}；原文链接 {{ products.original_url or '未提供' }}，供应商记录不等于公告原文核验。
 
 {% set rows = products['items'] if products is mapping else products.items %}
+{% set ndp = (products.get('no_data_periods') if products is mapping else products.no_data_periods) or [] %}
+{% set earlier = (products.get('earlier_period_reference') if products is mapping else products.earlier_period_reference) or false %}
+{% if earlier %}
+> 采用**较早财期**主营结构参考（各产品实际财期见行内）{% if ndp %}；本期（{{ ndp[0] }}）经供应商证实无分产品明细覆盖{% endif %}；不替代本期核心财务，不作跨期求和或混算。
+{% endif %}
 {% if rows %}
 | 产品 | 实际财期 | 收入 | 成本 | 毛利金额 | 毛利率 |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -11,7 +16,11 @@
 | {{ item.name }} | {{ item.report_date }} |{% for field in ('revenue','cost','gross_profit','gross_margin') %}{% set r = item[field] %} {{ display.value(r) }}{% if r %}（{{ display.label(r.unit or '单位未知') }}{% if r.currency %} / {{ display.label(r.currency) }}{% endif %}{% if r.normalization_error %}；{{ display.label(r.normalization_error) }}{% endif %}）{% endif %} |{% endfor +%}
 {% endfor %}
 {% else %}
+{% if ndp %}
+供应商正常无覆盖：{{ ndp | join('、') }} 期间未取得分产品明细（成功返回且证券/结构/财期证据齐备，明细确为空）；不以整体财务值或概念标签充当产品值。
+{% else %}
 分产品资料未取得或证券、财期、排名无法匹配。
+{% endif %}
 {% endif %}
 {% if products.errors %}
 - 分产品资料缺口：{{ display.reasons(products.errors) }}。

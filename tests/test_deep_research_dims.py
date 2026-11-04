@@ -628,7 +628,7 @@ class TestSnapshotCache:
         monkeypatch.setattr(cfg, "deep_research_cross_validate", False)
         key = (
             f"stage0_fund_{cfg.data_source_contract}"
-            f"_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519"
+            f"_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_600519"
         )
         dim_cache.save_snapshot(key, {
             "pe_ttm": 19.09, "pb": 2.0, "roe": 18.0, "gross_margin": 40.0,
