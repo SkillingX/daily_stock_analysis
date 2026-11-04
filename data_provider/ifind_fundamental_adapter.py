@@ -180,6 +180,52 @@ def _parse_ifind_markdown_table(text: str, period: Optional[str] = None, keyword
     return rows[selected if selected is not None else 0] if rows else {}
 
 
+# issue #73：公司资料列 → 内部字段键（消费层映射到 research["company"] 的
+# Choice 兼容键）；带单位后缀的列只认可「（单位：…）」这一种后缀形态。
+_COMPANY_COLUMNS: Dict[str, str] = {
+    "name": "公司中文名称",
+    "profile": "公司简介",
+    "main_business": "主营业务",
+    "main_products": "主营产品名称",
+    "controller": "实际控制人",
+    "controller_type": "实际控制人类型",
+    "holding_ratio": "实际控制人持股比例",
+}
+
+_UNIT_SUFFIX_RE = re.compile(r"[（(]单位[：:][^()（）]*[）)]\s*$")
+
+
+def _strip_recognized_unit_suffix(column: str) -> str:
+    """去掉已认可的单位后缀（``（单位：…）``）用于列名精确比较；其余后缀
+    （如「类型」）不剥——「实际控制人类型」不得充当「实际控制人」。"""
+    return _UNIT_SUFFIX_RE.sub("", column).strip()
+
+
+def _qualify_pb_reading(reading: AnchorReading, field: str, data: Any, session_window: set[str], as_of: str) -> AnchorReading:
+    """当前资料批次的估值读数资格（生产解析后的同一套消费层结论）。
+
+    PB 仅在表头确为「最新」且该列参数 ``基准日=报表截止日期`` 同时成立时按
+    供应商证据认定为 MRQ（root 批准的 P2 范围，不做全局「最新→MRQ」词表映射）。
+    issue #71：供应商只回显字面「最新」等不可证明观测时间时持久标记
+    time_unknown；实际观测日期必须落在最近已完成交易日截至窗口（严格日历
+    T/T-1 会话集合）内：缺失/非法 → time_unknown，晚于截至日 → time_in_future，
+    早于窗口 → stale；实际 observed_at 保留，请求日期不回填。所有消费层经同一
+    reading_input_reasons 得到一致资格结论，不依赖任何合并层补丁。
+    """
+    if field == "pb_ratio" and reading.caliber is None and "最新" in (reading.raw_label or ""):
+        bare = re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", reading.raw_label).strip()
+        basis = str(data.indicators_params.get(bare, {}).get("基准日") or "").strip()
+        if basis == "报表截止日期":
+            reading = replace(reading, caliber="MRQ")
+    observed = normalize_report_period(reading.observed_at)[0]
+    if not observed:
+        return replace(reading, normalization_error=reading.normalization_error or "time_unknown")
+    if observed not in session_window:
+        return replace(reading, normalization_error=reading.normalization_error or
+                       ("time_in_future" if observed > as_of else "stale"))
+    return reading
+
+
 def _safe_float(value: Any) -> Optional[float]:
     """容错转 float（处理数字/科学计数/中文金额单位）。"""
     if value is None:
@@ -273,6 +319,33 @@ class ProductSegments(BaseModel):
     errors: list[str] = Field(default_factory=list)
     disclosed_at: str | None = None
     original_url: str | None = None
+    # issue #73（v5）：正常空覆盖（成功信封+证券/结构/财期证据+明细确为空）的
+    # 已证实财期，本期在前、历史候选随后；旧载荷无该字段（空元组）兼容读取。
+    no_data_periods: tuple[str, ...] = ()
+    # items 为较早财期主营结构参考（本期正常无明细时的唯一历史候选回查采用）。
+    earlier_period_reference: bool = False
+
+
+class CompanyFact(BaseModel):
+    """单个公司事实：供应商原文值 + 该列自身截止日期（无则保持 None，不补造）。"""
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    value: Annotated[str, Field(min_length=1)]
+    observed_at: str | None = None
+    raw_column: str | None = None
+
+
+class CompanyProfile(BaseModel):
+    """iFinD 公司资料（issue #73 深研 scope 的公司事实来源）。
+
+    ``facts`` 键为内部字段名（name/profile/main_business/main_products/
+    controller/controller_type/holding_ratio）；消费层映射到既有
+    ``research["company"]`` 的 Choice 兼容键，来源标注按 research 块实际
+    source 走，不得硬编码 Choice。
+    """
+    model_config = ConfigDict(strict=True, frozen=True, validate_assignment=True)
+    source: Literal["ifind"] = "ifind"
+    facts: dict[str, CompanyFact] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
 
 
 class IfindHolder(BaseModel):
@@ -423,6 +496,84 @@ def _same_security(returned: str | None, requested: str) -> bool:
     from data_provider.choice_adapter import ChoiceAdapter
     expected = ChoiceAdapter.stock_code(requested)
     return returned in {expected, expected.split(".")[0]}
+
+
+# issue #73（v5）：主营分产品字段 → 表头语义前缀（``_ranked_cells`` 与正常空覆盖
+# 分类共用同一映射；同表整体财务列（销售毛利率/毛利等）不匹配任何前缀，不充当
+# 产品值也不影响空覆盖判定）。
+_PRODUCT_FIELD_PREFIXES: dict[str, str] = {
+    "name": "主营构成-项目名称(按产品)",
+    "revenue": "主营构成-项目收入(按产品)",
+    "cost": "主营构成-项目成本(按产品)",
+    "gross_profit": "主营构成-项目毛利(按产品)",
+    "gross_margin": "主营构成-项目毛利率(按产品)",
+}
+
+
+def _products_no_data_period(data: IfindData, code: str) -> str | None:
+    """正常空覆盖分类（issue #73 v5-v7）：仅当成功信封中明确匹配证券的行上，
+    产品语义列**结构完整且可按同一合法排名关联**——存在至少一个 rank 同时具有
+    名称列结构与至少一种数值明细列结构，且这些列的单元格确为空——单一可解析
+    财期证据（行日期/报告期或列参数，与 join 同一冲突规则；结构行缺财期证据
+    不可跳过）、财期不晚于当日时，返回该财期；否则 None（维持
+    invalid_response/资格拒绝）。规则：
+    - 产品语义列的排名必须可解析且合法（≥1）；不可解析/非法排名列不静默
+      忽略（含空列，尤其非空非法值），一律整体资格失败；
+    - 名称与数值结构必须共享同一合法 rank（不同 rank 拼接不能冒充同一明细
+      确为空）；「缺列」≠「值确为空」；
+    - 任何产品单元格非空、财期冲突/跨行不一致/未来期均为资格失败；
+    - 整体财务列（销售毛利率/毛利等）不匹配产品前缀，不充当数值明细结构。
+    """
+    matched_period: str | None = None
+    name_ranks: set[int] = set()
+    value_ranks: set[int] = set()
+    for table in _ifind_tables(data.answer):
+        for row in table:
+            if not _same_security(row.get("证券代码"), code):
+                continue
+            structure_labels: list[tuple[int, str, object]] = []
+            for label, raw in row.items():
+                stem = re.sub(r"[（(][^()（）]*(?:排名|单位)[^()（）]*[）)]", "", label).strip()
+                if stem not in _PRODUCT_FIELD_PREFIXES.values():
+                    continue
+                rank_match = re.search(r"第(\d+)名", label)
+                if rank_match is None or int(rank_match.group(1)) < 1:
+                    return None  # 产品语义列的排名不可解析或非法：结构资格失败
+                structure_labels.append((int(rank_match.group(1)), stem, raw))
+            if not structure_labels:
+                continue
+            if any(str(raw).strip() for _rank, _stem, raw in structure_labels):
+                return None  # 存在非空产品单元格：走 join/资格路径
+            for rank, stem, _raw in structure_labels:
+                if stem == _PRODUCT_FIELD_PREFIXES["name"]:
+                    name_ranks.add(rank)
+                else:
+                    value_ranks.add(rank)
+            periods: set[str] = set()
+            row_period = normalize_report_period(row.get("日期") or row.get("报告期"))[0]
+            if row_period:
+                periods.add(row_period)
+            for _rank, stem, _raw in structure_labels:
+                for key, params in data.indicators_params.items():
+                    if key.split("__")[0] != stem or str(params.get("排名") or "") != f"第{_rank}名":
+                        continue
+                    parameter_period = normalize_report_period(params.get("报告期") or params.get("截止日期"))[0]
+                    if parameter_period:
+                        periods.add(parameter_period)
+            if not periods:
+                return None  # 结构行缺财期证据：时间不明，不能认定正常空覆盖
+            if len(periods) > 1:
+                return None  # 财期冲突
+            period = next(iter(periods))
+            if period > date.today().isoformat():
+                return None  # 未来期不可作为正常无覆盖证据
+            if matched_period is not None and matched_period != period:
+                return None
+            matched_period = period
+    if matched_period is None or not (name_ranks & value_ranks):
+        # 无任何「同一合法排名上名称+数值结构齐备」的关联：结构不完整或不可关联。
+        return None
+    return matched_period
 
 
 def _detail_reading(cell: _RankedCell, period: str, field: str) -> AnchorReading | None:
@@ -855,9 +1006,15 @@ class IfindFetcher:
             raise SourceReadError("ifind", "calendar_unavailable")
         as_of = sessions[0].isoformat()
         session_window = {session.isoformat() for session in sessions}
-        question = (f"{ChoiceAdapter.stock_code(code)} 截至{as_of}的市盈率PE(TTM)、市净率PB(最新)、总市值、流通市值，"
-                    "以及所属申万行业（一级行业）名称与代码。每项注明实际交易日期、单位、币种和统计口径；"
-                    "行业注明行业级别与截止日期。总市值与流通市值以人民币元返回；无数据请留空，不推算。")
+        # issue #73：PB 按真实验证过的精确写法请求（2026-11-02 600176 实测：模糊
+        # 「市净率PB(最新)」会被供应商映射为「市净率(中证发布)（单位：%）」，无
+        # MRQ 基准、生产解析拒绝）。精确指标名+基准日参数+反混诓名令一次批次
+        # 取得合格读数；解析资格（表头/基准日/日期窗口）不放宽。
+        question = (f"{ChoiceAdapter.stock_code(code)} 截至{as_of}的市盈率PE(TTM)、市净率(PB,最新)（基准日=报表截止日期，单位为倍）、"
+                    "总市值、流通市值，以及所属申万行业（一级行业）名称与代码。每项注明实际交易日期、单位、币种和统计口径；"
+                    "行业注明行业级别与截止日期。总市值与流通市值以人民币元返回；"
+                    "市净率请使用市净率(PB,最新)，不使用市净率(中证发布)，不将百分比当倍数，"
+                    "若此指标不支持请明确说明；无数据请留空，不推算。")
         data = self.query("get_stock_info", question, deadline=deadline)
         raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
         valuation: Dict[str, AnchorReading] = {}
@@ -865,25 +1022,7 @@ class IfindFetcher:
             reading = _parse_ifind_response(raw, _IFIND_ANCHOR_QUERIES[field][2], field, None, code=code, a_share_contract=True)
             if reading is None:
                 continue
-            if field == "pb_ratio" and reading.caliber is None and "最新" in (reading.raw_label or ""):
-                bare = re.sub(r"[（(][^()（）]*单位[^()（）]*[）)]", "", reading.raw_label).strip()
-                basis = str(data.indicators_params.get(bare, {}).get("基准日") or "").strip()
-                if basis == "报表截止日期":
-                    reading = replace(reading, caliber="MRQ")
-            # issue #71：供应商只回显字面「最新」等不可证明观测时间时，在源读数上
-            # 持久标记 time_unknown（保留 raw observed_at）——所有消费层经同一
-            # reading_input_reasons 得到一致资格结论，不依赖任何合并层补丁。
-            # issue #71：本批估值的实际观测日期必须落在最近已完成交易日截至窗口
-            # （严格日历 T / T-1 会话集合）内：缺失/非法/字面「最新」→ time_unknown，
-            # 晚于截至日 → time_in_future，早于窗口 → stale；实际 observed_at 保留，
-            # 请求日期不回填。所有消费层经同一 reading_input_reasons 得到一致结论。
-            observed = normalize_report_period(reading.observed_at)[0]
-            if not observed:
-                reading = replace(reading, normalization_error=reading.normalization_error or "time_unknown")
-            elif observed not in session_window:
-                reading = replace(reading, normalization_error=reading.normalization_error or
-                                  ("time_in_future" if observed > as_of else "stale"))
-            valuation[field] = reading
+            valuation[field] = _qualify_pb_reading(reading, field, data, session_window, as_of)
         industry = _parse_industry(data, code)
         # issue #71：行业截止日期晚于严格日历请求截至日 = 供应商返回了未来日期，
         # 不可作为当前行业采用：保留实际返回日期，记明确拒绝原因（不填请求日期、
@@ -891,16 +1030,108 @@ class IfindFetcher:
         industry_as_of = str(industry.get("as_of") or "")
         if industry_as_of and industry_as_of > as_of:
             industry = {**industry, "errors": [*(industry.get("errors") or []), "industry_time_in_future"]}
+        # issue #73（返修）：PB 缺合格读数时不得静默——本批实际回执含已知误映射
+        # 变体（如「市净率(中证发布)（单位：%）」）时记 wrong_indicator_variant，
+        # 否则记 no_qualified_reading；均作为字段级未采纳原因随聚合层 field_meta
+        # 保留，不补造读数或元数据。
+        pb_rejection: tuple[str, ...] = ()
+        if valuation.get("pb_ratio") is None:
+            pb_rejection = ("wrong_indicator_variant",) if "市净率(中证" in data.answer else ("no_qualified_reading",)
         if not valuation and not industry.get("name"):
             raise SourceReadError("ifind", "invalid_response")
-        return {"valuation": valuation, "industry": industry, "requested_date": as_of}
+        return {"valuation": valuation, "industry": industry, "requested_date": as_of, "pb_rejection": pb_rejection}
+
+    def directed_pb_snapshot(self, code: str, *, deadline: float | None = None, current_time: Any = None) -> Dict[str, Any]:
+        """单指标定向 PB 补查（issue #73 获准的每报告至多一次有界补全）。
+
+        仅在当前资料批次未取得合格 PB（含已知中证/% 误映射变体）时由聚合层
+        调用；问句/参数用 root 已捕获验证过的定向写法，解析与资格（表头「最新」
+        + ``基准日=报表截止日期`` 双证据 MRQ、严格交易日历 T/T-1 观测窗口）与
+        聚合批次完全同一套生产代码，不放宽任何资格。未取得合格读数时如实返回
+        拒绝原因（不补造读数/元数据）。
+        """
+        from src.core.trading_calendar import recent_completed_trading_sessions
+        from data_provider.choice_adapter import ChoiceAdapter
+        sessions = recent_completed_trading_sessions("cn", 2, current_time=current_time)
+        if not sessions:
+            raise SourceReadError("ifind", "calendar_unavailable")
+        as_of = sessions[0].isoformat()
+        session_window = {session.isoformat() for session in sessions}
+        question = (f"{ChoiceAdapter.stock_code(code)} 截至{as_of}的市净率(PB,最新)，基准日=报表截止日期，单位为倍。"
+                    "请返回实际交易日期及该指标参数。请使用市净率(PB,最新)，不使用市净率(中证发布)，"
+                    "不将百分比当倍数；若此指标不支持请明确说明，不推算。")
+        data = self.query("get_stock_info", question, deadline=deadline)
+        raw = json.dumps({"code": 1, "data": data.model_dump()}, ensure_ascii=False)
+        reading = _parse_ifind_response(raw, _IFIND_ANCHOR_QUERIES["pb_ratio"][2], "pb_ratio", None, code=code, a_share_contract=True)
+        if reading is not None:
+            reading = _qualify_pb_reading(reading, "pb_ratio", data, session_window, as_of)
+        # issue #73（v3 返修）：不合格读数（stale/future/口径/单位未知等）的真实
+        # 原因同样随 rejection 返回——聚合层经既有 source_errors 边界保留，不
+        # 丢弃被拒读数及其原因，也不伪装合格采纳。
+        rejection: tuple[str, ...] = ()
+        if reading is None:
+            rejection = ("wrong_indicator_variant",) if "市净率(中证" in data.answer else ("no_qualified_reading",)
+        else:
+            reasons = reading_input_reasons(reading, "pb_ratio")
+            if reasons:
+                rejection = tuple(reasons)
+        return {"pb_ratio": reading, "rejection": rejection, "requested_date": as_of}
+
+    def company_profile(self, code: str, *, deadline: float | None = None) -> CompanyProfile:
+        """iFinD 公司资料批次（issue #73 深研 scope 公司事实来源）。
+
+        问句为 2026-11-02 root 授权探针真实验证过的写法；每字段保留供应商
+        原文值与该列自身截止日期（列参数未提供的字段保持 None，不补造）。
+        证券归属只用「证券代码」列并经既有 ``normalize_stock_code`` 规范化
+        后精确匹配（叙述文本中的代码字样不构成行归属）；列匹配只接受精确
+        语义列名或带认可单位后缀（``（单位：…）``）的同一列名——绝不用
+        类型/比例列补控制人，空/占位单元格保持字段缺失；raw_column 记录
+        实际命中列名，截止日期按该实际列名取参数元数据。
+        """
+        from data_provider.base import normalize_stock_code
+        from data_provider.choice_adapter import ChoiceAdapter
+        today = date.today().isoformat()
+        question = (f"{ChoiceAdapter.stock_code(code)} 截至{today}的公司名称、主营业务描述、主要产品、"
+                    "公司简介、实际控制人名称及性质。按实际数据列出各字段来源和截止日期，"
+                    "无数据留空，不以概念标签推断，不推算。")
+        data = self.query("get_stock_info", question, deadline=deadline)
+        requested = normalize_stock_code(code)
+        rows = [row for table in _ifind_tables(data.answer) for row in table]
+        matched = [row for row in rows
+                   if row.get("证券代码") is not None
+                   and normalize_stock_code(str(row["证券代码"]).strip()) == requested]
+        if len(matched) != 1:
+            raise SourceReadError("ifind", "invalid_response")
+        row = matched[0]
+        facts: dict[str, CompanyFact] = {}
+        for key, column in _COMPANY_COLUMNS.items():
+            hit_column = next((col for col in row
+                               if col == column or _strip_recognized_unit_suffix(col) == column), None)
+            if hit_column is None:
+                continue
+            raw_value = str(row.get(hit_column) or "").strip()
+            if raw_value in {"", "\t", "-", "--"}:
+                continue
+            observed = str(data.indicators_params.get(hit_column, {}).get("截止日期")
+                           or data.indicators_params.get(column, {}).get("截止日期") or "").strip() or None
+            facts[key] = CompanyFact(value=raw_value, observed_at=observed, raw_column=hit_column)
+        if not facts:
+            raise SourceReadError("ifind", "invalid_response")
+        return CompanyProfile(facts=facts)
 
     def product_segments(self, code: str, period: str | None = None, *, deadline: float | None = None) -> ProductSegments:
         target = period or f"{date.today().year - 1}-12-31"
         data = self.query("get_stock_financials", f"{code} 报告期{target} 主营构成(按产品)：项目名称、收入、成本、毛利金额、毛利率，列出排名与实际财期、各字段单位、披露日期及原文链接；空值不要推算。", deadline=deadline)
-        cells, errors = _ranked_cells(data, code, {"name": "主营构成-项目名称(按产品)", "revenue": "主营构成-项目收入(按产品)", "cost": "主营构成-项目成本(按产品)", "gross_profit": "主营构成-项目毛利(按产品)", "gross_margin": "主营构成-项目毛利率(按产品)"})
+        cells, errors = _ranked_cells(data, code, _PRODUCT_FIELD_PREFIXES)
         if not cells and not errors:
-            raise SourceReadError("ifind", "invalid_response")
+            # issue #73（v5）：无 cells 且无 errors 时不再一律 invalid_response——
+            # 仅当成功信封中证券/分产品结构/财期证据齐备且产品单元格确为空时
+            # 分类为该财期的正常无覆盖（同表整体财务值不充当产品值）；错证券/
+            # 缺结构/期冲突/未来期/非空畸形仍维持原拒绝。
+            no_data = _products_no_data_period(data, code)
+            if no_data is None:
+                raise SourceReadError("ifind", "invalid_response")
+            return ProductSegments(items=[], errors=[], no_data_periods=(no_data,))
         names = [(period, row["name"].raw) for (period, rank), row in cells.items() if "name" in row]
         items = []
         for (actual, rank), row in sorted(cells.items()):

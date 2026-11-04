@@ -35,7 +35,7 @@ from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import SharedContext, build_shared_context
 from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
 from src.deep_research_dims.dim_cache import quote_market_identity
-from src.deep_research_dims.fundamental_dim import build_fundamental_dim
+from src.deep_research_dims.fundamental_dim import build_fundamental_dim, nonvaluation_financial_inputs_ok
 from src.deep_research_dims.manager_writeup import DIRECTIVE_WORDS, mask_research_role_terms
 from src.deep_research_dims.sector_dim import build_sector_dim
 from src.deep_research_dims.guardrail import apply_guardrails
@@ -1176,9 +1176,24 @@ def _qualitative_evidence_pack(dims: Dict[str, DimEnvelope]) -> Dict[str, Any]:
     pack: Dict[str, Any] = {}
     # 核心 gate（R7 最短收敛）：fundamental/capital 两个核心研究任一未正常完成
     # 时，非估值证据不充分——返回空包，情景维度按真实缺口降级。
+    # issue #73：F1 整维 gate 的唯一例外**仅限获准的 iFinD 主源深研策略**——F1
+    # 不完整只来自 PE/PB 估值输入（四个非估值评分输入为实际 iFinD 合格读数、
+    # 无资产负债等非估值缺口，谓词见 nonvaluation_financial_inputs_ok）时，已
+    # 采纳财务证据不因可选估值缺口整体作废；F1 自身保持 degraded 并列明真实
+    # 缺口。Choice 主源（含 ifind 关闭）与 legacy 策略不适用豁免，维持基线整维
+    # gate 行为；资金 gate 不变，核心字段缺失/证据空壳仍不放行。
+    from src.config import get_config as _get_pack_config
+    _policy = _get_pack_config()
+    ifind_primary_deep_policy = (
+        _policy.data_source_profile == "choice"
+        and _policy.financial_primary_source == "ifind"
+        and _policy.enable_ifind_mcp
+    )
     for core in ("fundamental", "capital"):
         core_dim = dims.get(core)
         if core_dim is None or core_dim.status != "ok":
+            if core == "fundamental" and ifind_primary_deep_policy and nonvaluation_financial_inputs_ok(core_dim):
+                continue
             return {}
     intel = dims.get("intel")
     intel_ok = intel is not None and intel.status == "ok"
@@ -1254,9 +1269,10 @@ def _has_useful_data(dims: dict[str, Any]) -> bool:
             return True
         if any(getattr(getattr(dim, field, None), "items", []) for field in ("product_segments",)):
             return True
-        # B6（规格 §1）：业务画像叙述中留存的 Choice 公司原始事实（控制人/带报告
-        # 期股东名单）是已取得事实——足以让部分报告成文留存，不抬升评分或结论。
-        if "公司资料（Choice 原始字段留存" in str(getattr(dim, "narrative", "") or ""):
+        # B6（规格 §1）：业务画像叙述中留存的公司原始事实（控制人/带报告期股东
+        # 名单）是已取得事实——足以让部分报告成文留存，不抬升评分或结论。
+        # issue #73：来源按块内实际 source 标注（Choice/iFinD 同语义）。
+        if "原始字段留存，未核实控制链" in str(getattr(dim, "narrative", "") or ""):
             return True
     financial = dims.get("fundamental")
     if financial is None or financial.status == "skipped":
@@ -1277,32 +1293,34 @@ def restore_vendor_facts(dim_id: str, dim: DimEnvelope, research: dict[str, Any]
     数、不推断控制链、不评分。
     """
     from src.schemas.deep_research_dims import parse_dim
+    from src.core.research_run import research_field_date, vendor_source_label
     if dim_id != "business" or dim.status == "ok":
         return dim
     payload = dim.model_dump()
     company = research.get("company") or {}
+    _label = vendor_source_label(research)
     if dim_id == "business":
         for field, key in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
             if company.get(key):
-                payload[field] = {"value": company[key], "source": f"Choice {key}，截至 {research.get('as_of')}"}
+                payload[field] = {"value": company[key], "source": f"{_label} {key}，截至 {research_field_date(research, company, key)}"}
         if research.get("product_segments"):
             payload["product_segments"] = research["product_segments"]
         fact_parts = []
         if company.get("AHOLDER"):
             fact_parts.append(
-                f"实际控制人（Choice 原始字段，截至 {research.get('as_of') or '未标注'}）：{company['AHOLDER']}"
+                f"实际控制人（{_label} 原始字段，截至 {research_field_date(research, company, 'AHOLDER')}）：{company['AHOLDER']}"
             )
         holders = research.get("holders") or {}
         holder_names = holders.get("HOLDNAMER")
         if isinstance(holder_names, str) and holder_names.strip():
             names = "；".join(name.strip() for name in holder_names.split(";") if name.strip())
             fact_parts.append(
-                f"十大股东名单（Choice 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
+                f"十大股东名单（{_label} 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
             )
         if fact_parts:
             payload["narrative"] = (
                 str(payload.get("narrative") or "").rstrip()
-                + "\n\n公司资料（Choice 原始字段留存，未核实控制链）："
+                + f"\n\n公司资料（{_label} 原始字段留存，未核实控制链）："
                 + "；".join(fact_parts)
                 + "。"
             )

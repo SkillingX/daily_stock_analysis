@@ -74,7 +74,7 @@ def test_partial_financial_snapshot_retries_real_manager_and_provider(financial_
     first = context.build_shared_context('600519', '样本')
     assert first.fundamental['roe'] is None
     # Seed a previously persisted partial snapshot, too: it must not prevent retry.
-    key = f'stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_600519'
+    key = f'stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_600519'
     dim_cache.save_snapshot(key, first.fundamental)
     load_snapshot = dim_cache.load_snapshot
     consulted = []

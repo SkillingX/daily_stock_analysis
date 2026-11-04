@@ -652,7 +652,9 @@ def _stage_zero_capital_flow(stock_code: str, run: Any) -> Optional[Dict[str, An
     from src.config import get_config
 
     deadline = monotonic() + get_config().fundamental_stage_timeout_seconds
-    return _apply_capital_cross_validation(stock_code, flow, block, deadline)
+    # issue #73：阶段0深研块复用路径的核验回填同样零 Choice 回退（块本身取自
+    # include_sector_flows=False 的深研 scope）。
+    return _apply_capital_cross_validation(stock_code, flow, block, deadline, allow_choice_fallback=False)
 
 
 def _capital_flow_material(stock_code: str) -> Optional[Dict[str, Any]]:
@@ -1112,33 +1114,37 @@ def run_business_agent(
         out["data"].pop("product_segments", None)
     if not out.get("ok") and (company.get("MAINBUSINESS") or company.get("MAINPRODUCT") or (products or {}).get("items")):
         out = {**out, "ok": True, "data": {"status": "degraded", "degraded_reason": str(out.get("error") or "研究模型未完成") + "；保留已取得业务资料", "data_gaps": ["竞争地位与同行对比未完成"], "narrative": "以下为已取得供应商结构化资料，未取得定期报告原文及竞争证据，不生成业务评分。"}}
+        from src.core.research_run import research_field_date, vendor_source_label
         for field, indicator in (("business_model", "MAINBUSINESS"), ("main_products", "MAINPRODUCT")):
             if company.get(indicator):
-                out["data"][field] = {"value": company[indicator], "source": f"Choice {indicator}，截至{research.get('as_of')}"}
+                out["data"][field] = {"value": company[indicator], "source": f"{vendor_source_label(research)} {indicator}，截至{research_field_date(research, company, indicator)}"}
     if out.get("ok") and products:
         out["data"]["product_segments"] = products
         if products.get("errors"):
             out["data"]["data_gaps"] = list(dict.fromkeys([*(out["data"].get("data_gaps") or []), *products["errors"]]))
-    # issue #64（规格 §1 保留项）：阶段0已取得的 Choice 公司原始事实（控制人、带
-    # 报告期的十大股东名单）随既有公司资料字段留存展示——不补查、不推断控制链、
-    # 不评分，仅按原来源与财期呈现。
+    # issue #64（规格 §1 保留项）：阶段0已取得的公司原始事实（控制人、带报告期
+    # 的十大股东名单）随既有公司资料字段留存展示——不补查、不推断控制链、
+    # 不评分，仅按原来源（issue #73：按块内实际 source 标注，不硬编码 Choice）
+    # 与自身日期呈现。
     company = research.get("company") or {}
     holders = research.get("holders") or {}
+    from src.core.research_run import research_field_date, vendor_source_label
+    _label = vendor_source_label(research)
     fact_parts = []
     if company.get("AHOLDER"):
         fact_parts.append(
-            f"实际控制人（Choice 原始字段，截至 {research.get('as_of') or '未标注'}）：{company['AHOLDER']}"
+            f"实际控制人（{_label} 原始字段，截至 {research_field_date(research, company, 'AHOLDER')}）：{company['AHOLDER']}"
         )
     holder_names = holders.get("HOLDNAMER")
     if isinstance(holder_names, str) and holder_names.strip():
         names = "；".join(name.strip() for name in holder_names.split(";") if name.strip())
         fact_parts.append(
-            f"十大股东名单（Choice 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
+            f"十大股东名单（{_label} 原始字段，报告期 {holders.get('period') or '未标注'}）：{names}"
         )
     if fact_parts and isinstance(out.get("data"), dict):
         out["data"]["narrative"] = (
             str(out["data"].get("narrative") or "").rstrip()
-            + "\n\n公司资料（Choice 原始字段留存，未核实控制链）："
+            + f"\n\n公司资料（{_label} 原始字段留存，未核实控制链）："
             + "；".join(fact_parts)
             + "。"
         )
