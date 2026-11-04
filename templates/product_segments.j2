@@ -8,6 +8,7 @@
 {% set earlier = (products.get('earlier_period_reference') if products is mapping else products.earlier_period_reference) or false %}
 {% if earlier %}
 > 采用**较早财期**主营结构参考（各产品实际财期见行内）{% if ndp %}；本期（{{ ndp[0] }}）经供应商证实无分产品明细覆盖{% endif %}；不替代本期核心财务，不作跨期求和或混算。
+
 {% endif %}
 {% if rows %}
 | 产品 | 实际财期 | 收入 | 成本 | 毛利金额 | 毛利率 |
