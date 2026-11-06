@@ -170,18 +170,35 @@ def _ak_with_retry(call: Callable[..., Any], *args: Any,
     预算纪律（``retry_budget`` 由 :func:`_bounded_ak` 注入）：每次新出站前
     检查同一取数截止（含从队列晚获得执行权的任务——首次 require_fetch 即
     失败，不再发新调用）；退避时长钳制剩余取数预算。
+
+    root-decision 线程内边界（PR84 复审 P2）：真正执行 SDK 的本工作线程
+    内幂等安装 ``eastmoney_patch(budget_only=True)`` 并 bind 同一
+    ``fetch_deadline`` 到 ``request_deadline``——AkShare 内部分页/重试
+    （如 ``stock_board_industry_name_em`` → ``fetch_paginated_data``）在
+    调用方放弃后发出的新 ``Session.request`` 同样服从取数截止（截止后
+    派发被拒绝，不产生新 wire）。成功/供应商失败/截止异常三类退出都在
+    finally reset；无 deadline 的无关 requests 不受影响，同线程后续任务
+    不残留上下文。
     """
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+
     last_exc: Optional[BaseException] = None
-    for i in range(retries + 1):
-        retry_budget.require_fetch()
-        try:
-            return call(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - 保留原 except 兼容
-            last_exc = exc
-            if i < retries:
-                time.sleep(min(delay, max(retry_budget.fetch_remaining(), 0.0)))
-    assert last_exc is not None  # 至少跑了一次循环
-    raise last_exc
+    token: Optional["object"] = None
+    eastmoney_patch(budget_only=True)
+    token = request_deadline.set(retry_budget.fetch_deadline)
+    try:
+        for i in range(retries + 1):
+            retry_budget.require_fetch()
+            try:
+                return call(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - 保留原 except 兼容
+                last_exc = exc
+                if i < retries:
+                    time.sleep(min(delay, max(retry_budget.fetch_remaining(), 0.0)))
+        assert last_exc is not None  # 至少跑了一次循环
+        raise last_exc
+    finally:
+        request_deadline.reset(token)
 
 
 def _bounded_ak(fn: Callable[..., Any], *args: Any, budget: ReportBudget,

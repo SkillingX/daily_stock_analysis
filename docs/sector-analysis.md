@@ -239,7 +239,11 @@
   （不启用 auth、不改共享默认）——ContextVar 只有 patch 在位才真正钳制真实
   requests/Tenacity 传输（fresh 进程验证：首请求 timeout ≤ remaining，
   fetch_deadline 后绝对零 wire，无上下文的下一个请求保持默认行为）；
-  线程上下文 finally reset（不向共享池下一个请求泄漏）；迟到 worker 只写自己的
+  AkShare 统一工作线程（`_ak_with_retry`）在**真正执行 SDK 的线程内**同样
+  幂等安装并绑定同一 fetch_deadline——SDK 内部分页/重试（如行业全表
+  `fetch_paginated_data`）在调用方放弃后发出的新请求同样服从截止
+  （截止后派发被拒绝，不产生新 wire）；线程上下文 finally reset（不向共享
+  池下一个请求泄漏）；迟到 worker 只写自己的
   诊断，不 mutate 已返回报告或迟到归档。
 - **程序错误不伪装（真实 SDK 包装下同样成立）**：共享 `LLMToolAdapter.call_text/
   call_completion` 可选 `propagate_program_errors`（默认 False，全部既有消费者
