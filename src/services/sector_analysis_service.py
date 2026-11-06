@@ -26,18 +26,31 @@ import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time as dt_time, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, cast
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
 from icontract import ensure, require
 from pydantic import ValidationError
 
-from src.core.trading_calendar import recent_completed_trading_sessions
+from src.core.trading_calendar import (
+    MARKET_TIMEZONE,
+    get_market_now,
+    recent_completed_trading_sessions,
+)
 from src.schemas.sector_analysis import SectorReportPayload
+from src.schemas.sector_vendor import (
+    BoardQuote,
+    F10BoardResponse,
+    F10BoardRow,
+    MemberQuote,
+    Trends2Response,
+)
 
 if TYPE_CHECKING:  # 跨模块字符串注解（避免循环 import；见三层防御 Layer 1）
     from src.services.sector_research import ArticleDateEvidence, EvidenceRegistry
@@ -69,6 +82,16 @@ _FINISH_MARGIN_SECONDS = 5.0
 
 class BudgetExhausted(Exception):
     """报告总预算已耗尽：终结为超时，不采纳晚到 IO、不保存伪成功。"""
+
+
+class SectorInputError(ValueError):
+    """板块专项**用户输入错误**（仅无效 A 股代码等请求侧校验）。
+
+    本 API 对该类型返回 400；供应商/程序侧 ``ValueError`` **不属于**本类型，
+    走既有通用 500——新 F10/报价传输层的程序缺陷不冒充用户请求错误
+    （root entry-closure 反例：程序 ValueError 曾被通用 catch 误报 400 并
+    泄漏缺陷原文）。不新增通用异常框架，仅本入口窄化输入错误归属。
+    """
 
 
 class ReportBudget:
@@ -211,6 +234,807 @@ def _bounded_ak(fn: Callable[..., Any], *args: Any, budget: ReportBudget,
     """
     return bounded_call(_ak_with_retry, fn, *args, retries=retries, delay=delay,
                         budget=budget, retry_budget=budget, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# 东财替代接入（2026-11-07 收敛轮）：datacenter F10 身份/成员 + push2 单标的
+# 行情 + trends2 分钟累计 backup。取数路径经生产只读探针验证；wire 契约见
+# src/schemas/sector_vendor.py（严格消费字段 + extra=allow 兼容合法元数据）。
+# ---------------------------------------------------------------------------
+
+_EM_DATACENTER_URL = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+_EM_STOCK_GET_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+_EM_TRENDS2_URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+_BOARD_QUOTE_FIELDS = "f48,f57,f58,f86,f116,f168,f170"
+_MEMBER_QUOTE_FIELDS = "f48,f57,f58,f86,f170"
+_F10_PAGE_SIZE = 100
+_F10_MAX_PAGES = 40
+_HTTP_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+# 衍生口径标记（provenance 单一 owner：生成与判定同用本常量，不散落字符串）
+_DERIVED_MARKER = "供应商分钟累计衍生"
+
+_CONS_SNAPSHOT_SOURCE = "东财行业板块成分（身份验证同一快照）"
+_F10_CONS_SNAPSHOT_SOURCE = "东财 F10 板块完整成员（身份验证同一集合）"
+_F10_AMOUNT_PROVENANCE_PREFIX = (
+    "成交额单位为元：成分集合来自东财 F10 板块完整成员（datacenter "
+    "RPT_F10_CORETHEME_BOARDTYPE）"
+)
+
+
+@dataclass(frozen=True)
+class QuoteSnapshot:
+    """单标的当日快照：已校验报价 + 来源/时间元数据（provenance 贯穿载荷）。
+
+    ``derived_amount=True`` 表示 ``f48`` 是 trends2 分钟额求和的**衍生值**
+    （与 stock/get f48 同元级口径，非原样字段）；``vendor_as_of`` 是供应商
+    数据截至（trends2=最后一根分钟时间，stock/get=f86 时间戳的市场时区
+    iso）——采集时间不冒充供应商时间。
+    """
+
+    quote: Any
+    source: str
+    derived_amount: bool
+    vendor_as_of: Optional[str] = None
+    vendor_time_epoch: Optional[int] = None
+
+
+def _secucode(code: str) -> str:
+    """A 股 6 位代码 → 东财 SECUCODE（交易所后缀与 `_stock_secid` 同一识别源）。
+
+    复用 :func:`data_provider.base.is_bse_code` 权威北交所识别（43/83/87/88/92
+    段，含 920 新段；900 沪 B 不误判），与成员行情 secid 一致——同一代码全链
+    一个交易所口径。
+    """
+    from data_provider.base import is_bse_code
+
+    if code.startswith("6") or (code.startswith("9") and not is_bse_code(code)):
+        return f"{code}.SH"
+    if is_bse_code(code):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def _stock_secid(code: str) -> str:
+    """A 股 6 位代码 → stock/get secid 市场前缀（沪 1，深/北 0）。
+
+    与 `_secucode` 同一 ``is_bse_code`` 识别源：920 北交段归 0 市场，不按 9
+    前缀误判沪市。
+    """
+    from data_provider.base import is_bse_code
+
+    if code.startswith("6") or (code.startswith("9") and not is_bse_code(code)):
+        return f"1.{code}"
+    return f"0.{code}"
+
+
+def _f10_row_identity_ok(row: "F10BoardRow") -> bool:
+    """F10 行自身双股票键一致：SECUCODE 的 6 位代码段与交易所后缀都必须与
+    SECURITY_CODE 及其权威交易所识别一致。
+
+    请 600519 返回 000001.SZ、或 600519/000001.SZ 单列漂移、或 920 段错标
+    .SZ，都按源错误整体拒绝（不丢行缩集合冒充完整）。
+    """
+    from data_provider.base import is_bse_code
+
+    code_part, _, suffix = row.SECUCODE.partition(".")
+    return (code_part == row.SECURITY_CODE
+            and suffix == _secucode(row.SECURITY_CODE).partition(".")[2]
+            and suffix in {"SH", "SZ", "BJ"}
+            and bool(is_bse_code(row.SECURITY_CODE)) == (suffix == "BJ"))
+
+
+def _http_get_json(url: str, params: Dict[str, Any], *,
+                   budget: ReportBudget, timeout: float = 6.0,
+                   model: Optional[type] = None,
+                   retries: int = 1) -> Optional[Any]:
+    """受同一预算与执行器约束的东财 JSON GET（替代接入统一出站入口）。
+
+    - 复用 :func:`bounded_call`：线程等待上界=剩余取数预算，等待超时抛
+      BudgetExhausted（迟到结果丢弃）；竞态守卫只在主截止前采纳。
+    - worker 内幂等安装 ``eastmoney_patch(budget_only=True)`` 并绑定同一线程级
+      fetch deadline，finally 恢复——与 AkShare 出站同一 deadline/调度停止纪律。
+    - 异常分层：requests 网络/HTTP 状态异常与供应商 JSON/模型校验错误 → None
+      （调用方记缺口）；程序错误（TypeError/ValueError/AssertionError）原样
+      传播，不吞异常、不伪装成供应商故障。
+    - ``retries``：间歇拒绝（生产实测 stock/get 部分请求被拒后相邻请求成功）
+      单次重试，退避钳制剩余预算——与 ``_ak_with_retry`` 同语义；程序错误不重试。
+    - ``model``：严格供应商 I/O 模型（src/schemas/sector_vendor.py），形状/类型
+      不符按源错误返回 None，不 str() 合法化。
+    """
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+
+    def _call() -> Any:
+        eastmoney_patch(budget_only=True)
+        token = request_deadline.set(budget.fetch_deadline)
+        try:
+            with requests.Session() as session:
+                resp = session.get(url, params=params, timeout=timeout,
+                                   headers={"User-Agent": _HTTP_UA})
+                resp.raise_for_status()
+                return resp.json()
+        finally:
+            request_deadline.reset(token)
+
+    host = url.split("/")[2] if "//" in url else url
+    data: Optional[Any] = None
+    last_error: Optional[str] = None
+    for attempt in range(retries + 1):
+        try:
+            data = bounded_call(_call, budget=budget)
+            last_error = None
+            break
+        except BudgetExhausted:
+            raise
+        except requests.exceptions.JSONDecodeError as exc:
+            # 仅 JSON 解码边界：resp.json() 失败（502 HTML 等）。注意它继承
+            # RequestException，必须先于网络异常分支捕获才能区分错误文案。
+            # 程序层的 ValueError/TypeError/AssertionError 不在此捕获，原样传播。
+            last_error = f"response not JSON: {str(exc)[:60]}"
+        except requests.RequestException as exc:  # noqa: BLE001 - 网络/HTTP 状态按源错误
+            last_error = str(exc)[:100]
+        if attempt < retries:
+            remaining = budget.fetch_remaining()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.3, remaining))
+    if last_error is not None or data is None:
+        logger.warning("[SectorAnalysis] 替代接入 GET 失败 host=%s: %s",
+                       host, last_error or "empty payload")
+        return None
+    if model is None:
+        return data
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:  # 供应商字段/形状不符按源错误
+        logger.warning("[SectorAnalysis] 供应商响应模型校验失败 host=%s: %s",
+                       host, str(exc)[:140])
+        return None
+
+
+def _f10_fetch_all_pages(filter_expr: str, *, budget: ReportBudget,
+                         label: str) -> Optional[List[F10BoardRow]]:
+    """F10 datacenter 报表完整分页取数（声明列表与反向成员共用同一实现）。
+
+    完整性纪律（root 反例：正向声明 pages=2/count=2 仅 1 行曾被采纳）：
+    逐页遍历到 pages 尾（不只取第一页）；跨页 count/pages 一致（漂移=源
+    错误，服务端翻页间集合变化不得静默采为完整集合，预算内一次判定）；
+    每页行数契约（非末页满 pageSize、末页恰余量）；总行数与 count 核齐；
+    每行 `_f10_row_identity_ok` 双键校验。**SECURITY_CODE 去重不在此层**：
+    个股声明列表同一股票合法多行（行业+概念各一行）；成员集合语义的去重
+    由 `_fetch_board_members` 施加。
+    返回 None=源不可用/形状异常/完整性不成立（调用方记缺口，不据此采用）。
+    """
+    all_rows: List[F10BoardRow] = []
+    expected_count: Optional[int] = None
+    pages = 1
+    for page in range(1, _F10_MAX_PAGES + 1):
+        resp = cast(
+            Optional[F10BoardResponse],
+            _http_get_json(_EM_DATACENTER_URL, {
+                "reportName": "RPT_F10_CORETHEME_BOARDTYPE",
+                # ALL：行业名/类型层级判定需要 BOARD_TYPE/BOARD_LEVEL
+                "columns": "ALL",
+                "filter": filter_expr,
+                "pageNumber": str(page), "pageSize": str(_F10_PAGE_SIZE),
+                "source": "WEB", "client": "WEB",
+            }, budget=budget, model=F10BoardResponse),
+        )
+        if resp is None:
+            return None
+        if expected_count is None:
+            expected_count = resp.result.count
+            pages = resp.result.pages
+            if pages > _F10_MAX_PAGES:
+                logger.warning(
+                    "[SectorAnalysis] F10 %s 页数 %s 超防御上限 %s，按源错误拒绝",
+                    label, pages, _F10_MAX_PAGES)
+                return None
+        elif (resp.result.count != expected_count
+                or resp.result.pages != pages):
+            logger.warning(
+                "[SectorAnalysis] F10 %s 跨页元数据漂移：page1 count=%s/pages=%s，"
+                "page%s count=%s/pages=%s，不采用", label, expected_count,
+                pages, page, resp.result.count, resp.result.pages)
+            return None
+        # 每页行数契约：非末页必须满 pageSize，末页恰为余量（缺行/多行=源错误）
+        expected_page_rows = (_F10_PAGE_SIZE if page < pages
+                              else expected_count - _F10_PAGE_SIZE * (pages - 1))
+        if len(resp.result.data) != expected_page_rows:
+            logger.warning(
+                "[SectorAnalysis] F10 %s 页 %s 行数不符：期望 %s 实际 %s，"
+                "分页不完整，不采用", label, page, expected_page_rows,
+                len(resp.result.data))
+            return None
+        for row in resp.result.data:
+            if not _f10_row_identity_ok(row):
+                logger.warning(
+                    "[SectorAnalysis] F10 %s 行双键不符：SECUCODE=%s "
+                    "SECURITY_CODE=%s，整体不采用", label, row.SECUCODE,
+                    row.SECURITY_CODE)
+                return None
+            all_rows.append(row)
+        if page >= pages:
+            break
+    if expected_count is None or len(all_rows) != expected_count:
+        logger.warning(
+            "[SectorAnalysis] F10 %s 总数不符：count=%s 实际收齐 %s 行，不采用",
+            label, expected_count, len(all_rows))
+        return None
+    return all_rows
+
+
+def _fetch_board_claims(code: str, *, budget: ReportBudget,
+                        ) -> Optional[F10BoardResponse]:
+    """东财 F10 所属板块声明列表（SECUCODE filter，个股侧结构化归属）。
+
+    完整分页核齐（与反向成员同一 `_f10_fetch_all_pages` 契约）+ 响应同键
+    校验：全部行 SECUCODE 必须等于请求的 ``_secucode(code)``（请 600519
+    返回 000001.SZ 属源错误，整体拒绝）。供应商失败/形状异常/同键/完整性
+    不符 → None（调用方记缺口，不据此锁定）。成功时聚合为单一
+    F10BoardResponse（pages=1/count=实际行数），接口形状与反向成员一致。
+    """
+    rows = _f10_fetch_all_pages(f'(SECUCODE="{_secucode(code)}")',
+                                budget=budget, label="归属声明")
+    if rows is None:
+        return None
+    expected = _secucode(code)
+    for row in rows:
+        if row.SECUCODE != expected:
+            logger.warning(
+                "[SectorAnalysis] F10 声明行同键不符：请求 %s，"
+                "实际 SECUCODE=%s SECURITY_CODE=%s，整体不采用",
+                expected, row.SECUCODE, row.SECURITY_CODE)
+            return None
+    return F10BoardResponse.model_validate({
+        "success": True, "code": 0,
+        "result": {"pages": 1, "count": len(rows),
+                   "data": [row.model_dump() for row in rows]},
+    })
+
+
+def _fetch_board_members(board_code: str, board_name: str, code: str, *,
+                         budget: ReportBudget) -> Optional[Dict[str, Any]]:
+    """东财 F10 板块反向完整成员（NEW_BOARD_CODE filter，分页核完）。
+
+    返回 None=源不可用/形状异常/同键或类型不符（源错误）；成功返回
+    ``{"rows": [...], "target_in": bool, "member_count": int}``——
+    ``target_in`` 表达目标股是否在成员集合（归属验证语义，非源错误）。
+
+    分页完整性由 `_f10_fetch_all_pages` 共用契约保证；本入口追加成员语义
+    校验：每行 NEW_BOARD_CODE/BOARD_NAME 同键（漂移=源错误）、BOARD_TYPE
+    必须「行业」、BOARD_LEVEL ∈ {"1","2","3"}（概念/衍生同名板块拒绝）、
+    SECURITY_CODE 跨页去重（成员集合内同一股票重复=源错误，不静默取其一）。
+    """
+    all_rows = _f10_fetch_all_pages(f'(NEW_BOARD_CODE="{board_code}")',
+                                    budget=budget,
+                                    label=f"板块成员（{board_code}）")
+    if all_rows is None:
+        return None
+    seen_codes: set = set()
+    for row in all_rows:
+        if row.NEW_BOARD_CODE != board_code or row.BOARD_NAME != board_name:
+            logger.warning(
+                "[SectorAnalysis] F10 成员行同键不符：请求 %s/%s 实际 %s/%s，"
+                "整体不采用", board_code, board_name,
+                row.NEW_BOARD_CODE, row.BOARD_NAME)
+            return None
+        if row.BOARD_TYPE != "行业" or row.BOARD_LEVEL not in ("1", "2", "3"):
+            logger.warning(
+                "[SectorAnalysis] F10 成员行类型/层级异常：%s/%s（%s），"
+                "整体不采用", row.BOARD_TYPE, row.BOARD_LEVEL,
+                row.SECURITY_CODE)
+            return None
+        if row.SECURITY_CODE in seen_codes:
+            logger.warning(
+                "[SectorAnalysis] F10 成员集合重复代码 %s，按源错误拒绝",
+                row.SECURITY_CODE)
+            return None
+        seen_codes.add(row.SECURITY_CODE)
+    return {"rows": all_rows, "target_in": code in seen_codes,
+            "member_count": len(all_rows)}
+
+
+def _members_snapshot_df(rows: List[F10BoardRow]) -> pd.DataFrame:
+    """F10 反向成员 → 同业支柱成分快照形状（代码/名称；行情列由逐股采集填充）。"""
+    return pd.DataFrame({
+        "代码": [r.SECURITY_CODE for r in rows],
+        "名称": [r.SECURITY_NAME_ABBR for r in rows],
+    })
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    """市场会话上下文：**只拥有日历事实**（XSHG 会话日与该日开/收盘时刻）。
+
+    会话上下文的存在不暗示冻结测试世界，也绝不冒充响应接收钟——「会话
+    是否已完结」与一切供应商时点上界都在取数处按**该响应实际接收时刻**
+    （``_received_at_now``，HTTP 完成后取得）判定。
+    """
+
+    session_date: date
+    session_open: datetime
+    session_close: datetime
+
+
+def _calendar_naive_local(value: Any) -> Optional[datetime]:
+    """日历时间戳 → 市场本地 naive datetime（会话日/开收盘锚定用）。"""
+    tz = ZoneInfo(MARKET_TIMEZONE["cn"])
+    if hasattr(value, "tz_convert"):
+        converted = cast(datetime, value.tz_convert(tz).to_pydatetime())
+        return converted.replace(tzinfo=None)
+    dt = cast(datetime,
+              value.to_pydatetime() if hasattr(value, "to_pydatetime") else value)
+    if dt.tzinfo is not None:
+        return dt.astimezone(tz).replace(tzinfo=None)
+    return dt.replace(tzinfo=None)
+
+
+def _session_context(now: Optional[datetime] = None) -> Optional[SessionContext]:
+    """当前报价归属会话上下文（会话感知，单一 now 注入点，测试冻结用）。
+
+    会话感知规则（root 反例：盘中不得用「最近已完成交易日」拒绝合法当日分钟；
+    ``now`` 只锚定会话日归属，不是接收钟——接收钟在每次 HTTP 完成后由
+    :func:`_received_at_now` 取得）：
+    - 交易日当天开盘（含）后：当天会话（盘中前缀覆盖与盘后全天同属当日）；
+    - 非交易日 / 开盘前：最近已完成会话（date_to_session previous）；
+    - 交易日历不可用：None（调用方拒绝采用，不按自然日猜测）。
+    """
+    market_now = get_market_now("cn", current_time=now)
+    try:
+        import exchange_calendars as xcals
+
+        cal = xcals.get_calendar("XSHG")
+    except Exception as exc:  # noqa: BLE001 - 日历不可用按明确未知处理
+        logger.warning("[SectorAnalysis] 交易日历不可用，无法判定会话: %s", exc)
+        return None
+    try:
+        local_date = market_now.date()
+        session = cal.date_to_session(local_date, direction="previous")
+        if cal.is_session(local_date):
+            open_local = _calendar_naive_local(cal.session_open(session))
+            if open_local is not None and market_now.replace(tzinfo=None) >= open_local:
+                return SessionContext(
+                    session_date=local_date,
+                    session_open=open_local,
+                    session_close=_calendar_naive_local(cal.session_close(session)),
+                )
+            session = cal.previous_session(session)
+        session_open = _calendar_naive_local(cal.session_open(session))
+        session_close = _calendar_naive_local(cal.session_close(session))
+        if session_open is None or session_close is None:
+            return None
+        return SessionContext(
+            session_date=session.date(), session_open=session_open,
+            session_close=session_close,
+        )
+    except Exception as exc:  # noqa: BLE001 - 日历越界/异常按明确未知处理
+        logger.warning("[SectorAnalysis] 会话解析失败: %s", exc)
+        return None
+
+
+def _received_at_now() -> datetime:
+    """当前响应实际接收时刻（市场本地 naive；每次响应各自取钟，不用批次
+    开始时刻冒充后续响应的接收时刻）。"""
+    return get_market_now("cn").replace(tzinfo=None)
+
+
+def _vendor_epoch_naive_local(epoch: int) -> Optional[datetime]:
+    """供应商 epoch 秒 → 市场本地 naive datetime；畸形值（溢出/负/超界）返回
+    None（调用方按源错误拒绝），不泄 OverflowError/ValueError/OSError。"""
+    try:
+        return datetime.fromtimestamp(
+            epoch, tz=ZoneInfo(MARKET_TIMEZONE["cn"])).replace(tzinfo=None)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+_TRENDS_MIN_TIME = dt_time(9, 30)
+_TRENDS_MORNING_END = dt_time(11, 30)
+_TRENDS_AFTERNOON_OPEN = dt_time(13, 1)
+_TRENDS_AFTERNOON_END = dt_time(15, 0)
+_TRENDS_LUNCH_GAP_MIN = 91  # 11:30 → 13:01（真实 wire：午后首根分钟为 13:01）
+
+
+@require(lambda last_close: isinstance(last_close, Decimal)
+         and last_close.is_finite() and last_close > 0,
+         "last_close must be a finite positive Decimal")
+@require(lambda pre_close: isinstance(pre_close, Decimal)
+         and pre_close.is_finite() and pre_close > 0,
+         "pre_close must be a finite positive Decimal")
+@ensure(lambda result: isinstance(result, Decimal) and result.is_finite(),
+        "trends2 change pct must be a finite Decimal")
+def _trends_change_pct(last_close: Decimal, pre_close: Decimal) -> Decimal:
+    """trends2 涨跌幅（百分点，2 位小数）：(末分钟现价 − preClose)/preClose×100。
+
+    Layer 2 金融公式契约：现价列（close）对昨收的 Decimal 派生；现价/昨收
+    有限正是 require 前置（Pydantic 已管 wire 字段范围，此处不重复字段搬运
+    校验，只约束公式输入域）；preClose=10、close=11 → 10.00（高列 15 不得
+    参与公式——真实 wire board 末行 close≠high 直接判别列选择）。
+    """
+    return ((last_close - pre_close) / pre_close
+            * Decimal("100")).quantize(Decimal("0.01"))
+
+
+@require(lambda amounts: len(amounts) > 0 and all(
+    isinstance(a, Decimal) and a.is_finite() and a >= 0 for a in amounts),
+    "amounts must be non-empty finite non-negative Decimals")
+@ensure(lambda result: isinstance(result, Decimal) and result.is_finite()
+        and result >= 0,
+        "cumulative amount must be a finite non-negative Decimal")
+def _sum_minute_amounts(amounts: List[Decimal]) -> Decimal:
+    """trends2 当日累计额：供应商分钟额列 Decimal 求和（衍生口径）。
+
+    Layer 2 金融公式契约：输入必须是已通过行级资格的有限非负分钟额
+    （零额分钟合法）；不完整/缺段行不得进入（调用方整体拒绝后才求和），
+    部分行部分和不冒充当日累计。
+    """
+    total = Decimal("0")
+    for a in amounts:
+        total += a
+    return total
+
+
+@ensure(
+    lambda result: result is None or (
+        isinstance(result, QuoteSnapshot)
+        and result.quote is not None
+        and result.quote.f48 is not None and result.quote.f48 >= 0
+        and result.quote.f170 is not None
+        and math.isfinite(float(result.quote.f170))
+    ),
+    "accepted trends2 snapshot must carry non-negative cumulative amount "
+    "(known-zero is a legal observation) and finite change pct "
+    "(None = rejected, not partial)")
+def _fetch_trends2_snapshot(secid: str, expected_code: str, expected_name: str,
+                            *, budget: ReportBudget,
+                            quote_model: type,
+                            now: Optional[datetime] = None,
+                            session_ctx: Optional[SessionContext] = None,
+                            received_at: Optional[datetime] = None,
+                            ) -> Optional[QuoteSnapshot]:
+    """trends2 当日累计口径快照（stock/get 不可用时的同口径 backup）。
+
+    严格契约（真实 wire fixture 全链回放验证）：
+    - wire 经 :class:`Trends2Response` 严格模型（消费字段 code/name/market/
+      preClose/time/trendsTotal/trends 显式校验；无关合法元数据兼容放行）；
+    - ``market`` 回显请求 secid 市场前缀、code/name 同键（身份漂移拒绝）；
+    - ``len(trends) == trendsTotal``（供应商声明行数与实际核齐，完整性依据）；
+    - **接收钟（root entry-closure 反例驱动）**：``received`` 在本 source 的
+      ``_http_get_json`` 完成后立即取得（``received_at`` 仅供测试显式注入；
+      session_ctx 只锚日历会话，绝不冒充冻结接收钟，生产调用链不提前取钟）。
+      分钟未来上界、``time`` 上界与「会话是否已完结」（完整日 15:00 资格）
+      全部按该接收时刻相对同一 open/close 判定；首源失败后的 fallback 独立
+      取得自己的接收钟。
+    - 供应商时点 ``time``：解码畸形（溢出等）按源错误拒绝；必须属于会话日、
+      不早于末根分钟且不晚于接收时刻。
+    - 分钟行逐行：8 列具名解析（time,open,close,high,low,volume,amount,avg）、
+      单一会话日（=会话上下文判定）、**严格递增**、交易时段窗口
+      （09:30-11:30 / 13:01-15:00）内、覆盖自 09:30 起、段内连续（仅午休
+      11:30→13:01 跳变合法）、分钟不晚于当前时刻（未来拒绝）；
+    - **覆盖资格（root 反例：盘后截尾曾采为累计）**：会话已完结
+      （now >= session_close，含盘后/过去会话/周末盘前）→ 末分钟必须为该
+      会话收盘 15:00（结合首分钟 09:30 与连续性即完整日）；盘中（now <
+      session_close）允许截至供应商已完成分钟的真实连续前缀，as_of=最后一根
+      已完成分钟如实透出；
+    - 价格列（开/收/高/低/均价）有限正、量额有限非负（零量零额是合法观测；
+      任一行参与字段缺失/畸形/负值 → 整体不可信返回 None，不跳坏行部分累计）；
+    - 行内 OHLC 一致（low <= min(open, close) <= max <= high）；
+    - **现价取 close 列**；累计/涨跌幅经 `_sum_minute_amounts` /
+      `_trends_change_pct` typed 金融契约（Layer 2）；
+    - ``preClose`` 模型层强制有限正（"Infinity"/"-"/0/负按源错误拒绝）。
+    累计额是**衍生分钟累计**：调用方 provenance 必须标注衍生来源，不写 f48 原样。
+    """
+    raw = _http_get_json(_EM_TRENDS2_URL, {
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
+        "secid": secid, "iscr": "0",
+    }, budget=budget)
+    if not isinstance(raw, dict):
+        return None
+    inner = raw.get("data")
+    if not isinstance(inner, dict):
+        return None
+    try:
+        data = Trends2Response.model_validate(inner)
+    except ValidationError as exc:
+        logger.warning("[SectorAnalysis] trends2 wire 模型校验失败 secid=%s: %s",
+                       secid, str(exc)[:120])
+        return None
+    secid_market = secid.partition(".")[0]
+    if not secid_market.isdigit() or data.market != int(secid_market):
+        logger.warning(
+            "[SectorAnalysis] trends2 market 回显不符：secid=%s 实际 market=%s，"
+            "不采用", secid, data.market)
+        return None
+    if data.code != expected_code or data.name != expected_name:
+        logger.warning(
+            "[SectorAnalysis] trends2 快照同键不符：期望 %s/%s 实际 %s/%s，不采用",
+            expected_code, expected_name, data.code, data.name)
+        return None
+    ctx = session_ctx if session_ctx is not None else _session_context(now)
+    if ctx is None:
+        logger.warning(
+            "[SectorAnalysis] trends2 快照：交易日历不可用，无法判定分钟归属"
+            "交易日，不采用")
+        return None
+    # 接收钟：本响应 HTTP 完成后立即取得（显式注入仅供测试；不提前取钟）
+    received = received_at if received_at is not None else _received_at_now()
+    # 会话阶段按接收时刻判定（14:59:58 请求、15:00:02 接收 → 完结会话）
+    session_finished = received >= ctx.session_close
+    if len(data.trends) != data.trendsTotal or not data.trends:
+        logger.warning(
+            "[SectorAnalysis] trends2 行数与声明不符或为空：trendsTotal=%s 实际=%s，"
+            "完整性依据缺失，不采用", data.trendsTotal, len(data.trends))
+        return None
+    expected_date = ctx.session_date.isoformat()
+    prev_minute: Optional[datetime] = None
+    minute_amounts: List[Decimal] = []
+    last_minute: Optional[str] = None
+    last_minute_dt: Optional[datetime] = None
+    last_close: Optional[Decimal] = None
+    for raw_row in data.trends:
+        cols = raw_row.split(",")
+        if len(cols) != 8:
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟行列数 %s ≠ 8（%s），整体不采用",
+                len(cols), raw_row[:40])
+            return None
+        try:
+            minute_dt = datetime.strptime(cols[0], "%Y-%m-%d %H:%M")
+        except ValueError:
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟时间不可解析 %r，整体不采用",
+                cols[0][:24])
+            return None
+        if minute_dt.date().isoformat() != expected_date:
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟日期 %s ≠ 会话日 %s，整体不采用"
+                "（不跨日累计）", minute_dt.date().isoformat(), expected_date)
+            return None
+        t = minute_dt.time()
+        morning = _TRENDS_MIN_TIME <= t <= _TRENDS_MORNING_END
+        afternoon = _TRENDS_AFTERNOON_OPEN <= t <= _TRENDS_AFTERNOON_END
+        if not (morning or afternoon):
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟 %s 不在交易时段窗口内，整体不采用",
+                cols[0])
+            return None
+        if minute_dt > received:
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟 %s 晚于响应接收时刻 %s（未来数据），"
+                "整体不采用", cols[0], received.isoformat())
+            return None
+        if prev_minute is not None:
+            gap_min = (minute_dt - prev_minute).total_seconds() / 60.0
+            is_lunch = (prev_minute.time() == _TRENDS_MORNING_END
+                        and gap_min == _TRENDS_LUNCH_GAP_MIN)
+            if not is_lunch and gap_min != 1.0:
+                logger.warning(
+                    "[SectorAnalysis] trends2 分钟序列断档/乱序：%s → %s（%s 分钟），"
+                    "整体不采用（不把有限行部分求和冒充累计）",
+                    prev_minute.strftime("%H:%M"), minute_dt.strftime("%H:%M"),
+                    gap_min)
+                return None
+        else:
+            if t != _TRENDS_MIN_TIME:
+                logger.warning(
+                    "[SectorAnalysis] trends2 首分钟 %s 非 09:30（覆盖缺段），"
+                    "整体不采用", cols[0])
+                return None
+        prev_minute = minute_dt
+        named: Dict[str, Decimal] = {}
+        for idx, key in ((1, "open"), (2, "close"), (3, "high"), (4, "low"),
+                         (5, "volume"), (6, "amount"), (7, "avg")):
+            cell = cols[idx]
+            if cell in ("", "-", None):
+                logger.warning(
+                    "[SectorAnalysis] trends2 分钟 %s 字段 %s 缺失，当日累计"
+                    "不完整，整体不采用", cols[0], key)
+                return None
+            try:
+                value = Decimal(cell)
+            except (ArithmeticError, ValueError):
+                logger.warning(
+                    "[SectorAnalysis] trends2 分钟 %s 字段 %s 非数值 %r，"
+                    "整体不采用", cols[0], key, cell[:12])
+                return None
+            if not value.is_finite():
+                logger.warning(
+                    "[SectorAnalysis] trends2 分钟 %s 字段 %s 非有限 %s，"
+                    "整体不采用", cols[0], key, value)
+                return None
+            if key in ("volume", "amount"):
+                if value < 0:
+                    logger.warning(
+                        "[SectorAnalysis] trends2 分钟 %s 字段 %s 为负 %s，"
+                        "整体不采用", cols[0], key, value)
+                    return None
+            elif value <= 0:
+                logger.warning(
+                    "[SectorAnalysis] trends2 分钟 %s 价格字段 %s 非正 %s，"
+                    "整体不采用", cols[0], key, value)
+                return None
+            named[key] = value
+        if not (named["low"] <= min(named["open"], named["close"])
+                <= max(named["open"], named["close"]) <= named["high"]):
+            logger.warning(
+                "[SectorAnalysis] trends2 分钟 %s OHLC 行内不一致（o=%s c=%s "
+                "h=%s l=%s），整体不采用", cols[0], named["open"], named["close"],
+                named["high"], named["low"])
+            return None
+        minute_amounts.append(named["amount"])
+        last_minute = cols[0]
+        last_minute_dt = minute_dt
+        last_close = named["close"]
+    if session_finished and (last_minute_dt is None
+                             or last_minute_dt.time() != _TRENDS_AFTERNOON_END):
+        # 接收时该会话已完结：截尾前缀 ≠ 全天，不得充当日累计
+        # （结合首分钟 09:30 + 段内连续 + 末分钟 15:00 = 完整交易时段）
+        logger.warning(
+            "[SectorAnalysis] trends2 接收时刻 %s 已过收盘但末分钟 %s 非 15:00"
+            "（盘后截尾不冒充全天累计），整体不采用",
+            received.isoformat(), last_minute)
+        return None
+    if not minute_amounts or last_close is None or last_close <= 0:
+        logger.warning(
+            "[SectorAnalysis] trends2 累计额/现价无效（rows=%s close=%s），"
+            "不采用", len(minute_amounts), last_close)
+        return None
+    # time 与实际分钟序列/会话/接收上界一致（final 反例：完整分钟 + time=2030
+    # 曾被采纳）：属于会话日、不早于末根分钟、不晚于实际接收时刻
+    vendor_time = _vendor_epoch_naive_local(data.time)
+    if (vendor_time is None
+            or vendor_time.date() != ctx.session_date
+            or last_minute_dt is None
+            or not (last_minute_dt <= vendor_time <= received)):
+        logger.warning(
+            "[SectorAnalysis] trends2 供应商时点 %s 与会话 %s/分钟序列末根 %s/"
+            "接收时刻 %s 不一致（畸形/旧日/未来），按源错误整体不采用",
+            vendor_time.isoformat() if vendor_time else "畸形",
+            ctx.session_date.isoformat(),
+            last_minute_dt.isoformat(timespec="minutes") if last_minute_dt else "无",
+            received.isoformat())
+        return None
+    total_amount = _sum_minute_amounts(minute_amounts)
+    pre_close = Decimal(str(data.preClose))
+    change_pct = float(_trends_change_pct(last_close, pre_close))
+    payload = {
+        "f57": data.code, "f58": data.name,
+        "f48": float(total_amount), "f170": change_pct,
+    }
+    try:
+        quote = quote_model.model_validate(payload)
+    except ValidationError as exc:
+        logger.warning("[SectorAnalysis] trends2 快照模型校验失败 secid=%s: %s",
+                       secid, str(exc)[:120])
+        return None
+    logger.info(
+        "[SectorAnalysis] trends2 backup 采纳：%s/%s 当日累计额 %s、涨跌幅 %s"
+        "（供应商分钟截至 %s；衍生口径，非 f48 原样字段）",
+        data.code, data.name, quote.f48, quote.f170, last_minute)
+    return QuoteSnapshot(
+        quote=quote, source="trends2当日累计", derived_amount=True,
+        vendor_as_of=last_minute, vendor_time_epoch=data.time,
+    )
+
+
+def _fetch_stock_quote(secid: str, expected_code: str, expected_name: str,
+                       *, budget: ReportBudget,
+                       quote_model: type,
+                       session_ctx: Optional[SessionContext] = None,
+                       received_at: Optional[datetime] = None,
+                       ) -> Optional[QuoteSnapshot]:
+    """stock/get 单标的快照（板块或成员），f57/f58 与预期同键完整校验。
+
+    代码或名称任一不符即源错误整体不采用（错名板块/错股票行情不得采用）。
+    **交易时点资格（root entry-closure 反例驱动）**：供应商时点 f86 必须
+    存在、解码不畸形、属于当前会话日，且**不晚于该响应实际接收时刻**。
+    接收钟在本 source 的 ``_http_get_json`` 完成后立即取得（``received_at``
+    仅供测试显式注入；session_ctx 只锚日历会话，绝不自动当冻结接收钟，
+    生产调用链不提前取钟）；「会话是否已完结」同样按接收时刻判定——
+    完结会话要求 f86 ≥ 收盘（盘后收到盘中旧快照拒），盘中要求 ≥ 开盘
+    （同日未来拒），日期 ≠ 会话日拒（旧日/跨会话未来）。无时效阈值。
+    缺时点 = 无可比资格，拒绝。as_of = f86 供应商时间戳（市场时区 iso）。
+    """
+    params = {"fltt": "2", "invt": "2", "fields": _BOARD_QUOTE_FIELDS,
+              "secid": secid}
+    if quote_model is MemberQuote:
+        params["fields"] = _MEMBER_QUOTE_FIELDS
+    data = _http_get_json(_EM_STOCK_GET_URL, params, budget=budget)
+    inner = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(inner, dict):
+        return None
+    try:
+        quote = quote_model.model_validate(inner)
+    except ValidationError as exc:
+        logger.warning("[SectorAnalysis] 行情快照模型校验失败 secid=%s: %s",
+                       secid, str(exc)[:120])
+        return None
+    if quote.f57 != expected_code or quote.f58 != expected_name:
+        logger.warning(
+            "[SectorAnalysis] 行情快照同键不符：期望 %s/%s 实际 %s/%s，不采用",
+            expected_code, expected_name, quote.f57, quote.f58)
+        return None
+    if quote.f86 is None or quote.f86 <= 0:
+        logger.warning(
+            "[SectorAnalysis] 行情快照无供应商时点 f86（secid=%s），"
+            "无可比当日资格，不采用", secid)
+        return None
+    f86_local = _vendor_epoch_naive_local(int(quote.f86))
+    ctx = session_ctx if session_ctx is not None else _session_context()
+    # 接收钟：本响应 HTTP 完成后立即取得（显式注入仅供测试；不提前取钟）
+    received = (received_at if received_at is not None
+                else _received_at_now())
+    if f86_local is None or ctx is None:
+        logger.warning(
+            "[SectorAnalysis] 行情快照时点/会话不可判定（secid=%s），不采用",
+            secid)
+        return None
+    # 会话阶段按接收时刻判定（14:59:58 请求、15:00:02 接收 → 完结会话）
+    lower = (ctx.session_close if received >= ctx.session_close
+             else ctx.session_open)
+    if (f86_local.date() != ctx.session_date
+            or not (lower <= f86_local <= received)):
+        logger.warning(
+            "[SectorAnalysis] 行情快照供应商时点 %s 不具备会话 %s 当日可比资格"
+            "（窗口 [%s, %s]；旧日/未来/盘后旧盘中快照/缺资格），不采用",
+            f86_local.isoformat(), ctx.session_date.isoformat(),
+            lower.isoformat(), received.isoformat())
+        return None
+    as_of = f86_local.replace(tzinfo=ZoneInfo(MARKET_TIMEZONE["cn"])).isoformat(
+        timespec="seconds")
+    return QuoteSnapshot(quote=quote, source="stock/get", derived_amount=False,
+                         vendor_as_of=as_of,
+                         vendor_time_epoch=int(quote.f86))
+
+
+def _fetch_board_quote(board_code: str, board_name: str, *, budget: ReportBudget,
+                       now: Optional[datetime] = None,
+                       session_ctx: Optional[SessionContext] = None,
+                       received_at: Optional[datetime] = None,
+                       ) -> Optional[QuoteSnapshot]:
+    """东财板块单标的当日快照：stock/get 优先，不可用时 trends2 当日累计口径
+    backup（锁定名称+代码同键；换手率/总市值在 backup 无来源为 None+缺口）。
+    会话上下文只锚日历；接收钟由每个 source 在其 HTTP 完成后自行取得。"""
+    snap = _fetch_stock_quote(f"90.{board_code}", board_code, board_name,
+                              budget=budget, quote_model=BoardQuote,
+                              session_ctx=session_ctx, received_at=received_at)
+    if snap is not None:
+        return snap
+    return _fetch_trends2_snapshot(f"90.{board_code}", board_code, board_name,
+                                   budget=budget, quote_model=BoardQuote,
+                                   now=now, session_ctx=session_ctx,
+                                   received_at=received_at)
+
+
+def _fetch_member_quote(member_code: str, member_name: str, *,
+                        budget: ReportBudget,
+                        now: Optional[datetime] = None,
+                        session_ctx: Optional[SessionContext] = None,
+                        received_at: Optional[datetime] = None,
+                        ) -> Optional[QuoteSnapshot]:
+    """成员个股行情快照：stock/get 优先，不可用时 trends2 当日累计口径 backup。
+
+    backup 口径（2026-11-07 生产/真实 wire 对照）：trends2 分钟额求和=当日
+    累计成交额（元，元级与 f48 同口径）、末分钟 close 对 preClose 的 Decimal
+    涨跌幅；来源/as_of/衍生标记随 QuoteSnapshot 透出（provenance 贯穿载荷，
+    不写 f48 原样）。两路共用同一会话时点资格（调用方单次锚定传入）。
+    """
+    snap = _fetch_stock_quote(_stock_secid(member_code), member_code,
+                              member_name, budget=budget, quote_model=MemberQuote,
+                              session_ctx=session_ctx, received_at=received_at)
+    if snap is not None:
+        return snap
+    return _fetch_trends2_snapshot(_stock_secid(member_code), member_code,
+                                   member_name, budget=budget,
+                                   quote_model=MemberQuote, now=now,
+                                   session_ctx=session_ctx,
+                                   received_at=received_at)
 
 
 def get_report_dir() -> Path:
@@ -449,6 +1273,109 @@ def _resolve_em_board(industry_name: str, board_table: pd.DataFrame) -> Dict[str
     return out
 
 
+def _fallback_f10_verify(code: str, out: Dict[str, Any], *,
+                         budget: ReportBudget) -> None:
+    """路径 A（clist 全表锁定成功）成分验证失败后的 F10 兜底：反向成员验证。
+
+    clist 成分端点不可用/为空时：F10 反向完整成员（同 clist 成分语义，
+    f10_members）验证归属。目标不在集合或成员查询不可用时保持 unverified
+    （root 收敛轮契约：**声明只用于精确板块锁定，不作为归属确认证据**——
+    完整成员不可得即归属未确认，不创建更弱确认口径）。仅在板块已锁定且
+    尚未 verified 时调用；程序异常原样传播（调用方不在 broad except 内调用）。
+    ``claims_resp`` 由调用方传入已取得的声明列表（避免同预算内重复出站）。
+    """
+    if not out.get("board_code") or out["membership"].get("verified"):
+        return
+    members = _fetch_board_members(out["board_code"], out["board_name"],
+                                   code, budget=budget)
+    if members is None:
+        out["gaps"].append(
+            "F10 板块完整成员查询不可用，归属未确认（声明仅用于板块锁定，"
+            "不作为确认证据）")
+        return
+    if not members["target_in"]:
+        out["gaps"].append(
+            f"F10 板块成员集合 {members['member_count']} 只不含目标股 {code}，"
+            "归属未确认")
+        return
+    out["membership"]["verified"] = True
+    out["membership"]["verified_source"] = "f10_members"
+    out["membership"]["member_count"] = members["member_count"]
+    df = _members_snapshot_df(members["rows"])
+    batch = _collect_member_quotes(df, budget=budget)
+    out["_cons_snapshot"] = batch.df
+    out["_cons_observed_at"] = datetime.now().isoformat(timespec="seconds")
+    out["_cons_quote_batch"] = batch
+    out["gaps"].append(
+        "归属确认来源：东财 F10 板块完整成员集合（成分来源 f10_members）")
+    out["gaps"].extend(batch.gaps)
+
+
+def _lock_board_via_claim(code: str, industry_name: str, out: Dict[str, Any], *,
+                          budget: ReportBudget,
+                          claims_resp: Optional[F10BoardResponse] = None) -> None:
+    """clist 全表不可用时的 F10 声明锁定 + 板块反向完整成员成分验证。
+
+    锁定：个股声明列表中**恰一行** BOARD_TYPE=「行业」AND BOARD_LEVEL=「2」
+    的精确同名行业板块 → 名称+代码（概念/衍生同名行不参与锁定；多行/无
+    命中不取首行、不近似锁定）。归属验证：板块反向完整成员（分页核齐、
+    类型层级校验、目标在集合）→ verified_source="f10_members" + member_count
+    + 同业成分快照（成员行情逐股采集，预算内受同一取数截止）；**成员查询
+    不可用 → 保持 unverified**（声明只用于锁定，不升 confirmed）。
+    observed_at 在锁定成功时统一设置。
+    """
+    claims = (claims_resp if claims_resp is not None
+              else _fetch_board_claims(code, budget=budget))
+    if claims is None:
+        out["gaps"].append(
+            "东财行业板块表与 F10 归属声明均不可用，板块身份未锁定")
+        return
+    industry_hits = [
+        r for r in claims.result.data
+        if r.BOARD_NAME == industry_name
+        and r.BOARD_TYPE == "行业" and r.BOARD_LEVEL == "2"
+    ]
+    if len(industry_hits) > 1:
+        codes = sorted({r.NEW_BOARD_CODE for r in industry_hits})
+        out["gaps"].append(
+            f"F10 归属声明「{industry_name}」行业 L2 板块命中 {len(industry_hits)} 行"
+            f"（{codes[:5]}），无法唯一锁定，不取首行")
+        return
+    if not industry_hits:
+        out["gaps"].append(
+            f"F10 归属声明列表无精确同名行业 L2 板块「{industry_name}」，"
+            "不按近似名/概念同名锁定")
+        return
+    claim = industry_hits[0]
+    out["board_name"] = claim.BOARD_NAME
+    out["board_code"] = claim.NEW_BOARD_CODE
+    out["observed_at"] = datetime.now().isoformat(timespec="seconds")
+
+    members = _fetch_board_members(claim.NEW_BOARD_CODE, claim.BOARD_NAME,
+                                   code, budget=budget)
+    if members is None:
+        out["gaps"].append(
+            "归属验证未执行：东财 F10 板块完整成员查询不可用（声明仅用于"
+            "板块锁定，不作为确认证据），归属未确认")
+        return
+    if not members["target_in"]:
+        out["gaps"].append(
+            f"东财板块「{industry_name}」（{claim.NEW_BOARD_CODE}）F10 成员集合 "
+            f"{members['member_count']} 只不含目标股 {code}，归属未确认")
+        return
+    out["membership"]["verified"] = True
+    out["membership"]["verified_source"] = "f10_members"
+    out["membership"]["member_count"] = members["member_count"]
+    df = _members_snapshot_df(members["rows"])
+    batch = _collect_member_quotes(df, budget=budget)
+    out["_cons_snapshot"] = batch.df
+    out["_cons_observed_at"] = datetime.now().isoformat(timespec="seconds")
+    out["_cons_quote_batch"] = batch
+    out["gaps"].append(
+        "归属确认来源：东财 F10 板块完整成员集合（成分来源 f10_members）")
+    out["gaps"].extend(batch.gaps)
+
+
 def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
     """识别个股主行业身份（同一东财行业板块口径，issue #78/#81）。
 
@@ -469,7 +1396,8 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         "board_name": "",         # 东财行业板块精确名称
         "board_code": "",         # 东财板块代码（BK****）
         "subject_status": "missing",
-        "membership": {"verified": False, "member_count": None},
+        "membership": {"verified": False, "member_count": None,
+                       "verified_source": None},
         "observed_at": None,      # 本系统采集时点（与供应商 as_of 区分）
         "vendor_as_of": None,     # 供应商未回显 as_of，如实为未知
         "classification_system": None,   # 分类体系（锁定口径）；无行业数据时 None
@@ -482,20 +1410,24 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         "_cons_snapshot": None,   # 非载荷键：成分验证同一快照（同业支柱复用，issue #82）
         "_cons_observed_at": None,  # 非载荷键：成分快照采集时点（与板块表时点分开）
     }
-    # 1) 东财个股信息（行业名；字段仅名称，无层级/代码/日期元数据，如实未知）
+    # 1) 东财个股信息（行业名 f127；字段仅名称，无层级/代码/日期元数据，如实未知；
+    #    stock/get 间歇不可用时由 F10 声明 L2 行业板块补位，来源如实标注）
+    f127_name = ""
     try:
         import akshare as ak
 
         df = _bounded_ak(ak.stock_individual_info_em, symbol=code, budget=budget)
         if df is not None and not df.empty:
             kv = dict(zip(df["item"], df["value"]))
-            out["industry_em"] = str(kv.get("行业") or "").strip()
+            f127_name = str(kv.get("行业") or "").strip()
+            out["industry_em"] = f127_name
     except BudgetExhausted:
         raise
     except Exception as exc:  # noqa: BLE001
         out["gaps"].append(f"东财个股行业查询失败: {str(exc)[:50]}")
 
-    # 2) 巨潮资讯（证监会行业 + 主营业务文本，独立链路兜底参考）
+    # 2) 巨潮资讯（证监会行业 + 主营业务文本，独立链路兜底参考；不同分类体系，
+    #    仅作行业名参考，不参与东财锁定与成分/行情拼接）
     if not out["industry_em"]:
         try:
             import akshare as ak
@@ -516,8 +1448,33 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             out["gaps"].append(f"巨潮行业查询失败: {str(exc)[:50]}")
 
-    lookup_industry = out["industry_em"] or out["industry_cninfo"]
-    # 3) 东财行业板块锁定（全表一次取回，身份与当日行情共用同一口径）
+    # 3) 东财行业锁定：行业名优先取 F10 声明列表的 L2 行业板块（BOARD_TYPE=
+    #    「行业」AND BOARD_LEVEL=「2」，与 stock/get f127 同义同源——2026-11-07
+    #    生产/本地双源比对一致；datacenter 集群稳定，规避 stock/get 间歇不可用）。
+    #    f127 可用时与声明名交叉校验（不一致=源歧义不锁定）；clist 全表可用时
+    #    原路径优先（全功能），否则声明+反向完整成员。
+    claims_resp = _fetch_board_claims(code, budget=budget)
+    declared_name: Optional[str] = None
+    if claims_resp is not None:
+        l2_rows = [r for r in claims_resp.result.data
+                   if r.BOARD_TYPE == "行业" and r.BOARD_LEVEL == "2"]
+        if len(l2_rows) == 1:
+            declared_name = l2_rows[0].BOARD_NAME
+        elif len(l2_rows) > 1:
+            out["gaps"].append(
+                f"F10 声明列表 L2 行业板块命中 {len(l2_rows)} 行，无法唯一锁定")
+    if f127_name and declared_name and f127_name != declared_name:
+        out["gaps"].append(
+            f"行业名源不一致：stock/get「{f127_name}」vs F10 声明「{declared_name}」，"
+            "不锁定（源歧义如实）")
+        declared_name = None
+        f127_name = ""
+    industry_name = declared_name or f127_name
+    if industry_name and not out["industry_em"]:
+        out["industry_em"] = industry_name
+        out["gaps"].append(
+            "个股行业名来源：东财 F10 声明列表 L2 行业板块（stock/get 不可用）")
+    lookup_industry = industry_name  # 仅东财口径名参与锁定；巨潮名不参与
     board_table: Optional[pd.DataFrame] = None
     if lookup_industry:
         try:
@@ -529,7 +1486,13 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         except BudgetExhausted:
             raise
         except Exception as exc:  # noqa: BLE001
-            out["gaps"].append(f"东财行业板块表查询失败: {str(exc)[:50]}")
+            out["gaps"].append(
+                f"东财行业板块表查询失败: {str(exc)[:50]}（转 F10 归属声明路径）")
+            board_table = None
+        if board_table is not None and board_table.empty:
+            # 空表等同不可用：身份走声明路径，行情支柱不再复用空快照
+            board_table = None
+            out["_board_table"] = None
 
     if lookup_industry and board_table is not None and not board_table.empty:
         resolved = _resolve_em_board(lookup_industry, board_table)
@@ -537,41 +1500,64 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         if resolved["locked"]:
             out["board_name"] = resolved["board_name"]
             out["board_code"] = resolved["board_code"]
-            # 4) 同板块成分验证目标股（归属确认；申万成分不替代东财成分）
+            # 4) 同板块成分验证目标股（归属确认；申万成分不替代东财成分）。
+            #    异常所有权（root 收敛轮）：AkShare 供应商边界的 broad except
+            #    只生成缺口文本；成分不可用的统一处理（含 F10 反向成员 fallback）
+            #    在 try/except **之外**——程序 TypeError/ValueError/AssertionError
+            #    原样传播、fallback 仅派发一次，不被吞成缺口、不被当供应商故障
+            #    重试（budget 截止仍按原语义向上传播走 504 路径）。
+            cons: Optional[pd.DataFrame] = None
+            cons_error: Optional[str] = None
             try:
                 import akshare as ak
 
-                cons = _bounded_ak(
+                cons_df = _bounded_ak(
                     ak.stock_board_industry_cons_em,
                     symbol=out["board_code"], budget=budget,
                 )
-                if cons is not None and not cons.empty and "代码" in cons.columns:
-                    cons_codes = cons["代码"].astype(str)
-                    out["membership"]["member_count"] = int(len(cons_codes))
-                    if (cons_codes == code).any():
-                        out["membership"]["verified"] = True
-                    else:
-                        out["gaps"].append(
-                            f"东财板块「{out['board_name']}」（{out['board_code']}）成分 "
-                            f"{len(cons_codes)} 只不含目标股 {code}，归属未确认"
-                        )
-                    # issue #82：同一已验证快照保留给同业支柱（避免重复请求与
-                    # 盘中漂移）；非载荷键，compose_report pop。
-                    out["_cons_snapshot"] = cons
-                    out["_cons_observed_at"] = datetime.now().isoformat(timespec="seconds")
-                else:
-                    out["gaps"].append("东财板块成分表为空或缺代码列，归属未确认")
+                if isinstance(cons_df, pd.DataFrame):
+                    cons = cons_df
             except BudgetExhausted:
                 raise
-            except Exception as exc:  # noqa: BLE001
-                out["gaps"].append(f"东财板块成分查询失败: {str(exc)[:50]}，归属未确认")
+            except Exception as exc:  # noqa: BLE001 - AkShare 供应商边界错误
+                cons_error = f"东财板块成分查询失败: {str(exc)[:50]}"
+                cons = None
+            if cons is None or cons.empty or "代码" not in cons.columns:
+                if cons_error is not None:
+                    out["gaps"].append(cons_error)
+                else:
+                    out["gaps"].append("东财板块成分表为空或缺代码列，归属未确认")
+                # clist 成分不可用：F10 反向完整成员兜底（同 clist 成分语义）
+                _fallback_f10_verify(code, out, budget=budget)
+            else:
+                cons_codes = cons["代码"].astype(str)
+                out["membership"]["member_count"] = int(len(cons_codes))
+                if (cons_codes == code).any():
+                    out["membership"]["verified"] = True
+                    out["membership"]["verified_source"] = "cons_table"
+                else:
+                    out["gaps"].append(
+                        f"东财板块「{out['board_name']}」（{out['board_code']}）成分 "
+                        f"{len(cons_codes)} 只不含目标股 {code}，归属未确认"
+                    )
+                # issue #82：同一已验证快照保留给同业支柱（避免重复请求与
+                # 盘中漂移）；非载荷键，compose_report pop。
+                out["_cons_snapshot"] = cons
+                out["_cons_observed_at"] = datetime.now().isoformat(timespec="seconds")
+    elif lookup_industry and claims_resp is not None:
+        # clist 全表不可用：F10 声明锁定 + 板块反向完整成员成分验证（同业恢复）
+        _lock_board_via_claim(code, lookup_industry, out, budget=budget,
+                              claims_resp=claims_resp)
+    elif lookup_industry:
+        out["gaps"].append(
+            "东财行业板块表与 F10 归属声明均不可用，板块身份未锁定")
 
     # 5) 申万一/二/三级参考链移至 compose_report（issue #82）：趋势/同业等
     # 必需新块必须先于申万参考等可选长链出站，不能让可选链吃完取数预算；
     # 申万链在此处为空 dict，由编排层回填同一结构。
 
-    # 6) subject_status 判定
-    if not lookup_industry:
+    # 6) subject_status 判定（行业数据缺失 = 东财 f127/F10 声明与巨潮均无）
+    if not lookup_industry and not out["industry_cninfo"]:
         out["subject_status"] = "missing"
         out["gaps"].append("板块识别失败：无行业数据")
     elif out["board_code"]:
@@ -703,7 +1689,9 @@ def _median(values: List[Optional[float]]) -> Optional[float]:
 )
 def _prosperity_pillar(sector_name: str, *, budget: ReportBudget,
                        board_code: Optional[str] = None,
-                       board_table: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+                       board_table: Optional[pd.DataFrame] = None,
+                       now: Optional[datetime] = None,
+                       received_at: Optional[datetime] = None) -> Dict[str, Any]:
     """东财行业板块全表 → 目标板块行 + 四维当日行情分（0-100）。
 
     四维：动量（涨跌幅有效样本分位 = 严格低于目标的有效样本数 ÷
@@ -724,17 +1712,27 @@ def _prosperity_pillar(sector_name: str, *, budget: ReportBudget,
     唯一精确名称（多行命中不可锁定、不取首行）；包含/前缀截短近似不命中。
     东财表不可用时不回退新浪口径板块表。``board_table`` 传入身份阶段的
     同一快照时直接复用，不再二次出站（身份与行情同一口径快照）。
+
+    全表不可用（clist 被拒，2026-11-07 生产窗口）且已锁定板块代码时：板块
+    单标的快照（stock/get 优先，trends2 供应商分钟累计口径 backup）恢复 row
+    ——动量/换手活跃度/成交额活跃度/广度/全表排名是**全表口径**，单标的
+    快照无全表聚合来源，如实 N/A + 缺口（不按单板块值冒充分位）；上涨/
+    下跌家数与领涨股同为全表字段保持 None；快照来源/as_of 经
+    ``snapshot_source`` 载荷字段与缺口贯穿（衍生口径如实标注，不写 f48 原样）。
     """
     out: Dict[str, Any] = {
         "sector_found": False,
         "momentum": None, "activity": None, "amount_activity": None, "breadth": None,
         "rank_of": None, "total_boards": None,
         "row": {},
+        "snapshot_source": None,
         "gaps": [],
     }
     if not sector_name:
         out["gaps"].append("当日行情：板块名为空")
         return out
+    df: Optional[pd.DataFrame] = None
+    ctx = _session_context(now)
     if board_table is not None:
         df = board_table
     else:
@@ -745,10 +1743,59 @@ def _prosperity_pillar(sector_name: str, *, budget: ReportBudget,
         except BudgetExhausted:
             raise
         except Exception as exc:  # noqa: BLE001
-            out["gaps"].append(f"当日行情：东财行业板块表查询失败 {str(exc)[:50]}")
+            out["gaps"].append(
+                f"当日行情：东财行业板块表查询失败 {str(exc)[:50]}"
+                "（转板块单标的快照路径）")
+            df = None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        df = None
+        if not board_code:
+            out["gaps"].append(
+                "当日行情：东财行业板块全表为空或不可用，且无板块代码可查单标的快照")
             return out
-    if df is None or df.empty:
-        out["gaps"].append("当日行情：东财行业板块表为空")
+        # 全表不可用（clist 被拒，2026-11-07 生产窗口）：板块单标的快照恢复 row
+        # （锁定名称+代码同键校验，错名板块不得采用）。动量/换手活跃度/
+        # 成交额活跃度/广度/全表排名是**全表口径**——单标的快照无全表聚合
+        # 来源，如实 N/A + 缺口，不按单板块值冒充分位；上涨/下跌家数与
+        # 领涨股同为全表字段，快照无来源保持 None。
+        snap = _fetch_board_quote(board_code, sector_name, budget=budget,
+                                  now=now, session_ctx=ctx,
+                                  received_at=received_at)
+        if snap is None:
+            out["gaps"].append(
+                "当日行情：东财行业板块全表与板块单标的快照均不可用")
+            return out
+        quote = snap.quote
+        if snap.source != "stock/get":
+            out["snapshot_source"] = (
+                f"东财 trends2 {_DERIVED_MARKER}（f48=分钟额求和、非原样字段，"
+                f"元级与 f48 同口径；涨跌幅=末分钟现价对 preClose Decimal 计算；"
+                f"供应商分钟截至 {snap.vendor_as_of or '未知'}）")
+            out["gaps"].append(
+                f"当日行情：板块快照经 trends2 {_DERIVED_MARKER}补采"
+                f"（供应商分钟截至 {snap.vendor_as_of or '未知'}，非 f48 原样；"
+                "换手率/总市值无该来源字段保持 None）")
+        else:
+            out["snapshot_source"] = (
+                f"东财 stock/get 单标的快照（f48/f170 原样映射；供应商时间戳 "
+                f"{snap.vendor_as_of or '未提供'}）")
+        out["sector_found"] = True
+        out["row"] = {
+            "board_name": quote.f58,
+            "board_code": quote.f57,
+            "change_pct": quote.f170,
+            "turnover_rate": quote.f168,
+            "total_market_cap": quote.f116,
+            "amount": quote.f48,
+            "up_count": None,
+            "down_count": None,
+            "leader": "",
+            "leader_change_pct": None,
+        }
+        out["gaps"].append(
+            "当日行情：东财行业板块全表不可用（clist 被拒），仅恢复单板块"
+            "快照行；动量/换手活跃度/成交额活跃度/广度/全表排名为全表口径，"
+            "如实 N/A（不按单板块值冒充分位）")
         return out
     if "板块名称" not in df.columns:
         out["gaps"].append("当日行情：板块表缺少名称列")
@@ -1137,8 +2184,13 @@ def _sector_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudg
         ret = _period_return_pct(board_closes)
         out["period_return_pct"] = float(round(ret, 4))
 
-    # 基准日线（沪深300，同一期望窗口；失败/不合格单独降基准块）
+    # 基准日线（沪深300，同一期望窗口；失败/不合格单独降基准块）。
+    # 东财指数日线不可用时切换腾讯同一指数（sh000300）日线：同一指数标的、
+    # 同一收盘点位口径（指数无复权，切换经生产/本地双源逐日比对验证），
+    # 实际来源在基准块 source 如实标注；东财失败缺口保留（不因 fallback 成功清空）。
     bench_gaps: List[str] = []
+    bench_source = "东财指数日线"
+    bench_note: Optional[str] = None
     try:
         bench_df = _bounded_ak(
             ak.stock_zh_index_daily_em, symbol="sh000300",
@@ -1148,29 +2200,52 @@ def _sector_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudg
             shape = type(bench_df).__name__
             bench_df = None
             bench_gaps = [f"基准日线（沪深300）：返回形状异常（{shape}，源错误），本次不采用"]
+            bench_note = f"基准（沪深300）东财日线返回形状异常（{shape}），尝试腾讯同一指数"
     except BudgetExhausted:
         out["gaps"].append("板块趋势：取数预算不足，基准日线未取得（板块已取得部分保留）")
         bench_df = None
         bench_gaps = ["基准日线未取得：取数预算不足"]
     except Exception as exc:  # noqa: BLE001
-        out["gaps"].append(
-            f"板块趋势：基准（沪深300）日线查询失败: {str(exc)[:60]}（只降基准块）"
-        )
         bench_df = None
         bench_gaps = [f"基准日线查询失败: {str(exc)[:60]}"]
+        bench_note = f"基准（沪深300）东财日线查询失败: {str(exc)[:60]}，尝试腾讯同一指数"
+    if not isinstance(bench_df, pd.DataFrame) or bench_df.empty:
+        try:
+            bench_df = _bounded_ak(
+                ak.stock_zh_index_daily_tx, symbol="sh000300",
+                start_date=start_yyyymmdd, end_date=end_yyyymmdd, budget=budget,
+            )
+            if isinstance(bench_df, pd.DataFrame) and not bench_df.empty:
+                bench_source = "腾讯指数日线"
+                bench_note = None
+                out["gaps"].append(
+                    "板块趋势：基准（沪深300）切换腾讯同一指数日线（东财源不可用，"
+                    "同一指数收盘点位口径，来源已在基准块标注）"
+                )
+        except BudgetExhausted:
+            bench_df = None
+            bench_gaps = bench_gaps or ["基准日线未取得：取数预算不足"]
+        except Exception as exc:  # noqa: BLE001
+            bench_df = None
+            bench_gaps = bench_gaps + [f"腾讯指数日线查询失败: {str(exc)[:60]}"]
+    if bench_note:
+        out["gaps"].append(f"板块趋势：{bench_note}（只降基准块）")
     bench_obs: Dict[Any, Decimal] = {}
     bench_qualified = False
+    # 东财源失败/形状异常缺口在 fallback 资格化前快照保留——资格化 gaps 只
+    # 描述最终采用源，东财源错误不因腾讯 fallback 成功被覆盖清空
+    em_bench_gaps = list(bench_gaps)
     if isinstance(bench_df, pd.DataFrame):
         bench_obs, bench_qualified, bench_gaps = _qualify_daily_closes(
             bench_df, "date", "close", expected, "基准日线（沪深300）"
         )
     bench_block: Dict[str, Any] = {
-        "name": "沪深300", "symbol": "sh000300", "source": "东财指数日线",
+        "name": "沪深300", "symbol": "sh000300", "source": bench_source,
         "start_date": out["start_date"], "end_date": out["end_date"],
         "qualified_sessions": len(bench_obs),
         "observations": _observation_rows(bench_obs),
         "period_return_pct": None,
-        "gaps": bench_gaps,
+        "gaps": em_bench_gaps + bench_gaps,
     }
     if bench_qualified:
         bench_closes = [bench_obs[d] for d in expected]
@@ -1194,9 +2269,11 @@ def _sector_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudg
 def _decimal_amount(v: Any) -> Tuple[Optional[Decimal], str]:
     """成交额适配：原始值直接解析 Decimal（金融排序不经 float 中转）。
 
-    返回 (Decimal 或 None, 原因)：``ok``=有限正；``missing``=缺失/空/NaN；
-    ``non_positive``=0/负；``invalid``=无法解析/±inf。分类计数用于过滤前
-    缺口（不因剩余足够而吞掉无效行事实）。
+    返回 (Decimal 或 None, 原因)：``ok``=有限**正**（活跃代表排名资格）；
+    ``zero``=**已知零**（合法零额观测——公开载荷/显示保留 0，不参与活跃
+    前五，全体报价已知时目标 0 可判「不在前五」）；``missing``=缺失/空/
+    NaN；``invalid``=负值/无法解析/±inf（源边界无效，保持 None=未知语义）。
+    分类计数用于过滤前缺口（零额与无效分开披露，不因剩余足够而吞事实）。
     """
     if v is None or (isinstance(v, float) and not math.isfinite(v)):
         return None, "missing"
@@ -1209,8 +2286,10 @@ def _decimal_amount(v: Any) -> Tuple[Optional[Decimal], str]:
         return None, "invalid"
     if not d.is_finite():
         return None, "invalid"
-    if d <= 0:
-        return None, "non_positive"
+    if d < 0:
+        return None, "invalid"
+    if d == 0:
+        return Decimal("0"), "zero"
     return d, "ok"
 
 
@@ -1241,6 +2320,163 @@ def _bound_gaps(gaps: List[str], cap: int) -> List[str]:
     return clamped[: cap - 1] + [f"（另有 {omitted} 条缺口略，均为同类来源限制）"]
 
 
+@dataclass(frozen=True)
+class MemberQuoteBatch:
+    """成员行情逐股采集批次（F10 成员集合无 clist 成交额列时填充）。
+
+    ``amounts_known``：全体成员均有**已知**成交额（有报价且 f48 非 None）——
+    这是全体 top5 资格可判定的唯一依据；任一成员缺报价/缺额 → False，
+    ``target_in_amount_top5`` 必须为 None（缺报价成员资格未知，零与 None 分开）。
+    """
+
+    df: pd.DataFrame
+    gaps: List[str]
+    ts_min: Optional[float] = None
+    ts_max: Optional[float] = None
+    stockget_count: int = 0
+    trends2_count: int = 0
+    failed_count: int = 0
+    amounts_known: bool = False
+    trends2_as_of: Optional[str] = None
+
+
+def _f10_quote_provenance(batch: MemberQuoteBatch) -> str:
+    """F10 成员集合行情来源口径（逐来源计数，衍生值不冒充 f48 原样）。"""
+    parts: List[str] = [_F10_AMOUNT_PROVENANCE_PREFIX]
+    if batch.stockget_count and batch.trends2_count:
+        parts.append(
+            f"行情 {batch.stockget_count} 只为 stock/get f48 原样映射，"
+            f"{batch.trends2_count} 只经 trends2 {_DERIVED_MARKER}"
+            "（非原样字段，元级与 f48 同口径）")
+    elif batch.trends2_count:
+        parts.append(
+            f"行情全部 {batch.trends2_count} 只经 trends2 {_DERIVED_MARKER}"
+            "（非 f48 原样字段，元级同口径）")
+    elif batch.stockget_count:
+        parts.append("行情为 stock/get f48 原样映射（fltt=2）")
+    else:
+        parts.append("成员行情未取得（成交额均缺失，不产金额排名）")
+    return "；".join(parts)[:240]
+
+
+def _quote_as_of_note(batch: MemberQuoteBatch) -> Optional[str]:
+    """成员行情供应商时点说明（逐股采集如实披露，不冒称同一瞬间快照）。"""
+    segs: List[str] = []
+    if batch.trends2_as_of:
+        segs.append(
+            f"trends2 补采 {batch.trends2_count} 只供应商分钟截至 "
+            f"{batch.trends2_as_of}")
+    if batch.ts_min is not None and batch.ts_max is not None:
+        if batch.ts_min == batch.ts_max:
+            segs.append(
+                f"stock/get {batch.stockget_count} 只时间戳 "
+                f"{int(batch.ts_min)}（epoch 秒）")
+        else:
+            segs.append(
+                f"stock/get {batch.stockget_count} 只时间戳范围 "
+                f"{int(batch.ts_min)}~{int(batch.ts_max)}"
+                "（epoch 秒，逐股采集非同一瞬间）")
+    return "；".join(segs)[:240] or None
+
+
+def _collect_member_quotes(df: pd.DataFrame, *, budget: ReportBudget,
+                           now: Optional[datetime] = None,
+                           session_ctx: Optional[SessionContext] = None,
+                           received_at: Optional[datetime] = None,
+                           ) -> MemberQuoteBatch:
+    """成员逐股行情快照（同一取数预算，顺序有界；不缩分母语义）。
+
+    **形状契约（root 反例：先失败后预算耗尽曾产出 3 值/2 行 ValueError）**：
+    每行无论成功/失败都推进 `processed` 位置；预算中断时只补
+    `total - processed` 个未尝试行——df 行数恒等于成员行数，已采成功/
+    采集失败/未尝试三类分别计数并全部进缺口。会话上下文在入口**单次锚定**
+    （now 只取一次，循环内不重复取钟），两路来源共用同一会话时点资格；
+    资格被拒/失败的行成员资格保留、金额 None（不冒充全体成交额分布）。
+    程序异常原样传播。
+    """
+    ctx = session_ctx if session_ctx is not None else _session_context(now)
+    gaps: List[str] = []
+    amount_col: List[Optional[float]] = []
+    change_col: List[Optional[float]] = []
+    ts_min: Optional[float] = None
+    ts_max: Optional[float] = None
+    trends2_as_ofs: List[str] = []
+    fetched = 0
+    processed = 0
+    total = len(df)
+    stockget_count = 0
+    trends2_count = 0
+    failed_count = 0
+    interrupted = False
+    for i in range(total):
+        row = df.iloc[i]
+        member_code = str(row["代码"])
+        member_name = str(row["名称"])
+        try:
+            snap = _fetch_member_quote(member_code, member_name,
+                                       budget=budget, now=now, session_ctx=ctx,
+                                       received_at=received_at)
+        except BudgetExhausted:
+            untried = total - processed
+            gaps.append(
+                f"同业行情：取数预算耗尽，已采成功 {fetched} 只、采集失败 "
+                f"{failed_count} 只、未尝试 {untried} 只（成员资格保留，"
+                "缺失金额不参与成交额排名，不冒充全体分布）")
+            for _ in range(untried):
+                amount_col.append(None)
+                change_col.append(None)
+            interrupted = True
+            break
+        processed += 1
+        if snap is None:
+            failed_count += 1
+            gaps.append(
+                f"同业行情：{member_code}（{member_name}）快照失败或同键/会话"
+                "资格不符，金额/涨跌幅缺失（成员资格保留）")
+            amount_col.append(None)
+            change_col.append(None)
+            continue
+        fetched += 1
+        quote = snap.quote
+        amount_col.append(quote.f48)
+        change_col.append(quote.f170)
+        if quote.f48 is None:
+            gaps.append(
+                f"同业行情：{member_code}（{member_name}）成交额缺值，资格未知"
+                "（零与缺失分开，不补 0）")
+        if snap.source == "stock/get":
+            stockget_count += 1
+            if quote.f86 is not None:
+                ts_min = quote.f86 if ts_min is None else min(ts_min, quote.f86)
+                ts_max = quote.f86 if ts_max is None else max(ts_max, quote.f86)
+        else:
+            trends2_count += 1
+            if snap.vendor_as_of:
+                trends2_as_ofs.append(snap.vendor_as_of)
+    assert len(amount_col) == total and len(change_col) == total, (
+        "成员行情批次列数必须等于成员行数（含失败与未尝试行）")
+    df = df.copy()
+    df["成交额"] = amount_col
+    df["涨跌幅"] = change_col
+    as_of_text: Optional[str] = None
+    if trends2_as_ofs:
+        uniq = sorted(set(trends2_as_ofs))
+        as_of_text = uniq[0] if len(uniq) == 1 else f"{uniq[0]}~{uniq[-1]}"
+    if trends2_count:
+        gaps.append(
+            f"同业行情：{trends2_count} 只经 trends2 {_DERIVED_MARKER}补采"
+            f"（供应商分钟截至 {as_of_text}，元级与 f48 同口径；该来源无 f86 "
+            "单标的时间戳，批次时间窗仅覆盖 stock/get 来源行）")
+    amounts_known = (not interrupted and failed_count == 0
+                     and all(v is not None for v in amount_col))
+    return MemberQuoteBatch(
+        df=df, gaps=gaps, ts_min=ts_min, ts_max=ts_max,
+        stockget_count=stockget_count, trends2_count=trends2_count,
+        failed_count=failed_count, amounts_known=amounts_known,
+        trends2_as_of=(as_of_text if trends2_as_ofs else None),
+    )
+
+
 _AMOUNT_PROVENANCE = (
     "成交额单位为元：已装 AkShare 成分接口与全市场快照接口同为东财 clist "
     "f6 字段且 fltt=2、原样映射「成交额」；官方行情文档标注全市场快照成交额"
@@ -1261,8 +2497,18 @@ _AMOUNT_PROVENANCE = (
 def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
                   budget: ReportBudget,
                   snapshot_observed_at: Optional[str] = None,
-                  subject_confirmed: bool = False) -> Dict[str, Any]:
+                  subject_confirmed: bool = False,
+                  amount_provenance: Optional[str] = None,
+                  snapshot_source: Optional[str] = None,
+                  quotes_as_of: Optional[str] = None,
+                  quotes_complete: bool = True) -> Dict[str, Any]:
     """同业比较（issue #82）：身份验证同一成分快照按成交额选「成交活跃代表」。
+
+    ``amount_provenance``/``snapshot_source``/``quotes_as_of``：成分集合来源为
+    F10 反向完整成员（成员行情逐股采集）时注入对应口径与时点说明（缺省为
+    clist 快照口径）。``quotes_complete=False`` 表示存在缺报价/缺额成员——
+    ``target_in_amount_top5`` 必须为 None（无法证明全体资格返回未知），选取
+    规则动态标注有效报价子集范围（缺报价成员资格未知，非全体板块排名）。
 
     规则（issue #78）：同一快照按成交额前五 + 目标股去重（目标在前五则 5 家，
     否则 6 家）；成交额原始值经 Decimal 判定后降序、并列按代码升序（稳定可
@@ -1284,12 +2530,13 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         "target_in_amount_top5": None,
         "target_change_pct_rank": None,
         "amount_unit": "元",
-        "amount_provenance": _AMOUNT_PROVENANCE,
+        "amount_provenance": amount_provenance or _AMOUNT_PROVENANCE,
         "snapshot_rows": 0,
         "rankable_rows": 0,
         "sample_size": 0,
         "snapshot_observed_at": snapshot_observed_at,
-        "source": None,
+        "source": snapshot_source,
+        "quotes_as_of": quotes_as_of,
         "gaps": [],
     }
     if not subject_confirmed:
@@ -1301,7 +2548,7 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
             "同业比较：成分快照未取得或形状异常，样本为空（不伪排名）"
         )
         return out
-    out["source"] = "东财行业板块成分（身份验证同一快照）"
+    out["source"] = snapshot_source or _CONS_SNAPSHOT_SOURCE
     df = cons_snapshot
     out["snapshot_rows"] = int(len(df))
     if "代码" not in df.columns:
@@ -1331,7 +2578,8 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
     # 成交额整列缺失与逐行金额缺失同语义：成员保留、金额 None、不产金额排名
     # （不把未知金额成员列成伪 top5，也不为缺列丢弃已确认目标股）。
     blank_names = 0
-    amount_reasons = {"missing": 0, "non_positive": 0, "invalid": 0}
+    # 零额=已知零观测（公开保留 0、不参与活跃前五）；负/非数=无效（未知）
+    amount_reasons = {"missing": 0, "zero": 0, "invalid": 0}
     members: List[Dict[str, Any]] = []
     member_index = valid_mask.to_numpy() & ~dup_mask.to_numpy()
     for i in range(len(df)):
@@ -1345,7 +2593,9 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
             blank_names += 1
         if amount_raw is not None:
             amount, reason = _decimal_amount(amount_raw.iloc[i])
-            if reason != "ok":
+            if reason == "zero":
+                amount_reasons["zero"] += 1
+            elif reason != "ok":
                 amount_reasons[reason] += 1
         else:
             amount, reason = None, "missing"
@@ -1358,6 +2608,22 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         out["gaps"].append(
             f"同业比较：{blank_names} 行供应商名称空白/缺失，按代码显示（成员保留，源数据限制）"
         )
+    # 全体报价完整性从**最终实际成员行**推导（root entry-closure 反例：clist
+    # 缺额曾被外传 flag 宣称「全体成员报价完整」）：无效代码行/重复冲突行/
+    # 任何金额未知（None）成员都使集合不完整。外传 ``quotes_complete``
+    # 只能**降低**资格、不能提升——F10 批次与 clist 快照同一规则。
+    derived_complete = (
+        bad_codes == 0 and not dup_codes
+        and all(m["amount"] is not None for m in members))
+    quotes_effective = quotes_complete and derived_complete
+    if not quotes_complete:
+        out["gaps"].append(
+            "同业比较：成员行情批次存在失败/未尝试成员（批次完整性标记否定全体资格）")
+    elif not derived_complete:
+        out["gaps"].append(
+            f"同业比较：成分快照存在金额未知/资格剔除成员（原始观测 "
+            f"{out['snapshot_rows']} 行、身份有效 {len(members)} 行，真实成员"
+            "总数未知；由最终实际成员行推导，全体报价完整性不成立）")
     if amount_raw is None:
         out["gaps"].append(
             "同业比较：成分快照无成交额列，成交额均无数据（缺列不逐行伪计），"
@@ -1365,24 +2631,45 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         )
         out["rankable_rows"] = 0
     else:
-        out["rankable_rows"] = sum(1 for m in members if m["amount"] is not None)
-        invalid_amount_total = len(members) - out["rankable_rows"]
+        # 可排名行 = 有限**正**成交额（活跃代表资格）；合法零额是已知值，
+        # 公开载荷保留 0 且不参与活跃前五；负/非数仍是无效（未知语义）
+        out["rankable_rows"] = sum(
+            1 for m in members
+            if m["amount"] is not None and m["amount"] > 0)
+        zero_total = amount_reasons["zero"]
+        invalid_amount_total = (len(members) - out["rankable_rows"] - zero_total)
+        if zero_total:
+            out["gaps"].append(
+                f"同业比较：{zero_total} 行成交额为合法零额（已知零观测，"
+                "公开载荷保留 0；不参与成交额活跃前五，全体报价已知时其"
+                "「不在前五」资格可判定）")
         if invalid_amount_total:
             parts = []
             if amount_reasons["missing"]:
                 parts.append(f"缺失 {amount_reasons['missing']}")
-            if amount_reasons["non_positive"]:
-                parts.append(f"零或负 {amount_reasons['non_positive']}")
             if amount_reasons["invalid"]:
-                parts.append(f"非数值 {amount_reasons['invalid']}")
+                parts.append(f"负值/非数值 {amount_reasons['invalid']}")
             out["gaps"].append(
-                f"同业比较：成分快照 {invalid_amount_total} 行成交额无效（{'、'.join(parts)}），"
-                f"不参与成交额排名；观测 {len(members)} 行、成交额可排名 {out['rankable_rows']} 行"
+                f"同业比较：成分快照 {invalid_amount_total} 行成交额无效（{'、'.join(parts)}，"
+                f"未知语义），不参与成交额排名；原始观测 {out['snapshot_rows']} 行、"
+                f"身份有效 {len(members)} 行、正额可排名 {out['rankable_rows']} 行"
+                "（真实成员总数未知，不以过滤后计数冒充）"
             )
+    if not quotes_effective:
+        # 缺报价/缺额/身份剔除成员资格未知：选取规则按真实角色标注有效子集
+        # 范围（原始观测/身份有效/正额可排名；真实成员总数未知不称已知总数）
+        # ——top5 次序只在有效报价子集内有语义，不冒充全体板块排名
+        out["selection_rule"] = (
+            "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）；"
+            f"有效报价 {out['rankable_rows']} 行内次序（原始观测 "
+            f"{out['snapshot_rows']} 行、身份有效 {len(members)} 行；"
+            "缺报价/身份剔除成员资格未知，非全体板块排名）")
 
-    # 成交额降序（Decimal 排序）、并列代码升序（稳定可解释）；无效额不进排名
+    # 成交额降序（Decimal 排序）、并列代码升序（稳定可解释）；无效额与
+    # 合法零额都不进活跃排名（活跃代表只按正成交额选取，不把 0 塞进前五）
     rankable = sorted(
-        (m for m in members if m["amount"] is not None),
+        (m for m in members
+         if m["amount"] is not None and m["amount"] > 0),
         key=lambda m: (-m["amount"], m["code"]),
     )
     ranked_codes = [m["code"] for m in rankable]
@@ -1397,10 +2684,28 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         out["target_in_amount_top5"] = None
     elif target_member["amount"] is None:
         out["gaps"].append(
-            f"同业比较：目标股 {code} 快照成交额缺失或无效，不参与成交额排名"
+            f"同业比较：目标股 {code} 快照成交额缺失或无效（未知语义），不参与成交额排名"
             "（成员保留，top5 资格无法判定）"
         )
         out["target_in_amount_top5"] = None  # 无法判定，不误报 False
+    elif target_member["amount"] == 0:
+        # 已知零额目标：全体报价已知时不属于正额活跃前五——可判 False
+        # （与缺报价的「未知」分开；缺报价仍走 quotes_complete=False → None）
+        if quotes_effective:
+            out["gaps"].append(
+                f"同业比较：目标股 {code} 成交额为已知零（合法零额观测），"
+                "不属于正额活跃前五，target_in_amount_top5 判定为 False")
+            out["target_in_amount_top5"] = False
+        else:
+            out["gaps"].append(
+                "同业比较：存在缺报价/缺额或被剔除成员（全体资格未知），"
+                "target_in_amount_top5 不输出 True/False（不冒充全体排名）")
+            out["target_in_amount_top5"] = None
+    elif not quotes_effective:
+        out["gaps"].append(
+            "同业比较：存在缺报价/缺额或被剔除成员（全体资格未知），"
+            "target_in_amount_top5 不输出 True/False（不冒充全体排名）")
+        out["target_in_amount_top5"] = None
     else:
         out["target_in_amount_top5"] = code in ranked_codes[:5]
 
@@ -2238,6 +3543,7 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
     ))
     row = prosper.get("row") or {}
     if prosper.get("sector_found"):
+        snapshot_source = prosper.get("snapshot_source")
         registry.register(sector_research.EvidenceEntry.build(
             "intraday", "fact", "当日板块行情（当前快照，单期观测）",
             {
@@ -2246,6 +3552,11 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
                 "total_boards": prosper.get("total_boards"),
                 "momentum": prosper.get("momentum"),
                 "breadth": prosper.get("breadth"),
+                # 快照来源/时点贯穿登记表（root 纪律：as_of 不止 logger）；
+                # 衍生标记与 provenance 文本同源（_DERIVED_MARKER 单一 owner）
+                "snapshot_source": snapshot_source,
+                "snapshot_derived": bool(
+                    snapshot_source and _DERIVED_MARKER in snapshot_source),
                 "metric_meaning": {
                     "change_pct": "板块指数当日涨跌幅（百分比，负值为下跌）",
                     "rank_of/total_boards": "按当日涨跌幅在全部行业板块中的"
@@ -2280,9 +3591,15 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
             {
                 # 选取规则是权威口径元数据（同一快照成交额前五 + 目标股
                 # 去重；活跃代表，非市值/基本面龙头）——投影给模型输入，
-                # 防止把活跃代表升格为「龙头」
+                # 防止把活跃代表升格为「龙头」；缺报价时动态标注有效子集范围
                 "selection_rule": peers.get("selection_rule"),
                 "items": peer_items,
+                # 成交额来源口径与供应商时点贯穿登记表（root 纪律：
+                # 衍生来源/as_of 不止 logger，模型投影同样不得越过真实口径）
+                "amount_provenance": peers.get("amount_provenance"),
+                "amount_derived": bool(
+                    _DERIVED_MARKER in (peers.get("amount_provenance") or "")),
+                "quotes_as_of": peers.get("quotes_as_of"),
             },
         ))
     target_change = next(
@@ -2711,6 +4028,9 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     board_snapshot = ident.pop("_board_table", None)
     cons_snapshot = ident.pop("_cons_snapshot", None)
     cons_observed = ident.pop("_cons_observed_at", None)
+    cons_batch = ident.pop("_cons_quote_batch", None)
+    verified_source = (ident.get("membership") or {}).get("verified_source")
+    f10_members_source = verified_source == "f10_members"
 
     # 必需新块（issue #82）：confirmed 才发出站（支柱内部判定资格），
     # 先于申万参考链等可选长链。
@@ -2721,7 +4041,15 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     )
     peers = _peers_pillar(code, cons_snapshot if isinstance(cons_snapshot, pd.DataFrame) else None,
                           budget=budget, snapshot_observed_at=cons_observed,
-                          subject_confirmed=confirmed)
+                          subject_confirmed=confirmed,
+                          amount_provenance=(_f10_quote_provenance(cons_batch)
+                                             if f10_members_source and cons_batch else None),
+                          snapshot_source=(_F10_CONS_SNAPSHOT_SOURCE
+                                           if f10_members_source else None),
+                          quotes_as_of=(_quote_as_of_note(cons_batch)
+                                        if f10_members_source and cons_batch else None),
+                          quotes_complete=(cons_batch.amounts_known
+                                           if f10_members_source and cons_batch else True))
     # 当日行情先于催化/综合：来自身份阶段同一板块全表快照（本地计算，无新
     # 出站），综合登记表需要 intraday 事实完整。
     prosper = _prosperity_pillar(
@@ -2907,7 +4235,9 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
     报告 ID/文件经 ``_claim_report_file`` 原子独占，失败只清理本请求拥有的
     新文件，不动他人存档。
 
-    代码/市场资格错误抛 ValueError（API 层 400），不落入以上终态。
+    代码/市场资格错误抛 :class:`SectorInputError`（API 层 400），不落入以上
+    终态；其它 ``ValueError``（含新 source 传输层程序缺陷）不属于输入错误，
+    原样传播走通用 500。
     """
     from src.config import get_config
     from src.services.stock_code_utils import normalize_code
@@ -2915,7 +4245,7 @@ def generate_report(raw_code: str, raw_name: Optional[str] = None) -> Dict[str, 
     raw = str(raw_code or "").strip()
     code = normalize_code(raw) if raw else ""
     if not code or not code.isdigit() or len(code) != 6:
-        raise ValueError(f"仅支持 A 股 6 位代码：{raw_code}")
+        raise SectorInputError(f"仅支持 A 股 6 位代码：{raw_code}")
     name = (raw_name or "").strip()
     if name and code in name:
         name = name.replace(code, "").replace(".SZ", "").replace(".SH", "").strip()

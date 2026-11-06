@@ -564,7 +564,7 @@ class TestTrendPeersBudgetPriority:
                     "observed_at": "2026-11-05T14:00:02", "gaps": []}
 
         def _peers(code, cons, *, budget, snapshot_observed_at=None,
-                   subject_confirmed=False):
+                   subject_confirmed=False, **_kwargs):
             order.append("peers")
             return {"eligible": subject_confirmed,
                     "selection_rule": "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）",

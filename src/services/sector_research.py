@@ -748,6 +748,10 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
             parts.append("板块指数当日涨跌方向未取得")
         parts.append("当日行情为单期快照，分位/占比类指标仅表示横截面相对"
                      "位置，不提供方向或历史动量证据")
+        # 口径元数据随观察关系进模型 wire（root 反例：材料带来源/asof 但投影
+        # 丢失）；纯口径描述，不投影 raw magnitudes（数值仍只在公开载荷）
+        if m.get("snapshot_source"):
+            parts.append(f"快照口径：{m['snapshot_source']}")
         observations.append({
             "evidence_id": "intraday",
             "observation": "；".join(parts) + "。",
@@ -797,6 +801,21 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
                 parts.append(f"样本内当日涨跌方向一致（{observed[0]}）")
             else:
                 parts.append("样本内当日涨跌方向存在差异")
+        # 口径元数据随观察关系进模型 wire（root final 反例：只写「见公开载荷」
+        # 不等于把实际来源/时点传给模型——模型没有该载荷）。保留实际供应商
+        # 来源、成交额口径、衍生标记、供应商时点与时间窗、子集范围文本；
+        # 纯口径描述，raw magnitudes（价格/涨幅/金额/分位/收益）仍只在公开
+        # 载荷与服务端表格。
+        if m.get("source"):
+            parts.append(f"成员集合来源：{m['source']}")
+        if m.get("amount_provenance"):
+            parts.append(f"成交额口径：{m['amount_provenance']}")
+        if m.get("amount_derived"):
+            parts.append("部分或全部成员成交额为供应商分钟累计衍生口径"
+                         "（非原样快照字段）")
+        if m.get("quotes_as_of"):
+            parts.append(f"行情为逐股实际采集（{m['quotes_as_of']}），"
+                         "非同一瞬间全表快照")
         observations.append({
             "evidence_id": "peers",
             "observation": "；".join(parts) + "。",
@@ -837,6 +856,10 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
         if momentum is not None:
             seg.append(f"涨跌幅分位 {momentum}/100（横截面相对位置，"
                        "不提供方向或历史动量证据）")
+        # 快照来源/时点贯穿事实摘要（root 纪律：来源与 as_of 不止 logger；
+        # 全表路径 snapshot_source 为 None 不追加）
+        if m.get("snapshot_source"):
+            seg.append(f"快照口径：{m['snapshot_source']}")
         if seg:
             parts.append("；".join(seg))
     trend = registry.get("trend")
@@ -868,6 +891,9 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
             seg.append(f"同业样本（{rule}）")
         if items:
             seg.append(f"样本 {len(items)} 家（快照当日口径）")
+        # 成交额来源口径与供应商时点贯穿事实摘要（衍生值不冒充原样字段）
+        if m.get("quotes_as_of"):
+            seg.append(f"行情时点：{m['quotes_as_of']}")
         if seg:
             parts.append("；".join(seg))
     target = registry.get("target")
@@ -891,9 +917,20 @@ def program_fact_limitations(registry: EvidenceRegistry) -> Optional[str]:
         parts.append("当日行情为单期快照，不外推历史趋势；涨跌幅分位仅为"
                      "横截面相对位置，不提供方向或历史动量证据")
         parts.append("行情与换手表现不构成资金流入流出或投资者偏好证据")
+        m = json.loads(registry.get("intraday").material)  # type: ignore[union-attr]
+        if m.get("snapshot_derived"):
+            parts.append("当日板块快照为供应商分钟累计衍生口径"
+                         "（trends2 求和，非原样快照字段；时点见载荷）")
     if registry.get("peers"):
         parts.append("同业样本按成交额活跃代表选取，不代表市值或基本面"
                      "龙头分类")
+        m = json.loads(registry.get("peers").material)  # type: ignore[union-attr]
+        if m.get("amount_derived"):
+            parts.append("部分/全部成员成交额为供应商分钟累计衍生值"
+                         "（trends2 求和），非原样快照字段")
+        if m.get("quotes_as_of"):
+            parts.append("同业行情为逐股实际采集（供应商时点/时间窗见载荷），"
+                         "非同一瞬间全表快照")
     if registry.get("trend"):
         parts.append("窗口收益为已完成交易日区间关系，不构成趋势延续证据")
     return "；".join(parts)[:500] if parts else None

@@ -216,7 +216,7 @@ class TestComposeReportContracts:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: {
+            subject_confirmed=False, **_kwargs: {
                 "eligible": bool(subject_confirmed),
                 "selection_rule": "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）",
                 "items": ([
@@ -372,7 +372,7 @@ class TestTrendPeersEligibilityContracts:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: {
+            subject_confirmed=False, **_kwargs: {
                 "eligible": peers_eligible,
                 "selection_rule": "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）",
                 "items": [], "target_in_amount_top5": None,
@@ -429,3 +429,84 @@ class TestTrendPeersEligibilityContracts:
         with pytest.raises(ViolationError):
             self._run(monkeypatch, subject="unverified",
                       trend_eligible=False, peers_eligible=True)
+
+
+# ========================================================================
+# trends2 金融派生契约（Layer 2；root 收敛轮新增公式边界）
+# ========================================================================
+
+class TestTrendsFinancialDerivationContracts:
+    """trends2 累计额与涨跌幅 typed 金融公式（icontract require/ensure）。
+
+    反例来自 root 审查：parsed 位置魔数曾把最高价当现价——preClose=10、
+    close=11、high=15 必须得 10.00%（非 50%）；累计额必须来自完整合格
+    分钟额（部分和不冒充当日累计）。
+    """
+
+    def test_change_pct_close_column_ten_percent(self):
+        assert svc._trends_change_pct(
+            __import__("decimal").Decimal("11"),
+            __import__("decimal").Decimal("10"),
+        ) == __import__("decimal").Decimal("10.00")
+
+    def test_change_pct_independent_real_wire_values(self):
+        from decimal import Decimal
+
+        # 真实 wire 独立对照：600519 末分钟 close=1453 / preClose=1452
+        assert svc._trends_change_pct(
+            Decimal("1453"), Decimal("1452")) == Decimal("0.07")
+        # BK1277 末分钟 close=4543.15 / preClose=4642.21（close≠high 列判别）
+        assert svc._trends_change_pct(
+            Decimal("4543.15"), Decimal("4642.21")) == Decimal("-2.13")
+
+    def test_change_pct_high_column_not_used(self):
+        from decimal import Decimal
+
+        # 若实现误用 high=15：(15-10)/10*100=50% —— 公式只接受显式现价入参，
+        # 输入域由 require 限定，调用方（wire 解析）负责取 close 列
+        result = svc._trends_change_pct(Decimal("11"), Decimal("10"))
+        assert result != Decimal("50.00")
+
+    def test_change_pct_zero_preclose_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("11"), Decimal("0"))
+
+    def test_change_pct_negative_preclose_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("11"), Decimal("-10"))
+
+    def test_change_pct_non_finite_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("Infinity"), Decimal("10"))
+
+    def test_sum_minute_amounts_golden_independent(self):
+        from decimal import Decimal
+
+        # 真实 wire 前两分钟额（600519 09:30/09:31）逐值可核算；
+        # 全 241 行金标准求和由 wire 全链测试覆盖（6199528292）
+        assert svc._sum_minute_amounts(
+            [Decimal("226345000.00"), Decimal("420208080.00")],
+        ) == Decimal("646553080.00")
+
+    def test_sum_minute_amounts_partial_zero_minutes_legal(self):
+        from decimal import Decimal
+
+        # 零额分钟是合法观测：求和只累计已通过行级资格的有限非负额
+        assert svc._sum_minute_amounts(
+            [Decimal("0"), Decimal("100.5")]) == Decimal("100.5")
+
+    def test_sum_minute_amounts_negative_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._sum_minute_amounts([Decimal("-1")])
+
+    def test_sum_minute_amounts_empty_raises(self):
+        with pytest.raises(ViolationError):
+            svc._sum_minute_amounts([])

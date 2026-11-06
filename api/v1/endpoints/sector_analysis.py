@@ -35,25 +35,43 @@ def _validate_id(report_id: str) -> str:
 
 
 @router.post("/generate", response_model=SectorAnalysisGenerateResponse)
-async def generate(stock_code: str, stock_name: Optional[str] = None):
+async def generate(stock_code: str,
+                   stock_name: Optional[str] = None,
+                   ) -> "SectorAnalysisGenerateResponse":
     """同步生成（报告总预算默认 300s）。终态精确表达，不假成功：
 
     - success → 200 + 完整载荷（部分报告同样 200，缺口随载荷透出）
     - timeout（预算耗尽，未存档）→ 504
     - failed（保存失败，未存档）→ 500
     """
-    from src.core.market_policy import require_stock_market
-    require_stock_market(stock_code)
+    from src.core.market_policy import MarketDisabledError, require_stock_market
 
+    # 输入错误窄化（root entry-closure 反例）：仅本专项用户输入错误（无效
+    # A 股代码/未启用市场）映射 400；供应商/程序侧 ValueError 属程序缺陷，
+    # 走既有通用 500（不吞、不降级、零存档），不新增通用异常框架。
     try:
+        require_stock_market(stock_code)
         raw = await asyncio.to_thread(
             sector_analysis_service.generate_report, stock_code, stock_name
         )
-    except ValueError as exc:
+    except (sector_analysis_service.SectorInputError, MarketDisabledError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
-        logger.error("[SectorAnalysis] 生成失败: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"生成失败：{exc}")
+        # 程序缺陷日志与响应都不携带异常原文/参数值/traceback（root 纪律：
+        # 500 固定安全文案；日志仅保留异常类型与不含值的位置——filename/
+        # lineno/function，不输出参数/源码行/locals）
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        frame = tb.tb_frame.f_code if tb is not None else None
+        logger.error(
+            "[SectorAnalysis] 生成失败（程序缺陷，详情见服务端诊断）: %s @ %s:%s(%s)",
+            type(exc).__name__,
+            frame.co_filename if frame else "<unknown>",
+            tb.tb_lineno if tb else -1,
+            frame.co_name if frame else "<unknown>",
+        )
+        raise HTTPException(status_code=500, detail="生成失败：内部错误（详见服务端日志）")
     status = raw.get("status")
     if status == "timeout":
         raise HTTPException(status_code=504, detail=raw.get("message") or "生成超时，未保存报告")

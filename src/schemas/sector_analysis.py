@@ -86,7 +86,6 @@ PayloadVersion = Literal[2]
 _GapList = List[Annotated[str, Field(min_length=1, max_length=200)]]
 
 
-
 # ---------------------------------------------------------------------------
 # 身份子结构
 # ---------------------------------------------------------------------------
@@ -102,10 +101,23 @@ class SWChain(_StrictBase):
 
 
 class MembershipInfo(_StrictBase):
-    """东财板块成分验证结果（同板块成分表含目标股才算 confirmed）。"""
+    """东财板块归属验证结果（成分集合含目标股才算 confirmed）。
+
+    ``verified_source``（追加兼容字段，默认 None）区分验证证据来源：
+    - ``cons_table``：同板块成分表含目标股（clist 可用时的口径，含
+      member_count 与同业成分快照）
+    - ``f10_members``：东财 F10 板块反向完整成员集合含目标股（datacenter
+      RPT_F10_CORETHEME_BOARDTYPE 反向查询，BOARD_TYPE=行业校验+分页核完+
+      去重；与 clist 成分表同语义，member_count 与同业成分快照可用，成员
+      行情为逐股采集，批次时间范围在同业缺口如实标注）
+    F10 所属板块声明只用于**精确板块锁定**（BOARD_TYPE=行业、LEVEL=2 唯一
+    命中），不作为归属确认证据——完整反向成员不可得时归属保持 unverified
+    （root 收敛轮：confirmed 必须有成分集合验证，无更弱确认口径）。
+    """
 
     verified: bool = False
     member_count: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
+    verified_source: Optional[Literal["cons_table", "f10_members"]] = None
 
 
 class BoardIdentity(_StrictBase):
@@ -218,6 +230,10 @@ class IntradayPillar(_StrictBase):
     rank_of: Optional[int] = Field(default=None, ge=1)
     total_boards: Optional[int] = Field(default=None, ge=1)
     row: IntradayRow = Field(default_factory=IntradayRow)
+    snapshot_source: Optional[Annotated[str, Field(max_length=200)]] = None
+    """当日行情快照来源/时点说明：东财行业板块全表路径为 None（口径见文档）；
+    全表不可用时单标的快照来源如实标注（stock/get 原样映射或 trends2
+    供应商分钟累计衍生——衍生值非 f48 原样字段，供应商分钟截至随附）。"""
     gaps: _GapList = Field(default_factory=list, max_length=10)
 
     @model_validator(mode="after")
@@ -360,6 +376,9 @@ class SectorPeersBlock(_StrictBase):
     sample_size: Annotated[int, Field(ge=0, le=6)] = 0
     snapshot_observed_at: Optional[Annotated[str, Field(max_length=32)]] = None
     source: Optional[Annotated[str, Field(max_length=48)]] = None
+    quotes_as_of: Optional[Annotated[str, Field(max_length=240)]] = None
+    """成员行情供应商时点说明（逐股采集的来源/时间窗；F10 成员集合路径携带，
+    clist 成分快照路径为 None——采集时间不冒充供应商时间）。"""
     gaps: _GapList = Field(default_factory=list, max_length=14)
 
 

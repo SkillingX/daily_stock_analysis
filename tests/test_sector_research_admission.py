@@ -456,11 +456,14 @@ class TestOneAdmissionPath:
         assert "URL" in (out["background_items"][0]["downgrade_reason"] or "")
 
     def test_conflicting_url_meta_dates_stay_background(self, monkeypatch):
-        url = "https://example.com/2026/11/06/baijiu.html"
+        # 单一明确时钟锚点（root 纪律：两次 now() 跨午夜会令两源同日、反例
+        # 失效）：URL 日期=今天、meta=昨天，两源恒差一天，冲突反例语义不变
+        today = datetime.now().date()
+        url = (f"https://example.com/{today:%Y/%m/%d}/baijiu.html")
         out = _run_admission(monkeypatch, [
             _result("白酒行业新政策发布", url, snippet="新规落地"),
         ], probe_results={url: _META_HTML.format(
-            ts=(datetime.now().date() - timedelta(days=1)).isoformat() + "T09:00:00")})
+            ts=(today - timedelta(days=1)).isoformat() + "T09:00:00")})
         assert out["items"] == []
         reasons = " ".join(
             b["downgrade_reason"] or "" for b in out["background_items"])

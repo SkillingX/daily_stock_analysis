@@ -167,6 +167,15 @@ class SectorReportApiV2TestCase(unittest.TestCase):
         svc._REPORT_DIR = self.report_dir
         self._report_dir_patcher = patch.object(svc, "get_report_dir", _fake_report_dir)
         self._report_dir_patcher.start()
+        # 2026-11-07 收敛轮新增出站边界隔离：F10 声明/成员（datacenter）属
+        # 独立外部边界——本基线用例的 clist/akshare 全链 mock 不覆盖它，统一
+        # 关闭使身份链走既有 akshare mock 路径；F10 路径契约见
+        # tests/test_sector_board_data_rebuild.py（真实 wire fixture 全链）。
+        self._f10_isolation = patch.object(
+            svc, "_fetch_board_claims", lambda code, budget: None,
+        )
+        self._f10_isolation.start()
+        self.addCleanup(self._f10_isolation.stop)
 
     def tearDown(self) -> None:
         self._report_dir_patcher.stop()
