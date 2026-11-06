@@ -100,6 +100,45 @@ def _resolve_litellm_exception(name: str) -> type[BaseException]:
     return _FallbackLiteLLMError
 
 
+_PROGRAM_ERROR_TYPES = (TypeError, AssertionError)
+_CHAIN_MAX_OBJECTS = 32
+"""真实异常对象链遍历上限：SDK 包装链实测 4 层（InternalServerError →
+OpenAIError → APIConnectionError → __cause__ TypeError）；上限只防伪造的
+自引用/超长链失控，不是异常分类框架。"""
+
+
+def _find_program_error(exc: BaseException) -> Optional[BaseException]:
+    """在真实异常**对象链**上定位底层程序契约错误（TypeError/AssertionError）。
+
+    仅 opt-in（``propagate_program_errors=True``）路径调用：SDK（LiteLLM/
+    OpenAI）会把 httpx 终端程序错误包装成 InternalServerError 等远端异常，
+    外层 isinstance 挡不住——真实对象仍记录在 ``__cause__``/``__context__``
+    与 SDK 保留的 ``original_exception`` 属性上（root 实录链：
+    ``InternalServerError.__context__.__context__.__cause__`` 是原 TypeError）。
+
+    - 只对真实异常对象做 ``isinstance`` 检查，不匹配错误文本/类名子串：
+      远端 HTTP500/JSON 消息提到「TypeError」但链上无真实对象时不误判。
+    - 有界 + 环安全（visited-id 集合 + 对象数上限）；每个对象只检查一次。
+    - 找到 → 返回该底层异常对象（调用方 rethrow 原对象）；链上无 → None
+      （保持默认包装异常处理不变）。
+    """
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack and len(seen) < _CHAIN_MAX_OBJECTS:
+        current = stack.pop()
+        obj_id = id(current)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        if isinstance(current, _PROGRAM_ERROR_TYPES):
+            return current
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nxt = getattr(current, attr, None)
+            if isinstance(nxt, BaseException) and id(nxt) not in seen:
+                stack.append(nxt)
+    return None
+
+
 # ============================================================
 # Unified response types
 # ============================================================
@@ -735,6 +774,7 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        propagate_program_errors: bool = False,
     ) -> LLMResponse:
         """Send a text-only completion through the shared routing stack."""
         return self.call_completion(
@@ -744,6 +784,7 @@ class LLMToolAdapter:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            propagate_program_errors=propagate_program_errors,
         )
 
     def call_completion(
@@ -755,8 +796,21 @@ class LLMToolAdapter:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        propagate_program_errors: bool = False,
     ) -> LLMResponse:
-        """Shared completion path for both tool and text-only calls."""
+        """Shared completion path for both tool and text-only calls.
+
+        ``propagate_program_errors``（默认 False，保持全部既有消费者行为不变）：
+        为 True 时，fallback 循环内出现的 ``TypeError``/``AssertionError`` 不再
+        被吞成 ``provider="error"`` 响应，而是原样 re-raise——调用方（如板块
+        研判）必须显式区分「已识别模型/传输失败」与「程序契约错误」，后者不得
+        伪装成数据缺失或模型失败。真实 SDK（LiteLLM）会把 httpx 终端程序错误
+        包装成 InternalServerError 等远端异常：此时对真实异常对象链（``__cause__``
+        /``__context__``/``original_exception``，有界环安全遍历）定位底层
+        TypeError/AssertionError 对象并 re-raise 原对象；只查对象不匹配错误
+        文本（远端消息提到 TypeError 不误判）。仅改本地异常边界；该标志不进入
+        任何 SDK kwargs。
+        """
         config = self._config
         models_to_try = get_effective_agent_models_to_try(config)
         if not models_to_try:
@@ -792,6 +846,17 @@ class LLMToolAdapter:
                     timeout=remaining_timeout,
                 )
             except Exception as e:
+                if propagate_program_errors:
+                    # Opt-in（默认 False）：SDK 包装链上的真实程序契约错误
+                    # （TypeError/AssertionError 对象，含 LiteLLM
+                    # InternalServerError 等远端异常壳内经 __cause__/
+                    # __context__/original_exception 保留的底层对象）保留
+                    # 原样身份上抛，不进入「All LLM models failed」聚合，
+                    # 不伪装 provider=error。仅查真实异常对象链（不匹配
+                    # 错误文本）；链上无真实对象（真远端失败）走既有分支。
+                    underlying = _find_program_error(e)
+                    if underlying is not None:
+                        raise underlying from e
                 if isinstance(e, _resolve_litellm_exception("RateLimitError")):
                     logger.warning("Agent LLM rate-limited on %s: %s", model, e)
                     last_error = e

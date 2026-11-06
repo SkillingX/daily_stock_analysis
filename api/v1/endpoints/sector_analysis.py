@@ -36,6 +36,12 @@ def _validate_id(report_id: str) -> str:
 
 @router.post("/generate", response_model=SectorAnalysisGenerateResponse)
 async def generate(stock_code: str, stock_name: Optional[str] = None):
+    """同步生成（报告总预算默认 300s）。终态精确表达，不假成功：
+
+    - success → 200 + 完整载荷（部分报告同样 200，缺口随载荷透出）
+    - timeout（预算耗尽，未存档）→ 504
+    - failed（保存失败，未存档）→ 500
+    """
     from src.core.market_policy import require_stock_market
     require_stock_market(stock_code)
 
@@ -48,6 +54,11 @@ async def generate(stock_code: str, stock_name: Optional[str] = None):
     except Exception as exc:  # noqa: BLE001
         logger.error("[SectorAnalysis] 生成失败: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"生成失败：{exc}")
+    status = raw.get("status")
+    if status == "timeout":
+        raise HTTPException(status_code=504, detail=raw.get("message") or "生成超时，未保存报告")
+    if status == "failed":
+        raise HTTPException(status_code=500, detail=raw.get("message") or "报告保存失败，未存档")
     # FastAPI 的 response_model 会用 SectorAnalysisGenerateResponse 校验；
     # 这里显式再过一次保证 schema 错误在 service 边界暴露，不污染 HTTP 层
     return SectorAnalysisGenerateResponse.model_validate({
@@ -55,7 +66,7 @@ async def generate(stock_code: str, stock_name: Optional[str] = None):
         "stock_code": raw["stock_code"],
         "stock_name": raw.get("stock_name"),
         "markdown": raw["markdown"],
-        "analysis": raw["analysis"],
+        "analysis": raw["payload"],
     })
 
 
@@ -87,9 +98,25 @@ async def get_report(report_id: str):
         record["analysis_json"] = None
     if record.get("md_path"):
         try:
-            record["markdown"] = Path(record["md_path"]).read_text(encoding="utf-8")
+            markdown = Path(record["md_path"]).read_text(encoding="utf-8")
         except OSError:
-            record["markdown"] = ""
+            # 存档文件缺失/不可读：明确报错，不吞异常返回 200 空正文
+            raise HTTPException(
+                status_code=500,
+                detail="报告存档文件缺失或不可读（存档不完整），详情不可用；"
+                       "可尝试直接下载或删除该记录",
+            )
+        if not markdown.strip():
+            raise HTTPException(
+                status_code=500,
+                detail="报告存档文件为空（存档不完整），详情不可用",
+            )
+        record["markdown"] = markdown
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail="报告记录缺少存档路径（存档不完整），详情不可用",
+        )
     item = SectorAnalysisReportItem.model_validate(record)
     return {"success": True, "data": item}
 
@@ -103,9 +130,6 @@ async def download_markdown(report_id: str, download: int = 0):
     path = Path(record["md_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="报告文件不存在")
-    from starlette.datastructures import MutableHeaders  # noqa: F401
-    # FileResponse 的 kwargs 是 Unpack[ResponseInit]，pyright strict 不能用裸 Dict[str, str]
-    # 这里展开为 explicit 关键字避免 pyright 把 kwargs 视为宽类型
     media_type = "text/markdown; charset=utf-8"
     filename = f"{report_id}.md" if download else None
     if filename:
@@ -115,6 +139,12 @@ async def download_markdown(report_id: str, download: int = 0):
 
 @router.delete("/reports/{report_id}", response_model=SectorAnalysisDeleteResponse)
 async def delete_report(report_id: str):
+    """删除报告记录与存档文件。两步操作如实反馈（不静默假成功）：
+
+    - 记录与文件都清理成功 → file_cleanup=ok
+    - DB 已删但文件清理失败（OSError）→ 200 + file_cleanup=failed + 可理解
+      message（记录已删除、文件可能残留）——不吞异常伪报完全成功
+    """
     _validate_id(report_id)
     paths = await asyncio.to_thread(get_db().delete_sector_analysis_report, report_id)
     if paths is None:
@@ -123,6 +153,8 @@ async def delete_report(report_id: str):
     if p:
         try:
             Path(p).unlink(missing_ok=True)
-        except OSError:
-            pass
-    return {"success": True, "deleted": report_id}
+        except OSError as exc:
+            logger.warning("[SectorAnalysis] 报告 %s 存档文件清理失败: %s", report_id, exc)
+            return {"success": True, "deleted": report_id, "file_cleanup": "failed",
+                    "message": "记录已删除，但存档文件清理失败（文件可能残留，可手动删除）"}
+    return {"success": True, "deleted": report_id, "file_cleanup": "ok"}

@@ -9,12 +9,18 @@ from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-# Mock newspaper before search_service import (optional dependency)
-if "newspaper" not in sys.modules:
-    mock_np = MagicMock()
-    mock_np.Article = MagicMock()
-    mock_np.Config = MagicMock()
-    sys.modules["newspaper"] = mock_np
+# Mock newspaper before search_service import (optional dependency).
+# 只在真实 newspaper 不可导入时注入 stub：无条件注入 MagicMock 会永久污染
+# sys.modules（'newspaper' 不再是包），拖垮同进程后续真实 newspaper 提取
+# 测试（issue #83 定性轮修复的测试顺序污染）。
+try:
+    import newspaper  # noqa: F401
+except ImportError:
+    if "newspaper" not in sys.modules:
+        mock_np = MagicMock()
+        mock_np.Article = MagicMock()
+        mock_np.Config = MagicMock()
+        sys.modules["newspaper"] = mock_np
 
 from src.search_service import (
     BaseSearchProvider,
