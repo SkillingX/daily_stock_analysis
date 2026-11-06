@@ -3343,25 +3343,107 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     # 个股板块分析（sa_ 前缀）
     # ------------------------------------------------------------------
 
-    def save_sector_analysis_report(self, record: Dict[str, Any]) -> bool:
+    def save_sector_analysis_report(self, record: Dict[str, Any],
+                                    deadline: Optional[float] = None) -> bool:
+        """保存板块分析报告（issue #81 第三轮：连接独占 + flush 后截止复核）。
+
+        ``deadline``（``time.monotonic()`` 绝对时刻）仅由板块报告生成入口传入，
+        使 DB 提交与报告总截止同界：进入时剩余耗尽直接拒绝；真实 INSERT 经
+        **显式 flush** 提前发生，flush 后复核同一截止——过期即 rollback 不提交；
+        flush 前与 commit 前分别按剩余时间钳制锁等待（SQLite 方言 per-connection
+        ``PRAGMA busy_timeout``）。锁超时提交失败 rollback 返回 False（由调用方
+        结合自身截止区分「总截止耗尽」与「保存故障」）；commit 一旦成功即返回
+        True——不存在提交后再伪报超时的路径。
+
+        连接生命周期（第三轮修正）：commit/rollback 会释放 Session 默认借用的
+        连接归还池（下次可能是任意一条），钳制与恢复必须落在同一条连接上——
+        deadline 路径由本请求**独占持有**一条物理连接并以
+        ``Session(bind=conn)`` 绑定（ORM flush/INSERT/COMMIT 全走该连接），
+        归还池**之前**在 finally 中恢复原 busy_timeout：成功/失败/超期路径一致，
+        不把请求级锁等待泄漏给共享池的其他使用者。
+        ``deadline=None``（默认）行为与本表既有写入完全一致，不影响其他调用者。
+
+        注意：这是有界**同步**提交，不是 OS 层硬截止——SQLite 方言的锁等待
+        由 busy_timeout 钳制，可检查的截止边界覆盖到真实 INSERT/flush 之后；
+        其他方言仅提交前检查，阻塞上限取决于驱动。
+        """
         session_local = self._SessionLocal
         if session_local is None:
             return False
         try:
-            db = session_local()
+            if deadline is not None and time.monotonic() >= deadline:
+                logger.warning(
+                    "[Storage] save_sector_analysis_report: deadline 已过，"
+                    "不开始保存（%s）", record.get("id"))
+                return False
+            row = SectorAnalysisReport(
+                id=str(record.get("id") or ""),
+                stock_code=str(record.get("stock_code") or ""),
+                stock_name=record.get("stock_name"),
+                md_path=str(record.get("md_path") or ""),
+                sector_score=record.get("sector_score"),
+                analysis_json=record.get("analysis_json"),
+            )
+            if deadline is None:
+                db = session_local()
+                try:
+                    db.add(row)
+                    db.commit()
+                    return True
+                finally:
+                    db.close()
+            # deadline 路径：SQLite 由本请求独占持有连接（钳制/恢复同一条连接，
+            # 归还池前恢复原 PRAGMA）；其他方言 Session 自管连接，仅提交前检查。
+            conn_ctx = (
+                self._engine.connect()
+                if self._is_sqlite_engine and self._engine is not None else None
+            )
+            conn = None
+            original_ms: Optional[int] = None
             try:
-                db.add(SectorAnalysisReport(
-                    id=str(record.get("id") or ""),
-                    stock_code=str(record.get("stock_code") or ""),
-                    stock_name=record.get("stock_name"),
-                    md_path=str(record.get("md_path") or ""),
-                    sector_score=record.get("sector_score"),
-                    analysis_json=record.get("analysis_json"),
-                ))
-                db.commit()
-                return True
+                if conn_ctx is not None:
+                    conn = conn_ctx.__enter__()
+                    db = session_local(bind=conn)
+                    # 由 Session 首次使用（autobegin）开启 root 事务后，再在该
+                    # 连接上读原值/钳制——若先在连接上直接执行 PRAGMA，Session
+                    # 只会在既有外部事务上开 savepoint，session.commit() 不提交
+                    # 外部事务，数据会被池归还时的 rollback 丢弃（实测反例）。
+                    conn = db.connection()
+                    original_ms = int(
+                        conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one())
+                    remaining_ms = max(int((deadline - time.monotonic()) * 1000), 0)
+                    conn.exec_driver_sql(f"PRAGMA busy_timeout = {remaining_ms}")
+                else:
+                    db = session_local()
+                try:
+                    db.add(row)
+                    db.flush()  # 真实 INSERT/flush 在此显式发生，不再是 commit 内黑盒
+                    if time.monotonic() >= deadline:
+                        db.rollback()
+                        logger.warning(
+                            "[Storage] save_sector_analysis_report: flush 后 "
+                            "deadline 已过，rollback 不提交（%s）", record.get("id"))
+                        return False
+                    if conn is not None:
+                        remaining_ms = max(int((deadline - time.monotonic()) * 1000), 0)
+                        conn.exec_driver_sql(f"PRAGMA busy_timeout = {remaining_ms}")
+                    db.commit()
+                    return True
+                finally:
+                    db.close()
+                    if conn is not None and original_ms is not None:
+                        # 归还池之前恢复原值（失败/超期路径同样执行）；连接已不可用
+                        # 时不掩盖主结果，如实留痕后交由池归还语义处理
+                        try:
+                            conn.exec_driver_sql(
+                                f"PRAGMA busy_timeout = {original_ms}")
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "[Storage] 恢复连接 busy_timeout 失败（归还池前）: %s",
+                                exc)
             finally:
-                db.close()
+                if conn_ctx is not None:
+                    conn_ctx.__exit__(None, None, None)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Storage] save_sector_analysis_report failed: %s", exc)
             return False

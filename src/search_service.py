@@ -156,6 +156,13 @@ class SearchResponse:
     success: bool = True
     error_message: Optional[str] = None
     search_time: float = 0.0  # 搜索耗时（秒）
+    malformed_rows: int = 0
+    """供应商 raw 响应中被逐行拒绝的畸形行计数（类型契约，非错误文本解析）。
+
+    追加兼容字段（默认 0）：MiniMax raw 行在切片/域名/日期处理**前**校验
+    title/link/snippet/date 实际类型，畸形行本地拒绝并计数、有效行全部保留
+    （root 批准的最小共享适配器改动，issue #83）。既有构造/复制/缓存路径
+    按默认值携带；调用方（板块准入）聚合计数，不解析 error_message。"""
 
     def to_context(self, max_results: int = 5) -> str:
         """将搜索结果转换为可用于 AI 分析的上下文"""
@@ -1443,20 +1450,47 @@ class MiniMaxSearchProvider(BaseSearchProvider):
             self._log("debug", "[MiniMax] Raw response keys: %s", list(data.keys()))
 
             # Parse organic results
+            # 行类型契约（issue #83，root 批准的最小共享适配器改动）：
+            # 在切片/域名/日期处理**前**校验 raw 行实际类型——畸形行逐行拒绝
+            # 并计数（malformed_rows）、有效行全部保留；不做 str(...) 伪合法，
+            # 不加逐行宽异常吞噬（切片对 dict 抛 TypeError 曾被外层广捕获
+            # 变成整批空失败，rows=[good, bad, good] 的两条有效行全丢）。
+            # 契约：title/link 必需（非空 str）；snippet/date 可选（缺失合法，
+            # 出现即必须 str）。
+            organic_raw = data.get("organic", [])
             results: List[SearchResult] = []
-            for item in data.get("organic", []):
+            malformed_rows = 0
+            for item in organic_raw:
+                if not isinstance(item, dict):
+                    malformed_rows += 1
+                    continue
+                title_val = item.get("title")
+                link_val = item.get("link")
+                if not isinstance(title_val, str) or not title_val.strip():
+                    malformed_rows += 1
+                    continue
+                if not isinstance(link_val, str) or not link_val.strip():
+                    malformed_rows += 1
+                    continue
+                snippet_val = item.get("snippet")
+                if snippet_val is not None and not isinstance(snippet_val, str):
+                    malformed_rows += 1
+                    continue
                 date_val = item.get("date")
+                if date_val is not None and not isinstance(date_val, str):
+                    malformed_rows += 1
+                    continue
 
-                # Client-side time filtering
+                # Client-side time filtering（类型已验证：str 或 None）
                 if not self._is_within_days(date_val, days):
                     continue
 
                 results.append(
                     SearchResult(
-                        title=item.get("title", ""),
-                        snippet=(item.get("snippet", "") or "")[:500],
-                        url=item.get("link", ""),
-                        source=self._extract_domain(item.get("link", "")),
+                        title=title_val,
+                        snippet=(snippet_val or "")[:500],
+                        url=link_val,
+                        source=self._extract_domain(link_val),
                         published_date=date_val,
                     )
                 )
@@ -1464,10 +1498,39 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                 if len(results) >= max_results:
                     break
 
+            if malformed_rows:
+                self._log(
+                    "warning",
+                    "[MiniMax] %s malformed organic rows rejected by field-type contract",
+                    malformed_rows,
+                )
+            # organic 有行且**全部**畸形 → 显式数据失败（不冒充「无新闻」，
+            # malformed_rows 计数仍随响应携带供调用方聚合）；真正空 organic
+            # 是合法空结果。
+            if organic_raw and not results and malformed_rows >= len(organic_raw):
+                self._evidence(
+                    call_id, phase="end", status="data_error",
+                    result_count=0, malformed_rows=malformed_rows,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+                return SearchResponse(
+                    query=query,
+                    results=[],
+                    provider=self.name,
+                    success=False,
+                    error_message=(
+                        f"供应商返回 {malformed_rows} 行数据全部字段类型畸形"
+                        "（本地逐行拒绝，不冒充无新闻）"
+                    ),
+                    malformed_rows=malformed_rows,
+                )
+
             self._log("info", "[MiniMax] Parsed %s results (after time filter)", len(results))
             self._evidence(
                 call_id, phase="end", status="ok" if results else "empty",
-                result_count=len(results), duration_ms=int((time.monotonic() - started) * 1000),
+                result_count=len(results),
+                malformed_rows=malformed_rows,
+                duration_ms=int((time.monotonic() - started) * 1000),
             )
 
             return SearchResponse(
@@ -1475,6 +1538,7 @@ class MiniMaxSearchProvider(BaseSearchProvider):
                 results=results,
                 provider=self.name,
                 success=True,
+                malformed_rows=malformed_rows,
             )
 
         except requests.exceptions.Timeout:
@@ -3438,6 +3502,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            malformed_rows=response.malformed_rows,
         )
 
     @classmethod
@@ -3500,6 +3565,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            malformed_rows=response.malformed_rows,
         )
 
     @classmethod
@@ -3805,6 +3871,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            malformed_rows=response.malformed_rows,
         )
 
     def _normalize_and_limit_response(
@@ -3844,6 +3911,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            malformed_rows=response.malformed_rows,
         )
 
     @staticmethod
@@ -3867,6 +3935,7 @@ class SearchService:
             success=response.success,
             error_message=response.error_message,
             search_time=response.search_time,
+            malformed_rows=response.malformed_rows,
         )
 
     @staticmethod

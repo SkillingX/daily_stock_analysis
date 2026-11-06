@@ -1,71 +1,362 @@
+{% set st = a.identity.subject_status %}
+{% set st_label = {'confirmed': '已确认（成分验证通过）', 'unverified': '已锁定但成分未验证',
+                   'ambiguous': '无法唯一锁定', 'missing': '未取得'}[st] %}
+{% if a.assessment.status == 'unscored' %}
+{% set status_text = '**未评分**（首版板块专项不产出综合评分）' %}
+{% else %}
+{% set status_text = '**资料不足**' %}
+{% endif %}
+{% if a.assessment.completeness == 'complete' %}
+{% set completeness_text = '完整（当日行情等动态事实已取得）' %}
+{% else %}
+{% set completeness_text = '**部分**（动态事实未全部取得，见缺口与不足原因）' %}
+{% endif %}
+{% if a.identity.vendor_as_of %}
+{% set as_of_text = a.identity.vendor_as_of %}
+{% else %}
+{% set as_of_text = '未提供（as_of 未知，不补造）' %}
+{% endif %}
+{% if a.identity.board_code %}
+{% set locked_text = '**' ~ a.identity.board_name ~ '（' ~ a.identity.board_code ~ '）**' %}
+{% else %}
+{% set locked_text = '未锁定（不按近似名取行）' %}
+{% endif %}
+{% if a.identity.membership.verified %}
+{% set membership_text = '目标股在该板块成分内' ~ (('（成分 ' ~ a.identity.membership.member_count ~ ' 只）') if a.identity.membership.member_count is not none else '') %}
+{% elif a.identity.board_code %}
+{% set membership_text = '未通过（归属未确认，见缺口）' %}
+{% else %}
+{% set membership_text = '未执行（板块未锁定）' %}
+{% endif %}
+{% set sw = a.identity.sw_chain %}
+{% set trend = a.get('sector_trend') %}
+{% set peers = a.get('sector_peers') %}
 # {{ stock_name }}（{{ stock_code }}）板块分析报告
 
 > 报告 id：{{ report_id }} ｜ 生成时间：{{ as_of }}
-> 综合板块得分：**{{ a.sector_score if a.sector_score is not none else 'N/A' }}/100 —— {{ a.band }}** ｜ 对个股的 β 含义：{{ a.beta_meaning }}
-> 权重：政策倾向 {{ (a.weights.policy * 100)|round(0) }}% + 行业基率 {{ (a.weights.base_rate * 100)|round(0) }}% + 板块景气 {{ (a.weights.prosperity * 100)|round(0) }}%
+> 主行业身份：**{{ st_label }}** ｜ 资料状态：{{ status_text }} ｜ 完整性：{{ completeness_text }}
+> 采集时点：{{ a.identity.observed_at or '未记录' }} ｜ 供应商数据截止：{{ as_of_text }}
 > 本报告基于公开数据与启发式规则，仅供研究参考，不构成投资建议
 
-## 一、板块定位
+## 一、主行业定位（同一东财行业板块）
 
-{% set ident = a.identification %}
-- 东财行业归属：**{{ ident.industry_em or '未识别' }}**
-{% if ident.industry_cninfo %}- 巨潮证监会行业：**{{ ident.industry_cninfo }}**
-{% endif %}
-- 申万行业链（成分验证）：
-{% set sw = ident.sw_chain %}
+- 东财个股行业：**{{ a.identity.industry_em or '未返回' }}**
+- 锁定板块：{{ locked_text }}
+- 成分验证：{{ membership_text }}
+- 分类体系：{{ a.identity.classification_system or '未知' }} ｜ 分类层级：{{ a.identity.classification_level or '未知（供应商未返回，不推算）' }} ｜ 分类版本：{{ a.identity.classification_version or '未知（供应商未返回，不推算）' }}
 {% if sw and (sw.l3 or sw.l2) %}
-  - 申万一级：{{ sw.l1 or 'N/A' }}
-  - 申万二级：{{ sw.l2 or 'N/A' }}
-  - 申万三级：{{ sw.l3 or 'N/A' }}{% if sw.l3_code %}（{{ sw.l3_code }}）{% endif %}
+- 申万参考链（申万口径，仅作归属参考，不与东财成分/行情混算）：
+  - 申万一级：{{ sw.l1 or 'N/A' }} ｜ 申万二级：{{ sw.l2 or 'N/A' }} ｜ 申万三级：{{ sw.l3 or 'N/A' }}{% if sw.l3_code %}（{{ sw.l3_code }}）{% endif %}
+
 {% else %}
-  - （申万链未锁定，见数据缺口）
+- 申万参考链（申万口径，仅作归属参考）：未锁定，见数据缺口
+
 {% endif %}
-- 景气查询板块名：{{ ident.sector_name or 'N/A' }}
+{% if a.identity.industry_cninfo %}
+- 巨潮证监会行业（参考）：{{ a.identity.industry_cninfo }}
 
-## 二、政策倾向（行业 DNA 库）
+{% endif %}
+## 二、当日板块行情（价格强弱与活跃度）
 
-{% set p = a.policy %}
-- 判定：**{{ p.label }}**{% if p.lean %}（{{ p.lean }}）{% else %}（未识别）{% endif %} ｜ 档位分：{{ p.score if p.score is not none else 'N/A' }}/100
-- 说明：政策倾向来自行业 DNA 库的关键词匹配（supportive=支持 / neutral=中性 / restrictive=限制），
-  反映产业目录、政策文件对该行业的总体取向；方向确定但兑现为收入需要经过「项目验收」类闸门。
-
-## 三、行业基率（启发式默认表，可迭代）
-
-{% set b = a.base_rate %}
-- 命中基率：**{{ (b.base_rate * 100)|round(0) }}%**（{{ b.hit_keyword or '未命中' }}）
-- 命中依据：{{ b.basis }}
-- 全表分位：{{ (b.percentile * 100)|round(0) if b.percentile is not none else 'N/A' }}%（高于表中 {{ (b.percentile * 100)|round(0) if b.percentile is not none else '—' }}% 的行业）
-- 🔴 **基率表版本：{{ b.table_version }}（更新于 {{ b.table_updated }}，共 {{ b.table_industry_count }} 个行业）**
-- 说明：基率为该行业「长期获胜概率」的先验锚点（0-1），启发式默认值；
-  迭代方式：修改 `data/deep_research/industry_base_rates.json` 后热生效，报告自动携带新版本号。
-
-## 四、板块景气（东财行业板块全表）
-
-{% set pr = a.prosperity %}
+{% set pr = a.background.intraday %}
 {% if pr.sector_found %}
-- 板块：**{{ pr.row.board_name }}** ｜ 全表排名：{{ pr.rank_of }} / {{ pr.total_boards }}（按涨跌幅）
-- 涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}%
-- 总市值：{{ pr.row.total_market_cap if pr.row.total_market_cap is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
+- 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ 当日涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
+- 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ 当日成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
 - 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
 
-| 景气维度 | 得分（0-100） | 口径 |
+| 当日行情维度 | 分值（0-100） | 口径 |
 |---------|--------------|------|
-| 动量（涨跌幅全表分位） | {{ pr.momentum if pr.momentum is not none else 'N/A' }} | 前 10% = 100 分 |
-| 活跃度（换手率/全表中位） | {{ pr.activity if pr.activity is not none else 'N/A' }} | 中位 = 50 分 |
-| 资金（成交额/全表中位） | {{ pr.capital if pr.capital is not none else 'N/A' }} | 中位 = 50 分 |
+| 动量（涨跌幅有效样本分位） | {{ pr.momentum if pr.momentum is not none else 'N/A' }} | 严格低于目标的有效样本数÷(有效样本数−1)×100；并列不计入「低于」数 |
+| 换手活跃度（换手率/全表中位） | {{ pr.activity if pr.activity is not none else 'N/A' }} | 中位 = 50 分 |
+| 成交额活跃度（成交额/全表中位） | {{ pr.amount_activity if pr.amount_activity is not none else 'N/A' }} | 中位 = 50 分 |
 | 广度（上涨家数占比） | {{ pr.breadth if pr.breadth is not none else 'N/A' }} | 全涨 = 100 分 |
 
-- 景气综合分：**{{ a.prosperity_score if a.prosperity_score is not none else 'N/A' }}/100**（可用维度均值）
+> ⚠️ 口径说明：以上是**当日行情**（价格强弱与交易活跃度），不代表产业景气；
+> 「成交额活跃度」是成交额的相对水平，**不是资金净流入**；单日行情不构成趋势结论。
 {% else %}
-- ⚠️ 板块景气未产出：{{ pr.gaps[0] if pr.gaps else '未知原因' }}
+- ⚠️ 当日行情未产出：{{ pr.gaps[0] if pr.gaps else '未知原因' }}
 {% endif %}
 
-## 五、综合结论
+## 三、近期板块趋势（最近 20 个已完成交易日）
 
-- 综合板块得分：**{{ a.sector_score if a.sector_score is not none else 'N/A' }}/100 —— {{ a.band }}**
-- 对个股的 β 含义：{{ a.beta_meaning }}
-- 操作提示：板块分 ≥75 顺风时个股回调优先找买点；≤50 逆风时仓位打折、买点从严；
-  50-65 之间板块基本中性，个股自身证据（订单/业绩/资金）主导定价。
+{% if trend %}
+{% if trend.eligible %}
+{% if trend.start_date %}
+- 窗口：**{{ trend.start_date }} → {{ trend.end_date }}**（严格交易日历最近 {{ trend.window_completed_sessions }} 个已完成交易日；盘中未收盘当日已剔除）
+{% endif %}
+{% if trend.observations %}
+- 板块合格观测：{{ trend.qualified_sessions }}/{{ trend.window_completed_sessions }} 个交易日{% if trend.period_return_pct is not none %}；板块区间收益：**{{ trend.period_return_pct }}%**（{{ trend.interval_count }} 个交易日间隔复合；区间起止如上，不是「20日收益」口径）{% endif %}
+
+实际日线观测（板块侧；缺失/无效日期不占位，不取旧日凑数，见缺口）：
+
+| 日期 | 板块收盘（板块指数点位） |
+|------|------------------------|
+{% for o in trend.observations %}
+| {{ o.date }} | {{ o.close }} |
+{% endfor %}
+
+{% else %}
+- ⚠️ 板块趋势未产出：{{ trend.gaps[0] if trend.gaps else '未知原因' }}
+{% endif %}
+{% if trend.benchmark %}
+{% if trend.benchmark.period_return_pct is not none %}
+- 基准（{{ trend.benchmark.name }}）：同窗口合格观测 {{ trend.benchmark.qualified_sessions if trend.benchmark.qualified_sessions is not none else 'N/A' }}/{{ trend.window_completed_sessions }} 个交易日；同窗口区间收益：{{ trend.benchmark.period_return_pct }}%（{{ trend.interval_count }} 个交易日间隔复合）
+{% else %}
+- 基准（{{ trend.benchmark.name }}）：同窗口合格观测 {{ trend.benchmark.qualified_sessions if trend.benchmark.qualified_sessions is not none else 'N/A' }}/{{ trend.window_completed_sessions }} 个交易日（本窗口区间收益不合格或未取得，见缺口，相对表现不计算）
+{% endif %}
+{% if trend.benchmark.observations %}
+基准实际日线观测（{{ trend.benchmark.observations | length }}/{{ trend.window_completed_sessions }} 天；缺失/无效日期不占位，不取旧日凑数，见缺口）：
+
+| 日期 | 沪深300收盘（指数点位） |
+|------|----------------------|
+{% for o in trend.benchmark.observations %}
+| {{ o.date }} | {{ o.close }} |
+{% endfor %}
+
+{% endif %}
+{% else %}
+- 基准（沪深300）：未取得（见缺口），相对表现不计算
+{% endif %}
+{% if trend.relative_return_pp is not none %}
+- **相对表现：区间收益差 {{ trend.relative_return_pp }} 个百分点**（板块 − 基准；百分点是区间收益之差，不是相对收益率）
+{% elif trend.benchmark and trend.benchmark.period_return_pct is not none and trend.period_return_pct is none %}
+- 相对表现：不计算（需板块与基准同窗口均 20/20 合格；当前板块侧不合格，见缺口）
+{% endif %}
+- 数据来源：板块 {{ trend.source or '东财行业板块日线' }}（板块代码直查）、基准 东财指数日线（sh000300）；期望交易日集来自严格交易日历（不补自然日）
+{% if trend.expected_dates %}
+- 期望交易日集（{{ trend.expected_dates | length }} 天）：{{ trend.expected_dates | join('、') }}
+{% endif %}
+> ⚠️ 口径说明：区间收益由窗口内首尾收盘复合得出（{{ trend.interval_count }} 个间隔）；盘中未收盘
+> 交易日的当日 K 线已剔除；节假日顺延按交易日历而非自然日补齐；这是**近期价格趋势**，
+> 不构成中长期产业景气判断。
+{% for g in trend.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% else %}
+- ⚠️ 板块趋势未执行：主行业身份未确认（confirmed 前置不满足），不发起板块/基准行情查询、不给趋势结论。
+{% endif %}
+{% endif %}
+
+## 四、行业催化（近期政策/新闻，统一准入）
+
+{% set cat = a.get('sector_catalysts') %}
+{% if cat %}
+{% if cat.eligible %}
+- 查询：{{ cat.query or 'N/A' }} ｜ 窗口：{{ cat.window_start or 'N/A' }} → {{ cat.window_end or 'N/A' }}（{{ cat.window_days }} 天有效新闻窗口）｜ 供应商：{{ cat.provider or 'N/A' }} ｜ 采集时点：{{ cat.observed_at or '未记录' }}
+{% set cat_items = cat['items'] %}
+{% if cat_items %}
+- 已证实近期催化（{{ cat_items | length }} 条；发布日期在窗口内（不含未来日）、行业相关、去重后）：
+
+| 证据 ID | 标题（链接为原始引用） | 发布日期 | 日期口径 | 来源 |
+|---------|------|----------|----------|------|
+{% for c in cat_items %}
+| {{ c.evidence_id }} | [{{ c.title | md_link_text }}]({{ c.url }}) | {{ c.published_date }} | {{ {'provider_published': '供应商发布字段', 'article_metadata': '文章元数据（含原始依据）'}[c.date_basis] }} | {{ c.source_domain }} |
+{% endfor %}
+
+{% for c in cat_items %}
+{% if c.same_event_urls %}
+- {{ c.evidence_id }} 同一事件的其他转载链接（不作独立佐证）：{{ c.same_event_urls | join('、') }}
+{% endif %}
+{% if c.date_basis_detail %}
+- {{ c.evidence_id }} 日期原始依据：{{ c.date_basis_detail }}
+{% endif %}
+{% if c.final_url and c.final_url != c.url %}
+- {{ c.evidence_id }} 日期证据实际终态地址（重定向后文章；溯源域名按此判定）：{{ c.final_url }}
+{% endif %}
+{% endfor %}
+> 发布日期只作窗口资格依据；事件日期未知即为未知，不用发布日期顶替。
+{% else %}
+- ⚠️ 已证实近期催化未取得：{{ cat.gaps[0] if cat.gaps else '未知原因' }}
+{% endif %}
+{% if cat.background_items %}
+- 背景线索（明确限制：无可靠发布日期或历史回顾降级，仅背景参考，**不作为已证实近期催化**，不单独支撑重要结论）：
+
+| 证据 ID | 标题（链接为原始引用） | 发布日期 | 来源 | 限制说明 |
+|---------|------|----------|------|----------|
+{% for c in cat.background_items %}
+| {{ c.evidence_id }} | [{{ c.title | md_link_text }}]({{ c.url }}) | {{ c.published_date or '未知' }} | {{ c.source_domain }} | {{ c.downgrade_reason or '无可靠发布日期' }} |
+{% endfor %}
+
+{% for c in cat.background_items %}
+{% if c.final_url and c.final_url != c.url %}
+- {{ c.evidence_id }} 实际文章终态地址（重定向后；溯源域名按此判定）：{{ c.final_url }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if cat.dropped_duplicate_url or cat.dropped_syndicated or cat.dropped_offwindow or cat.dropped_offtopic or cat.dropped_invalid_source or cat.dropped_invalid_field %}
+- 过滤计数：重复 URL {{ cat.dropped_duplicate_url }} ｜ 同源转载 {{ cat.dropped_syndicated }} ｜ 窗口外/未来 {{ cat.dropped_offwindow }} ｜ 行业无关 {{ cat.dropped_offtopic }} ｜ 来源无效 {{ cat.dropped_invalid_source }} ｜ 字段无效 {{ cat.dropped_invalid_field }}
+{% endif %}
+{% for g in cat.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% else %}
+- ⚠️ 行业催化未执行：主行业身份未确认（confirmed 前置不满足），不发起行业新闻搜索、不给催化结论。
+{% endif %}
+{% endif %}
+
+## 五、同业比较（成交活跃代表）
+
+{% if peers %}
+{% if peers.eligible %}
+{% set peer_rows = peers['items'] %}
+- 选取规则：{{ peers.selection_rule }}；不逐股补市值、不混用其他分类权重
+{% if peers.amount_provenance %}
+- 成交额单位：{{ peers.amount_unit or '元' }}（{{ peers.amount_provenance }}）
+{% endif %}
+- 成分快照采集时点：{{ peers.snapshot_observed_at or '未记录' }}（快照当日口径，与上方 20 日趋势窗口是**不同时间口径**）
+{% if peer_rows %}
+{% if peers.rankable_rows and peers.rankable_rows > 0 %}
+- 样本（{{ peers.sample_size }} 家，按快照成交额降序；并列按代码升序）：
+{% else %}
+- 样本（{{ peers.sample_size }} 家；无成交额数据，不按成交额排序，仅列示成员实际字段）：
+{% endif %}
+
+| 代码 | 名称 | 当日成交额（元） | 当日涨跌幅 | 目标股 |
+|------|------|-----------------|-----------|--------|
+{% for p in peer_rows %}
+| {{ p.code }} | {{ p.name }} | {{ p.amount if p.amount is not none else 'N/A' }} | {{ p.change_pct if p.change_pct is not none else 'N/A' }}% | {{ '✔' if p.is_target else '' }} |
+{% endfor %}
+
+{% if peers.target_change_pct_rank is not none %}
+- 目标股相对位置：按快照当日涨跌幅在样本内排第 **{{ peers.target_change_pct_rank }}** / {{ peers.sample_size }}（降序，名次 = 严格更高数 + 1，并列同名次；同单位同观测范围）
+{% elif peer_rows | selectattr('is_target') | list %}
+{% set target_item = peer_rows | selectattr('is_target') | first %}
+{% if target_item.change_pct is none %}
+- 目标股相对位置：N/A（快照当日涨跌幅缺失，不按其他指标顶替，见缺口）
+{% else %}
+- 目标股相对位置：N/A（无可比同行或同行涨跌幅缺失，有效比较范围见缺口，不输出全样本名次）
+{% endif %}
+{% endif %}
+{% if peers.target_in_amount_top5 is false %}
+- 目标股不在快照成交额前五内，作为第 {{ peers.sample_size }} 家加入样本（去重后共 {{ peers.sample_size }} 家）
+{% elif peers.target_in_amount_top5 %}
+- 目标股在快照成交额前五内（样本不重复计入，共 {{ peers.sample_size }} 家）
+{% elif peer_rows | selectattr('is_target') | list %}
+{% set target_item2 = peer_rows | selectattr('is_target') | first %}
+{% if target_item2.amount is none %}
+- 目标股快照成交额缺失或无效，不参与成交额排名（成员保留，top5 资格无法判定，见缺口）
+{% endif %}
+{% endif %}
+- ⚠️ 口径说明：「成交活跃代表」按**成交额**选取，是交易活跃度代表，**不是市值或基本面龙头**；
+  相对位置基于快照当日涨跌幅（与趋势窗口不同口径），单日表现不构成同业强弱结论。
+{% else %}
+- ⚠️ 同业样本未产出：{{ peers.gaps[0] if peers.gaps else '未知原因' }}（已有有效内容保留，不生成伪排名）
+{% endif %}
+{% if peers.gaps %}
+{% for g in peers.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% endif %}
+{% else %}
+- ⚠️ 同业比较未执行：主行业身份未确认（confirmed 前置不满足），不选取成交活跃代表、不给同业结论。
+{% endif %}
+{% endif %}
+
+## 六、证据化综合研判与风险
+
+{% set syn = a.get('sector_synthesis') %}
+{% if syn %}
+{% if syn.eligible and syn.status == 'ok' %}
+{% if syn.summary_origin == 'server_facts' %}
+- 综合（服务端事实摘要）：{{ syn.summary }}
+{% if syn.uncertainty_note %}
+- 观察限制与不确定性：{{ syn.uncertainty_note }}
+{% endif %}
+{% else %}
+- 综合：{{ syn.summary }}
+{% if syn.uncertainty_note %}
+- 反面证据与不确定性：{{ syn.uncertainty_note }}
+{% endif %}
+{% endif %}
+- 路由：{{ syn.provider or 'N/A' }}{% if syn.model %}（{{ syn.model }}）{% endif %}；结论引用上方证据 ID（cat-*=已证实催化、identity/intraday/trend/peers/target=实际取得的载荷事实、bg-*=无日期或降级背景线索，仅可附加引用）。
+{% if syn['claims'] %}
+{% for c in syn['claims'] %}
+{% if c.kind == 'interpretation' %}
+- 解读（{{ c.evidence_refs | join('、') }}）：{{ c.text }}
+{% elif c.kind == 'counterevidence' %}
+- ⚠️ 反面证据（{{ c.evidence_refs | join('、') }}）：{{ c.text }}
+{% else %}
+- ⚠️ 风险（{{ c.evidence_refs | join('、') }}）：{{ c.text }}
+{% endif %}
+{% endfor %}
+{% endif %}
+{% if syn.rejected_count %}
+- ⚠️ 模型输出共 {{ syn.rejected_count }} 条结论未通过定性/引用/结构校验并整条拒绝（明细见缺口与不足原因）；本报告完整性为**部分**，不呈现「全部合格研究」。
+{% endif %}
+{% if syn.gaps %}
+{% for g in syn.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% endif %}
+{% if syn.summary_origin == 'server_facts' %}
+> ⚠️ 口径说明：上方「综合（服务端事实摘要）」与观察限制由服务端从已采纳
+> 事实程序化生成（精确数值以各节表格为准）；「解读/反面证据/风险」条目为
+> 模型生成的催化与条件风险观点（已通过结构/引用与纯定性校验，但**语义
+> 准确性不由此保证**，可能仍有误读——请以上方表格与所引原始材料为准）；
+> 静态政策 DNA 与基率先验是报告背景，不作为综合依据；综合判断不构成投资建议。
+{% else %}
+> ⚠️ 口径说明：本报告摘要与不确定性说明由历史版本系统从合格结论派生
+> （模型自由摘要不直接采纳；模型陈述为纯定性，不含数字/日期/价格/比率/倍数词，
+> 数值事实由服务端从所引证据渲染到上方既有数字表格）；
+> 静态政策 DNA 与基率先验是报告背景，不作为综合依据；综合判断不构成投资建议。
+{% endif %}
+{% else %}
+- ⚠️ 证据化综合未产出（{{ {'model_unavailable': '模型未配置',
+    'model_error': '模型调用失败或超时',
+    'malformed_output': '模型输出未通过定性/引用/结构校验',
+    'no_qualified_facts': '无已证实近期催化事实',
+    'skipped_identity': '主行业身份未确认'}[syn.status] }}）：
+  {{ syn.gaps[0] if syn.gaps else '未知原因' }}；已取得的有效内容保留。
+{% for g in syn.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% endif %}
+{% endif %}
+
+## 七、政策倾向（行业 DNA 库·静态规则背景）
+
+{% set p = a.background.policy %}
+{% if p.lean %}
+{% set policy_note = '（' ~ p.lean ~ '）' %}
+{% else %}
+{% set policy_note = '（未识别）' %}
+{% endif %}
+- 判定：**{{ p.label }}**{{ policy_note }}
+- 说明：政策倾向来自本地行业 DNA 库的关键词匹配（supportive=支持 / neutral=中性 / restrictive=限制），
+  反映产业目录、政策文件对该行业的**总体取向**，属于静态规则背景，不是近期新闻事件或已落地的资金支持。
+
+## 八、行业基率（启发式先验背景，非实测胜率）
+
+{% set b = a.background.base_rate %}
+{% if b.percentile is not none %}
+{% set percentile_text = (b.percentile * 100)|round(0)|int ~ '%（高于表中 ' ~ ((b.percentile * 100)|round(0)|int) ~ '% 的行业）' %}
+{% else %}
+{% set percentile_text = 'N/A' %}
+{% endif %}
+{% if b.is_default %}
+{% set default_note = ' ｜ 🔴 默认先验：仅背景依据，不据此形成任何结论' %}
+{% else %}
+{% set default_note = '' %}
+{% endif %}
+- 命中基率：**{{ (b.base_rate * 100)|round(0) }}%**（{{ b.hit_keyword or '未命中，使用默认值 50%' }}）{{ default_note }}
+- 全表分位：{{ percentile_text }}
+- 🔴 **基率表版本：{{ b.table_version }}（更新于 {{ b.table_updated }}，共 {{ b.table_industry_count }} 个行业）**
+- 说明：基率为启发式默认先验锚点（0-1），**不是实测胜率**；本报告不据基率单独产生任何「中性」判断或行动结论。
+
+## 九、相关概念（仅列示）
+
+{% set concept_items = a.concepts['items'] %}
+{% if concept_items %}
+{% for c in concept_items %}
+- {{ c.name }}（来源 {{ c.source }}{% if c.as_of_nature %}，归属口径 {{ c.as_of_nature }}{% endif %}）
+{% endfor %}
+{% if a.concepts['truncated'] %}
+- 展示截取：供应商共返回 {{ a.concepts['total_returned'] }} 条，以上列示前 {{ concept_items | length }} 条（展示上限），其余未列示；展示截取，非供应商故障。
+{% endif %}
+- 概念仅列示：不作为行业归属依据，不展开独立研究。
+{% else %}
+- 未取得相关概念列表（见缺口）；概念缺失不影响主行业报告。
+{% endif %}
 
 {% if a.gaps %}
 ## 数据缺口（按纪律不编造）
@@ -75,16 +366,17 @@
 {% endfor %}
 {% endif %}
 
-## 附录：行业基率全表（{{ b.table_version }}，{{ b.table_updated }} 更新）
+## 资料状态说明
 
-| 行业关键词 | 基率 | 说明 |
-|-----------|------|------|
-{% for r in b.all_rates %}
-| {{ r.keyword }}{% if r.keyword == b.hit_keyword %} ⬅ 本次命中{% endif %} | {{ (r.base_rate * 100)|round(0) }}% | {{ r.note }} |
+{% if a.assessment.status == 'insufficient_data' %}
+- **资料不足**：{% for r in a.assessment.reasons %}{{ r }}{% if not loop.last %}；{% endif %}{% endfor %}。
+  在主行业身份缺失或无法唯一锁定时，本报告不产出任何评分、分档或行动建议。
+{% else %}
+- **未评分**：板块专项报告不产出综合评分与分档结论；政策 DNA、启发式基率与当日行情仅作背景依据；
+  新闻催化经统一日期资格与去重准入，综合研判由证据登记表约束（模型不得补造事实与数值）。
+{% for r in a.assessment.reasons %}
+- {{ r }}
 {% endfor %}
-| （默认） | 50% | 未命中行业使用板块中性值 |
+{% endif %}
 
-*基率表为启发式默认值（龙头胜率口径），迭代方式：直接修改 `data/deep_research/industry_base_rates.json`
-的数值并更新 `_updated` 字段，服务热加载生效，报告自动携带新版本号。*
-
-*本报告由 AI 生成，所引数据以生成时点为准；不构成投资建议。*
+*本报告由 AI 生成，所引数据以采集时点为准；不构成投资建议。*

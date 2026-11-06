@@ -1191,6 +1191,9 @@ class Config:
     enable_fundamental_pipeline: bool = True
     # 基本面阶段总预算（秒）
     fundamentals_report_timeout_seconds: float = 300.0
+    # 个股板块专项报告总预算（秒）：独立板块取数/等待共用同一剩余预算，
+    # 不复用基本面产品 timeout，避免隐式耦合（issue #79 实施默认 300s、1—300）
+    sector_analysis_report_timeout_seconds: float = 300.0
     fundamental_stage_timeout_seconds: float = FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = FUNDAMENTAL_FETCH_TIMEOUT_SECONDS_DEFAULT
@@ -2421,6 +2424,13 @@ class Config:
                 os.getenv("FUNDAMENTALS_REPORT_TIMEOUT_SECONDS"),
                 300.0,
                 field_name="FUNDAMENTALS_REPORT_TIMEOUT_SECONDS",
+                minimum=1.0,
+                maximum=300.0,
+            ),
+            sector_analysis_report_timeout_seconds=parse_env_float(
+                os.getenv("SECTOR_ANALYSIS_REPORT_TIMEOUT_SECONDS"),
+                300.0,
+                field_name="SECTOR_ANALYSIS_REPORT_TIMEOUT_SECONDS",
                 minimum=1.0,
                 maximum=300.0,
             ),
