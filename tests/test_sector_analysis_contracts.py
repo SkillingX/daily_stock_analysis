@@ -510,3 +510,70 @@ class TestTrendsFinancialDerivationContracts:
     def test_sum_minute_amounts_empty_raises(self):
         with pytest.raises(ViolationError):
             svc._sum_minute_amounts([])
+
+
+# ========================================================================
+# 腾讯公开行情批量金额/币种契约（Layer 2；共享字段约定，Decimal 无 float 换算）
+# ========================================================================
+
+class TestTencentAmountContracts:
+    """既有优先级契约：字段35三元组第三段=精确金额（元）优先；字段37=万元
+    兜底（仅精确金额缺值时 ×10000）；字段35 存在但畸形/负值/非有限 = 真实
+    坏值，不回退兜底、不补 0 冒充（金额未知）。B 股代码币种可比性未证实。"""
+
+    def _fields(self, exact: str, wan: str) -> list:
+        fields = [""] * 38
+        fields[35] = exact
+        fields[37] = wan
+        return fields
+
+    def test_exact_triplet_amount_decimal(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("34.91/68243/239321750", "23932"))
+        assert known is True and amount == Decimal("239321750")
+        assert source == "exact35"
+
+    def test_known_zero_exact_is_known_zero(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("0/0/0", "0"))
+        assert known is True and amount == Decimal("0")
+        assert source == "exact35"
+
+    def test_wan_fallback_only_when_exact_absent(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("", "949"))
+        # 字段37为万元整口（949×10000=9490000）；精确分位在字段35三元组
+        assert known is True and amount == Decimal("9490000")
+        assert source == "rounded37"
+
+    def test_malformed_exact_does_not_fall_back(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("12.34/abc", "949"))
+        assert known is False and amount is None and source is None
+
+    def test_negative_exact_rejected(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("1/1/-5", "5"))
+        assert known is False and amount is None and source is None
+
+    def test_nonfinite_exact_rejected(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("1/1/Infinity", "5"))
+        assert known is False and amount is None and source is None
+
+    def test_both_missing_amount_unknown(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("", ""))
+        assert known is False and amount is None and source is None
+
+    def test_b_share_codes_uncertain_currency(self):
+        assert svc._is_uncertain_currency_code("200596") is True
+        assert svc._is_uncertain_currency_code("900901") is True
+        assert svc._is_uncertain_currency_code("600519") is False
+        assert svc._is_uncertain_currency_code("920001") is False  # BJ 合法 CNY

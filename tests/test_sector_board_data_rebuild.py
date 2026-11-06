@@ -654,6 +654,9 @@ def test_identity_f10_claim_lock_confirmed(monkeypatch) -> None:
 
     monkeypatch.setattr(svc, "_bounded_ak", _ak_down)
     monkeypatch.setattr(svc, "_session_context", _frozen_session_ctx)
+    monkeypatch.setattr(
+        svc, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)  # 腾讯批量源不可用→既有路径
     members_rows = [_f10_row(*_REAL_BAIJIU_ROWS[0]),  # 酒鬼酒
                     _f10_row(*_REAL_BAIJIU_ROWS[3])]  # 贵州茅台（目标股）
     budget = ReportBudget(60)
@@ -750,6 +753,10 @@ def test_member_batch_partial_then_budget_keeps_shape(monkeypatch) -> None:
     frame = pd.DataFrame({
         "代码": ["600519", "600031"], "名称": ["贵州茅台", "三一重工"],
     })
+    from src.services import sector_analysis_service as _svc2
+    monkeypatch.setattr(
+        _svc2, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)  # 腾讯批量源不可用→既有路径
     outcomes = [None, BudgetExhausted("probe exhausted")]
 
     def _fake_quote(*a, **k):  # noqa: ANN002
@@ -766,7 +773,9 @@ def test_member_batch_partial_then_budget_keeps_shape(monkeypatch) -> None:
     assert batch.amounts_known is False
     joined = "\n".join(batch.gaps)
     assert "采集失败 1 只" in joined
-    assert "未尝试 1 只" in joined
+    # 预算未获取（未出站/未取得）——root final 契约：不发明 dispatch 角色时
+    # 以「预算未获取」统一命名
+    assert "预算未获取 1 只" in joined
     assert "已采成功 0 只" in joined
 
 
@@ -1286,6 +1295,9 @@ def test_collect_accepts_quote_arriving_after_request(monkeypatch) -> None:
 
     raw = _load("stock-quote.json")
     raw["data"]["f86"] = int(datetime(2026, 11, 6, 10, 0, 1).timestamp())
+    from src.services import sector_analysis_service as _svc
+    monkeypatch.setattr(_svc, "_fetch_tencent_member_quotes",
+                        lambda df, *, budget, session_ctx: None)
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"stockget:1.600519": raw}))
     monkeypatch.setattr(svc, "_received_at_now",
@@ -1311,6 +1323,9 @@ def test_trends_fallback_receive_after_batch_start_accepted(monkeypatch) -> None
 
     payload = _trim_fixture_to(32)  # 09:30..10:01 连续前缀（time 同步末根）
     assert payload["data"]["trends"][-1].startswith("2026-11-06 10:01")
+    monkeypatch.setattr(
+        svc, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)  # 腾讯批量源不可用→既有路径
     budget = ReportBudget(60)
     _install_wire(monkeypatch, _route_by_secid({
         "stockget:1.600519": requests.ConnectionError("stock/get 拒绝窗口"),
@@ -1343,6 +1358,9 @@ def test_cross_close_intraday_snapshot_rejected(monkeypatch) -> None:
 
     raw = _load("board-quote.json")
     raw["data"]["f86"] = int(datetime(2026, 11, 6, 14, 59, 30).timestamp())
+    monkeypatch.setattr(
+        svc, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)  # 腾讯批量源不可用→既有路径
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"stockget:90.BK1277": raw}))
     monkeypatch.setattr(svc, "_received_at_now",
@@ -1640,3 +1658,1199 @@ def test_api_500_fixed_text_log_no_marker_and_annotation(monkeypatch):
             assert e.status_code == 400
         except svc.SectorInputError:
             pass  # 控制器外直接调用按类型传播（API 层映射 400 已由上一分支证明）
+
+
+# ---------------------------------------------------------------------------
+# 腾讯公开行情批量补采（F10 成员行情；真实生产 wire fixture 驱动）
+# ---------------------------------------------------------------------------
+
+def _load_tencent_body(bk: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "sector_eastmoney"
+            / f"tencent-{bk.lower()}-batch-body.txt").read_text(encoding="utf-8")
+
+
+def _tencent_members_df(body: str) -> pd.DataFrame:
+    import re as _re
+
+    rows = []
+    for m in _re.finditer(r'v_([a-z]{2}\d{6})="([^"]*)"', body):
+        f = m.group(2).split("~")
+        rows.append((f[2], f[1]))
+    return pd.DataFrame({"代码": [r[0] for r in rows],
+                         "名称": [r[1] for r in rows]})
+
+
+def _install_tencent_wire(monkeypatch, body: str) -> Dict[str, int]:
+    """腾讯批量 wire 回放（GBK 编码，按 q 参数符号集回放真实 body）。"""
+    calls = {"n": 0}
+
+    def fake_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" not in prepared.url:
+            return _wire_response({"data": None})
+        calls["n"] += 1
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.encoding = "gbk"
+        resp._content = body.encode("gbk")
+        return resp
+
+    monkeypatch.setattr(requests.Session, "send", fake_send)
+    return calls
+
+
+def _tencent_after_close_ctx():
+    return _session_context(datetime(2026, 11, 6, 16, 20))
+
+
+_TENCENT_AFTER_CLOSE_RECEIVE = datetime(2026, 11, 6, 16, 20)
+
+
+def test_tencent_batch_20_members_b_retained_amount_unknown(monkeypatch):
+    """生产实证 BK1277 精确 20 成员：19 只 CNY 采纳、B 股保留金额未知。
+
+    200596.SZ 古井贡Ｂ成员与精确集合完整保留，币种可比性未证实 → 金额
+    未知 + 精确缺口（不并入 CNY 排名、不逐股补采重引入）；全体完整性
+    不成立 → top5=None；来源/供应商时点贯穿 provenance。
+    """
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body)
+    assert len(df) == 20
+    budget = ReportBudget(60)
+    _install_tencent_wire(monkeypatch, body)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20  # 精确分母不变
+    assert batch.tencent_count == 19  # 19 只 CNY A 股采纳
+    assert batch.currency_unknown_count == 1  # 古井贡Ｂ保留金额未知
+    assert batch.amounts_known is False
+    b_row = batch.df[batch.df["代码"] == "200596"].iloc[0]
+    assert pd.isna(b_row["成交额"]) or b_row["成交额"] is None
+    assert any("古井贡Ｂ" in g and "币种可比性未证实" in g for g in batch.gaps)
+    assert any("腾讯公开行情批量补采" in g for g in batch.gaps)
+    # provenance / as_of 贯穿
+    prov = svc._f10_quote_provenance(batch)
+    assert "腾讯批量19只" in prov and "字段35精确19" in prov
+    assert "币种未证" in prov
+    note = svc._quote_as_of_note(batch)
+    assert note is not None and "腾讯批量19只供应时点" in note and "16:14" in note
+    # peers：全体完整性不成立 → top5 未知；可用 A 同业子集可见
+    out = _peers_pillar("600519", batch.df, budget=ReportBudget(30),
+                        subject_confirmed=True,
+                        quotes_complete=batch.amounts_known)
+    assert out["target_in_amount_top5"] is None
+    codes = [i["code"] for i in out["items"]]
+    assert "200596" not in codes  # 未证币种不进排名
+    assert len(codes) >= 5  # 可用 A 同业子集可见
+
+
+def test_tencent_batch_35_members_all_judgable(monkeypatch):
+    """生产实证 BK0739 精确 35 成员（含 7 个 bj920）：全部 CNY A/BJ 合格
+    → 全体完整可判定（target_in 实际结论输出）。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK0739")
+    df = _tencent_members_df(body)
+    assert len(df) == 35
+    budget = ReportBudget(120)
+    _install_tencent_wire(monkeypatch, body)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 35
+    assert batch.tencent_count == 35
+    assert batch.currency_unknown_count == 0
+    assert batch.amounts_known is True
+    out = _peers_pillar("600031", batch.df, budget=ReportBudget(60),
+                        subject_confirmed=True,
+                        quotes_complete=batch.amounts_known)
+    assert out["target_in_amount_top5"] in (True, False)  # 全体已知 → 可判定
+    assert out["sample_size"] >= 5
+
+
+def test_tencent_mismatch_dup_extra_rejected_fallback_fills_gaps(monkeypatch):
+    """代码/名称不符、重复符号、未请求符号逐行拒绝（不覆盖不暗示覆盖），
+    实际缺口由既有逐股东财 fallback 补齐（仅缺行出站，不重复成功行）。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    assert len(segments) == 20
+
+    def sym_code(seg):
+        return seg.split('"')[1].split("~")[2]
+
+    def sym_name(seg):
+        return seg.split('"')[1].split("~")[1]
+
+    bad_name_seg = segments[0].replace(
+        f"~{sym_name(segments[0])}~", "~错名酒~", 1)
+    bad_code_seg = segments[1].replace(
+        f"~{sym_code(segments[1])}~", "~600198~", 1)
+    dup_seg = segments[2]
+    extra_seg = ('v_sh999999="51~多余行~999999~1~1~1~0~0~0~1~1~1~1~1~1~1~1~1~1'
+                 '~1~1~1~1~1~1~1~1~1~1~~20261106161400~0~0~1~1~1/1/1~1~1~1~1~~'
+                 + "~1~" * 45 + 'CNY~0~~1~1~"')
+    mutated = ";".join([bad_name_seg, bad_code_seg, dup_seg]
+                       + segments[2:] + [extra_seg]) + ";"
+    df = _tencent_members_df(body)
+    budget = ReportBudget(120)
+
+    gap_codes = {sym_code(segments[0]), sym_code(segments[1])}
+    # 重复拷贝仅产生异常披露；sz600809 原行有效照常采纳（不静默取其一：
+    # 首行已采用，后续重复行拒绝并披露）
+    eastmoney_codes = []
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            return resp
+        if "stock/get" in prepared.url:
+            from urllib.parse import urlparse, parse_qs
+
+            q = parse_qs(urlparse(prepared.url).query)
+            secid = q.get("secid", [""])[0]
+            code = secid.partition(".")[2]
+            eastmoney_codes.append(code)
+            member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+            payload = {"data": {
+                "f57": code, "f58": member_name,
+                "f48": 12345.0 + len(code), "f86": float(datetime(
+                    2026, 11, 6, 16, 10).timestamp()),
+                "f170": 0.5, "f168": 1.0, "f116": 1e9}}
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "utf-8"
+            resp._content = json.dumps(payload).encode()
+            return resp
+        raise AssertionError(f"unexpected wire: {prepared.url[:80]}")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20  # 精确分母不变
+    anomalies = "\n".join(batch.gaps)
+    assert "名称不符" in anomalies and "代码不符" in anomalies
+    assert "冲突组失效" in anomalies and "未请求符号" in anomalies
+    gap_codes.add(sym_code(segments[2]))  # 冲突组失效 → 600809 亦走逐股补采
+    assert sorted(eastmoney_codes) == sorted(gap_codes)  # 仅缺口行出站
+    # 缺口已由东财逐股补齐（3 行成交额到位）；但 B 股成员币种未证实 →
+    # 全体完整性仍不成立（契约：合法未知不冒充完整）
+    assert batch.currency_unknown_count == 1
+    assert batch.amounts_known is False
+    assert batch.tencent_count == 16  # 20 - 3 缺口行 - 1 B股（不预填）
+    filled = batch.df[batch.df["代码"].isin(gap_codes)]
+    assert all(float(v) > 0 for v in filled["成交额"])
+
+
+def test_tencent_stale_and_future_rows_rejected_rows_fall_back(monkeypatch):
+    """旧会话/未来供应商时点行按行级源错误拒绝（分母不变），缺口行由
+    既有逐股东财 fallback 补齐。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+
+    def set_time(seg, ts):
+        return seg.replace(seg.split('"')[1].split("~")[30], ts, 1)
+
+    stale_seg = set_time(segments[0], "20261105161430")   # 旧会话
+    future_seg = set_time(segments[1], "20261107100000")  # 未来
+    mutated = ";".join([stale_seg, future_seg] + segments[2:]) + ";"
+    df = _tencent_members_df(body)
+    budget = ReportBudget(120)
+
+    from urllib.parse import urlparse, parse_qs
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            return resp
+        if "stock/get" in prepared.url:
+            code = parse_qs(urlparse(prepared.url).query).get(
+                "secid", [""])[0].partition(".")[2]
+            member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+            payload = {"data": {"f57": code, "f58": member_name,
+                                "f48": 777.0, "f86": float(datetime(
+                                    2026, 11, 6, 16, 10).timestamp()),
+                                "f170": 0.3}}
+            return _wire_response(payload)
+        raise AssertionError(f"unexpected wire: {prepared.url[:80]}")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20
+    anomalies = "\n".join(batch.gaps)
+    assert "当日可比资格" in anomalies  # 行级资格拒绝披露
+    assert batch.tencent_count == 17  # 19 非 B - 2 行拒绝（B 股不预填）
+    filled = batch.df[batch.df["代码"].isin(
+        [segments[0].split('"')[1].split("~")[2],
+         segments[1].split('"')[1].split("~")[2]])]
+    assert all(abs(float(v) - 777.0) < 1 for v in filled["成交额"])
+
+
+def test_tencent_budget_exhaustion_denominator_and_no_late_wire(monkeypatch):
+    """腾讯批量阶段预算耗尽：分母/形状保持，无截止后 wire、无迟到采纳。"""
+    import time as _t
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body)
+    budget = ReportBudget(0.5)
+
+    slow_calls = {"n": 0}
+
+    def slow_send(self, prepared, **kwargs):  # noqa: ANN001
+        slow_calls["n"] += 1
+        _t.sleep(1.0)
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.encoding = "gbk"
+        resp._content = body.encode("gbk")
+        return resp
+
+    monkeypatch.setattr(requests.Session, "send", slow_send)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20  # 分母精确
+    assert batch.amounts_known is False
+    assert any("预算耗尽" in g for g in batch.gaps)
+    assert slow_calls["n"] <= 1  # 每块仅一次，无重试、无截止后出站
+
+
+def test_tencent_program_error_propagates(monkeypatch):
+    """腾讯批量层程序 TypeError/ValueError 原样传播（不吞成源缺口）。"""
+    df = _tencent_members_df(_load_tencent_body("BK1277"))
+    for exc in (TypeError("program bug"), ValueError("program bug")):
+        def broken_send(self, prepared, **kwargs):  # noqa: ANN001
+            raise exc
+
+        monkeypatch.setattr(requests.Session, "send", broken_send)
+        try:
+            _collect_member_quotes(df, budget=ReportBudget(10),
+                                   session_ctx=_tencent_after_close_ctx())
+            raise AssertionError(f"{type(exc).__name__} 被吞")
+        except type(exc):
+            pass
+
+
+def test_clist_amount_column_path_never_invokes_tencent(monkeypatch):
+    """normal clist 快照路径不变：带成交额列的快照不触发腾讯批量。"""
+
+    def no_tencent(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            raise AssertionError("clist 快照路径不得触发腾讯批量")
+        # 非腾讯域按既有路径（stock/get）回放合法报价
+        from urllib.parse import urlparse, parse_qs
+
+        code = parse_qs(urlparse(prepared.url).query).get(
+            "secid", [""])[0].partition(".")[2]
+        member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 100.0, "f86": float(datetime(
+                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f170": 0.1}})
+
+    monkeypatch.setattr(requests.Session, "send", no_tencent)
+    rows = [("600519", "贵州茅台", 100.0, 1.0),
+            ("000799", "酒鬼酒", 900.0, 0.5)]
+    df = pd.DataFrame({"代码": [r[0] for r in rows],
+                       "名称": [r[1] for r in rows],
+                       "成交额": [r[2] for r in rows],
+                       "涨跌幅": [r[3] for r in rows]})
+    batch = _collect_member_quotes(df, budget=ReportBudget(10),
+                                   session_ctx=_tencent_after_close_ctx())
+    assert batch.tencent_count == 0
+    assert batch.amounts_known is True
+
+
+def test_tencent_provenance_threads_model_wire(monkeypatch):
+    """来源/供应商时点经 MemberQuoteBatch → provenance → 真实模型 wire。"""
+    from src.services import sector_analysis_service as svc
+    from src.services import sector_research as sr
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body)
+    budget = ReportBudget(60)
+    _install_tencent_wire(monkeypatch, body)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    prov = svc._f10_quote_provenance(batch)
+    note = svc._quote_as_of_note(batch)
+    ident = {"stock_name": "贵州茅台", "board_name": "白酒Ⅱ",
+             "board_code": "BK1277", "industry_em": "白酒Ⅱ",
+             "membership": {"verified": True, "member_count": 20,
+                            "verified_source": "f10_members"}}
+    peers = {"eligible": True,
+             "selection_rule": "同一成分快照按成交额前五 + 目标股去重",
+             "items": [{"code": "600519", "name": "贵州茅台", "amount": None,
+                        "change_pct": None, "is_target": True}],
+             "target_in_amount_top5": None,
+             "target_change_pct_rank": None, "amount_unit": "元",
+             "amount_provenance": prov, "snapshot_rows": 20,
+             "rankable_rows": 19, "sample_size": 0,
+             "source": "东财 F10 板块完整成员（身份验证同一集合）",
+             "quotes_as_of": note, "gaps": []}
+    registry = svc._build_evidence_registry(
+        "贵州茅台", "600519", ident,
+        prosper={"sector_found": False, "row": {}, "gaps": []},
+        trend={"eligible": False}, peers=peers, catalysts={})
+    wire = sr.build_synthesis_user_text(registry)
+    assert "腾讯批量" in wire
+    assert "2026-11-06 16:1" in wire  # 供应商时点进模型消息
+    assert "币种未证" in wire
+
+
+# ---------------------------------------------------------------------------
+# tencent-contract-closure：整组契约收敛回归（typed IO/逐块 allowlist/部分
+# 存活/冲突失效/金额来源贯穿/240 schema）
+# ---------------------------------------------------------------------------
+
+def test_tencent_f32_overflow_change_pct_source_gap(monkeypatch):
+    """root typed IO 反例：f32='1e999' Decimal 有限但 float 溢出。
+
+    strict typed 行记录拒绝不可表示值 → 涨跌幅按源缺口未知，金额/身份
+    照常采纳（不产出 inf，也不整行丢失）。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    mutated = segments[0].replace(
+        segments[0].split('"')[1].split("~")[32], "1e999", 1)
+    mutated_body = ";".join([mutated] + segments[1:]) + ";"
+    df = _tencent_members_df(body)
+    budget = ReportBudget(60)
+    _install_tencent_wire(monkeypatch, mutated_body)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    row = batch.df[batch.df["代码"] == "000799"].iloc[0]
+    assert float(row["成交额"]) == 239321750.0  # 金额照常
+    assert not row["涨跌幅"] == row["涨跌幅"] or row["涨跌幅"] is None  # NaN/None
+    anomalies = "\n".join(batch.gaps)
+    assert "不可表示" in anomalies
+    from math import isfinite
+
+    assert isfinite(batch.df["涨跌幅"].fillna(0).astype(float).max())
+
+
+def test_tencent_36_members_partial_block_failure_survives(monkeypatch):
+    """root 反例：36 成员首 35 合格、第 2 块 HTTP 失败 → 35 行保留。
+
+    块失败隔离（已成功块保留）、缺口成员由既有逐股 fallback 补齐、分母
+    恒等成员数。"""
+    from src.services import sector_analysis_service as svc
+
+    body35 = _load_tencent_body("BK0739")
+    df35 = _tencent_members_df(body35)
+    # 第 36 名成员（不在 wire 内，走逐股 fallback）
+    df = pd.concat([df35, pd.DataFrame({"代码": ["600519"],
+                                        "名称": ["贵州茅台"]})],
+                   ignore_index=True)
+    assert len(df) == 36
+
+    qt_calls = {"n": 0}
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls["n"] += 1
+            resp = requests.Response()
+            resp.status_code = 503 if qt_calls["n"] > 1 else 200
+            resp.encoding = "gbk"
+            if qt_calls["n"] == 1:
+                resp._content = body35.encode("gbk")
+            return resp
+        from urllib.parse import urlparse, parse_qs
+
+        code = parse_qs(urlparse(prepared.url).query).get(
+            "secid", [""])[0].partition(".")[2]
+        member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 42.0, "f86": float(datetime(
+                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f170": 0.2}})
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(120),
+        session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 36  # 分母不变
+    assert batch.tencent_count == 35  # 首块 35 行全部保留
+    assert qt_calls["n"] == 2  # 两块确实到达
+    filled = batch.df[batch.df["代码"] == "600519"].iloc[0]
+    assert float(filled["成交额"]) == 42.0  # 缺口行既有逐股 fallback 补齐
+    assert batch.amounts_known is True
+    assert any("分块 HTTP 失败" in g for g in batch.gaps)
+
+
+def test_tencent_budget_after_early_success_keeps_rows(monkeypatch):
+    """root 反例：预算在第二块前耗尽 → 已成功 35 行保留、第 36 名如实未知
+    且截止后零出站（不冒充全体分布、不 500）。"""
+    import time as _t
+
+    from src.services import sector_analysis_service as svc
+
+    body35 = _load_tencent_body("BK0739")
+    df35 = _tencent_members_df(body35)
+    df = pd.concat([df35, pd.DataFrame({"代码": ["600519"],
+                                        "名称": ["贵州茅台"]})],
+                   ignore_index=True)
+    budget = ReportBudget(0.6)
+    send_calls = {"n": 0}
+
+    def slow_send(self, prepared, **kwargs):  # noqa: ANN001
+        send_calls["n"] += 1
+        if send_calls["n"] == 1:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = body35.encode("gbk")
+            return resp
+        _t.sleep(1.0)  # 第二块等待跨过截止
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.encoding = "gbk"
+        resp._content = body35.encode("gbk")
+        return resp
+
+    monkeypatch.setattr(requests.Session, "send", slow_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 36
+    assert batch.tencent_count == 35  # 已成功行保留
+    assert any("预算耗尽" in g for g in batch.gaps)
+    assert send_calls["n"] == 2  # 每块一次，无重试；截止后零出站
+
+
+def test_tencent_per_chunk_allowlist_and_cross_block(monkeypatch):
+    """root 反例：块 1 返回未请求的第 36 名、块 2 缺失它 → 仍 36/36 假完整。
+
+    逐块 allowlist：块 1 未请求符号拒绝；块 2 真实返回才采纳。"""
+    from src.services import sector_analysis_service as svc
+
+    body35 = _load_tencent_body("BK0739")
+    df35 = _tencent_members_df(body35)
+    df = pd.concat([df35, pd.DataFrame({"代码": ["600519"],
+                                        "名称": ["贵州茅台"]})],
+                   ignore_index=True)
+    extra_line = ('v_sh600519="51~贵州茅台~600519~1453~1452~1452~1~1~1~1~1~1~'
+                  '1~1~1~1~1~1~1~1~1~1~1~1~1~1~1~1~~20261106161400~0~0.07~1453'
+                  '~1451~1453/1/6199528289~1~6199~1~1~~1453~1451~1~1~1~1~1~1~'
+                  '1~1~1~1~1~1~1~1~1~1~1~~1~1~1~1~   A~GP-A~1~1~1~1~1~1~1~1~1~'
+                  '1~1~1~1~1~1~1~1~~CNY~0~~1~1~"')
+
+    qt_calls2 = {"n": 0}
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls2["n"] += 1
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            if qt_calls2["n"] == 1:
+                # 块 1：35 请求 + 未请求的 sh600519（36th，逐块 allowlist 拒绝）
+                resp._content = (body35 + ";" + extra_line).encode("gbk")
+            else:
+                resp._content = (body35 + ";" + extra_line).encode("gbk")
+            return resp
+        from urllib.parse import urlparse, parse_qs
+
+        code = parse_qs(urlparse(prepared.url).query).get(
+            "secid", [""])[0].partition(".")[2]
+        member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 6199528289.0, "f86": float(
+                                            datetime(2026, 11, 6, 16, 10)
+                                            .timestamp()),
+                                        "f170": 0.07}})
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(60), session_ctx=_tencent_after_close_ctx())
+    anomalies = "\n".join(batch.gaps)
+    assert "返回未请求符号 sh600519" in anomalies  # 块 1 未请求拒绝
+    # 块 1 未请求拒绝 → 600519 为真实缺口 → 既有逐股 fallback 补齐
+    row36 = batch.df[batch.df["代码"] == "600519"].iloc[0]
+    assert float(row36["成交额"]) == 6199528289.0
+    assert any("返回未请求符号 sh600519" in g for g in batch.gaps)
+
+
+def test_tencent_conflict_group_invalid_then_fallback(monkeypatch):
+    """root 反例：同 symbol 两 assignments 金额 100/999 → 首行采用+宣称完整。
+
+    冲突组失效：金额未知、成员保留、既有逐股 fallback 补实际缺口。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    first = [seg for seg in body.split(";") if seg.strip()][0]
+    base_fields = first.split('"')[1]
+    parts = base_fields.split("~")
+    parts[35] = "34.91/1/100"
+    conflict_a = f'{first.split("=")[0]}="{"~".join(parts)}"'
+    parts2 = base_fields.split("~")
+    parts2[35] = "34.91/1/999999999"
+    conflict_b = f'{first.split("=")[0]}="{"~".join(parts2)}"'
+    other = [seg for seg in body.split(";") if seg.strip()][1:]
+    mutated = ";".join([conflict_a, conflict_b] + other) + ";"
+    df = _tencent_members_df(body)
+    budget = ReportBudget(120)
+
+    from urllib.parse import urlparse, parse_qs
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            return resp
+        if "stock/get" in prepared.url:
+            code = parse_qs(urlparse(prepared.url).query).get(
+                "secid", [""])[0].partition(".")[2]
+            member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+            return _wire_response({"data": {"f57": code, "f58": member_name,
+                                            "f48": 555.0, "f86": float(datetime(
+                                                2026, 11, 6, 16, 10).timestamp()),
+                                            "f170": 0.1}})
+        raise AssertionError("unexpected wire")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20
+    anomalies = "\n".join(batch.gaps)
+    assert "000799 冲突组失效" in anomalies
+    assert "999999999" in anomalies and "100" in anomalies  # 两行金额披露
+    row = batch.df[batch.df["代码"] == "000799"].iloc[0]
+    assert float(row["成交额"]) == 555.0  # 既有逐股 fallback 补实际缺口
+    assert batch.tencent_count == 18  # 19 非 B - 1 冲突失效
+    assert batch.amounts_known is False  # B 股未证（不因冲突解决而假完整）
+
+
+def test_tencent_amount_source_rounded37_provenance_schema(monkeypatch):
+    """root 反例：f35 缺、f37=123.45 → 采纳 1234500 却宣称字段35 精确。
+
+    来源贯穿：parsed→batch 计数→gap/provenance 如实「字段37换算」；
+    混合来源 22 成员 provenance/quotes_as_of ≤240 且 SectorPeersBlock
+    strict 校验通过（可达 500 的真实路径闭合）。"""
+    from src.services import sector_analysis_service as svc
+    from src.schemas.sector_analysis import SectorPeersBlock
+
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    sym0 = segments[0].split("=")[0].replace("v_", "")
+    fields0 = segments[0].split('"')[1].split("~")
+    fields0[35] = ""  # f35 缺值
+    fields0[37] = "239.321750"  # f37 万元口
+    mutated_seg = f'v_{sym0}="{"~".join(fields0)}"'
+    mutated_body = ";".join([mutated_seg] + segments[1:]) + ";"
+    df = _tencent_members_df(body)
+    budget = ReportBudget(60)
+    _install_tencent_wire(monkeypatch, mutated_body)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    row = batch.df[batch.df["代码"] == "000799"].iloc[0]
+    assert float(row["成交额"]) == 2393217.5  # 239.321750 万元 ×10000
+    assert batch.tencent_wan_count == 1
+    assert batch.tencent_exact_count == 18  # 其余 18 只仍字段35精确
+    prov = svc._f10_quote_provenance(batch)
+    assert "字段37换算1只" in prov and "字段35精确18" in prov
+    assert len(prov) <= 240
+    note = svc._quote_as_of_note(batch)
+    assert note is not None and len(note) <= 240
+    # 混合来源 strict schema（root 真实 22 成员场景：腾讯10+stock/get10
+    # +trends2 1+B 1）：真实最终 collect 入口产出 provenance ≤240 且
+    # SectorPeersBlock 校验通过
+    # 以真实 fixture 行为模板逐行改写（字段序/时点/金额三元组与真实 wire 一致）
+    tmpl_body = _load_tencent_body("BK1277")
+    tmpl_segs = [seg for seg in tmpl_body.split(";") if seg.strip()]
+    codes = [f"60{i:04d}" for i in range(10)] + \
+            [f"00{i:04d}" for i in range(10)] + \
+            ["685001", "200596"]
+    names = [f"成员{c}" for c in codes]
+
+    def _rewrite_row(seg, code, name, i):
+        fields = seg.split('"')[1].split("~")
+        fields[1], fields[2], fields[30] = name, code, "20261106161400"
+        fields[35] = f"1/{i + 1}/{1000000 + i}"
+        fields[37] = str((1000000 + i) // 10000)
+        sym = "sh" if code.startswith("6") else (
+            "bj" if code.startswith("92") else "sz")
+        return f'v_{sym}{code}="{"~".join(fields)}"'
+
+    tencent_body = ";".join(
+        [_rewrite_row(tmpl_segs[i], codes[i], names[i], i)
+         for i in range(10)]) + ";"
+    mixed_df = pd.DataFrame({"代码": codes, "名称": names})
+    budget2 = ReportBudget(120)
+
+    def mixed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = tencent_body.encode("gbk")
+            return resp
+        from urllib.parse import urlparse, parse_qs
+
+        url_path = urlparse(prepared.url).path
+        code = parse_qs(urlparse(prepared.url).query).get(
+            "secid", [""])[0].partition(".")[2]
+        member_name = str(mixed_df[mixed_df["代码"] == code]["名称"].iloc[0])
+        if "trends2" in url_path:
+            # 真实 241 分钟 board trends（同会话/完整日），仅改 code/name
+            trends2_wire = _load_tencent_body  # noqa: F841 - 占位说明
+            board = _load("board-trends2.json")
+            board["data"]["code"] = code
+            board["data"]["name"] = member_name
+            board["data"]["market"] = 1  # secid=1.685001 回显一致
+            return _wire_response(board)
+        if code == "685001":
+            # stock/get 对 685001 失败 → 强制 trends2 fallback（混源第三来源）
+            return _wire_response({"data": None})
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 500000.0, "f86": float(
+                                            datetime(2026, 11, 6, 16, 10)
+                                            .timestamp()),
+                                        "f170": 0.4}})
+
+    monkeypatch.setattr(requests.Session, "send", mixed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    mixed_batch = _collect_member_quotes(
+        mixed_df, budget=budget2, session_ctx=_tencent_after_close_ctx())
+    mixed_prov = svc._f10_quote_provenance(mixed_batch)
+    mixed_note = svc._quote_as_of_note(mixed_batch)
+    assert len(mixed_prov) <= 240
+    assert mixed_batch.tencent_count == 10
+    assert mixed_batch.stockget_count + mixed_batch.trends2_count == 11
+    assert mixed_batch.currency_unknown_count == 1
+    peers_payload = {
+        "eligible": True,
+        "selection_rule": "同一成分快照按成交额前五 + 目标股去重",
+        "items": [{"code": codes[0], "name": "成员0", "amount": 1000000.0,
+                   "change_pct": 1.0, "is_target": True}],
+        "target_in_amount_top5": None, "target_change_pct_rank": None,
+        "amount_unit": "元", "amount_provenance": mixed_prov,
+        "snapshot_rows": 22, "rankable_rows": 21, "sample_size": 1,
+        "source": "东财 F10 板块完整成员（身份验证同一集合）",
+        "quotes_as_of": mixed_note, "gaps": [],
+    }
+    SectorPeersBlock.model_validate(peers_payload)  # 混源 ≤240 不再 500
+
+
+def test_tencent_no_retry_single_wire_per_chunk(monkeypatch):
+    """root 反例：ConnectionError 后出现第二次同 URL 请求（新增重试）。
+
+    每块仅一次尝试；失败块隔离（该块成员交既有逐股 fallback），无重复
+    出站。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body)
+    send_log = []
+
+    def conn_fail_then_decline(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            send_log.append(prepared.url)
+            raise requests.ConnectionError("synthetic connection error")
+        code = "000799"
+        member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 8.0, "f86": float(datetime(
+                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f170": 0.0}})
+
+    monkeypatch.setattr(requests.Session, "send", conn_fail_then_decline)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    single = pd.DataFrame({"代码": ["000799"], "名称": ["酒鬼酒"]})
+    batch = _collect_member_quotes(
+        single, budget=ReportBudget(30), session_ctx=_tencent_after_close_ctx())
+    assert len([u for u in send_log if "qt.gtimg.cn" in u]) == 1  # 无重试
+    assert float(batch.df["成交额"].iloc[0]) == 8.0  # 既有逐股 fallback 补齐
+
+
+def test_tencent_b_gap_no_availability_claim_when_batch_failed(monkeypatch):
+    """root 反例：批量失败时 B 股缺口仍宣称「行情可得」。
+
+    批次失败/名称不符未观察到 B 行时，B 缺口只说币种未证/成员保留，
+    不发明可用性。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body)
+
+    def fail_send(self, prepared, **kwargs):  # noqa: ANN001
+        raise requests.ConnectionError("批量不可用")
+
+    monkeypatch.setattr(requests.Session, "send", fail_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(30), session_ctx=_tencent_after_close_ctx())
+    b_gap = next((g for g in batch.gaps if "200596" in g), None)
+    assert b_gap is not None
+    assert "币种可比性未证实" in b_gap
+    assert "行情可得" not in b_gap
+
+
+# ---------------------------------------------------------------------------
+# final-three-fixes：预算终态单一所有权 / 金额边界 / no-auth wire fixture
+# ---------------------------------------------------------------------------
+
+def test_budget_terminal_36_early_missing_single_summary(monkeypatch):
+    """root 反例：36 成员首块 34 只（首名缺失）、块 2 预算耗尽 → 单一预算
+    终态汇总（不重入逐股 fallback、不出第二份汇总），34 只已成功保留。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    # 去掉首名 000799 行 → 19 只腾讯可采 + 1 B；再补 16 只占位成员 = 36
+    others = segments[1:]
+    extra_codes = [f"605{i:03d}" for i in range(17)]  # 605000+ 合法沪代码
+    extra_rows = []
+    for i, code in enumerate(extra_codes):
+        f = segments[2].split('"')[1].split("~")
+        f[1], f[2], f[35] = f"占位{i}", code, f"1/{i + 1}/{900000 + i}"
+        extra_rows.append(f'v_sh{code}="{"~".join(f)}"')
+    mutated = ";".join(others + extra_rows) + ";"
+    codes_all = [seg.split('"')[1].split("~")[2] for seg in others + extra_rows]
+    names_all = [seg.split('"')[1].split("~")[1] for seg in others + extra_rows]
+    df = pd.DataFrame({"代码": codes_all, "名称": names_all})
+    # 块 1 即时成功；块 2 慢响应跨过截止（确定性预算终态）；首名缺失
+    budget = ReportBudget(0.5)
+
+    import time as _t
+
+    qt_calls2 = {"n": 0}
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls2["n"] += 1
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            if qt_calls2["n"] >= 2:
+                _t.sleep(1.0)  # 块 2 等待跨过剩余预算（确定性终态）
+            return resp
+        from urllib.parse import urlparse, parse_qs
+
+        code = parse_qs(urlparse(prepared.url).query).get(
+            "secid", [""])[0].partition(".")[2]
+        member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+        return _wire_response({"data": {"f57": code, "f58": member_name,
+                                        "f48": 10.0, "f86": float(datetime(
+                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f170": 0.1}})
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 36  # 分母不变
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1  # 单一预算终态汇总
+    assert summaries[0].startswith("同业行情：取数预算耗尽")
+    assert qt_calls2["n"] == 2  # 两块确实到达
+    # 末名 60516 缺失（wire 无此行）→ 预算已过 → 预算未获取（未知保留）；
+    # 其余 34 只（含 1 B 币种未证 = None）在原始位置保留，分母 36 恒等
+    last_row = batch.df.iloc[35]
+    assert pd.isna(last_row["成交额"]) or last_row["成交额"] is None
+    first_row = batch.df.iloc[0]
+    assert float(first_row["成交额"]) == 49720032.0  # 首行已成功保留
+    assert batch.tencent_count == 34
+    known_rows = batch.df["成交额"].notna().sum()
+    assert known_rows == 34
+
+
+def test_budget_terminal_71_three_blocks_all_covered(monkeypatch):
+    """root 反例：71 成员 = 35 成功 + 35 超时 + 第 3 块 1 只未请求 →
+    全部剩余位置预算未获取、单一汇总、无第三次出站。"""
+    from src.services import sector_analysis_service as svc
+
+    body35 = _load_tencent_body("BK0739")
+    df35 = _tencent_members_df(body35)
+    codes36 = [f"60{400 + i:03d}" for i in range(35)]
+    df36 = pd.DataFrame({"代码": codes36, "名称": [f"占位{i}" for i in range(35)]})
+    df = pd.concat([df35, df36, pd.DataFrame({"代码": ["600519"],
+                                              "名称": ["贵州茅台"]})],
+                   ignore_index=True)
+    assert len(df) == 71
+    budget = ReportBudget(0.5)
+    qt_calls3 = {"n": 0}
+
+    def slow_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls3["n"] += 1
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            if qt_calls3["n"] == 1:
+                resp._content = body35.encode("gbk")
+            else:
+                _t.sleep(1.0)  # 第二块等待跨过截止
+                resp._content = body35.encode("gbk")
+            return resp
+        raise AssertionError("预算截止后不得再出站逐股补采")
+
+    import time as _t
+
+    monkeypatch.setattr(requests.Session, "send", slow_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 71  # 分母精确
+    assert batch.tencent_count == 35  # 首块成功保留
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1
+    assert "预算未获取 36 只" in summaries[0]  # 35 超时 + 1 未请求全覆盖
+    assert qt_calls3["n"] == 2  # 第三块从未出站
+
+
+def test_budget_fallback_exhaustion_single_terminal(monkeypatch):
+    """首块全失败 + 逐股 fallback 中预算耗尽：单一终态、无第二份汇总、
+    无假 0 成功（root 反例：batch summary 后 fallback 重入再发一份）。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK1277")
+    df = _tencent_members_df(body).iloc[:3].copy()
+    budget = ReportBudget(0.4)
+
+    def fail_all(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            raise requests.ConnectionError("批量不可用")
+        import time as _t
+
+        _t.sleep(0.3)  # 逐股阶段跨过截止
+        raise requests.ConnectionError("逐股不可用")
+
+    monkeypatch.setattr(requests.Session, "send", fail_all)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 3
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1  # 单一终态（无 batch+fallback 双汇总）
+    assert "已采成功 0 只" in summaries[0]  # 无假 0 成功反例（实为全未知）
+    known = batch.df["成交额"].notna().sum()
+    assert known == 0
+
+
+# ---------------------------------------------------------------------------
+# CI 隔离 fixture（root ci-auth-isolation 最小方案）：本模块 wire 测试默认
+# budget-only/无 auth 模式，自动恢复原全局态；保留真实 worker/request_
+# deadline/Session 路由与全部风险断言，不改共享/runtime auth 默认。
+# ---------------------------------------------------------------------------
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _wire_tests_no_auth(monkeypatch):
+    """本模块 wire 回归默认 budget-only/无 auth wire 模式。
+
+    根因（ci-auth-isolation/root-review-report.md）：先前任何测试调用
+    ``eastmoney_patch()`` 会遗留全局 ``_auth_patch_enabled=True``，使本模块
+    的 wire 断言遭遇额外匿名 NID flow 出站而失败。此 fixture 仅对本模块
+    的用例显式置 ``em._auth_patch_enabled=False``（monkeypatch 自动恢复），
+    不改共享 auth 默认/runtime；auth 专属测试仍显式置 True 并验证恢复。
+    """
+    import src.patches.eastmoney_patch as _em
+
+    monkeypatch.setattr(_em, "_auth_patch_enabled", False)
+    yield
+
+
+# ---------------------------------------------------------------------------
+# remaining-two-contracts：金额 Decimal 算术下溢双符号 / 批量预算终态零重入
+# ---------------------------------------------------------------------------
+
+def test_tencent_wan_arithmetic_underflow_both_signs():
+    """root 反例：±极小 wan 的 Decimal 乘法算术下溢为 ±0E-x → 金额未知。
+
+    非 zero raw wan 换算为 0 = 算术下溢（不发明合法 known0、不因 ±0E-x
+    ≥ 0 比较而通过）；真实 raw 0 保留 known0；正常/溢出对照不变。"""
+    from src.services.sector_analysis_service import (
+        _parse_tencent_amount_decimal as P,
+    )
+
+    def F(exact, wan):
+        f = [""] * 38
+        f[35] = exact
+        f[37] = wan
+        return f
+
+    # 反例双符号：±极小 wan 算术下溢 → 金额未知（known=False, source=None）
+    assert P(F("", "1e-1000100")) == (None, False, None)
+    assert P(F("", "-1e-1000100")) == (None, False, None)
+    assert P(F("", "1e-999999999")) == (None, False, None)
+    assert P(F("1/1/1e-999999", "1e-999999")) == (None, False, None)
+    # 真实 raw 0 = 已知 0（source rounded37）
+    amount, known, source = P(F("", "0"))
+    assert known is True and amount == 0 and source == "rounded37"
+    # 对照：正常 rounded37 / 溢出 / 负值不变
+    assert P(F("", "123.45")) == (Decimal("1234500.00"), True, "rounded37")
+    assert P(F("", "1e999999")) == (None, False, None)
+    assert P(F("", "-5")) == (None, False, None)
+
+
+def test_tencent_exact_zero_representable_paths():
+    """exact35 下溢/溢出/真实 0 对照（raw Decimal 直接外投射）。"""
+    from src.services.sector_analysis_service import (
+        _parse_tencent_amount_decimal as P,
+    )
+
+    def F(exact, wan):
+        f = [""] * 38
+        f[35] = exact
+        f[37] = wan
+        return f
+
+    assert P(F("1/1/1e-999999", "1")) == (None, False, None)
+    assert P(F("1/1/1e999999", "1")) == (None, False, None)
+    amount, known, source = P(F("0/0/0", "0"))
+    assert known is True and amount == 0 and source == "exact35"
+
+
+def test_batch_budget_terminal_skips_fallback_entirely(monkeypatch):
+    """root SPEC 反例（sys.setprofile 实证）：批量预算终态后仍进入
+    _fetch_member_quote 一次（expired=True）。
+
+    契约：批量预算中断后整体跳过逐股 fallback——零 _fetch_member_quote
+    调用、全部剩余位置未知、单一汇总；成功位（含后置位置）保留。"""
+    from src.services import sector_analysis_service as svc
+
+    fallback_calls = {"n": 0}
+    real_fallback = svc._fetch_member_quote
+
+    def counting_fallback(code, name, *, budget, now=None,
+                          session_ctx=None, received_at=None):  # noqa: ANN001
+        fallback_calls["n"] += 1
+        return real_fallback(code, name, budget=budget, now=now,
+                             session_ctx=session_ctx, received_at=received_at)
+
+    # 36 成员：块 1 wire 缺首名 000799（34 只有效非 B 成功），块 2 超时
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    wire_rows = segments[1:]  # 响应缺首名 000799
+    others = wire_rows
+    missing_code = segments[0].split('"')[1].split("~")[2]  # 000799
+    missing_name = segments[0].split('"')[1].split("~")[1]
+    # 36 成员 = 首名缺失 1 + 块1有效非B 18 + B 1 + 补位 16
+    extra_codes = [f"605{i:03d}" for i in range(16)]
+    extra_rows = []
+    for i, code in enumerate(extra_codes):
+        f = segments[2].split('"')[1].split("~")
+        f[1], f[2], f[35] = f"占位{i}", code, f"1/{i + 1}/{900000 + i}"
+        extra_rows.append(f'v_sh{code}="{"~".join(f)}"')
+    mutated = ";".join(others + extra_rows) + ";"
+    # 请求 df = 完整 36 成员（含首名 000799）；响应 wire 缺首名
+    codes_all = [missing_code] + [
+        seg.split('"')[1].split("~")[2] for seg in others + extra_rows]
+    names_all = [missing_name] + [
+        seg.split('"')[1].split("~")[1] for seg in others + extra_rows]
+    df = pd.DataFrame({"代码": codes_all, "名称": names_all})
+    budget = ReportBudget(0.5)
+    qt_calls = {"n": 0}
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls["n"] += 1
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            if qt_calls["n"] == 1:
+                resp._content = mutated.encode("gbk")
+            else:
+                import time as _t
+
+                _t.sleep(1.0)  # 块 2 等待跨过截止
+                resp._content = mutated.encode("gbk")
+            return resp
+        raise AssertionError("预算终态后不得出站逐股补采")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    monkeypatch.setattr(svc, "_fetch_member_quote", counting_fallback)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 36  # 分母不变（1 缺失 + 33 块1已采 + 1 B + 1 块2）
+    # 块边界 35/1：605015 落块 2（预算中断→未知），非 B 已采 = 33
+    assert batch.tencent_count == 33
+    assert fallback_calls["n"] == 0  # **零 fallback 重入**（root 反例：1 次）
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1  # 单一终态汇总
+    assert qt_calls["n"] == 2
+    # 成功位保留（任意位置），缺失位（首名 000799）未知
+    row0 = batch.df[batch.df["代码"] == "600197"].iloc[0]
+    assert float(row0["成交额"]) > 0
+    missing_row = batch.df[batch.df["代码"] == "000799"].iloc[0]
+    assert pd.isna(missing_row["成交额"]) or missing_row["成交额"] is None
+    unknown_rows = batch.df["成交额"].isna().sum()  # B 1 + 首名缺失 1 + 块2 1 = 3
+    assert unknown_rows == 3
+
+
+def test_budget_71_members_third_block_never_wired(monkeypatch):
+    """root 反例：71 成员 = 35 成功 + 35 超时 + 第 3 块 1 只未请求 →
+    零 fallback 重入、第 3 块零出站、36 只预算未获取全覆盖。"""
+    from src.services import sector_analysis_service as svc
+
+    body35 = _load_tencent_body("BK0739")
+    df35 = _tencent_members_df(body35)
+    codes36 = [f"607{i:03d}" for i in range(35)]
+    df36 = pd.DataFrame({"代码": codes36, "名称": [f"占位{i}" for i in range(35)]})
+    df = pd.concat([df35, df36, pd.DataFrame({"代码": ["600519"],
+                                              "名称": ["贵州茅台"]})],
+                   ignore_index=True)
+    assert len(df) == 71
+    budget = ReportBudget(0.5)
+    qt_calls = {"n": 0}
+    fallback_calls = {"n": 0}
+    real_fallback = svc._fetch_member_quote
+
+    def counting_fallback(code, name, *, budget, now=None,
+                          session_ctx=None, received_at=None):  # noqa: ANN001
+        fallback_calls["n"] += 1
+        return real_fallback(code, name, budget=budget, now=now,
+                             session_ctx=session_ctx, received_at=received_at)
+
+    def slow_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            qt_calls["n"] += 1
+            import time as _t
+
+            if qt_calls["n"] >= 2:
+                _t.sleep(1.0)  # 块 2 等待跨过截止；块 3 从未出站
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = body35.encode("gbk")
+            return resp
+        raise AssertionError("预算终态后不得出站逐股补采")
+
+    monkeypatch.setattr(requests.Session, "send", slow_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    monkeypatch.setattr(svc, "_fetch_member_quote", counting_fallback)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 71  # 分母精确
+    assert batch.tencent_count == 35  # 首块成功保留
+    assert qt_calls["n"] == 2  # 第三块从未出站
+    assert fallback_calls["n"] == 0  # 零 fallback 重入
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1
+    assert "预算未获取 36 只" in summaries[0]  # 35 超时 + 1 未请求全覆盖
+
+
+def test_fallback_stage_exhaustion_single_summary(monkeypatch):
+    """逐股阶段预算耗尽（批量正常）：一次终态汇总、成功位保留、剩余未知；
+    汇总角色计数与 B/缺额排除语义一致（不虚称三类覆盖分母）。"""
+    from src.services import sector_analysis_service as svc
+
+    codes = [f"609{i:03d}" for i in range(3)] + ["200596"]
+    df = pd.DataFrame({"代码": codes,
+                       "名称": [f"成员{c}" for c in codes]})
+    budget = ReportBudget(0.4)
+
+    def fail_all(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            raise requests.ConnectionError("批量不可用")
+        import time as _t
+
+        _t.sleep(0.3)
+        raise requests.ConnectionError("逐股不可用")
+
+    monkeypatch.setattr(requests.Session, "send", fail_all)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 4
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1
+    # 汇总如实披露 B 币种排除（分母≠三类简单相加时可见）
+    assert any("B 股成员" in g for g in batch.gaps)
+    known = batch.df["成交额"].notna().sum()
+    assert known == 0
+
+
+def test_mixed_batch_terminal_summary_wording(monkeypatch):
+    """汇总措辞：B/缺额排除单独可见时，三类计数不虚称覆盖分母。"""
+    from src.services import sector_analysis_service as svc
+
+    # 36 成员：块 1 缺首名+1 只缺额行（f35 畸形），块 2 超时
+    body = _load_tencent_body("BK1277")
+    segments = [seg for seg in body.split(";") if seg.strip()]
+    wire_rows = segments[1:]
+    # 第二行 f35 畸形（金额未知，需逐股补采但预算终态 → 未知）
+    bad = wire_rows[0].replace(
+        wire_rows[0].split('"')[1].split("~")[35], "1/x", 1)
+    wire_rows = [bad] + wire_rows[1:]
+    extra_codes = [f"605{i:03d}" for i in range(17)]
+    extra_rows = []
+    for i, code in enumerate(extra_codes):
+        f = segments[2].split('"')[1].split("~")
+        f[1], f[2], f[35] = f"占位{i}", code, f"1/{i + 1}/{900000 + i}"
+        extra_rows.append(f'v_sh{code}="{"~".join(f)}"')
+    mutated = ";".join(wire_rows + extra_rows) + ";"
+    codes_all = [seg.split('"')[1].split("~")[2] for seg in wire_rows
+                 + extra_rows]
+    names_all = [seg.split('"')[1].split("~")[1] for seg in wire_rows
+                 + extra_rows]
+    df = pd.DataFrame({"代码": codes_all, "名称": names_all})
+    budget = ReportBudget(0.001)  # 块 1 后即耗尽（确定性批量终态）
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            return resp
+        raise AssertionError("预算终态后不得出站")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=budget, session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 36
+    summaries = [g for g in batch.gaps if "预算耗尽" in g]
+    assert len(summaries) == 1
+    # B 币种排除单独可见：汇总三类计数不虚称覆盖全分母（36 - 1 B = 35）
+    assert any("B 股成员" in g and "币种可比性未证实" in g for g in batch.gaps)
+    known = batch.df["成交额"].notna().sum()
+    assert known == 0  # 预算终态：零出站、全部未知

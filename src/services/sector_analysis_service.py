@@ -49,6 +49,7 @@ from src.schemas.sector_vendor import (
     F10BoardResponse,
     F10BoardRow,
     MemberQuote,
+    TencentMemberRow,
     Trends2Response,
 )
 
@@ -620,6 +621,51 @@ def _received_at_now() -> datetime:
     """当前响应实际接收时刻（市场本地 naive；每次响应各自取钟，不用批次
     开始时刻冒充后续响应的接收时刻）。"""
     return get_market_now("cn").replace(tzinfo=None)
+
+
+def _http_get_text(url: str, params: Dict[str, Any], *,
+                   budget: ReportBudget, encoding: str = "utf-8",
+                   timeout: float = 6.0,
+                   ) -> Optional[str]:
+    """受同一预算与执行器约束的公开行情文本 GET（腾讯批量行情专用）。
+
+    与 :func:`_http_get_json` 同一预算/接收钟/异常分层纪律：worker 内
+    ``eastmoney_patch(budget_only=True)`` + request_deadline 绑定（finally
+    恢复）；requests 网络/HTTP 状态异常 → None（调用方记缺口）；程序异常
+    原样传播。腾讯响应为 GBK JavaScript 赋值文本（非 JSON），故独立返回
+    解码后文本。**单次尝试零重试**：每块仅一次终端请求，失败交既有
+    选择性补缺——不新增请求消耗。
+    """
+    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+
+    def _call() -> Any:
+        eastmoney_patch(budget_only=True)
+        token = request_deadline.set(budget.fetch_deadline)
+        try:
+            with requests.Session() as session:
+                resp = session.get(url, params=params, timeout=timeout,
+                                   headers={"User-Agent": _HTTP_UA,
+                                            "Referer": "http://finance.qq.com"})
+                resp.raise_for_status()
+                resp.encoding = encoding
+                return resp.text
+        finally:
+            request_deadline.reset(token)
+
+    host = url.split("/")[2] if "//" in url else url
+    try:
+        data = cast(str, bounded_call(_call, budget=budget))
+    except BudgetExhausted:
+        raise
+    except requests.RequestException as exc:  # noqa: BLE001 - 网络/HTTP 状态按源错误
+        logger.warning("[SectorAnalysis] 公开行情文本 GET 失败 host=%s: %s",
+                       host, str(exc)[:100])
+        return None
+    if data is None:
+        logger.warning("[SectorAnalysis] 公开行情文本 GET 失败 host=%s: %s",
+                       host, "empty payload")
+        return None
+    return data
 
 
 def _vendor_epoch_naive_local(epoch: int) -> Optional[datetime]:
@@ -2325,8 +2371,9 @@ class MemberQuoteBatch:
     """成员行情逐股采集批次（F10 成员集合无 clist 成交额列时填充）。
 
     ``amounts_known``：全体成员均有**已知**成交额（有报价且 f48 非 None）——
-    这是全体 top5 资格可判定的唯一依据；任一成员缺报价/缺额 → False，
-    ``target_in_amount_top5`` 必须为 None（缺报价成员资格未知，零与 None 分开）。
+    这是全体 top5 资格可判定的唯一依据；任一成员缺报价/缺额/币种未证实
+    （B 股成员保留但金额未知）→ False，``target_in_amount_top5`` 必须为
+    None（缺报价成员资格未知，零与 None 分开）。
     """
 
     df: pd.DataFrame
@@ -2335,48 +2382,347 @@ class MemberQuoteBatch:
     ts_max: Optional[float] = None
     stockget_count: int = 0
     trends2_count: int = 0
+    tencent_count: int = 0
+    tencent_exact_count: int = 0
+    tencent_wan_count: int = 0
     failed_count: int = 0
     amounts_known: bool = False
     trends2_as_of: Optional[str] = None
+    tencent_as_of: Optional[str] = None
+    currency_unknown_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# 腾讯公开行情批量补采（F10 成员行情专用；共享 akshare_fetcher 的既有
+# 端点/symbol/金额字段约定原样复用，不改共享模块/路由/熔断/默认）。
+# 生产实证（2026-11-07 04:37+08 生产出口，root 只读控制）：BK1277 精确 20
+# 符号 200/20 行 0.11s、BK0739 精确 35 符号（含 7 个 bj920）200/35 行 0.054s
+# ——分块上限按实测 35 收敛，不凭猜测扩大。
+# ---------------------------------------------------------------------------
+
+_TENCENT_REALTIME_QUOTE_URL = "http://qt.gtimg.cn/q"
+_TENCENT_BATCH_CHUNK = 35  # 生产实测单批上限（BK0739 35 符号 200 全行）
+_TENCENT_MEMBER_FIELDS_MIN = 38  # 覆盖 f30 时点 / f32 涨跌幅 / f35 金额 / f37 兜底
+_TENCENT_PROVIDER_TIME_FMT = "%Y%m%d%H%M%S"
+_TENCENT_AMOUNT_WAN = Decimal("10000")
+_TENCENT_SYMBOL_RE = re.compile(r'v_([a-z]{2}\d{6})="([^"]*)"')
+_UNCERTAIN_CURRENCY_PREFIXES = ("200", "900")  # 深/沪 B 股：币种可比性未证实
+
+
+def _is_uncertain_currency_code(code: str) -> bool:
+    """B 股成员（深 200xxx/沪 900xxx）：**币种可比性未证实**。
+
+    成员资格保留、金额未知——不并入 CNY 活跃排名、不据此判定全体完整，
+    也不让后续逐股 fallback 重引入未证币种金额（生产实证 BK1277 含
+    200596.SZ 古井贡Ｂ）。
+    """
+    return code.startswith(_UNCERTAIN_CURRENCY_PREFIXES)
+
+
+def _parse_tencent_amount_decimal(
+    fields: List[str],
+) -> Tuple[Optional[Decimal], bool, Optional[str]]:
+    """腾讯行金额解析归一边界（Decimal 算术 + 外投射统一错误边界）。
+
+    返回 (金额, 是否已知, 来源)：``exact35``=字段35 三元组第三段**精确
+    金额（元）**优先；``rounded37``=字段37 万元口 ×10000（仅精确金额
+    **缺值**时的兜底口径，Decimal 换算）。仅捕**供应商数值解析/Decimal
+    算术/换算**错误（InvalidOperation/Overflow/Underflow 类）与外投射
+    有限性失败——非零金额不可向外表示（含正下溢为 0）= 金额未知；
+    **真实来源 0 保留为已知 0**；字段 35 存在但畸形/负值属真实坏值——
+    不回退字段37、不补 0 冒充。无关 TypeError/AssertionError 原样传播，
+    不做宽程序捕获。
+    """
+    exact = fields[35] if len(fields) > 35 else ""
+    if exact:
+        parts = exact.split("/")
+        if len(parts) >= 3 and parts[2]:
+            try:
+                value = Decimal(parts[2])
+                if value.is_finite() and value >= 0:
+                    outward = float(value)
+                    # 外投射三查：有限、非零 Decimal 不下溢为 0.0
+                    if (math.isfinite(outward)
+                            and not (outward == 0.0 and value > 0)):
+                        return value, True, "exact35"
+                # 非负但不可外投射（溢出/正下溢为 0）= 金额未知
+                return None, False, None
+            except (ArithmeticError, ValueError):
+                return None, False, None
+            # 不可达：仅算术/值错误归本边界
+        return None, False, None  # 存在但非三元组：真实畸形，不回退兜底
+    fallback_wan = fields[37] if len(fields) > 37 else ""
+    if fallback_wan:
+        # 原始 wan 先资格限定（finite/非负/零与正分开），**再**算术：
+        # Decimal 乘法对极小 ±wan 会算术下溢为 ±0E-x（如 ±1e-1000100
+        # ×10000 → ±0E-1000026）、对极大 wan 会溢出——仅捕供应商数值
+        # 类（ArithmeticError/ValueError），金额未知；真实 raw 0 保留为
+        # 已知 0；非零 wan 换算后必须仍 > 0 且可外表示为非零有限 float
+        try:
+            wan = Decimal(fallback_wan)
+        except (ArithmeticError, ValueError):
+            return None, False, None
+        if not wan.is_finite():
+            return None, False, None
+        if wan < 0:
+            return None, False, None  # 负值：真实坏值（含负下溢 ±0E-x 前拒绝）
+        if wan == 0:
+            return Decimal("0"), True, "rounded37"  # 真实 raw 0 = 已知 0
+        try:
+            converted = wan * _TENCENT_AMOUNT_WAN
+        except (ArithmeticError, ValueError):
+            return None, False, None
+        if converted.is_finite() and converted > 0:
+            outward = float(converted)
+            if math.isfinite(outward) and outward > 0:
+                return converted, True, "rounded37"
+        # 溢出不可表示 / 算术下溢为 0 = 金额未知
+        return None, False, None
+    return None, False, None  # 两者皆缺值：金额未知（缺失语义）
+
+
+def _parse_tencent_member_body(
+    text: str, chunk_allowlist: Dict[str, Tuple[str, str]],
+) -> Tuple[List["TencentMemberRow"], List[str], List[str]]:
+    """腾讯 GBK 批量响应体解析（严格 typed wire 边界）。
+
+    ``chunk_allowlist`` 是**本分块实际请求的符号集**（非全量成员表）：
+    未请求符号不得暗示本块覆盖。行归一经 :class:`TencentMemberRow`
+    strict/frozen 模型（消费字段边界 + 可表示性：如 f32=``1e999`` Decimal
+    有限但 float 溢出 → 源错误行不采用）；重复 symbol 同键交给上层按
+    code 冲突组统一失效（本层不采信首行）。供应商供应时点/金额来源
+    （exact35/rounded37）随记录携带。程序异常原样传播。
+    """
+    from src.schemas.sector_vendor import TencentMemberRow
+
+    rows: List[TencentMemberRow] = []
+    anomalies: List[str] = []
+    unsolicited_symbols: List[str] = []
+    raw_symbol_amounts: Dict[str, List[str]] = {}
+    raw_symbol_counts: Dict[str, int] = {}
+    raw_duplicated: set = set()
+    for match in _TENCENT_SYMBOL_RE.finditer(text or ""):
+        symbol, body = match.group(1), match.group(2)
+        fields = body.split("~")
+        expected = chunk_allowlist.get(symbol)
+        if expected is None:
+            unsolicited_symbols.append(symbol)
+            continue
+        # raw 重复计数在资格过滤**之前**（第二行即便资格不过也不能证明
+        # 首行无歧义——冲突组由上层统一失效）
+        if symbol in raw_symbol_counts:
+            raw_duplicated.add(symbol)
+        raw_symbol_counts[symbol] = raw_symbol_counts.get(symbol, 0) + 1
+        raw_symbol_amounts.setdefault(symbol, [])
+        try:
+            raw_symbol_amounts[symbol].append(
+                fields[35].split("/")[-1] if fields[35] else f"wan:{fields[37]}")
+        except (IndexError, AttributeError):
+            pass
+        code, name = expected
+        if len(fields) < _TENCENT_MEMBER_FIELDS_MIN:
+            anomalies.append(
+                f"{symbol} 字段数 {len(fields)} 不足，行不采用")
+            continue
+        if fields[2] != code:
+            anomalies.append(
+                f"{symbol} 代码不符：请求 {code} 实际 {fields[2]}，行不采用")
+            continue
+        if fields[1] != name:
+            anomalies.append(
+                f"{symbol} 名称不符：请求「{name}」实际「{fields[1]}」，行不采用")
+            continue
+        try:
+            provider_time = datetime.strptime(
+                fields[30], _TENCENT_PROVIDER_TIME_FMT)
+        except ValueError:
+            anomalies.append(
+                f"{symbol} 供应商时点畸形（{fields[30][:16]}），行不采用")
+            continue
+        change_raw = fields[32] if len(fields) > 32 else ""
+        change: Optional[float] = None
+        if change_raw:
+            try:
+                change_value = Decimal(change_raw)
+            except (ArithmeticError, ValueError):
+                change_value = None
+            if (change_value is not None and change_value.is_finite()
+                    and -float("inf") < float(change_value) < float("inf")):
+                change = float(change_value)
+            else:
+                anomalies.append(
+                    f"{symbol} 涨跌幅不可表示（{change_raw[:16]}），涨跌幅未知")
+        amount, amount_known, amount_source = (
+            _parse_tencent_amount_decimal(fields))
+        try:
+            rows.append(TencentMemberRow.model_validate({
+                "symbol": symbol, "code": code, "name": name,
+                "provider_time": provider_time, "change_pct": change,
+                "amount": amount, "amount_known": amount_known,
+                "amount_source": amount_source,
+            }))
+        except ValidationError as exc:
+            anomalies.append(
+                f"{symbol} 行消费字段校验失败（源错误）：{str(exc)[:80]}")
+    # raw 重复符号在资格过滤**之前**记录（含各行金额披露）：同 symbol
+    # 第二行（即便名称/时点/金额资格不过）不能证明首行无歧义——冲突组
+    # 由上层统一失效
+    for sym, n in raw_symbol_counts.items():
+        if n > 1 and sym in chunk_allowlist:
+            amounts = "、".join(raw_symbol_amounts.get(sym, [])[:4])
+            anomalies.append(
+                f"{sym} raw 重复 {n} 行（金额 {amounts}）：整组失效，"
+                "不采信任一行")
+    if unsolicited_symbols:
+        sample = ", ".join(unsolicited_symbols[:3])
+        more = f" 等{len(unsolicited_symbols)}个" if len(unsolicited_symbols) > 3 else ""
+        anomalies.append(
+            f"返回未请求符号 {sample}{more}（忽略，不暗示本块覆盖）")
+    return rows, anomalies, sorted(raw_duplicated)
+
+
+def _fetch_tencent_member_quotes(
+    df: pd.DataFrame, *, budget: ReportBudget, session_ctx: SessionContext,
+) -> Dict[str, Any]:
+    """腾讯公开行情批量补采（精确 F10 成员集合，分块 ≤35 符号，同一预算）。
+
+    整组契约（root tencent 复审收敛）：
+    - **每块仅尝试一次**（无重试）；接收钟在本块 HTTP 完成后取得；
+    - **逐块 allowlist**：每块响应按该块实际请求符号集校验——其它块的
+      成员即使返回也不暗示本块覆盖；
+    - **部分存活**：某块 HTTP 失败/空响应只隔离该块（该块成员记为未
+      取得），已成功块的合格行保留；预算中断保留已成功行并如实记录
+      未尝试成员（collect 据此不再出站、不迟到采纳）；
+    - **冲突组失效**：同 code（含跨块/重复符号）多行 → 该组全部不采纳
+      （不采信任一行），成员保留并走既有逐股 fallback（仅实际缺口）；
+    - 行级会话时点资格与既有来源同一规则（会话日一致、不早于开盘/
+      已完结时不早于收盘、不晚于接收）。
+    程序异常原样传播；不伪造完整覆盖。
+    """
+    from data_provider.akshare_fetcher import _to_sina_tx_symbol
+
+    requested: Dict[str, Tuple[str, str]] = {}
+    order: List[str] = []
+    for i in range(len(df)):
+        row = df.iloc[i]
+        code = str(row["代码"])
+        name = str(row["名称"])
+        symbol = _to_sina_tx_symbol(code)
+        if symbol not in requested:
+            requested[symbol] = (code, name)
+            order.append(symbol)
+    rows_by_code: Dict[str, List[TencentMemberRow]] = {}
+    anomalies: List[str] = []
+    received_max: Optional[datetime] = None
+    budget_interrupted = False
+    untried_symbols: List[str] = []
+    failed_symbols: List[str] = []
+    raw_duplicated_symbols: set[str] = set()
+    for chunk_start in range(0, len(order), _TENCENT_BATCH_CHUNK):
+        chunk = order[chunk_start:chunk_start + _TENCENT_BATCH_CHUNK]
+        chunk_allowlist = {s: requested[s] for s in chunk}
+        try:
+            text = _http_get_text(_TENCENT_REALTIME_QUOTE_URL,
+                                  {"q": ",".join(chunk)}, budget=budget,
+                                  encoding="gbk")
+        except BudgetExhausted:
+            budget_interrupted = True
+            untried_symbols.extend(chunk)
+            break  # 截止后零出站；已成功块保留
+        if text is None or not text.strip():
+            failed_symbols.extend(chunk)
+            anomalies.append(
+                f"分块 HTTP 失败/空响应（{len(chunk)} 符号未取得，"
+                "交由既有逐股 fallback 或如实未知）")
+            continue  # 块失败隔离：已成功块保留，后续块照常
+        received = _received_at_now()  # 本块 HTTP 完成后取接收钟
+        received_max = (received if received_max is None
+                        else max(received_max, received))
+        rows, chunk_anomalies, raw_dup_symbols = (
+            _parse_tencent_member_body(text, chunk_allowlist))
+        anomalies.extend(chunk_anomalies)
+        raw_duplicated_symbols.update(raw_dup_symbols)
+        session_finished = received >= session_ctx.session_close
+        lower = (session_ctx.session_close if session_finished
+                 else session_ctx.session_open)
+        for row in rows:
+            provider_time = row.provider_time
+            if (provider_time.date() != session_ctx.session_date
+                    or not (lower <= provider_time <= received)):
+                anomalies.append(
+                    f"{row.symbol} 供应商时点 {provider_time.isoformat()} "
+                    f"不具会话 {session_ctx.session_date.isoformat()} 当日可比资格"
+                    f"（窗口 [{lower.isoformat()}, {received.isoformat()}]），行不采用")
+                continue
+            rows_by_code.setdefault(row.code, []).append(row)
+    # 冲突组失效：同 code 多行（跨块/重复符号）或 raw 同 symbol 重复
+    # （第二行即便资格不过也不能证明首行无歧义）→ 全组不采信任一行
+    conflicted = {row.code for code, group in rows_by_code.items()
+                  if len(group) > 1 for row in group}
+    for sym in raw_duplicated_symbols:
+        if sym in requested:
+            conflicted.add(requested[sym][0])
+    accepted: Dict[str, TencentMemberRow] = {}
+    conflict_codes: List[str] = []
+    for code in sorted({row.code for group in rows_by_code.values()
+                        for row in group}):
+        if code in conflicted:
+            anomalies.append(
+                f"{code} 冲突组失效（raw 重复/同键多值）：不采信任一行，"
+                "成员保留、金额/涨跌幅未知")
+            conflict_codes.append(code)
+            continue
+        group = rows_by_code[code]
+        accepted[code] = group[0]
+    return {"accepted": accepted, "anomalies": anomalies,
+            "received_max": received_max,
+            "budget_interrupted": budget_interrupted,
+            "untried_symbols": untried_symbols,
+            "failed_symbols": failed_symbols,
+            "conflict_codes": conflict_codes}
 
 
 def _f10_quote_provenance(batch: MemberQuoteBatch) -> str:
-    """F10 成员集合行情来源口径（逐来源计数，衍生值不冒充 f48 原样）。"""
-    parts: List[str] = [_F10_AMOUNT_PROVENANCE_PREFIX]
-    if batch.stockget_count and batch.trends2_count:
-        parts.append(
-            f"行情 {batch.stockget_count} 只为 stock/get f48 原样映射，"
-            f"{batch.trends2_count} 只经 trends2 {_DERIVED_MARKER}"
-            "（非原样字段，元级与 f48 同口径）")
-    elif batch.trends2_count:
-        parts.append(
-            f"行情全部 {batch.trends2_count} 只经 trends2 {_DERIVED_MARKER}"
-            "（非 f48 原样字段，元级同口径）")
-    elif batch.stockget_count:
-        parts.append("行情为 stock/get f48 原样映射（fltt=2）")
-    else:
+    """F10 成员集合行情来源口径（紧凑、真实来源/计数，≤240 严格 schema）。"""
+    parts: List[str] = ["成交额单位为元："]
+    segments: List[str] = []
+    if batch.tencent_count:
+        segments.append(
+            f"腾讯批量{batch.tencent_count}只(字段35精确{batch.tencent_exact_count}"
+            f"/字段37换算{batch.tencent_wan_count}只，非f48)")
+    if batch.stockget_count:
+        segments.append(f"stock/get {batch.stockget_count}只f48原样")
+    if batch.trends2_count:
+        segments.append(f"trends2 {batch.trends2_count}只{_DERIVED_MARKER}(非f48)")
+    if not segments:
         parts.append("成员行情未取得（成交额均缺失，不产金额排名）")
-    return "；".join(parts)[:240]
+    else:
+        parts.append("；".join(segments))
+    if batch.currency_unknown_count:
+        parts.append(
+            f"；B股{batch.currency_unknown_count}只币种未证金额未知(不并CNY排名)")
+    text = "".join(parts)
+    return text if len(text) <= 240 else text[:240]
 
 
 def _quote_as_of_note(batch: MemberQuoteBatch) -> Optional[str]:
-    """成员行情供应商时点说明（逐股采集如实披露，不冒称同一瞬间快照）。"""
+    """成员行情供应商时点说明（紧凑、≤240 严格 schema；不含值级诊断）。"""
     segs: List[str] = []
+    if batch.tencent_as_of:
+        segs.append(
+            f"腾讯批量{batch.tencent_count}只供应时点{batch.tencent_as_of}")
     if batch.trends2_as_of:
         segs.append(
-            f"trends2 补采 {batch.trends2_count} 只供应商分钟截至 "
-            f"{batch.trends2_as_of}")
+            f"trends2 {batch.trends2_count}只截至{batch.trends2_as_of}")
     if batch.ts_min is not None and batch.ts_max is not None:
         if batch.ts_min == batch.ts_max:
-            segs.append(
-                f"stock/get {batch.stockget_count} 只时间戳 "
-                f"{int(batch.ts_min)}（epoch 秒）")
+            segs.append(f"stock/get {batch.stockget_count}只@{int(batch.ts_min)}")
         else:
             segs.append(
-                f"stock/get {batch.stockget_count} 只时间戳范围 "
-                f"{int(batch.ts_min)}~{int(batch.ts_max)}"
-                "（epoch 秒，逐股采集非同一瞬间）")
-    return "；".join(segs)[:240] or None
+                f"stock/get {batch.stockget_count}只@{int(batch.ts_min)}~"
+                f"{int(batch.ts_max)}(逐股)")
+    text = "；".join(segs)
+    return text[:240] or None
 
 
 def _collect_member_quotes(df: pd.DataFrame, *, budget: ReportBudget,
@@ -2386,78 +2732,178 @@ def _collect_member_quotes(df: pd.DataFrame, *, budget: ReportBudget,
                            ) -> MemberQuoteBatch:
     """成员逐股行情快照（同一取数预算，顺序有界；不缩分母语义）。
 
-    **形状契约（root 反例：先失败后预算耗尽曾产出 3 值/2 行 ValueError）**：
-    每行无论成功/失败都推进 `processed` 位置；预算中断时只补
-    `total - processed` 个未尝试行——df 行数恒等于成员行数，已采成功/
-    采集失败/未尝试三类分别计数并全部进缺口。会话上下文在入口**单次锚定**
-    （now 只取一次，循环内不重复取钟），两路来源共用同一会话时点资格；
-    资格被拒/失败的行成员资格保留、金额 None（不冒充全体成交额分布）。
-    程序异常原样传播。
+    **形状契约**：按原始行位置物化全部已成功行（腾讯预填/逐股补采），
+    预算终态**单一所有权**——耗尽后一次性把全部剩余 pending/未获取位置
+    落为未知并只发一份终局汇总（不重入逐股 fallback、零出站、不发明
+    dispatch），df 行数恒等于成员行数；已采成功/采集失败/预算未获取三类
+    计数来自最终事实并全部进缺口。会话上下文单次锚定，两路来源共用同一
+    会话时点资格；资格被拒/失败的行成员资格保留、金额 None（不冒充全体
+    成交额分布）。程序异常原样传播。
     """
     ctx = session_ctx if session_ctx is not None else _session_context(now)
     gaps: List[str] = []
-    amount_col: List[Optional[float]] = []
-    change_col: List[Optional[float]] = []
     ts_min: Optional[float] = None
     ts_max: Optional[float] = None
     trends2_as_ofs: List[str] = []
+    tencent_times: List[datetime] = []
     fetched = 0
-    processed = 0
     total = len(df)
     stockget_count = 0
     trends2_count = 0
+    tencent_count = 0
+    tencent_exact_count = 0
+    tencent_wan_count = 0
     failed_count = 0
+    currency_unknown_count = 0
     interrupted = False
-    for i in range(total):
-        row = df.iloc[i]
-        member_code = str(row["代码"])
-        member_name = str(row["名称"])
+    # 腾讯公开行情批量预填（F10 成员集合路径；clist 快照路径不带成交额列
+    # 不会进入本函数）：在对每个成员连续重试两个不可用东财端点之前，先对
+    # 精确成员集合做一次有界批量补采（同一预算；分块 ≤ 实测 35 符号；接收
+    # 钟每分块 HTTP 完成后取得；行级会话时点资格与既有来源同一规则）。
+    # 腾讯公开行情批量预填（F10 成员集合路径；clist 快照路径带成交额列，
+    # 不进入本函数）：逐股重试不可用东财端点之前先做有界批量补采。整组
+    # 契约：每块一次、逐块 allowlist、部分存活（块失败隔离/预算中断保留
+    # 已成功）、raw 重复/同键冲突组失效、来源（exact35/rounded37）如实贯穿、
+    # **预算终态单一所有权**（见下 fallback 终局汇总）。
+    tencent_prefilled: Dict[int, TencentMemberRow] = {}  # 按 df 行位置预定位
+    tencent_anomalies: List[str] = []
+    budget_unacquired: set = set()  # 预算终态未出站/未取得成员（位置集）
+    batch_budget_interrupted = False
+    if ctx is not None and "成交额" not in df.columns:
         try:
-            snap = _fetch_member_quote(member_code, member_name,
-                                       budget=budget, now=now, session_ctx=ctx,
-                                       received_at=received_at)
+            tencent = _fetch_tencent_member_quotes(df, budget=budget,
+                                                   session_ctx=ctx)
         except BudgetExhausted:
-            untried = total - processed
-            gaps.append(
-                f"同业行情：取数预算耗尽，已采成功 {fetched} 只、采集失败 "
-                f"{failed_count} 只、未尝试 {untried} 只（成员资格保留，"
-                "缺失金额不参与成交额排名，不冒充全体分布）")
-            for _ in range(untried):
-                amount_col.append(None)
-                change_col.append(None)
-            interrupted = True
-            break
-        processed += 1
-        if snap is None:
-            failed_count += 1
-            gaps.append(
-                f"同业行情：{member_code}（{member_name}）快照失败或同键/会话"
-                "资格不符，金额/涨跌幅缺失（成员资格保留）")
-            amount_col.append(None)
-            change_col.append(None)
-            continue
-        fetched += 1
-        quote = snap.quote
-        amount_col.append(quote.f48)
-        change_col.append(quote.f170)
-        if quote.f48 is None:
-            gaps.append(
-                f"同业行情：{member_code}（{member_name}）成交额缺值，资格未知"
-                "（零与缺失分开，不补 0）")
-        if snap.source == "stock/get":
-            stockget_count += 1
-            if quote.f86 is not None:
-                ts_min = quote.f86 if ts_min is None else min(ts_min, quote.f86)
-                ts_max = quote.f86 if ts_max is None else max(ts_max, quote.f86)
-        else:
-            trends2_count += 1
-            if snap.vendor_as_of:
-                trends2_as_ofs.append(snap.vendor_as_of)
-    assert len(amount_col) == total and len(change_col) == total, (
+            # 整批阶段即耗尽：全成员未出站（如实未知，不发明 dispatch）
+            batch_budget_interrupted = True
+            tencent = {"accepted": {}, "anomalies": [],
+                       "budget_interrupted": True,
+                       "untried_symbols": [], "failed_symbols": [],
+                       "conflict_codes": []}
+        if tencent is None:
+            tencent = {"accepted": {}, "anomalies": [
+                "腾讯批量源不可用（网络/HTTP/空响应），走既有逐股补采"],
+                "budget_interrupted": False,
+                "untried_symbols": [], "failed_symbols": [],
+                "conflict_codes": []}
+        tencent_anomalies = list(tencent["anomalies"])
+        from data_provider.akshare_fetcher import _to_sina_tx_symbol as _tx
+        symbol_to_pos: Dict[str, int] = {}
+        for i in range(total):
+            symbol_to_pos[_tx(str(df.iloc[i]["代码"]))] = i
+        if tencent["budget_interrupted"]:
+            batch_budget_interrupted = True
+            for sym in tencent["untried_symbols"]:
+                if sym in symbol_to_pos:
+                    budget_unacquired.add(symbol_to_pos[sym])
+        # failed_symbols（块失败，预算未耗尽）：不进 budget_unacquired——
+        # 这些成员走既有逐股 fallback 在同一剩余预算内补实际缺口
+        for code, tencent_row in tencent["accepted"].items():
+            # 仅采纳金额已知的合格**非 B 股**行；金额畸形/缺失/冲突行留给
+            # 既有逐股 fallback（仅实际缺口，预算内）
+            if (tencent_row.amount_known
+                    and not _is_uncertain_currency_code(code)):
+                pos = next(i for i in range(total)
+                           if str(df.iloc[i]["代码"]) == code)
+                tencent_prefilled[pos] = tencent_row
+        if tencent_anomalies:
+            gaps.extend(_bound_gaps(
+                [f"腾讯批量：{a}" for a in tencent_anomalies], 6))
+    # 预填按**原始行位置**预定位：任何位置的已成功行不因更早缺口的
+    # fallback 预算中断而被抹掉（root 反例：反向顺序 36th 先成功后被抹）
+    final_amount: List[Optional[float]] = [None] * total
+    final_change: List[Optional[float]] = [None] * total
+    pos_state: List[str] = ["pending"] * total  # prefilled/b/unacquired/fallback
+    for i in range(total):
+        code = str(df.iloc[i]["代码"])
+        if i in tencent_prefilled:
+            pos_state[i] = "prefilled"
+            tencent_count += 1
+            tencent_row = tencent_prefilled[i]
+            final_amount[i] = float(tencent_row.amount)
+            final_change[i] = tencent_row.change_pct
+            if tencent_row.amount_source == "exact35":
+                tencent_exact_count += 1
+            elif tencent_row.amount_source == "rounded37":
+                tencent_wan_count += 1
+            tencent_times.append(tencent_row.provider_time)
+        elif _is_uncertain_currency_code(code):
+            pos_state[i] = "b"
+            currency_unknown_count += 1
+            if currency_unknown_count == 1:
+                gaps.append(
+                    f"同业行情：B 股成员（{code} {str(df.iloc[i]['名称'])}）"
+                    "币种可比性未证实，金额未知保留（成员资格保留，不并入 "
+                    "CNY 活跃排名，不另行逐股补采）")
+        elif i in budget_unacquired:
+            pos_state[i] = "unacquired"
+        elif batch_budget_interrupted:
+            # 批量预算终态：全部剩余 pending 位置一并记为预算未获取，
+            # **整体跳过逐股 fallback**（契约：已知批量中断后零重入/
+            # 零出站）——成功位已在上方按原始位置物化，不受影响
+            pos_state[i] = "unacquired"
+    fallback_budget_broken = False
+    if not batch_budget_interrupted:
+        for i in range(total):
+            if pos_state[i] != "pending":
+                continue
+            row = df.iloc[i]
+            member_code = str(row["代码"])
+            member_name = str(row["名称"])
+            try:
+                snap = _fetch_member_quote(member_code, member_name,
+                                           budget=budget, now=now,
+                                           session_ctx=ctx,
+                                           received_at=received_at)
+            except BudgetExhausted:
+                # 逐股阶段预算终态：剩余 pending 一并预算未获取，不再重入
+                fallback_budget_broken = True
+                break
+            pos_state[i] = "attempted"
+            if snap is None:
+                failed_count += 1
+                gaps.append(
+                    f"同业行情：{member_code}（{member_name}）快照失败或同键/会话"
+                    "资格不符，金额/涨跌幅缺失（成员资格保留）")
+                continue
+            fetched += 1
+            quote = snap.quote
+            final_amount[i] = quote.f48
+            final_change[i] = quote.f170
+            if quote.f48 is None:
+                gaps.append(
+                    f"同业行情：{member_code}（{member_name}）成交额缺值，资格未知"
+                    "（零与缺失分开，不补 0）")
+            if snap.source == "stock/get":
+                stockget_count += 1
+                if quote.f86 is not None:
+                    ts_min = (quote.f86 if ts_min is None
+                              else min(ts_min, quote.f86))
+                    ts_max = (quote.f86 if ts_max is None
+                              else max(ts_max, quote.f86))
+            else:
+                trends2_count += 1
+                if snap.vendor_as_of:
+                    trends2_as_ofs.append(snap.vendor_as_of)
+    # 预算终局：把所有 pending/unacquired 位置落为未知（一次、全覆盖、
+    # 不重入 fallback、不出站、不发明 dispatch；两阶段合并为单一终态）
+    budget_unacquired_total = sum(
+        1 for s in pos_state if s in ("pending", "unacquired"))
+    if batch_budget_interrupted or fallback_budget_broken:
+        # 角色计数来自最终事实（已采成功=实际非未知行；采集失败=已尝试
+        # 失败；预算未获取=未出站/未取得）；三者相加=分母
+        successes = sum(v is not None for v in final_amount)
+        gaps.append(
+            "同业行情：取数预算耗尽，已采成功 "
+            f"{successes} 只、采集失败 "
+            f"{failed_count} 只、预算未获取 {budget_unacquired_total} 只"
+            "（成员资格保留，缺失金额不参与成交额排名，不冒充全体分布；"
+            "截止后零出站）")
+    assert len(final_amount) == total and len(final_change) == total, (
         "成员行情批次列数必须等于成员行数（含失败与未尝试行）")
     df = df.copy()
-    df["成交额"] = amount_col
-    df["涨跌幅"] = change_col
+    df["成交额"] = final_amount
+    df["涨跌幅"] = final_change
     as_of_text: Optional[str] = None
     if trends2_as_ofs:
         uniq = sorted(set(trends2_as_ofs))
@@ -2467,13 +2913,32 @@ def _collect_member_quotes(df: pd.DataFrame, *, budget: ReportBudget,
             f"同业行情：{trends2_count} 只经 trends2 {_DERIVED_MARKER}补采"
             f"（供应商分钟截至 {as_of_text}，元级与 f48 同口径；该来源无 f86 "
             "单标的时间戳，批次时间窗仅覆盖 stock/get 来源行）")
+    if tencent_count:
+        gaps.append(
+            f"同业行情：{tencent_count} 只来自腾讯公开行情批量补采"
+            f"（字段35精确 {tencent_exact_count} 只/字段37换算 "
+            f"{tencent_wan_count} 只，单位元；非东财 f48 原样字段）")
     amounts_known = (not interrupted and failed_count == 0
-                     and all(v is not None for v in amount_col))
+                     and currency_unknown_count == 0
+                     and all(v is not None for v in final_amount))
+    tencent_as_of_text: Optional[str] = None
+    if tencent_times:
+        uniq_times = sorted(tencent_times)
+        tencent_as_of_text = (
+            uniq_times[0].strftime("%Y-%m-%d %H:%M:%S")
+            if uniq_times[0] == uniq_times[-1]
+            else f"{uniq_times[0].strftime('%Y-%m-%d %H:%M:%S')}~"
+                 f"{uniq_times[-1].strftime('%Y-%m-%d %H:%M:%S')}")
     return MemberQuoteBatch(
         df=df, gaps=gaps, ts_min=ts_min, ts_max=ts_max,
         stockget_count=stockget_count, trends2_count=trends2_count,
+        tencent_count=tencent_count,
+        tencent_exact_count=tencent_exact_count,
+        tencent_wan_count=tencent_wan_count,
         failed_count=failed_count, amounts_known=amounts_known,
         trends2_as_of=(as_of_text if trends2_as_ofs else None),
+        tencent_as_of=tencent_as_of_text,
+        currency_unknown_count=currency_unknown_count,
     )
 
 

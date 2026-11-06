@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated, List, Optional
+from datetime import datetime
+from decimal import Decimal
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -201,3 +203,41 @@ class Trends2Response(_VendorWireBase):
             except (TypeError, ValueError):
                 return v
         return v
+
+
+_TencentAmountSource = Literal["exact35", "rounded37"]
+"""腾讯行成交额来源：exact35=字段35三元组第三段精确金额（元）；
+rounded37=字段37万元口 ×10000 换算（仅精确金额缺值时的兜底口径）。"""
+
+
+class TencentMemberRow(_VendorWireBase):
+    """腾讯公开行情批量行的解析归一记录（Layer 3 供应商 wire 边界）。
+
+    消费字段严格 typed（无 Any 键字符串映射跨层传递）：
+    - ``provider_time``：字段30 市场本地供应时点（%Y%m%d%H%M%S，非请求时刻）；
+    - ``change_pct``：字段32 涨跌幅，可选且 ``allow_inf_nan=False``——供应
+      商可表达值必须可向外表示为有限 float（如 Decimal 有限但 float 溢出的
+      ``1e999`` 按源错误拒绝，不产出 inf）；
+    - ``amount``/``amount_known``/``amount_source``：字段35 三元组第三段
+      精确金额（Decimal 元）优先、字段37 万元 ×10000 兜底的**真实来源**
+      贯穿记录；畸形/负值/非有限 → 金额未知（不回退、不补 0 冒充）。
+    未消费的合法元数据由 extra=allow 兼容。解析层负责从原始字段归一，
+    本模型负责消费字段边界与可表示性校验。
+    """
+
+    model_config = ConfigDict(
+        strict=True,
+        frozen=True,
+        validate_assignment=True,
+        extra="allow",
+    )
+
+    symbol: Annotated[str, Field(min_length=8, max_length=8,
+                                 pattern=r"^(sh|sz|bj)\d{6}$")]
+    code: _SixDigitCode
+    name: _NonEmptyName
+    provider_time: datetime
+    change_pct: Optional[float] = Field(default=None, allow_inf_nan=False)
+    amount: Optional[Decimal] = Field(default=None, ge=0, allow_inf_nan=False)
+    amount_known: bool
+    amount_source: Optional[_TencentAmountSource] = None

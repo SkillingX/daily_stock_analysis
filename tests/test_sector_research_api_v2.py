@@ -238,10 +238,14 @@ class TestTerminalProgramErrorContract(SectorResearchApiV3TestCase):
             )
         self.assertEqual(resp.status_code, 500, resp.text)
         body = resp.json()
-        # 全局异常 handler 形状：message 携带原始底层程序错误（rethrow 的
-        # TypeError 原文，非「All LLM models failed」包装）→ 诚实失败
-        self.assertIn("生成失败", body.get("message") or "")
-        self.assertIn("terminal programming error", body.get("message") or "")
+        # 全局异常 handler 形状（root minor-review-closure 契约）：500 固定
+        # 安全文案——响应不携带底层程序错误原文（rethrow 的 TypeError 原文
+        # 与「All LLM models failed」包装都不出现在响应），诚实失败语义由
+        # 500 状态 + 零存档承载；服务端日志仅异常类型 + 不含值位置
+        # （filename/lineno/function），无参数/源码行/locals
+        self.assertEqual(body.get("message") or "",
+                         "生成失败：内部错误（详见服务端日志）")
+        self.assertNotIn("terminal programming error", body.get("message") or "")
         self.assertNotIn("All LLM models failed", body.get("message") or "")
         after_total = self.client.get(
             "/api/v1/sector-analysis/reports").json()["total"]
