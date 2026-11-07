@@ -1385,9 +1385,13 @@ class TestPersistenceDeadline(SectorReportApiV2TestCase):
         self.assertFalse(self.report_dir.exists() and any(self.report_dir.iterdir()))
 
     def test_real_sqlite_write_lock_clamped_to_deadline(self):
-        """独立连接持真实 SQLite 写锁：保存锁等待钳制剩余预算，到期不提交。"""
+        """独立连接持真实 SQLite 写锁：保存锁等待钳制剩余预算，到期不提交。
+
+        锁由本测试主线程跨**整个请求**持有（BEGIN IMMEDIATE 后无定时释放
+        线程——CI 排队/启动延迟下 5s 定时释放会在请求开始前回滚锁，使保存
+        在 3s 预算内合法成功 200）；请求结束后 finally 内 rollback/close。
+        """
         import sqlite3
-        import threading
         import time as _time
 
         import src.services.sector_analysis_service as svc
@@ -1396,16 +1400,8 @@ class TestPersistenceDeadline(SectorReportApiV2TestCase):
         Config.reset_instance()
         self._mock_vendors(industry="白酒Ⅱ", boards=[("白酒Ⅱ", "BK1277")],
                            cons=["600519"])
-        locker = sqlite3.connect(self.db_path, check_same_thread=False)
+        locker = sqlite3.connect(self.db_path)
         locker.execute("BEGIN IMMEDIATE")  # 真实写锁：保存事务将等待
-        release_lock = threading.Event()
-
-        def _release() -> None:
-            release_lock.wait(5)
-            locker.rollback()
-
-        release_thread = threading.Thread(target=_release)
-        release_thread.start()
         original_render = svc._render
 
         def _slow_render(*args, **kwargs):  # noqa: ANN001
@@ -1419,8 +1415,7 @@ class TestPersistenceDeadline(SectorReportApiV2TestCase):
                     "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
                 )
         finally:
-            release_lock.set()
-            release_thread.join(2)
+            locker.rollback()
             locker.close()
         self.assertEqual(resp.status_code, 504, resp.text)
         self.assertEqual(self.client.get("/api/v1/sector-analysis/reports").json()["total"], 0)
