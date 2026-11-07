@@ -258,6 +258,11 @@ class _AkStub:
         self.board_calls = 0
         self.bench_calls = 0
         self.board_kwargs: Dict[str, Any] = {}
+        # 腾讯同指数 fallback 替身（2026-11-07 收敛轮）：默认未配置即断言失败
+        # ——fallback 被意外触发时立刻暴露，不产生真实出网
+        self.bench_tx_df: Optional[pd.DataFrame] = None
+        self.bench_tx_exc: Optional[Exception] = None
+        self.bench_tx_calls = 0
 
     def stock_board_industry_hist_em(self, **kwargs: Any) -> pd.DataFrame:
         self.board_calls += 1
@@ -274,6 +279,13 @@ class _AkStub:
         assert self.bench_df is not None
         return self.bench_df
 
+    def stock_zh_index_daily_tx(self, **kwargs: Any) -> pd.DataFrame:
+        self.bench_tx_calls += 1
+        if self.bench_tx_exc is not None:
+            raise self.bench_tx_exc
+        assert self.bench_tx_df is not None, "腾讯基准替身未配置却被触发（意外 fallback）"
+        return self.bench_tx_df
+
 
 def _patch_ak(monkeypatch: pytest.MonkeyPatch, stub: _AkStub) -> None:
     import akshare as ak
@@ -282,6 +294,8 @@ def _patch_ak(monkeypatch: pytest.MonkeyPatch, stub: _AkStub) -> None:
                         stub.stock_board_industry_hist_em)
     monkeypatch.setattr(ak, "stock_zh_index_daily_em",
                         stub.stock_zh_index_daily_em)
+    monkeypatch.setattr(ak, "stock_zh_index_daily_tx",
+                        stub.stock_zh_index_daily_tx)
 
 
 class TestSectorTrendPillar:
@@ -466,6 +480,7 @@ class TestSectorTrendPillar:
             raise BudgetExhausted("取数预算已耗尽")
 
         stub.stock_zh_index_daily_em = _exhausted  # type: ignore[assignment]
+        stub.stock_zh_index_daily_tx = _exhausted  # type: ignore[assignment]
         _patch_ak(monkeypatch, stub)
         out = _sector_trend_pillar("BK1277", "白酒Ⅱ", budget=_budget(),
                                    subject_confirmed=True, current_time=_POST_CLOSE)
@@ -491,18 +506,31 @@ class TestSectorTrendPillar:
         assert out["benchmark"]["period_return_pct"] is not None  # 基准合格独立保留
 
     def test_wrong_shape_bench_history_is_source_gap_not_crash(self, monkeypatch):
+        """东财基准错误形状（dict）：源错误降块记缺口，不抛异常。
+
+        2026-11-07 收敛轮契约：东财源形状异常时切换腾讯同一指数（sh000300）
+        ——腾讯合格时基准区间收益照常产出（来源在基准块如实标注），东财源
+        形状异常缺口保留（不因 fallback 成功清空）；两源对同一期望窗口均
+        20/20 合格，相对差照常计算。
+        """
         expected = _expected_sessions(_POST_CLOSE)
         stub = _AkStub(
             board_df=_closes_df(expected, base=1000.0, step=1.0),
             bench_df="garbage",  # type: ignore[arg-type]
         )
+        stub.bench_tx_df = _closes_df(expected, base=4000.0, step=1.0,
+                                      date_col="date", close_col="close")
         _patch_ak(monkeypatch, stub)
         out = _sector_trend_pillar("BK1277", "白酒Ⅱ", budget=_budget(),
                                    subject_confirmed=True, current_time=_POST_CLOSE)
         assert out["period_return_pct"] is not None  # 板块合格不受基准形状影响
-        assert out["benchmark"]["period_return_pct"] is None
-        assert out["relative_return_pp"] is None
-        assert any("形状异常" in g for g in out["gaps"]), out["gaps"]
+        bench = out["benchmark"]
+        assert bench is not None and bench["source"] == "腾讯指数日线"
+        assert bench["period_return_pct"] is not None  # 腾讯同一指数合格产出收益
+        assert out["relative_return_pp"] is not None  # 同窗口双侧合格 → 相对差可算
+        # 东财源错误缺口保留在基准块内（不因 fallback 成功清空）；顶层有切换说明
+        assert any("形状异常" in g for g in (bench["gaps"] or [])), bench["gaps"]
+        assert any("腾讯" in g for g in out["gaps"]), out["gaps"]
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +607,12 @@ class TestPeersPillar:
         assert out["target_change_pct_rank"] == 3
 
     def test_invalid_and_zero_amount_excluded_with_gap(self):
-        """成交额缺失/0/负/非有限行不参与排名，缺口分类计数并暴露观测/可排名范围。"""
+        """成交额缺失/负/非有限行不参与排名（未知），合法零额不进活跃前五。
+
+        2026-11-07 final 收敛轮语义：0=已知零观测（不参与活跃排名、缺口单列
+        「合法零额」），负/非数值=无效（未知语义、缺口单列「负值/非数值」）——
+        不再合并称「零或负无效」。
+        """
         cons = _cons_snapshot(
             [("600001", 9e8), ("600002", None), ("600003", 0.0),
              ("600004", float("nan")), ("600005", -5.0), ("600006", 2e8),
@@ -594,9 +627,12 @@ class TestPeersPillar:
         assert out["sample_size"] == 3
         assert out["snapshot_rows"] == 7
         assert out["rankable_rows"] == 3
+        # 合法零额单列（已知零观测，不参与活跃前五）
+        assert any("合法零额" in g and "1 行" in g for g in out["gaps"]), out["gaps"]
+        # 无效单列（负值/非数值；缺失与 NaN 归 missing）
         invalid_gaps = [g for g in out["gaps"] if "成交额无效" in g]
         assert invalid_gaps, out["gaps"]
-        assert "缺失 2" in invalid_gaps[0] and "零或负 2" in invalid_gaps[0]
+        assert "缺失 2" in invalid_gaps[0] and "负值/非数值 1" in invalid_gaps[0]
         assert "观测 7 行" in invalid_gaps[0] and "可排名 3 行" in invalid_gaps[0]
         assert any("不足 5" in g for g in out["gaps"])
 

@@ -216,7 +216,7 @@ class TestComposeReportContracts:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: {
+            subject_confirmed=False, **_kwargs: {
                 "eligible": bool(subject_confirmed),
                 "selection_rule": "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）",
                 "items": ([
@@ -372,7 +372,7 @@ class TestTrendPeersEligibilityContracts:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: {
+            subject_confirmed=False, **_kwargs: {
                 "eligible": peers_eligible,
                 "selection_rule": "同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）",
                 "items": [], "target_in_amount_top5": None,
@@ -429,3 +429,151 @@ class TestTrendPeersEligibilityContracts:
         with pytest.raises(ViolationError):
             self._run(monkeypatch, subject="unverified",
                       trend_eligible=False, peers_eligible=True)
+
+
+# ========================================================================
+# trends2 金融派生契约（Layer 2；root 收敛轮新增公式边界）
+# ========================================================================
+
+class TestTrendsFinancialDerivationContracts:
+    """trends2 累计额与涨跌幅 typed 金融公式（icontract require/ensure）。
+
+    反例来自 root 审查：parsed 位置魔数曾把最高价当现价——preClose=10、
+    close=11、high=15 必须得 10.00%（非 50%）；累计额必须来自完整合格
+    分钟额（部分和不冒充当日累计）。
+    """
+
+    def test_change_pct_close_column_ten_percent(self):
+        assert svc._trends_change_pct(
+            __import__("decimal").Decimal("11"),
+            __import__("decimal").Decimal("10"),
+        ) == __import__("decimal").Decimal("10.00")
+
+    def test_change_pct_independent_real_wire_values(self):
+        from decimal import Decimal
+
+        # 真实 wire 独立对照：600519 末分钟 close=1453 / preClose=1452
+        assert svc._trends_change_pct(
+            Decimal("1453"), Decimal("1452")) == Decimal("0.07")
+        # BK1277 末分钟 close=4543.15 / preClose=4642.21（close≠high 列判别）
+        assert svc._trends_change_pct(
+            Decimal("4543.15"), Decimal("4642.21")) == Decimal("-2.13")
+
+    def test_change_pct_high_column_not_used(self):
+        from decimal import Decimal
+
+        # 若实现误用 high=15：(15-10)/10*100=50% —— 公式只接受显式现价入参，
+        # 输入域由 require 限定，调用方（wire 解析）负责取 close 列
+        result = svc._trends_change_pct(Decimal("11"), Decimal("10"))
+        assert result != Decimal("50.00")
+
+    def test_change_pct_zero_preclose_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("11"), Decimal("0"))
+
+    def test_change_pct_negative_preclose_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("11"), Decimal("-10"))
+
+    def test_change_pct_non_finite_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._trends_change_pct(Decimal("Infinity"), Decimal("10"))
+
+    def test_sum_minute_amounts_golden_independent(self):
+        from decimal import Decimal
+
+        # 真实 wire 前两分钟额（600519 09:30/09:31）逐值可核算；
+        # 全 241 行金标准求和由 wire 全链测试覆盖（6199528292）
+        assert svc._sum_minute_amounts(
+            [Decimal("226345000.00"), Decimal("420208080.00")],
+        ) == Decimal("646553080.00")
+
+    def test_sum_minute_amounts_partial_zero_minutes_legal(self):
+        from decimal import Decimal
+
+        # 零额分钟是合法观测：求和只累计已通过行级资格的有限非负额
+        assert svc._sum_minute_amounts(
+            [Decimal("0"), Decimal("100.5")]) == Decimal("100.5")
+
+    def test_sum_minute_amounts_negative_raises(self):
+        from decimal import Decimal
+
+        with pytest.raises(ViolationError):
+            svc._sum_minute_amounts([Decimal("-1")])
+
+    def test_sum_minute_amounts_empty_raises(self):
+        with pytest.raises(ViolationError):
+            svc._sum_minute_amounts([])
+
+
+# ========================================================================
+# 腾讯公开行情批量金额/币种契约（Layer 2；共享字段约定，Decimal 无 float 换算）
+# ========================================================================
+
+class TestTencentAmountContracts:
+    """既有优先级契约：字段35三元组第三段=精确金额（元）优先；字段37=万元
+    兜底（仅精确金额缺值时 ×10000）；字段35 存在但畸形/负值/非有限 = 真实
+    坏值，不回退兜底、不补 0 冒充（金额未知）。B 股代码币种可比性未证实。"""
+
+    def _fields(self, exact: str, wan: str) -> list:
+        fields = [""] * 38
+        fields[35] = exact
+        fields[37] = wan
+        return fields
+
+    def test_exact_triplet_amount_decimal(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("34.91/68243/239321750", "23932"))
+        assert known is True and amount == Decimal("239321750")
+        assert source == "exact35"
+
+    def test_known_zero_exact_is_known_zero(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("0/0/0", "0"))
+        assert known is True and amount == Decimal("0")
+        assert source == "exact35"
+
+    def test_wan_fallback_only_when_exact_absent(self):
+        from decimal import Decimal
+
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("", "949"))
+        # 字段37为万元整口（949×10000=9490000）；精确分位在字段35三元组
+        assert known is True and amount == Decimal("9490000")
+        assert source == "rounded37"
+
+    def test_malformed_exact_does_not_fall_back(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("12.34/abc", "949"))
+        assert known is False and amount is None and source is None
+
+    def test_negative_exact_rejected(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("1/1/-5", "5"))
+        assert known is False and amount is None and source is None
+
+    def test_nonfinite_exact_rejected(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("1/1/Infinity", "5"))
+        assert known is False and amount is None and source is None
+
+    def test_both_missing_amount_unknown(self):
+        amount, known, source = svc._parse_tencent_amount_decimal(
+            self._fields("", ""))
+        assert known is False and amount is None and source is None
+
+    def test_b_share_codes_uncertain_currency(self):
+        assert svc._is_uncertain_currency_code("200596") is True
+        assert svc._is_uncertain_currency_code("900901") is True
+        assert svc._is_uncertain_currency_code("600519") is False
+        assert svc._is_uncertain_currency_code("920001") is False  # BJ 合法 CNY

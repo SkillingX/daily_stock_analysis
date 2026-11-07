@@ -181,7 +181,7 @@ class TestComposeReport:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: _peers_stub(subject_confirmed),
+            subject_confirmed=False, **_kwargs: _peers_stub(subject_confirmed),
         )
         monkeypatch.setattr(
             svc, "_resolve_sw_chain",
@@ -312,18 +312,25 @@ class TestProsperityPillarBehavior:
         assert len(out["gaps"]) >= 3  # 缺失维度逐项记缺口
 
     def test_prosperity_all_missing_not_found(self, monkeypatch):
-        """行情支柱全缺失：sector_found=False 不产任何维度分。"""
+        """行情支柱全缺失：sector_found=False 不产任何维度分。
+
+        2026-11-07 收敛轮契约：全表不可用时若板块单标的快照可用则恢复 row
+        （见 tests/test_sector_board_data_rebuild.py）；本反例固定「全表与
+        单标的快照均不可用」→ False + 缺口。
+        """
         import akshare as ak
 
         def _em_down():
             raise RuntimeError("em down (fake)")
 
         monkeypatch.setattr(ak, "stock_board_industry_name_em", _em_down)
+        monkeypatch.setattr(svc, "_fetch_board_quote", lambda *a, **k: None)
         out = svc._prosperity_pillar("白酒Ⅱ", budget=_budget(), board_code="BK1277")
         assert out["sector_found"] is False
         for dim in ("momentum", "activity", "amount_activity", "breadth"):
             assert out[dim] is None
         assert out["gaps"]
+        assert any("单标的快照" in g for g in out["gaps"])
 
 
 class TestMedianAndNum:
@@ -372,7 +379,7 @@ class TestRenderReport:
         monkeypatch.setattr(
             svc, "_peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: _peers_stub(subject_confirmed),
+            subject_confirmed=False, **_kwargs: _peers_stub(subject_confirmed),
         )
         monkeypatch.setattr(
             svc, "_resolve_sw_chain",

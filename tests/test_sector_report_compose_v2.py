@@ -214,7 +214,13 @@ class TestProsperityPillarV2:
         assert any("无法唯一锁定" in g for g in out["gaps"])
 
     def test_no_sina_fallback_mixing(self, monkeypatch: pytest.MonkeyPatch):
-        """东财表失败时不混新浪证监会口径（身份必须同口径）。"""
+        """东财表失败且单标的快照亦不可用时，不混新浪证监会口径（身份必须同口径）。
+
+        2026-11-07 收敛轮契约：全表不可用 + 板块代码可用时会先走东财单标的
+        快照恢复（见 tests/test_sector_board_data_rebuild.py）；本反例固定
+        快照同样不可用，验证新浪口径永不混入。
+        """
+        import src.services.sector_analysis_service as svc
         import akshare as ak
 
         def _em_down():
@@ -225,6 +231,7 @@ class TestProsperityPillarV2:
 
         monkeypatch.setattr(ak, "stock_board_industry_name_em", _em_down)
         monkeypatch.setattr(ak, "stock_sector_spot", _sina_fail)
+        monkeypatch.setattr(svc, "_fetch_board_quote", lambda *a, **k: None)
         out = _prosperity_pillar("白酒Ⅱ", budget=_budget(), board_code="BK1277")
         assert out["sector_found"] is False
         assert any("东财" in g for g in out["gaps"])
@@ -433,7 +440,7 @@ class TestComposeReport:
         monkeypatch.setattr(
             "src.services.sector_analysis_service._peers_pillar",
             lambda code, cons, *, budget, snapshot_observed_at=None,
-            subject_confirmed=False: _peers_stub(subject_confirmed),
+            subject_confirmed=False, **_kwargs: _peers_stub(subject_confirmed),
         )
         monkeypatch.setattr(
             "src.services.sector_analysis_service._resolve_sw_chain",

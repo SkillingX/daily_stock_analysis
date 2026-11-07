@@ -21,7 +21,9 @@
 {% else %}
 {% set locked_text = '未锁定（不按近似名取行）' %}
 {% endif %}
-{% if a.identity.membership.verified %}
+{% if a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
+{% set membership_text = '目标股在东财 F10 板块完整成员集合中（' ~ a.identity.membership.member_count ~ ' 只，成分验证通过；成员行情为逐股采集，批次时间范围见同业缺口）' %}
+{% elif a.identity.membership.verified %}
 {% set membership_text = '目标股在该板块成分内' ~ (('（成分 ' ~ a.identity.membership.member_count ~ ' 只）') if a.identity.membership.member_count is not none else '') %}
 {% elif a.identity.board_code %}
 {% set membership_text = '未通过（归属未确认，见缺口）' %}
@@ -63,6 +65,9 @@
 - 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ 当日涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
 - 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ 当日成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
 - 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
+{% if pr.snapshot_source %}
+- 快照来源/时点：{{ pr.snapshot_source }}
+{% endif %}
 
 | 当日行情维度 | 分值（0-100） | 口径 |
 |---------|--------------|------|
@@ -203,6 +208,9 @@
 {% if peers.amount_provenance %}
 - 成交额单位：{{ peers.amount_unit or '元' }}（{{ peers.amount_provenance }}）
 {% endif %}
+{% if peers.quotes_as_of %}
+- 行情时点：{{ peers.quotes_as_of }}
+{% endif %}
 - 成分快照采集时点：{{ peers.snapshot_observed_at or '未记录' }}（快照当日口径，与上方 20 日趋势窗口是**不同时间口径**）
 {% if peer_rows %}
 {% if peers.rankable_rows and peers.rankable_rows > 0 %}
@@ -228,9 +236,9 @@
 {% endif %}
 {% endif %}
 {% if peers.target_in_amount_top5 is false %}
-- 目标股不在快照成交额前五内，作为第 {{ peers.sample_size }} 家加入样本（去重后共 {{ peers.sample_size }} 家）
+- 目标股不在快照成交额前五内，作为第 {{ peers.sample_size }} 家加入样本（去重后共 {{ peers.sample_size }} 家；全体成员报价完整，前五资格可判定）
 {% elif peers.target_in_amount_top5 %}
-- 目标股在快照成交额前五内（样本不重复计入，共 {{ peers.sample_size }} 家）
+- 目标股在快照成交额前五内（样本不重复计入，共 {{ peers.sample_size }} 家；全体成员报价完整，前五资格可判定）
 {% elif peer_rows | selectattr('is_target') | list %}
 {% set target_item2 = peer_rows | selectattr('is_target') | first %}
 {% if target_item2.amount is none %}
