@@ -871,7 +871,7 @@ class TestProvenanceRepairApiV2(SectorReportApiV2TestCase):
         self.assertEqual(len(syn["claims"]), 1)  # 正常 claim 保留
         self.assertNotIn("翻倍", syn["summary"] or "")  # 摘要不含模型文本
         md = resp.json()["markdown"]
-        self.assertIn("1 条结论未通过定性/引用/结构校验", md)
+        self.assertIn("1 条结论未通过结论/引用/结构校验", md)
         self.assertIn("完整性为**部分**", md)
 
     def test_malformed_title_type_counted_valid_row_kept_api(self):
@@ -2785,9 +2785,23 @@ class TestSynthesisPromptFidelity(SectorReportApiV2TestCase):
         self.assertIn("600519", user_text)
         self.assertIn("白酒Ⅱ", user_text)
         self.assertIn("BK1277", user_text)
-        # 既有 strict 定性约束与 root-decision 输出边界仍在 system prompt
-        # （单句存在性，非逐句镜像）
-        self.assertIn("不得出现任何数量字符", messages[0]["content"])
+        # 有限明确量值约束（issue #85）与 root-decision 输出边界仍在
+        # system prompt（单句存在性，非逐句镜像）；旧「数量字符逐字禁令」
+        # 及普通词同义替换指令不再出现
+        self.assertIn("不得新增、重述、计算或错配具体业务量值",
+                      messages[0]["content"])
+        self.assertIn("不需要回避数量形汉字", messages[0]["content"])
+        self.assertIn("中性", messages[0]["content"])
+        self.assertNotIn("不得出现任何数量字符", messages[0]["content"])
+        self.assertNotIn("换用同义定性说法", messages[0]["content"])
+        # B2 任务收敛（B1 真实验收语义 FAIL 收敛；单句存在性非逐句镜像）：
+        # identity 边界（含材料明示事实例外）、显式篇幅目标、观察关系推断禁令
+        self.assertIn("identity 只确立目标股的行业归属",
+                      messages[0]["content"])
+        self.assertIn("才可依材料原意陈述", messages[0]["content"])
+        self.assertIn("目标篇幅 200–300 字", messages[0]["content"])
+        self.assertIn("不作为因果、归因或市场效率判断的证据",
+                      messages[0]["content"])
         self.assertIn("市场事实已由服务端以定性观察关系提供",
                       messages[0]["content"])
         # 生成行为不变：claims 过 strict 校验、rejected→partial 语义与
@@ -2802,6 +2816,47 @@ class TestSynthesisPromptFidelity(SectorReportApiV2TestCase):
         self.assertEqual(detail.status_code, 200)
         self.assertEqual(detail.json()["data"]["markdown"], resp.json()["markdown"])
 
+    def test_render_note_wording_new_contract_and_legacy_branch_unchanged(self):
+        """真实 renderer 口径说明（issue #85）：server_facts 分支新措辞；
+        legacy 分支历史描述原样保留（旧存档 Markdown 不改写）。"""
+        import src.services.sector_analysis_service as svc
+
+        today = datetime.now().date().isoformat()
+        self._install_research_success(results=[{
+            "title": "白酒行业新政策发布",
+            "snippet": "监管部门发布白酒行业新规，行业迎来政策催化",
+            "url": "https://example.com/news/baijiu.html",
+            "source": "example.com",
+            "published_date": today,
+        }])
+        expected = recent_completed_trading_sessions("cn", 20)
+        board_hist = _daily_hist_df(expected, base=1000.0, step=1.0)
+        bench_hist = _daily_hist_df(expected, base=4000.0, step=1.0,
+                                    date_col="date", close_col="close")
+        boards = _board_table([("白酒Ⅱ", "BK1277"), ("电池", "BK1033")])
+        self._mock_vendors(
+            industry="白酒Ⅱ", boards=[("白酒Ⅱ", "BK1277"), ("电池", "BK1033")],
+            cons=["600519", "000568"], board_table=boards,
+            board_hist=board_hist, bench_hist=bench_hist)
+        resp = self.client.post(
+            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        md = resp.json()["markdown"]
+        # server_facts 分支：新合同措辞（数值表达规则），旧「纯定性校验」措辞不再出现
+        self.assertIn("已通过结构、引用与本报告的数值表达规则", md)
+        self.assertNotIn("已通过结构/引用与纯定性校验", md)
+        self.assertIn("语义准确性不由此保证", md)
+        # legacy 分支：历史描述原样保留（真实 renderer 重渲染，不改写旧口径）
+        payload = resp.json()["analysis"]
+        payload["sector_synthesis"]["summary_origin"] = "legacy_model_claims"
+        legacy_md = svc._render(payload["stock_name"], payload["stock_code"],
+                                payload["generated_at"], "sa_legacy_note_probe",
+                                payload)
+        self.assertIn("模型陈述为纯定性，不含数字/日期/价格/比率/倍数词", legacy_md)
+        self.assertIn("本报告摘要与不确定性说明由历史版本系统从合格结论派生",
+                      legacy_md)
+
 
 class TestMetricSemanticsInput(SectorReportApiV2TestCase):
     """真实 sa_202611061429 语义验收反例的 input-contract 修复（root 语义审查）。
@@ -2812,7 +2867,7 @@ class TestMetricSemanticsInput(SectorReportApiV2TestCase):
     → 真实 adapter wire（合成终端响应，捕获实际请求体）→ strict 存档/读回：
     - 完整原始事实（负日收益 + 正分位、成交额选取的活跃同业、无任何资金流
       字段）连同口径语义到达配置模型 seam；
-    - 无数量字符的定性 risk 通过 strict 校验（status ok）；
+    - 定性 risk（不含明确量值）通过 strict 校验（status ok）；
     - mixed invalid（含数字陈述）被整条拒绝、rejected→partial、存档读回一致。
     合成响应不证明真实模型遵守 prompt（live 归 root 一次真实验收）。
     """
@@ -2943,8 +2998,8 @@ class TestMetricSemanticsInput(SectorReportApiV2TestCase):
         # 完整性状态直接断言（generate 响应与存档两处）
         self.assertEqual(body["analysis"]["assessment"]["completeness"],
                          "partial")
-        # root-decision：程序化核心字段不消费模型文本——错误句（含数字被拒
-        # 或纯定性错误）都不可能进入 summary/uncertainty
+        # root-decision：程序化核心字段不消费模型文本——错误句（含明确量值被拒
+        # 或定性错误）都不可能进入 summary/uncertainty
         self.assertNotIn(wrong_clause, syn["summary"] or "")
         self.assertNotIn(wrong_clause, syn["uncertainty_note"] or "")
         self.assertEqual(syn["summary_origin"], "server_facts")
@@ -2966,7 +3021,7 @@ class TestMetricSemanticsInput(SectorReportApiV2TestCase):
         self.assertEqual(download.text, body["markdown"])
 
     def test_adversarial_qualitative_wrong_clause_never_enters_core_fields(self):
-        """1449 反例（sa_202611061449）形状：纯定性错误序数句（无数量字符，
+        """1449 反例（sa_202611061449）形状：定性错误序数句（不含明确量值表述，
         strict 校验无法拦截）——owner 边界保证其不进入 summary/uncertainty。
 
         该 claim 在 claims 列表中单独立示（模型 origin 可见），报告语义

@@ -4010,7 +4010,7 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
     同源（cat 条目字段一致）。root-decision 所有权：市场类证据
     （intraday/trend/peers/target）的 raw magnitudes 不进模型投影（由
     ``market_observation_relations`` 定性观察关系替代），非市场事实原样
-    投影；模型 claims 纯定性（qualitative 契约，无 numeric token 锚定）。
+    投影；模型 claims 不含明确业务量值（有限明确量值契约，无 numeric token 锚定）。
     """
     from src.services import sector_research
 
@@ -4152,7 +4152,7 @@ def _synthesis_pillar(stock_name: str, code: str, ident: Dict[str, Any],
                       peers: Dict[str, Any], catalysts: Dict[str, Any], *,
                       budget: ReportBudget,
                       subject_confirmed: bool = False) -> Dict[str, Any]:
-    """证据化综合研判（issue #83）：登记表引用 + 纯定性输出契约 + 绝对预算。
+    """证据化综合研判（issue #83）：登记表引用 + 有限明确量值输出契约 + 绝对预算。
 
     资格：confirmed 才执行；无已证实催化不调用模型（``no_qualified_facts``，
     先验/背景不产生空泛完整叙事）。模型未配置/失败/畸形是不同 ``status``；
@@ -4160,8 +4160,9 @@ def _synthesis_pillar(stock_name: str, code: str, ident: Dict[str, Any],
     可见**（root 批准的唯一共享边界变更，``propagate_program_errors=True``），
     不伪装成模型失败或数据缺失；已识别传输/超时错误降本块（sanitized）。
 
-    模型 claims 纯定性：claims 文本不含任何数字值/日期/价格/比率/代码编号，
-    定量陈述整条拒绝并记 sanitized 原因，事实全部保留；市场数值关系的
+    模型 claims 不含明确业务量值：明确量值/倍数陈述整条拒绝并记 sanitized
+    原因（普通中文含数量形汉字不因字形拒绝，issue #85 有限合同），事实
+    全部保留；市场数值关系的
     摘要/观察限制由服务端程序化渲染（``summary_origin="server_facts"``，
     含精确市场数值/日期——数值只来自服务端所有权，不来自模型文本）。
 
@@ -4312,7 +4313,7 @@ def _synthesis_pillar(stock_name: str, code: str, ident: Dict[str, Any],
         detail = rejected_reasons[0] if rejected_reasons else "unknown"
         safe = sanitize_diagnostic_text(detail, max_length=120) or detail
         out["gaps"].append(
-            f"证据化综合：模型结论均未通过定性/引用/结构校验"
+            f"证据化综合：模型结论均未通过结论/引用/结构与量值边界校验"
             f"（首个原因：{safe}），已整体拒绝，合格事实保留"
         )
         return out
@@ -4337,7 +4338,7 @@ def _synthesis_pillar(stock_name: str, code: str, ident: Dict[str, Any],
         )
         out["gaps"].append(
             f"证据化综合：模型返回 {safe} 未通过校验的结论已整条拒绝"
-            "（含数量字符陈述 / 未知证据 ID / 结构畸形 / 行动词 / 超限），未采纳"
+            "（明确量值陈述 / 未知证据 ID / 结构畸形 / 行动词 / 超限），未采纳"
         )
     out["gaps"] = _bound_gaps(out["gaps"], 14)
     return out

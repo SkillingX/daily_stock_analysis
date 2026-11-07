@@ -143,7 +143,7 @@ class TestMixedRejectionPartialContract(SectorResearchApiV3TestCase):
              "evidence_refs": ["cat-1", "peers"]},
             {"kind": "interpretation",
              "text": "板块区间收益99.9%遥遥领先大盘",
-             "evidence_refs": ["cat-1"]},  # 数量字符 → 整条拒绝
+             "evidence_refs": ["cat-1"]},  # 明确量值（数字字面量）→ 整条拒绝
         ]
         resp = self._generate_confirmed(board_hist=board_hist,
                                         bench_hist=bench_hist,
@@ -180,7 +180,7 @@ class TestMixedRejectionPartialContract(SectorResearchApiV3TestCase):
             f"/api/v1/sector-analysis/reports/{rid}/markdown?download=1")
         self.assertEqual(download.status_code, 200)
         markdown = download.text
-        self.assertIn("条结论未通过定性/引用/结构校验并整条拒绝", markdown)
+        self.assertIn("条结论未通过结论/引用/结构校验并整条拒绝", markdown)
         self.assertIn("完整性为**部分**", markdown)
         # 历史列表可见（mixed partial 同样存档）
         listing = self.client.get("/api/v1/sector-analysis/reports")

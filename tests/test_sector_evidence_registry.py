@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """证据登记表与综合输出校验（issue #83 单元契约，纯函数离线）。
 
-定性输出契约（root 数值反例的收敛形态——不存在数字锚定通道）：
-- target 1.0%、板块 1.9%：claim 引 target 说「1.9%」→ 拒绝（定量陈述）
+有限明确量值契约（issue #85；root 数值反例 + 三轮机制反例的收敛形态）：
+- target 1.0%、板块 1.9%：claim 引 target 说「1.9%」→ 拒绝（明确量值陈述）
 - claim「1.0%」引 target（数值与所引材料完全一致）→ 仍拒绝：重述数值本身
-  就是定量陈述，数字事实由服务端渲染（不存在跨字段/跨主体借用通道）
-- 「0%」/「-3.2%」/全角「１.５」/「百分之五」「三成」「第三」/证据 ID 进文本
-  都是同一保守文本边界（半角/全角/中文数字形态）
+  就是明确量值陈述，数字事实由服务端渲染（不存在跨字段/跨主体借用通道）
+- 字面数字层（Unicode 类别 Nd/Nl/No + 百分号）：「0%」/「-3.2%」/全角「１.５」
+  /「١٢倍」/「Ⅱ级」/「x²」/「½」/证据 ID 进文本 → 整条拒绝，无名称豁免
+- 结构层（封闭量值结构）：「百分之五」「约三成」「第三个月」「二〇二六年」
+  「三季度」「翻了一番」「倆元」「市盈率为十/两百」→ 整条拒绝
+- 双视图（原码点 + NFKC）：兼容/康熙码点（⼆/㋀）折叠出字面数字或量值结构
+  同样拒绝；输出原文不改写
+- 普通中文含数量形汉字不因字形拒绝：一致/统一/一方面/三一重工/二手设备/
+  半导体/半年报/参考/陆续/一般/一度/二级市场 照常通过（v1 逐字禁令已废弃）
 - 自然定性 complete 控制（无数字的证据关联解读 + 反证/风险）照常通过
 - 引用资格：未知 ID / 缺失事实引用（无 trend 时引用 trend）/ bg-* 唯一支撑
 - 行动词 / 超长文本 / 畸形结构 / claims 原始条数超限 → 整体拒绝
@@ -69,7 +75,8 @@ def registry() -> EvidenceRegistry:
 
 
 class TestQualitativeOnlyClaims:
-    """模型陈述纯定性：任何定量表述整条拒绝（root 数值反例收敛形态）。"""
+    """模型陈述不含明确业务量值：明确量值/倍数陈述整条拒绝
+    （issue #85 有限合同；root 数值反例 + 机制反例收敛形态）。"""
 
     def test_wrong_fact_borrowed_from_other_evidence_rejected(self, registry):
         # root 反例：target 1.0、板块 1.9；claim 引 target 说 1.9% → 拒绝
@@ -81,7 +88,7 @@ class TestQualitativeOnlyClaims:
         assert reason == "quantitative_statement:1"  # 稳定类别 + 首个命中字符
 
     def test_exact_reference_value_still_rejected(self, registry):
-        # 收敛关键：数值与所引材料**完全一致**也拒绝——重述数值即数量字符陈述，
+        # 收敛关键：数值与所引材料**完全一致**也拒绝——重述数值即明确量值陈述，
         # 数字事实由服务端渲染（不存在「正确锚定」通道，也无借用通道）
         verdict, reason = validate_synthesis_claim(
             {"kind": "interpretation", "text": "目标股当日涨跌幅1.0%",
@@ -128,12 +135,12 @@ class TestQualitativeOnlyClaims:
         assert reason.startswith("quantitative_statement:")
 
     def test_chinese_numeric_formulations_rejected(self, registry):
-        # 字符级边界：中文数字/数量/序数形态逐字符拒绝（不依赖后随单位；
-        # 简繁数量字变体両类：Unicode isnumeric 不覆盖 俩/倆、两/兩、几/幾）
+        # 结构层边界：占比/百分比/序数时长/日期/季度/倍数/货币结构拒绝
+        # （不依赖后随单位；简繁数量字在结构中同样命中）
         for text in ("政策利好约三成", "目标涨幅百分之五",
                      "板块已连续第三个月走强", "新规于二〇二六年落地",
                      "三季度景气上行", "翻了一番",
-                     "目标股股价为倆元", "板块裡僅幾家受惠", "兩大龙头共振"):
+                     "目标股股价为倆元"):
             verdict, reason = validate_synthesis_claim(
                 {"kind": "interpretation", "text": text,
                  "evidence_refs": ["cat-1"]}, registry,
@@ -167,9 +174,9 @@ class TestQualitativeOnlyClaims:
 
     def test_unit_free_chinese_values_rejected(self, registry):
         # root 边界反例（unit-free）：『目标股股价为一百元』『市盈率为十/两百』
-        # 旧单位白名单放行；字符边界整条拒绝（定性契约不依赖后随单位）
+        # 无单位终点同样整条拒绝（量纲词+系词桥+完结数字段）；时长量纲保持
         for text in ("目标股股价为一百元", "目标股市盈率为十", "目标股市盈率为两百",
-                     "政策持续了几个月", "目标股与同业俩龙头共振"):
+                     "政策持续了几个月"):
             verdict, reason = validate_synthesis_claim(
                 {"kind": "interpretation", "text": text,
                  "evidence_refs": ["target"]}, registry,
@@ -189,18 +196,25 @@ class TestQualitativeOnlyClaims:
             assert verdict is None, text
             assert reason.startswith("quantitative_statement:"), (text, reason)
 
-    def test_ordinary_phrases_with_numeral_chars_knowingly_rejected(self, registry):
-        # 已知保守代价（docs/prompt 披露）：含数量字符的普通词/名称一并拒绝；
-        # 不设短语白名单（会重开价格通道）；prompt 明示换用同义定性说法
+    def test_ordinary_phrases_with_numeral_chars_pass(self, registry):
+        # issue #85 获准语义变化：普通词不因数量形汉字字形拒绝（原逐字禁令
+        # 的已知保守代价集全部翻转放行；结构层不命中即放行，无逐词豁免）
         for text in ("行业观点高度一致", "产业链上下游统一涨价预期",
                      "一方面供给收缩，另一方面需求平稳", "三一重工带动板块",
-                     "板块已连续走强一段时间"):
+                     "板块已连续走强一段时间", "二手设备出口景气提升",
+                     "半导体材料国产化加快", "另一家同业公告扩产",
+                     "一体化布局推进协同显现", "政策在两方面形成支撑",
+                     "资金在产业链两端均有布局", "半年报披露后反应积极",
+                     "行业格局并非一成不变", "板块前景十分明朗",
+                     "需求呈现多元化特征", "二级市场流动性改善",
+                     "市场参考政策动向", "企業陸續披露訂單",
+                     "目标股与同业俩龙头共振", "兩大龙头共振带动板块",
+                     "板块裡僅幾家受惠", "业务数一数二的同业公告扩产"):
             verdict, reason = validate_synthesis_claim(
                 {"kind": "interpretation", "text": text,
                  "evidence_refs": ["cat-1"]}, registry,
             )
-            assert verdict is None, text
-            assert reason.startswith("quantitative_statement:"), (text, reason)
+            assert verdict is not None, (text, reason)
 
     def test_natural_qualitative_control_with_plain_synonyms_passes(self, registry):
         # 自然定性控制（无任何数量字符，含普通同义替换）：interpretation +
@@ -248,6 +262,93 @@ class TestQualitativeOnlyClaims:
         for claim in accepted:
             assert claim["text"]
             assert claim["evidence_refs"]
+
+
+class TestExplicitQuantityMechanism:
+    """issue #85 有限明确量值机制（原型三轮收敛：root 探针 v1/v2 + 决策记录）。
+
+    - 类别制字面层：Lo 数量形汉字归结构层（参/參/陸/陆带 Numeric 属性）
+    - 完结边界：量纲词后数字段必须完结（一般/一度/十大 放行）
+    - 有限分隔：空格/冒号分隔与紧邻同判；不跨句
+    - 双视图：兼容/康熙码点 NFKC 折叠命中（输出原文不改写）
+    - Roman 无例外：名称含字面数字（白酒Ⅱ）仍拒，身份走服务端字段+中性指称
+    """
+
+    def test_lo_numeric_property_chars_not_literal(self, registry):
+        # 参/參/陸/陆 category=Lo 且 isnumeric=True：旧 isnumeric 视图逐字
+        # 拒绝是机制错误；类别制下归结构层，普通词放行
+        for text in ("市场参考政策动向", "市場參考政策動向", "企業陸續披露訂單",
+                     "陆续披露订单的公司增加", "板块参与度提升"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is not None, (text, reason)
+
+    def test_metric_completion_boundary(self, registry):
+        # 普通词内部数字形（数字段未完结）放行；完结数字段拒绝
+        for text in ("利润一般，但订单回暖", "股价一度承压，另一催化仍待落地",
+                     "估值一般，相关政策提供支撑", "利润一般化趋势明显",
+                     "利润十大重仓股居前"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is not None, (text, reason)
+        for text in ("利润为一", "利润为一亿五", "利润一亿以上",
+                     "利润高于五成", "营收过十亿"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is None, (text, reason)
+            assert reason and reason.startswith("quantitative_statement:"), (text, reason)
+
+    def test_metric_separator_variants_same_verdict(self, registry):
+        # 有限分隔语法：空格/冒号/繁体系词与紧邻形态同判（不跨句）
+        for text in ("市盈率为十", "市盈率为 十", "市盈率为：十",
+                     "市盈率：十", "市盈率為十", "市盈率达到 十",
+                     "市盈率達兩百", "估值為 十亿元"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["target"]}, registry)
+            assert verdict is None, (text, reason)
+            assert reason and reason.startswith("quantitative_statement:"), (text, reason)
+        # 句读不跨句：量纲词后接句号，句号后的数字形汉字（三方面）不因
+        # 跨句桥接命中 metric_value（「三方面」本身亦无量值结构）
+        verdict, reason = validate_synthesis_claim(
+            {"kind": "interpretation", "text": "估值回落。三方面支撑明显",
+             "evidence_refs": ["cat-1"]}, registry)
+        assert verdict is not None, reason
+
+    def test_nfkc_folded_literal_and_structure(self, registry):
+        # 兼容/康熙部首/电报月名码点：折叠视图命中，原因记 nfkc:，原文不改写
+        for text, marker in (("市盈率为⼆", "nfkc:"), ("利润为㋀", "nfkc:"),
+                             ("市盈率为㍘", "nfkc:"), ("估值为㋁", "nfkc:")):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is None, (text, reason)
+            assert reason and reason.startswith(
+                "quantitative_statement:" + marker), (text, reason)
+
+    def test_roman_literals_no_name_exception(self, registry):
+        # Roman=Nl 字面数字无任何名称/上下文豁免（root v2 反例：与金融数值
+        # 同构的 Ⅱ/Ⅹ/Ⅻ 必须拒）；身份由服务端 identity 字段+中性指称承担
+        for text in ("市盈率Ⅱ", "市盈率为Ⅹ", "股价Ⅱ元", "目标股市盈率Ⅻ倍",
+                     "市盈率Ⅴ倍", "第Ⅱ名", "评级Ⅱ级表现",
+                     "白酒Ⅱ", "白酒Ⅱ板块的另一催化仍待落地",
+                     "白酒Ⅲ子行业的另一催化", "行业Ⅴ类后缀显性化"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is None, (text, reason)
+            assert reason and reason.startswith("quantitative_statement:"), (text, reason)
+
+    def test_names_without_literal_digits_pass(self, registry):
+        # 名称无字面数字时照常放行（对照）；汉字数量形名称不误拒
+        for text in ("白酒板块情绪一致", "工程机械出口景气", "三一重工带动板块"):
+            verdict, reason = validate_synthesis_claim(
+                {"kind": "interpretation", "text": text,
+                 "evidence_refs": ["cat-1"]}, registry)
+            assert verdict is not None, (text, reason)
 
 
 class TestReferenceQualification:
@@ -368,7 +469,7 @@ class TestOutputValidation:
             {"kind": "interpretation", "text": "政策催化落地，板块动能居前",
              "evidence_refs": ["cat-1", "trend"]},
             {"kind": "interpretation", "text": "板块区间收益5.0%远超基准",
-             "evidence_refs": ["trend"]},  # 数量字符陈述 → 整条拒绝
+             "evidence_refs": ["trend"]},  # 明确量值陈述 → 整条拒绝
         ]
         accepted, rejected = validate_synthesis_output({"claims": claims}, registry)
         assert len(accepted) == 1
