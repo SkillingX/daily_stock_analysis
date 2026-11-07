@@ -1,0 +1,86 @@
+{
+  "board_code": "BK1277",
+  "provenance": "captured-production-wire.json records.members:BK1277:1 (2026-11-07 生产出站只读捕获, RPT_F10_CORETHEME_BOARDTYPE NEW_BOARD_CODE=BK1277)；仅保存消费的公共成员字段 code/name (SECURITY_CODE/SECURITY_NAME_ABBR 原样)",
+  "members": [
+    {
+      "code": "000799",
+      "name": "酒鬼酒"
+    },
+    {
+      "code": "600197",
+      "name": "伊力特"
+    },
+    {
+      "code": "600809",
+      "name": "山西汾酒"
+    },
+    {
+      "code": "600519",
+      "name": "贵州茅台"
+    },
+    {
+      "code": "600199",
+      "name": "金种子酒"
+    },
+    {
+      "code": "603919",
+      "name": "金徽酒"
+    },
+    {
+      "code": "000568",
+      "name": "泸州老窖"
+    },
+    {
+      "code": "603198",
+      "name": "迎驾贡酒"
+    },
+    {
+      "code": "600559",
+      "name": "老白干酒"
+    },
+    {
+      "code": "603589",
+      "name": "口子窖"
+    },
+    {
+      "code": "002304",
+      "name": "洋河股份"
+    },
+    {
+      "code": "002646",
+      "name": "天佑德酒"
+    },
+    {
+      "code": "600779",
+      "name": "水井坊"
+    },
+    {
+      "code": "600702",
+      "name": "舍得酒业"
+    },
+    {
+      "code": "000596",
+      "name": "古井贡酒"
+    },
+    {
+      "code": "000860",
+      "name": "顺鑫农业"
+    },
+    {
+      "code": "000858",
+      "name": "五粮液"
+    },
+    {
+      "code": "000995",
+      "name": "皇台酒业"
+    },
+    {
+      "code": "200596",
+      "name": "古井贡B"
+    },
+    {
+      "code": "603369",
+      "name": "今世缘"
+    }
+  ]
+}

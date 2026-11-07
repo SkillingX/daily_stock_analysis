@@ -22,6 +22,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -52,6 +53,18 @@ _FIXTURES = Path(__file__).parent / "fixtures" / "sector_eastmoney"
 _AFTER_CLOSE = datetime(2026, 11, 6, 16, 30)
 # 盘中：11-06 10:00
 _INTRA_DAY = datetime(2026, 11, 6, 10, 0)
+
+_CN_MARKET_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _cn_epoch(*args: int) -> float:
+    """CN 市场本地墙钟 → epoch（合成 f86/time 输入专用，host TZ 无关）。
+
+    供应商 f86/time 语义是 CN 市场时区墙钟；naive ``.timestamp()`` 随
+    host 时区漂移（UTC 主机上 CN 10:00 会成为 18:00 被误拒）。比较时钟
+    （received/session ctx）按 runtime 契约保持 naive 市场本地，不走本函数。
+    """
+    return datetime(*args, tzinfo=_CN_MARKET_TZ).timestamp()
 
 
 def _load(name: str) -> Dict[str, Any]:
@@ -1035,10 +1048,8 @@ def _intraday_ctx() -> Any:
 
 def test_stockget_same_day_future_rejected(monkeypatch) -> None:
     """root final 反例：盘中 10:00 接收，f86=同日 14:30 是未来时点 → 拒绝。"""
-    from datetime import datetime as dtdt
-
     raw = _load("board-quote.json")
-    raw["data"]["f86"] = int(dtdt(2026, 11, 6, 14, 30).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 14, 30))
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"stockget:90.BK1277": raw}))
     assert _fetch_stock_quote("90.BK1277", "BK1277", "白酒Ⅱ", budget=budget,
@@ -1050,7 +1061,7 @@ def test_stockget_same_day_future_rejected(monkeypatch) -> None:
 def test_stockget_postclose_same_day_late_rejected(monkeypatch) -> None:
     """root final 反例：盘后 16:00 接收，f86=同日 23:00 晚于接收 → 拒绝。"""
     raw = _load("board-quote.json")
-    raw["data"]["f86"] = int(datetime(2026, 11, 6, 23, 0).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 23, 0))
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"stockget:90.BK1277": raw}))
     assert _fetch_stock_quote("90.BK1277", "BK1277", "白酒Ⅱ", budget=budget,
@@ -1066,7 +1077,7 @@ def test_stockget_postclose_older_intraday_rejected(monkeypatch) -> None:
     冒充盘后可比行情进入全体已知排名。
     """
     raw = _load("board-quote.json")
-    raw["data"]["f86"] = int(datetime(2026, 11, 6, 10, 0).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 10, 0))
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"stockget:90.BK1277": raw}))
     assert _fetch_stock_quote("90.BK1277", "BK1277", "白酒Ⅱ", budget=budget,
@@ -1090,10 +1101,8 @@ def test_stockget_fixture_ts_within_receive_window_accepted(monkeypatch) -> None
 
 def test_trends2_future_time_envelope_rejected(monkeypatch) -> None:
     """root final 反例：完整当日分钟 + time=2030 → 与接收时刻不一致 → 拒绝。"""
-    from datetime import datetime as dtdt
-
     payload = _load("board-trends2.json")
-    payload["data"]["time"] = int(dtdt(2030, 1, 1).timestamp())
+    payload["data"]["time"] = int(_cn_epoch(2030, 1, 1))
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"trends2:90.BK1277": payload}))
     assert _fetch_trends2_snapshot(
@@ -1105,7 +1114,7 @@ def test_trends2_future_time_envelope_rejected(monkeypatch) -> None:
 def test_trends2_time_before_last_minute_rejected(monkeypatch) -> None:
     """time 早于完整分钟序列末根（10:00 vs 15:00）= envelope 不一致 → 拒绝。"""
     payload = _load("board-trends2.json")
-    payload["data"]["time"] = int(datetime(2026, 11, 6, 10, 0).timestamp())
+    payload["data"]["time"] = int(_cn_epoch(2026, 11, 6, 10, 0))
     budget = ReportBudget(30)
     _install_wire(monkeypatch, _route_by_secid({"trends2:90.BK1277": payload}))
     assert _fetch_trends2_snapshot(
@@ -1294,7 +1303,7 @@ def test_collect_accepts_quote_arriving_after_request(monkeypatch) -> None:
     from src.services import sector_analysis_service as svc
 
     raw = _load("stock-quote.json")
-    raw["data"]["f86"] = int(datetime(2026, 11, 6, 10, 0, 1).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 10, 0, 1))
     from src.services import sector_analysis_service as _svc
     monkeypatch.setattr(_svc, "_fetch_tencent_member_quotes",
                         lambda df, *, budget, session_ctx: None)
@@ -1357,7 +1366,7 @@ def test_cross_close_intraday_snapshot_rejected(monkeypatch) -> None:
     from src.services import sector_analysis_service as svc
 
     raw = _load("board-quote.json")
-    raw["data"]["f86"] = int(datetime(2026, 11, 6, 14, 59, 30).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 14, 59, 30))
     monkeypatch.setattr(
         svc, "_fetch_tencent_member_quotes",
         lambda df, *, budget, session_ctx: None)  # 腾讯批量源不可用→既有路径
@@ -1390,7 +1399,7 @@ def test_prosperity_real_chain_receive_clock(monkeypatch) -> None:
 
     monkeypatch.setattr(ak, "stock_board_industry_name_em", _em_down)
     raw = _load("board-quote.json")
-    raw["data"]["f86"] = int(datetime(2026, 11, 6, 10, 0, 1).timestamp())
+    raw["data"]["f86"] = int(_cn_epoch(2026, 11, 6, 10, 0, 1))
     budget = ReportBudget(60)
     _install_wire(monkeypatch, _route_by_secid({"stockget:90.BK1277": raw}))
     monkeypatch.setattr(svc, "_received_at_now",
@@ -1822,8 +1831,8 @@ def test_tencent_mismatch_dup_extra_rejected_fallback_fills_gaps(monkeypatch):
             member_name = str(df[df["代码"] == code]["名称"].iloc[0])
             payload = {"data": {
                 "f57": code, "f58": member_name,
-                "f48": 12345.0 + len(code), "f86": float(datetime(
-                    2026, 11, 6, 16, 10).timestamp()),
+                "f48": 12345.0 + len(code), "f86": float(_cn_epoch(
+                    2026, 11, 6, 16, 10)),
                 "f170": 0.5, "f168": 1.0, "f116": 1e9}}
             resp = requests.Response()
             resp.status_code = 200
@@ -1883,8 +1892,8 @@ def test_tencent_stale_and_future_rows_rejected_rows_fall_back(monkeypatch):
                 "secid", [""])[0].partition(".")[2]
             member_name = str(df[df["代码"] == code]["名称"].iloc[0])
             payload = {"data": {"f57": code, "f58": member_name,
-                                "f48": 777.0, "f86": float(datetime(
-                                    2026, 11, 6, 16, 10).timestamp()),
+                                "f48": 777.0, "f86": float(_cn_epoch(
+                                    2026, 11, 6, 16, 10)),
                                 "f170": 0.3}}
             return _wire_response(payload)
         raise AssertionError(f"unexpected wire: {prepared.url[:80]}")
@@ -1948,6 +1957,182 @@ def test_tencent_program_error_propagates(monkeypatch):
             pass
 
 
+# ---------------------------------------------------------------------------
+# 跨源名称 display 等价（独立 F10 官方成员名预期 fixture 驱动；预期名
+# 不从腾讯响应名派生——f10-members-*.json 由生产捕获只读物化，仅含
+# 消费的公共成员字段 code/name）
+# ---------------------------------------------------------------------------
+
+def _f10_members_df(bk: str) -> pd.DataFrame:
+    """F10 官方成员表预期输入（独立 fixture，code/name 原样）。"""
+    fixture = json.loads(
+        (_FIXTURES / f"f10-members-{bk.lower()}.json").read_text(encoding="utf-8"))
+    return pd.DataFrame({"代码": [m["code"] for m in fixture["members"]],
+                         "名称": [m["name"] for m in fixture["members"]]})
+
+
+def _tencent_single_line(symbol: str, name: str, code: str) -> str:
+    """以 BK0739 首行真实字段为模板的单行腾讯 wire（仅换名称/代码）。"""
+    fields = (_load_tencent_body("BK0739").split(";")[0]
+              .split('"')[1].split("~"))
+    fields[1], fields[2] = name, code
+    return f'v_{symbol}="{"~".join(fields)}";'
+
+
+def test_tencent_f10_names_padding_equivalent_35_all_rankable(monkeypatch):
+    """F10 预期名 + 真实腾讯线材（BK0739）：35/35 全采纳——000528
+    「柳工」vs「柳    工」空白 padding 等价（保留 F10 规范名并披露原始
+    供应商名），含 7 个 bj920；无逐股 fallback 出站；全体排名可判定。"""
+    from src.services import sector_analysis_service as svc
+
+    body = _load_tencent_body("BK0739")
+    df = _f10_members_df("BK0739")
+    assert len(df) == 35
+
+    def strict_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = body.encode("gbk")
+            return resp
+        raise AssertionError("35/35 全覆盖时不得有逐股 fallback 出站")
+
+    monkeypatch.setattr(requests.Session, "send", strict_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(120), session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 35
+    assert batch.tencent_count == 35
+    assert batch.currency_unknown_count == 0
+    assert batch.amounts_known is True
+    row = batch.df[batch.df["代码"] == "000528"].iloc[0]
+    assert str(row["名称"]) == "柳工" and float(row["成交额"]) > 0
+    assert sum(1 for c in df["代码"] if c.startswith("920")) == 7
+    gaps = "\n".join(batch.gaps)
+    assert "名称空白等价接受" in gaps and "柳    工" in gaps
+    out = _peers_pillar("600031", batch.df, budget=ReportBudget(60),
+                        subject_confirmed=True,
+                        quotes_complete=batch.amounts_known)
+    assert out["target_in_amount_top5"] in (True, False)
+
+
+def test_tencent_f10_names_19_cny_b_unknown_fullwidth_rejected(monkeypatch):
+    """F10 预期名 + 真实腾讯线材（BK1277）：19 只 CNY 采纳（000858
+    「五粮液」vs「五 粮 液」padding 等价）；200596「古井贡B」vs
+    「古井贡Ｂ」全半角不归一、名称不符如实拒绝披露，B 股保留金额未知。"""
+    from src.services import sector_analysis_service as svc
+
+    _install_tencent_wire(monkeypatch, _load_tencent_body("BK1277"))
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    df = _f10_members_df("BK1277")
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(120), session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20
+    assert batch.tencent_count == 19
+    assert batch.currency_unknown_count == 1
+    assert batch.amounts_known is False
+    row = batch.df[batch.df["代码"] == "000858"].iloc[0]
+    assert str(row["名称"]) == "五粮液" and float(row["成交额"]) > 0
+    gaps = "\n".join(batch.gaps)
+    assert "名称空白等价接受" in gaps and "五 粮 液" in gaps
+    assert "200596 名称不符" in gaps
+    assert "古井贡B" in gaps and "古井贡Ｂ" in gaps
+    assert any("币种可比性未证实" in g for g in batch.gaps)
+    out = _peers_pillar("600519", batch.df, budget=ReportBudget(30),
+                        subject_confirmed=True,
+                        quotes_complete=batch.amounts_known)
+    assert out["target_in_amount_top5"] is None
+
+
+def test_tencent_name_display_equivalence_controls():
+    """名称 display 等价正/负控制（真实解析函数 + 真实行字段模板）：
+    剥除空白后相同即采纳（行名称保留请求规范名）；真不同名、纯空白名、
+    ST/*ST 前缀、大小写、全半角变体、不同代码均拒绝（无模糊/别名/ST
+    剥离/大小写或 Unicode 归一/仅名或仅码接受）。"""
+    from src.services.sector_analysis_service import _parse_tencent_member_body
+
+    def parse(expected, actual_name, actual_code="000799"):
+        text = _tencent_single_line("sz000799", actual_name, actual_code)
+        return _parse_tencent_member_body(
+            text, {"sz000799": ("000799", expected)})
+
+    # 正控制：相同名与空白 padding（半角/全角空格）等价采纳
+    for actual in ("酒鬼酒", "酒 鬼 酒", "酒    鬼酒", "酒　鬼　酒"):
+        rows, anomalies, _ = parse("酒鬼酒", actual)
+        assert [r.name for r in rows] == ["酒鬼酒"], actual
+        if actual != "酒鬼酒":
+            assert any("名称空白等价接受" in a and actual in a
+                       for a in anomalies), actual
+    # 负控制（真实形态变体）：真不同名 / 纯空白 / ST 与 *ST / 大小写 /
+    # 全半角（实证 200596 对）/ 不同代码
+    negative = [
+        ("酒鬼酒", "酒鬼酒股份", "000799"),
+        ("酒鬼酒", "   ", "000799"),
+        ("酒鬼酒", "ST酒鬼酒", "000799"),
+        ("酒鬼酒", "*ST酒鬼酒", "000799"),
+        ("TCL科技", "tcl科技", "000799"),
+        ("古井贡B", "古井贡Ｂ", "200596"),
+        ("酒鬼酒", "酒鬼酒", "000798"),
+    ]
+    for expected, actual_name, actual_code in negative:
+        rows, anomalies, _ = parse(expected, actual_name, actual_code)
+        assert rows == [], (expected, actual_name, actual_code)
+        marker = "代码不符" if actual_code != "000799" else "名称不符"
+        assert any(marker in a for a in anomalies), (expected, actual_name)
+
+
+def test_tencent_duplicate_wrong_name_group_invalidated(monkeypatch):
+    """重复符号其一错名：raw 重复先于资格过滤记录 → 冲突组整组失效
+    （不采信首行），缺口由既有逐股东财 fallback 以 F10 预期名仅补实际
+    缺口（不出站重复成功行）。"""
+    from urllib.parse import urlparse, parse_qs
+
+    from src.services import sector_analysis_service as svc
+
+    segments = [s for s in _load_tencent_body("BK1277").split(";") if s.strip()]
+    target = next(s for s in segments if s.startswith('v_sz000799="'))
+    wrong_copy = target.replace("~酒鬼酒~", "~错名酒~", 1)
+    mutated = ";".join([target, wrong_copy] + segments[1:]) + ";"
+    df = _f10_members_df("BK1277")
+    stockget_codes = []
+
+    def routed_send(self, prepared, **kwargs):  # noqa: ANN001
+        if "qt.gtimg.cn" in prepared.url:
+            resp = requests.Response()
+            resp.status_code = 200
+            resp.encoding = "gbk"
+            resp._content = mutated.encode("gbk")
+            return resp
+        if "stock/get" in prepared.url:
+            code = parse_qs(urlparse(prepared.url).query).get(
+                "secid", [""])[0].partition(".")[2]
+            stockget_codes.append(code)
+            member_name = str(df[df["代码"] == code]["名称"].iloc[0])
+            return _wire_response({"data": {
+                "f57": code, "f58": member_name, "f48": 1234.0,
+                "f86": float(_cn_epoch(
+                    2026, 11, 6, 16, 10)),
+                "f170": 0.5}})
+        raise AssertionError(f"unexpected wire: {prepared.url[:80]}")
+
+    monkeypatch.setattr(requests.Session, "send", routed_send)
+    monkeypatch.setattr(svc, "_received_at_now",
+                        lambda: _TENCENT_AFTER_CLOSE_RECEIVE)
+    batch = _collect_member_quotes(
+        df, budget=ReportBudget(120), session_ctx=_tencent_after_close_ctx())
+    assert len(batch.df) == 20  # 精确分母不变
+    gaps = "\n".join(batch.gaps)
+    assert "000799 冲突组失效" in gaps and "错名酒" in gaps
+    assert stockget_codes == ["000799"]  # 仅实际缺口逐股出站
+    row = batch.df[batch.df["代码"] == "000799"].iloc[0]
+    assert abs(float(row["成交额"]) - 1234.0) < 1  # fallback 补齐
+    assert batch.tencent_count == 18  # 19 CNY - 冲突失效的 000799
+    assert batch.currency_unknown_count == 1  # B 股保留金额未知
+
+
 def test_clist_amount_column_path_never_invokes_tencent(monkeypatch):
     """normal clist 快照路径不变：带成交额列的快照不触发腾讯批量。"""
 
@@ -1961,8 +2146,8 @@ def test_clist_amount_column_path_never_invokes_tencent(monkeypatch):
             "secid", [""])[0].partition(".")[2]
         member_name = str(df[df["代码"] == code]["名称"].iloc[0])
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 100.0, "f86": float(datetime(
-                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f48": 100.0, "f86": float(_cn_epoch(
+                                            2026, 11, 6, 16, 10)),
                                         "f170": 0.1}})
 
     monkeypatch.setattr(requests.Session, "send", no_tencent)
@@ -2083,8 +2268,8 @@ def test_tencent_36_members_partial_block_failure_survives(monkeypatch):
             "secid", [""])[0].partition(".")[2]
         member_name = str(df[df["代码"] == code]["名称"].iloc[0])
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 42.0, "f86": float(datetime(
-                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f48": 42.0, "f86": float(_cn_epoch(
+                                            2026, 11, 6, 16, 10)),
                                         "f170": 0.2}})
 
     monkeypatch.setattr(requests.Session, "send", routed_send)
@@ -2180,9 +2365,7 @@ def test_tencent_per_chunk_allowlist_and_cross_block(monkeypatch):
             "secid", [""])[0].partition(".")[2]
         member_name = str(df[df["代码"] == code]["名称"].iloc[0])
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 6199528289.0, "f86": float(
-                                            datetime(2026, 11, 6, 16, 10)
-                                            .timestamp()),
+                                        "f48": 6199528289.0, "f86": float(_cn_epoch(2026, 11, 6, 16, 10)),
                                         "f170": 0.07}})
 
     monkeypatch.setattr(requests.Session, "send", routed_send)
@@ -2232,8 +2415,8 @@ def test_tencent_conflict_group_invalid_then_fallback(monkeypatch):
                 "secid", [""])[0].partition(".")[2]
             member_name = str(df[df["代码"] == code]["名称"].iloc[0])
             return _wire_response({"data": {"f57": code, "f58": member_name,
-                                            "f48": 555.0, "f86": float(datetime(
-                                                2026, 11, 6, 16, 10).timestamp()),
+                                            "f48": 555.0, "f86": float(_cn_epoch(
+                                                2026, 11, 6, 16, 10)),
                                             "f170": 0.1}})
         raise AssertionError("unexpected wire")
 
@@ -2336,9 +2519,7 @@ def test_tencent_amount_source_rounded37_provenance_schema(monkeypatch):
             # stock/get 对 685001 失败 → 强制 trends2 fallback（混源第三来源）
             return _wire_response({"data": None})
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 500000.0, "f86": float(
-                                            datetime(2026, 11, 6, 16, 10)
-                                            .timestamp()),
+                                        "f48": 500000.0, "f86": float(_cn_epoch(2026, 11, 6, 16, 10)),
                                         "f170": 0.4}})
 
     monkeypatch.setattr(requests.Session, "send", mixed_send)
@@ -2384,8 +2565,8 @@ def test_tencent_no_retry_single_wire_per_chunk(monkeypatch):
         code = "000799"
         member_name = str(df[df["代码"] == code]["名称"].iloc[0])
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 8.0, "f86": float(datetime(
-                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f48": 8.0, "f86": float(_cn_epoch(
+                                            2026, 11, 6, 16, 10)),
                                         "f170": 0.0}})
 
     monkeypatch.setattr(requests.Session, "send", conn_fail_then_decline)
@@ -2468,8 +2649,8 @@ def test_budget_terminal_36_early_missing_single_summary(monkeypatch):
             "secid", [""])[0].partition(".")[2]
         member_name = str(df[df["代码"] == code]["名称"].iloc[0])
         return _wire_response({"data": {"f57": code, "f58": member_name,
-                                        "f48": 10.0, "f86": float(datetime(
-                                            2026, 11, 6, 16, 10).timestamp()),
+                                        "f48": 10.0, "f86": float(_cn_epoch(
+                                            2026, 11, 6, 16, 10)),
                                         "f170": 0.1}})
 
     monkeypatch.setattr(requests.Session, "send", routed_send)

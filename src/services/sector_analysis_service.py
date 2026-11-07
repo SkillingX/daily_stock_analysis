@@ -2481,6 +2481,18 @@ def _parse_tencent_amount_decimal(
     return None, False, None  # 两者皆缺值：金额未知（缺失语义）
 
 
+def _member_display_name_equal(expected: str, actual: str) -> bool:
+    """成员名称跨源 display 等价：剥除全部空白后完全相同且非空即同名。
+
+    覆盖供应商固定宽度显示 padding（如「柳    工」）；不做模糊/近似、
+    ST/*ST 剥离、大小写与全半角 Unicode 归一、前缀别名，剥后为空即
+    不等。代码/符号同键精确校验不受本函数影响。
+    """
+    stripped_expected = "".join(expected.split())
+    return (bool(stripped_expected)
+            and stripped_expected == "".join(actual.split()))
+
+
 def _parse_tencent_member_body(
     text: str, chunk_allowlist: Dict[str, Tuple[str, str]],
 ) -> Tuple[List["TencentMemberRow"], List[str], List[str]]:
@@ -2491,7 +2503,9 @@ def _parse_tencent_member_body(
     strict/frozen 模型（消费字段边界 + 可表示性：如 f32=``1e999`` Decimal
     有限但 float 溢出 → 源错误行不采用）；重复 symbol 同键交给上层按
     code 冲突组统一失效（本层不采信首行）。供应商供应时点/金额来源
-    （exact35/rounded37）随记录携带。程序异常原样传播。
+    （exact35/rounded37）随记录携带。名称比较经
+    :func:`_member_display_name_equal`（空白 padding 等价；原始名不同的
+    等价接受如实披露，行名称保留请求规范名）。程序异常原样传播。
     """
     from src.schemas.sector_vendor import TencentMemberRow
 
@@ -2528,10 +2542,16 @@ def _parse_tencent_member_body(
             anomalies.append(
                 f"{symbol} 代码不符：请求 {code} 实际 {fields[2]}，行不采用")
             continue
-        if fields[1] != name:
+        if not _member_display_name_equal(name, fields[1]):
             anomalies.append(
                 f"{symbol} 名称不符：请求「{name}」实际「{fields[1]}」，行不采用")
             continue
+        if fields[1] != name:
+            # 空白 padding 等价接受：行名称保留 F10 规范名，原始供应商名
+            # 如实披露（不静默归一，保留跨源 raw 来源可见性）
+            anomalies.append(
+                f"{symbol} 名称空白等价接受：请求「{name}」实际「{fields[1]}」"
+                "（显示 padding，非不同证券；行名称保留请求规范名）")
         try:
             provider_time = datetime.strptime(
                 fields[30], _TENCENT_PROVIDER_TIME_FMT)
