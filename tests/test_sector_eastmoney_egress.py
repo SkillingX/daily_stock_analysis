@@ -162,7 +162,32 @@ from src.patches.eastmoney_patch import (  # noqa: E402
     is_scoped_sector_quote_url,
     sector_eastmoney_proxy,
 )
+import src.patches.eastmoney_patch as _eastmoney_patch_module  # noqa: E402
 from src.services import sector_analysis_service as svc  # noqa: E402
+
+# 授权获取确定性合成值：autouse 隔离 fixture 作用域内把模块级 ``_get_nid``
+# 短路为固定值（纯函数、零网络）——wire 测试的计数/预算/denial 断言不依赖
+# 真实授权外联、授权缓存冷热/TTL 或前序用例是否启用过 auth 路由
+# （CI 42462666183 根因：前序模块将 ``_auth_patch_enabled`` 永久置位后，
+# 每次东财目标 dispatch 都会对 anonflow2 发真实授权外联）。
+_SYNTHETIC_NID = "synthetic-nid-for-egress-tests"
+
+
+class _DeterministicAuthRandom:
+    """auth/throttle 确定性替代（作用域内替换模块级 ``random`` 引用）。
+
+    生产 auth 分支 dispatch 前有 ``random.uniform(1, 4)`` 秒防风控暂停——
+    auth 激活路径的组成部分。测试作用域内将 uniform 归零、choice 取首元素，
+    使 wire 计数/预算断言不受随机暂停影响；teardown 恢复原模块引用。
+    """
+
+    @staticmethod
+    def uniform(low: float, high: float) -> float:
+        return 0.0
+
+    @staticmethod
+    def choice(seq: Any) -> Any:
+        return seq[0]
 
 
 def _env_only_proxy_bypass(host: str, **kwargs: Any) -> int:
@@ -505,12 +530,15 @@ def _egress_isolation() -> Iterator[_IsolationScope]:
     """作用域隔离（autouse，函数级）：import 无副作用——隔离只在每个测试
     期间安装，teardown 完全恢复并断言还原。
 
-    安装内容：清空继承代理 env（记录原值）→ neutralize 系统代理自动发现
-    （stdlib + requests 按值绑定缝；平台可选的 macOS sysconf 缝按**存在性**
-    快照/临时替换/恢复——缺席保持缺席，在位则恢复原对象身份）→ 以本轮
-    fresh 注册表替换 ``socket.connect``/``connect_ex``/``getaddrinfo``
-    （TCP 仅放行本轮注册的精确回环端口；DNS 仅数字地址与本轮注册的主机
-    映射，解析由守卫直接合成）。
+    安装内容：清空继承代理 env（记录原值）→ **隔离真实授权获取**（作用域内
+    把模块级 ``_get_nid`` 短路为固定合成值、``_auth_patch_enabled`` 固定为
+    True——本地与 CI/生产行为一致且覆盖 auth 激活路径，wire 断言不依赖真实
+    授权外联/授权缓存冷热 TTL/前序用例；auth 路由本身不关闭）→ neutralize
+    系统代理自动发现（stdlib + requests 按值绑定缝；平台可选的 macOS sysconf
+    缝按**存在性**快照/临时替换/恢复——缺席保持缺席，在位则恢复原对象身份）
+    → 以本轮 fresh 注册表替换 ``socket.connect``/``connect_ex``/
+    ``getaddrinfo``（TCP 仅放行本轮注册的精确回环端口；DNS 仅数字地址与本轮
+    注册的主机映射，解析由守卫直接合成）。
     恢复内容：全部缝按快照还原、env 按原值还原、活跃作用域清空，并断言
     全局状态与 import 快照一致——不毒化同进程其他模块的既有测试。
     """
@@ -524,7 +552,10 @@ def _egress_isolation() -> Iterator[_IsolationScope]:
         "getproxies": _urllib_request.getproxies,
         "requests_getproxies": _requests_utils.getproxies,
         "requests_proxy_bypass": _requests_utils.proxy_bypass,
+        "auth_patch_enabled": _eastmoney_patch_module._auth_patch_enabled,
     }
+    saved_auth_nid = _eastmoney_patch_module._get_nid
+    saved_auth_random = _eastmoney_patch_module.random
     # 平台可选属性：进入时的存在性与原对象身份（缺席不读取）
     entry_platform_attrs = {
         name: getattr(_urllib_request, name)
@@ -587,6 +618,15 @@ def _egress_isolation() -> Iterator[_IsolationScope]:
     socket.getaddrinfo = guarded_getaddrinfo  # type: ignore[assignment]
     _ACTIVE = scope
     try:
+        # 真实授权获取隔离：_get_nid 短路为固定合成值、auth/throttle 随机暂停
+        # 确定性归零（auth 路由保持开启，requests/TLS/proxy 状态拒绝等真实
+        # 风险层零 mock）
+        platform_stack.enter_context(patch.object(
+            _eastmoney_patch_module, "_get_nid",
+            lambda user_agent: _SYNTHETIC_NID))
+        platform_stack.enter_context(patch.object(
+            _eastmoney_patch_module, "random", _DeterministicAuthRandom))
+        _eastmoney_patch_module._auth_patch_enabled = True
         platform_stack.enter_context(patch.object(
             _urllib_request, "getproxies_macosx_sysconf", lambda: {}, create=True))
         platform_stack.enter_context(patch.object(
@@ -596,6 +636,10 @@ def _egress_isolation() -> Iterator[_IsolationScope]:
     finally:
         # 完全恢复 + invariance 断言（teardown 失败即测试失败，绝不静默残留）
         platform_stack.close()
+        assert _eastmoney_patch_module._get_nid is saved_auth_nid
+        assert _eastmoney_patch_module.random is saved_auth_random
+        _eastmoney_patch_module._auth_patch_enabled = saved["auth_patch_enabled"]
+        assert _eastmoney_patch_module._auth_patch_enabled == saved["auth_patch_enabled"]
         for name in _OPTIONAL_PLATFORM_PROXY_ATTRS:
             if name in entry_platform_attrs:
                 assert getattr(_urllib_request, name) is entry_platform_attrs[name], name
@@ -715,6 +759,56 @@ def test_isolation_denies_unowned_loopback_listener() -> None:
     assert accepted == [], "未持有端口竟能建立连接——隔离失效"
 
 
+def test_auth_fetch_synthetic_under_cold_or_expired_cache(
+        _egress_isolation: _IsolationScope) -> None:
+    """冷缓存/过期缓存下授权获取都是确定性合成值，零真实外联。
+
+    CI 42462666183 根因回归：授权缓存（成功 TTL 20s、失败负缓存每次仍重试）
+    的冷热与 TTL 不影响 wire 测试行为——fixture 已把 ``_get_nid`` 短路为固定
+    合成值，缓存字段完全不被触及。
+    """
+    cache = _eastmoney_patch_module._cache
+    saved_data, saved_expire = cache.data, cache.expire_at
+    denials_before = len(_egress_isolation.denied)
+    try:
+        # 冷缓存（CI 28 分钟全套后的真实状态）
+        cache.data, cache.expire_at = None, 0
+        assert _eastmoney_patch_module._get_nid("ua") == _SYNTHETIC_NID
+        # 过期缓存（有过残值但已过期）
+        cache.data, cache.expire_at = "stale-nid", 0
+        assert _eastmoney_patch_module._get_nid("ua") == _SYNTHETIC_NID
+        # 零真实外联：无新增 denial（含 DNS）
+        assert len(_egress_isolation.denied) == denials_before, \
+            _egress_isolation.denied[denials_before:]
+    finally:
+        cache.data, cache.expire_at = saved_data, saved_expire
+
+
+def test_wire_dispatch_stable_when_prior_module_enabled_auth(
+        loopback: _LoopbackFixture) -> None:
+    """前序模块启用 auth 路由后 wire dispatch 仍稳定（CI 失败机制直接反例）。
+
+    既有测试调用 ``eastmoney_patch()``（budget_only=False）会把模块级
+    ``_auth_patch_enabled`` 永久置 True——CI 上到本文件 wire 测试时每次东财
+    目标 dispatch 都触发真实授权外联（anonflow2），被 DNS 守卫拒绝后进入
+    denial 并漂移计数。fixture 作用域内的合成授权短路使 dispatch 与前序
+    状态完全无关。
+    """
+    with _proxy_config(loopback.proxy_addr):
+        # 显式走"前序模块"真实置位路径（fixture 已固定 True，此调用再验证
+        # 真实入口不改变确定性）
+        eastmoney_patch(budget_only=False)
+        try:
+            assert svc._http_get_json(
+                "http://7.push2his.eastmoney.com/api/qt/stock/kline/get",
+                {"secid": "90.BK1277"}, budget=_budget(5.0)) == {"ok": True}
+        finally:
+            eastmoney_patch(budget_only=True)
+    assert _FakeForwardProxy.received, "wire dispatch 应到达 fixture 代理"
+    scope_denied = len(_active_scope().denied)
+    assert scope_denied == 0, _active_scope().denied
+
+
 def test_module_import_is_inert_and_restores_global_state() -> None:
     """import 无副作用 + teardown 完全恢复的不变式检查。
 
@@ -728,6 +822,11 @@ def test_module_import_is_inert_and_restores_global_state() -> None:
     assert socket.getaddrinfo is not _IMPORT_SNAPSHOT["getaddrinfo"]
     sysconf = getattr(_urllib_request, "getproxies_macosx_sysconf", None)
     assert callable(sysconf) and sysconf() == {}
+    # 授权获取在作用域内为确定性合成短路（teardown 恢复原对象由 fixture 断言）
+    assert _eastmoney_patch_module._get_nid("ua") == _SYNTHETIC_NID
+    assert _eastmoney_patch_module._auth_patch_enabled is True
+    # auth/throttle 随机暂停在作用域内确定性归零
+    assert _eastmoney_patch_module.random.uniform(1, 4) == 0.0
     # 显式 env 注入 sentinel：fixture teardown 应将其原样恢复
     os.environ["HTTP_PROXY"] = "http://collection-sentinel.invalid:9"
     # 活跃作用域为本轮 fresh 注册表（非进程级共享残留）
