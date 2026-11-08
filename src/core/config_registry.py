@@ -128,6 +128,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": True, "is_required": False, "is_editable": False,
         "default_value": "", "options": [], "validation": {}, "display_order": 16,
     },
+    "SECTOR_EASTMONEY_PROXY_URL": {
+        "title": "板块东财出站代理", "description": "板块专项东财公共行情（push2/push2his 及数字分片子域）可选正向代理；空=直连行为不变；认证信息仅限本机.env或部署凭据注入，配置值部署敏感且服务端掩码显示，修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 16,
+    },
     "IFIND_MCP_TIMEOUT_SECONDS": {
         "title": "iFinD请求超时", "description": "同批MCP请求总等待上限，仍受报告剩余预算约束。",
         "category": "data_source", "data_type": "number", "ui_control": "number",

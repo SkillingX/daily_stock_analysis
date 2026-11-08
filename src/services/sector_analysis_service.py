@@ -181,6 +181,80 @@ def bounded_call(fn: Callable[..., Any], *args: Any, budget: ReportBudget,
     return result
 
 
+def _current_sector_em_proxy_url() -> Optional[str]:
+    """当前配置的板块专项东财出站代理 URL（None=未配置，既有直连行为不变）。"""
+    from src.config import get_config
+
+    return get_config().sector_eastmoney_proxy_url
+
+
+def _redact_scoped_proxy_error(exc: BaseException, proxy_url: Optional[str]) -> BaseException:
+    """供应商异常在传播前移除 scoped 代理地址（渲染状态完整脱敏）。
+
+    类型与 traceback 保留（异常类别/预算语义不变，不静默吞错）；调用方既有
+    ``str(exc)[:N]`` 截断发生在本 redact 之后——先脱敏再截断，raw 凭证不进
+    任何 gap/日志文本。未配置代理时原样返回。
+
+    脱敏对象是**实际渲染状态**而非仅 ``args``：``OSError.__str__`` 渲染
+    ``strerror``/``filename``/``filename2``（构造时从参数快照，事后改
+    ``args`` 不回填），``repr`` 渲染 ``args``，urllib3 ``MaxRetryError.__str__``
+    经 ``reason`` 属性 ``%r`` 渲染，traceback 格式化逐层渲染 ``str()`` 并沿
+    ``__cause__``/``__context__`` 链展开。故对异常树每个节点递归处理：
+    ``args`` 字符串成员 + OSError 渲染字段 + ``reason`` + 因果链，叶子字符串
+    用 ``redact_sector_eastmoney_proxy_text`` 变体替换（原地修改，类别/预算
+    语义不变）。
+
+    该边界对本传输实际会抛出的异常形态是完整的：requests/urllib3/stdlib
+    网络异常的 ``str()``/``repr()``/traceback 渲染只来自上述字段；``response``/
+    ``pool``/``conn`` 等对象属性不参与这些渲染（池 host:port 仅在构造时被
+    烘焙进 args 字符串，已被覆盖）。
+    """
+    if not proxy_url:
+        return exc
+    from src.config import redact_sector_eastmoney_proxy_text
+
+    visited: set[int] = set()
+
+    def walk(node: BaseException) -> None:
+        if id(node) in visited:
+            return  # 异常链可能成环（cause/context 互指），不无限递归
+        visited.add(id(node))
+        args = getattr(node, "args", None)
+        if isinstance(args, tuple):
+            new_args: list[Any] = []
+            changed = False
+            for arg in args:
+                if isinstance(arg, str):
+                    redacted = redact_sector_eastmoney_proxy_text(arg, proxy_url)
+                    changed = changed or redacted != arg
+                    new_args.append(redacted)
+                else:
+                    if isinstance(arg, BaseException):
+                        walk(arg)
+                    new_args.append(arg)
+            if changed:
+                node.args = tuple(new_args)
+        if isinstance(node, OSError):
+            # OSError 系（含 ssl.SSLError/socket.gaierror 等）的 str 渲染字段：
+            # 构造时从参数快照的独立属性，改 args 不回填，必须单独脱敏
+            for attr in ("strerror", "filename", "filename2"):
+                value = getattr(node, attr, None)
+                if isinstance(value, str):
+                    redacted = redact_sector_eastmoney_proxy_text(value, proxy_url)
+                    if redacted != value:
+                        setattr(node, attr, redacted)
+        reason = getattr(node, "reason", None)  # urllib3 MaxRetryError/ResponseError
+        if isinstance(reason, BaseException):
+            walk(reason)
+        for attr in ("__cause__", "__context__"):
+            chained = getattr(node, attr, None)
+            if isinstance(chained, BaseException):
+                walk(chained)
+
+    walk(exc)
+    return exc
+
+
 def _ak_with_retry(call: Callable[..., Any], *args: Any,
                    retries: int = 1, delay: float = 0.5,
                    retry_budget: ReportBudget,
@@ -203,13 +277,28 @@ def _ak_with_retry(call: Callable[..., Any], *args: Any,
     派发被拒绝，不产生新 wire）。成功/供应商失败/截止异常三类退出都在
     finally reset；无 deadline 的无关 requests 不受影响，同线程后续任务
     不残留上下文。
+
+    scoped 代理（opt-in）：配置 ``SECTOR_EASTMONEY_PROXY_URL`` 时本工作
+    线程同时 bind ``sector_eastmoney_proxy``（submit 不继承调用方
+    ContextVar，故必须在实际 worker 内 bind）——patched_request 只对
+    push2/push2his（含数字分片）目标路由到该代理，覆盖全局环境代理值；
+    重试仍走同一 scoped 路径，无配置代理失败后的隐藏直连回退。传播的
+    供应商异常 message 先脱敏代理地址再由调用方截断。
     """
-    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+    from src.patches.eastmoney_patch import (
+        eastmoney_patch,
+        request_deadline,
+        sector_eastmoney_proxy,
+    )
 
     last_exc: Optional[BaseException] = None
     token: Optional["object"] = None
+    proxy_token: Optional["object"] = None
+    scoped_proxy = _current_sector_em_proxy_url()
     eastmoney_patch(budget_only=True)
     token = request_deadline.set(retry_budget.fetch_deadline)
+    if scoped_proxy:
+        proxy_token = sector_eastmoney_proxy.set(scoped_proxy)
     try:
         for i in range(retries + 1):
             retry_budget.require_fetch()
@@ -220,9 +309,11 @@ def _ak_with_retry(call: Callable[..., Any], *args: Any,
                 if i < retries:
                     time.sleep(min(delay, max(retry_budget.fetch_remaining(), 0.0)))
         assert last_exc is not None  # 至少跑了一次循环
-        raise last_exc
+        raise _redact_scoped_proxy_error(last_exc, scoped_proxy)
     finally:
         request_deadline.reset(token)
+        if proxy_token is not None:
+            sector_eastmoney_proxy.reset(proxy_token)
 
 
 def _bounded_ak(fn: Callable[..., Any], *args: Any, budget: ReportBudget,
@@ -345,12 +436,26 @@ def _http_get_json(url: str, params: Dict[str, Any], *,
       单次重试，退避钳制剩余预算——与 ``_ak_with_retry`` 同语义；程序错误不重试。
     - ``model``：严格供应商 I/O 模型（src/schemas/sector_vendor.py），形状/类型
       不符按源错误返回 None，不 str() 合法化。
+
+    scoped 代理（opt-in）：worker 内与 AkShare 出站同一 ``sector_eastmoney_proxy``
+    bind/reset（push2/push2his 目标路由到配置代理，datacenter 等其他主机保持
+    既有路径）；代理地址属部署敏感——``last_error`` 先脱敏再截断，不进日志。
     """
-    from src.patches.eastmoney_patch import eastmoney_patch, request_deadline
+    from src.patches.eastmoney_patch import (
+        eastmoney_patch,
+        request_deadline,
+        sector_eastmoney_proxy,
+    )
+    from src.config import redact_sector_eastmoney_proxy_text
+
+    scoped_proxy = _current_sector_em_proxy_url()
 
     def _call() -> Any:
         eastmoney_patch(budget_only=True)
         token = request_deadline.set(budget.fetch_deadline)
+        proxy_token: Optional["object"] = None
+        if scoped_proxy:
+            proxy_token = sector_eastmoney_proxy.set(scoped_proxy)
         try:
             with requests.Session() as session:
                 resp = session.get(url, params=params, timeout=timeout,
@@ -359,6 +464,8 @@ def _http_get_json(url: str, params: Dict[str, Any], *,
                 return resp.json()
         finally:
             request_deadline.reset(token)
+            if proxy_token is not None:
+                sector_eastmoney_proxy.reset(proxy_token)
 
     host = url.split("/")[2] if "//" in url else url
     data: Optional[Any] = None
@@ -374,9 +481,10 @@ def _http_get_json(url: str, params: Dict[str, Any], *,
             # 仅 JSON 解码边界：resp.json() 失败（502 HTML 等）。注意它继承
             # RequestException，必须先于网络异常分支捕获才能区分错误文案。
             # 程序层的 ValueError/TypeError/AssertionError 不在此捕获，原样传播。
-            last_error = f"response not JSON: {str(exc)[:60]}"
+            last_error = ("response not JSON: "
+                          f"{redact_sector_eastmoney_proxy_text(str(exc), scoped_proxy)[:60]}")
         except requests.RequestException as exc:  # noqa: BLE001 - 网络/HTTP 状态按源错误
-            last_error = str(exc)[:100]
+            last_error = redact_sector_eastmoney_proxy_text(str(exc), scoped_proxy)[:100]
         if attempt < retries:
             remaining = budget.fetch_remaining()
             if remaining <= 0:

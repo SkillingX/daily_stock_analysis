@@ -10,6 +10,7 @@ A股自选股智能分析系统 - 配置管理模块
 3. 提供类型安全的配置访问接口
 """
 
+import ipaddress
 import json
 import logging
 import math
@@ -17,7 +18,7 @@ import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, cast
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from dotenv import load_dotenv, dotenv_values
 from dataclasses import dataclass, field
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
@@ -259,6 +260,133 @@ def parse_research_timeout(value: Optional[str]) -> float:
     if not math.isfinite(result) or result <= 0:
         raise ValueError("DEEP_RESEARCH_TIMEOUT_SECONDS must be finite and positive")
     return result
+
+
+def _is_valid_proxy_host(host: str) -> bool:
+    """正向代理主机语法校验（stdlib ipaddress + DNS 形态规则，非通用 URL 框架）。
+
+    - IPv4/IPv6（含 ``::1`` 等回环；``urlparse().hostname`` 已去 ``[]``）→ 合法
+    - 其余按 DNS 主机形态：总长 ≤253（允许单个 FQDN 尾点）、每段 1-63 字符、
+      仅 ASCII 字母/数字/``_``/``-`` 且段首尾不能是 ``-``——单段主机（如
+      ``localhost`` 与内网短名）与多段域名（如 ``proxy.corp.internal``）均合法
+    - 仅做语法校验，不做 DNS 解析/连通性探测（解析失败在出站时按既有
+      网络失败路径显式暴露）
+    """
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    candidate = host[:-1] if host.endswith(".") else host
+    if not candidate or len(candidate) > 253:
+        return False
+    for label in candidate.split("."):
+        if not 1 <= len(label) <= 63:
+            return False
+        if label[0] == "-" or label[-1] == "-":
+            return False
+        for ch in label:
+            if not (("a" <= ch <= "z") or ("A" <= ch <= "Z")
+                    or ("0" <= ch <= "9") or ch in "_-"):
+                return False
+    return True
+
+
+def validate_sector_eastmoney_proxy_url(raw: Optional[str]) -> Optional[str]:
+    """校验 ``SECTOR_EASTMONEY_PROXY_URL``（板块专项东财公共行情出站代理）。
+
+    - 未设置/空白 → ``None``（默认直连行为不变，不配置也可运行）
+    - 合法形态：``http://[user[:pass]@]host[:port]`` 或 ``https://...`` 的
+      正向代理地址；认证 userinfo 允许配置（不得出现在日志/repr/API/文档）
+    - 无效 → ``ValueError``：错误消息只含变量名，**绝不含配置值**、不含原始
+      解析错误链
+    校验顺序：先对**未归一化的原始输入**查控制字符（换行前缀的合法形态
+    URL 若先 strip 会被放行），再 strip 兼容既有空白容差，最后结构/主机语法。
+    """
+    if raw is None:
+        return None
+    if not raw.strip():
+        return None
+    invalid_prefix = "SECTOR_EASTMONEY_PROXY_URL 配置无效"
+    invalid_suffix = "（合法形态：http/https://[user[:pass]@]host[:port]）"
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise ValueError(f"{invalid_prefix}：包含控制字符{invalid_suffix}")
+    value = raw.strip()
+    try:
+        parts = urlparse(value)
+        port = parts.port
+    except ValueError:
+        raise ValueError(f"{invalid_prefix}：无法解析{invalid_suffix}") from None
+    if (parts.scheme or "").lower() not in ("http", "https"):
+        raise ValueError(f"{invalid_prefix}：scheme 必须为 http 或 https{invalid_suffix}")
+    if not parts.hostname:
+        raise ValueError(f"{invalid_prefix}：缺少主机名{invalid_suffix}")
+    if not _is_valid_proxy_host(parts.hostname):
+        raise ValueError(f"{invalid_prefix}：主机名语法无效{invalid_suffix}")
+    if parts.path not in ("", "/"):
+        raise ValueError(f"{invalid_prefix}：正向代理地址不应携带路径{invalid_suffix}")
+    if parts.query or parts.fragment:
+        raise ValueError(f"{invalid_prefix}：不应携带 query/fragment{invalid_suffix}")
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(f"{invalid_prefix}：端口超出 1-65535{invalid_suffix}")
+    return value
+
+
+# 带凭证 userinfo 的代理 URL（任何 scheme）：整个 URL 以 [REDACTED] 占位。
+# 仅匹配 user[:pass]@ 形态，正常无凭证业务 URL 不受影响。
+_CREDENTIALED_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://[^\s/@]+:[^\s/@]+@\S*")
+
+
+def _proxy_secret_redaction_variants(proxy_url: str) -> List[str]:
+    """配置代理 URL 的脱敏变体集合（长 → 短排序，避免部分替换破坏整体）。
+
+    覆盖 requests/urllib3 真实异常形态中出现的变体：原始整体 URL、
+    ``user:pass@host:port``（netloc）、``host:port``（连接池 repr）、userinfo、
+    单独 user/password，以及 % 编码形态（URL/userinfo 可能以编码形式渲染）。
+    不含单独 port（纯数字，误伤日志数字风险大于收益）。
+    """
+    variants = [proxy_url]
+    try:
+        parts = urlparse(proxy_url)
+    except ValueError:
+        parts = None
+    if parts is not None and parts.hostname:
+        if parts.netloc:
+            variants.append(parts.netloc)
+        if parts.port:
+            variants.append(f"{parts.hostname}:{parts.port}")
+        if parts.username and parts.password:
+            variants.append(f"{parts.username}:{parts.password}")
+        for credential in (parts.username, parts.password):
+            if credential:
+                variants.append(credential)
+                decoded = unquote(credential)
+                if decoded != credential:
+                    variants.append(decoded)
+    encoded = [quote(variant, safe="") for variant in variants]
+    variants.extend(v for v in encoded if v not in variants)
+    unique: List[str] = []
+    for variant in variants:
+        if variant and variant not in unique:
+            unique.append(variant)
+    return sorted(unique, key=len, reverse=True)
+
+
+def redact_sector_eastmoney_proxy_text(text: str, proxy_url: Optional[str]) -> str:
+    """从诊断文本中移除 scoped 代理地址（日志/gap 出口在**截断前**调用）。
+
+    三层：① 配置值原样出现的整体替换（含无凭证形态——配置值本身部署敏感）；
+    ② 解析出的变体替换（netloc/host:port/userinfo/凭证/编码形态，按长→短）；
+    ③ 通用带凭证 userinfo 的 URL 整体替换（异常链中未知形态的兜底）。
+    """
+    if not text:
+        return text
+    redacted = text
+    if proxy_url:
+        for variant in _proxy_secret_redaction_variants(proxy_url):
+            if variant in redacted:
+                redacted = redacted.replace(variant, "[REDACTED]")
+    return _CREDENTIALED_URL_RE.sub("[REDACTED]", redacted)
 
 
 def parse_env_float(
@@ -1194,6 +1322,12 @@ class Config:
     # 个股板块专项报告总预算（秒）：独立板块取数/等待共用同一剩余预算，
     # 不复用基本面产品 timeout，避免隐式耦合（issue #79 实施默认 300s、1—300）
     sector_analysis_report_timeout_seconds: float = 300.0
+    # 板块专项东财公共行情出站代理（opt-in 部署 secret；默认空=直连行为不变）。
+    # 仅作用于板块分析对 push2/push2his（含数字分片子域）的东财公共行情出站，
+    # 不改全局 HTTP(S)_PROXY/NO_PROXY 与其他数据源路径；配置值部署敏感，
+    # 不得出现在日志/repr/API——repr=False 是最小 repr 排除（生成 dataclass
+    # repr 默认含全部字段，凭证 URL 会随之泄露）；校验失败显式报错（只含变量名）。
+    sector_eastmoney_proxy_url: Optional[str] = field(default=None, repr=False)
     fundamental_stage_timeout_seconds: float = FUNDAMENTAL_STAGE_TIMEOUT_SECONDS_DEFAULT
     # 单能力源调用超时（秒）
     fundamental_fetch_timeout_seconds: float = FUNDAMENTAL_FETCH_TIMEOUT_SECONDS_DEFAULT
@@ -2433,6 +2567,10 @@ class Config:
                 field_name="SECTOR_ANALYSIS_REPORT_TIMEOUT_SECONDS",
                 minimum=1.0,
                 maximum=300.0,
+            ),
+            # 板块专项东财出站代理（opt-in；无效值显式报错，只含变量名不含值）
+            sector_eastmoney_proxy_url=validate_sector_eastmoney_proxy_url(
+                os.getenv("SECTOR_EASTMONEY_PROXY_URL")
             ),
             fundamental_stage_timeout_seconds=parse_env_float(
                 os.getenv("FUNDAMENTAL_STAGE_TIMEOUT_SECONDS"),

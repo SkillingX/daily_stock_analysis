@@ -410,6 +410,10 @@
 
 ## 数据源适配（2026-11-07 收敛轮：clist 断连窗口的替代接入）
 
+2026-11-08 生产路径对照证实 push2/push2his 家族存在路径相关访问失败；本专项新增
+可选出站代理 `SECTOR_EASTMONEY_PROXY_URL`（作用域、失败语义、验收边界与回滚见
+`docs/sector-eastmoney-egress.md`），未配置时本节数据源行为不变。
+
 生产实测东财 clist/ulist/kline 批量接口存在断连/502 窗口（身份丢失、后续全跳过），
 本专项按「已验证稳定源优先、合法部分先恢复、缺口如实」收敛以下适配（wire 契约见
 `src/schemas/sector_vendor.py`，风险回归见 `tests/test_sector_board_data_rebuild.py`，
@@ -621,6 +625,7 @@ TypeError/ValueError/AssertionError 等程序错误原样传播（API 500、零�
 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `SECTOR_ANALYSIS_REPORT_TIMEOUT_SECONDS` | `300.0` | 板块报告总预算（秒），1—300；独立板块配置，不复用基本面产品 timeout |
+| `SECTOR_EASTMONEY_PROXY_URL` | 空（未设置） | 板块专项东财公共行情出站正向代理（可选部署 secret）；空=既有直连行为不变；仅作用于 push2/push2his（含数字分片子域），详见 `docs/sector-eastmoney-egress.md` |
 
 概念列示复用既有 iFinD 入口（`ENABLE_IFIND_MCP` / `IFIND_MCP_ENDPOINT` / `IFIND_MCP_TOKEN` /
 `IFIND_MCP_TIMEOUT_SECONDS`）；入口停用时概念缺失仅记缺口，不影响主报告。

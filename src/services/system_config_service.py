@@ -85,6 +85,19 @@ class ConfigImportError(Exception):
         self.message = message
 
 
+class ConfigExportError(Exception):
+    """Raised when an export cannot be proven free of deployment-only secrets.
+
+    导出契约是「宁可拒绝、不得携带未过滤内容」：当 dotenv 解析失败、span
+    序列不完整、或畸形语句中可能携带 deployment-only 键时，导出显式失败
+    （错误消息只含安全语义，绝不含原始语句/配置值/异常原因链）。
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 @dataclass(frozen=True)
 class _LLMDiagnostic:
     """Internal structured diagnosis for LLM test and discovery failures."""
@@ -127,10 +140,17 @@ class SystemConfigService:
         "CHOICE_USERNAME",
         "CHOICE_PASSWORD",
         "IFIND_MCP_TOKEN",
+        "SECTOR_EASTMONEY_PROXY_URL",
         "TAVILY_API_KEYS",
         "ALPHASIFT_INSTALL_SPEC",
         "LLM_USAGE_HMAC_SECRET",
     }
+    # 导出（export_env / export_desktop_env 备份）中整体剔除的 deployment-only
+    # 键：这类键只属于部署侧凭据注入（.env/平台环境），不得进入可下载/可同步
+    # 的备份载荷。get/schema 掩码只管展示；导出是完整 .env 副本，必须以
+    # dotenv 语法感知的方式按**完整赋值 span** 剔除（见
+    # _strip_excluded_env_assignments），不能用物理行切分近似。
+    _EXPORT_EXCLUDED_ENV_KEYS: frozenset = frozenset({"SECTOR_EASTMONEY_PROXY_URL"})
     _NOTIFICATION_TEST_CHANNELS: Tuple[str, ...] = (
         "wechat",
         "feishu",
@@ -566,17 +586,112 @@ class SystemConfigService:
         }
 
     def export_env(self) -> Dict[str, Any]:
-        """Return the raw active `.env` content for backup."""
+        """Return the active `.env` content for backup, minus deployment-only keys.
+
+        ``_EXPORT_EXCLUDED_ENV_KEYS`` 中的键以 dotenv 语法感知方式按**完整赋值
+        span** 剔除（含 ``export`` 前缀、单引号键、完整多行引号值、重复赋值，
+        以及顶层历史注释赋值行）：deployment-only 凭据只属于部署侧，备份载荷
+        不得携带。与 ConfigManager 同一解析引擎定位 span；其余内容**逐字节**
+        保留（含无关多行引号值内的赋值形注释、U+2028、无尾换行），导入/备份
+        语义不变。
+        """
         if self._manager.env_path.exists():
             content = self._manager.env_path.read_text(encoding="utf-8")
         else:
             content = ""
-
+        content = self._strip_excluded_env_assignments(content)
         return {
             "content": content,
             "config_version": self._manager.get_config_version(),
             "updated_at": self._manager.get_updated_at(),
         }
+
+    _EXCLUDED_COMMENTED_ASSIGNMENT_RE = re.compile(
+        r"^\s*#\s*(?:export\s+)?[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?\s*="
+    )
+
+    def _strip_excluded_env_assignments(self, content: str) -> str:
+        """按完整 dotenv 赋值 span 重组导出内容；无法证明已剔除则显式失败。
+
+        用与 :meth:`ConfigManager.read_config_map` 同一解析引擎
+        （``dotenv.parser.parse_stream``）枚举绑定，**直接按
+        ``binding.original.string`` 的先后序列重组输出**（绑定原文序列恰好
+        拼接回整个输入；BOM 由 Reader 剥离、在输出端原样保留）：
+
+        - 正常赋值（``key`` 非 None）：键 Token（dotenv 保留键名两侧引号，
+          剥离后大小写不敏感）命中 deployment 键 → 整个 span 剔除；
+        - 注释/空白块（``key=None`` 且非 error）：其中匹配 deployment 键的
+          注释赋值行按行剔除，其余逐字节保留；
+        - **畸形语句（``binding.error=True``）**：dotenv 无法给出键语义——
+          span 内出现任何 deployment 键名（大小写不敏感）即视为可能携带其
+          凭证，无法建立「已安全剔除」→ 抛 :class:`ConfigExportError` 拒绝
+          导出（fail-closed）；不含 deployment 键名的无关畸形 span 原样保留。
+
+        解析异常、span 序列与输入不完全对应等任何无法建立安全剔除的情形
+        一律 fail-closed 拒绝导出，**绝不返回未过滤原文**；错误消息只含
+        安全语义（不含原始语句/配置值/异常原因链）。不重排行、不追加换行、
+        不规范化任何字符；无关多行值内部的赋值形注释位于值 span 内，天然
+        不受影响。
+        """
+        if not content or not content.strip() or not self._EXPORT_EXCLUDED_ENV_KEYS:
+            return content
+        from dotenv.parser import parse_stream
+
+        excluded = [key.upper() for key in self._EXPORT_EXCLUDED_ENV_KEYS]
+        bom = "\ufeff" if content.startswith("\ufeff") else ""
+        body = content[len(bom):]
+        pieces: List[str] = [bom]
+        try:
+            covered = 0
+            for binding in parse_stream(io.StringIO(body)):
+                original = binding.original.string
+                covered += len(original)
+                if binding.error:
+                    # 畸形语句（普通编辑错误：未闭合引号/尾随垃圾等）：
+                    # 无法建立键语义，deployment 键名出现即拒绝导出
+                    upper_span = original.upper()
+                    if any(name in upper_span for name in excluded):
+                        raise ConfigExportError(
+                            "配置导出被拒绝：.env 中存在无法安全剔除的"
+                            "部署专用配置项（.env 存在语法错误），请修正"
+                            " .env 语法后重试")
+                    pieces.append(original)
+                    continue
+                if binding.key is not None:
+                    key_token = str(binding.key).strip().strip("\"'").upper()
+                    if key_token in excluded:
+                        continue  # 剔除完整赋值 span
+                    pieces.append(original)
+                    continue
+                # key=None 且非 error：注释/空白块。只剔除其中匹配 deployment
+                # 键的注释赋值行（仅按 "\n" 切分，行内 U+2028 等字符原样保留）。
+                pieces.append(self._strip_commented_assignments(original, excluded))
+            if covered != len(body):
+                # 绑定序列未完整覆盖输入（无法证明剔除完整性）→ fail-closed
+                raise ConfigExportError(
+                    "配置导出被拒绝：.env 解析结果不完整，为避免部署专用"
+                    "配置项意外泄漏已拒绝本次导出")
+        except ConfigExportError:
+            raise
+        except Exception:
+            raise ConfigExportError(
+                "配置导出被拒绝：.env 解析失败，为避免部署专用配置项意外"
+                "泄漏已拒绝本次导出") from None
+        return "".join(pieces)
+
+    def _strip_commented_assignments(self, block: str,
+                                     excluded: List[str]) -> str:
+        """注释/空白块中剔除 deployment 键的注释赋值行，其余逐字节保留。"""
+        kept: List[str] = []
+        lines = block.split("\n")
+        for index, line in enumerate(lines):
+            match = self._EXCLUDED_COMMENTED_ASSIGNMENT_RE.match(line)
+            if match and match.group(1).upper() in excluded:
+                continue
+            kept.append(line)
+            if index < len(lines) - 1:
+                kept.append("\n")
+        return "".join(kept)
 
     def export_desktop_env(self) -> Dict[str, Any]:
         """Return the raw active `.env` content for desktop backup compatibility."""
