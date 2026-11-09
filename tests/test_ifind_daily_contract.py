@@ -31,15 +31,16 @@ def test_high_below_close_violates_contract():
         _bar(h="10.4", c="10.5")
 
 
-def test_non_positive_low_rejected():
-    with pytest.raises(ViolationError):
+def test_non_positive_low_owned_by_pydantic_layer():
+    # AGENTS §1.4：单字段正值范围归 Pydantic Field(gt=0)（Layer 3），契约层不重复。
+    with pytest.raises(ValidationError):
         _bar(l="0")
 
 
-def test_non_positive_volume_or_amount_rejected():
-    with pytest.raises(ViolationError):
+def test_non_positive_volume_or_amount_owned_by_pydantic_layer():
+    with pytest.raises(ValidationError):
         _bar(v="0")
-    with pytest.raises(ViolationError):
+    with pytest.raises(ValidationError):
         _bar(a="-1")
 
 
@@ -50,6 +51,8 @@ def test_model_rejects_nonfinite_and_bad_date():
         IfindDailyBar(date="20261106", open=10, high=11, low=9, close=10, volume=1, amount=1)
     with pytest.raises(ValidationError):
         IfindDailyBar(date="2026-11-06", open=-1, high=11, low=9, close=10, volume=1, amount=1)
+    with pytest.raises(ValidationError):
+        IfindDailyBar(date="2026-11-06", open=10, high=11, low=9, close=10, volume=0, amount=1)
 
 
 def _records(dates, close=10.0):

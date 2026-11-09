@@ -9,7 +9,10 @@ import logging
 from time import monotonic
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from src.core.research_run import ResearchRun
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,29 @@ class SharedContext:
             self.limitations.append(msg)
 
 
+def sync_unmet_history_notes(ctx: SharedContext, run: "ResearchRun | None" = None) -> None:
+    """把「未满足扩窗拒绝」注记与 run 内实际需求状态对齐（成文/中断渲染前调用）。
+
+    只管理拒绝形注记（``HISTORY_MISSING_NOTE`` 前缀且含 daily window expansion
+    rejected）：仍未被一致采纳满足的需求保留/补录原文；已被满足的（owner 在
+    采纳锁内清除）不再残留假警报。通用缺失/失败/超时注记不属于本函数范围，
+    既有清理语义不变。本函数不取数；状态经 owner 快照隔离读取（停止后可用）。
+    """
+    from src.core.research_run import current_research
+
+    active = run if run is not None else current_research.get()
+    if active is None:
+        return
+
+    def _is_rejection_note(note: str) -> bool:
+        return note.startswith(HISTORY_MISSING_NOTE) and "daily window expansion rejected" in note
+
+    ctx.limitations[:] = [note for note in ctx.limitations if not _is_rejection_note(note)]
+    unmet = active.unmet_daily_history_snapshot()
+    for reason in sorted(unmet.values()):
+        ctx.limitation(f"{HISTORY_MISSING_NOTE}: {reason}")
+
+
 def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, Any]]:
     try:
         from src.services.history_loader import load_history_df
@@ -48,7 +74,12 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
         df, source = load_history_df(code, days=days)
         ctx.history_source = str(source or "")
         if df is None or df.empty:
-            ctx.limitation(HISTORY_MISSING_NOTE)
+            if source and source != "none":
+                # issue #86（PR87 spec）：换源/重叠冲突扩窗的显式拒绝原因进
+                # 限制注记（同前缀，后续同 run 采纳仍会清理）。
+                ctx.limitation(f"{HISTORY_MISSING_NOTE}: {source}")
+            else:
+                ctx.limitation(HISTORY_MISSING_NOTE)
             return []
         records: List[Dict[str, Any]] = df.tail(days).to_dict(orient="records")  # type: ignore[assignment]
         for r in records:

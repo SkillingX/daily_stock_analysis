@@ -470,6 +470,13 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]
     refuse_stopped_or_expired()
 
     if df is None or df.empty:
+        if source and source != "none":
+            # issue #86（PR87 spec）：换源/重叠冲突扩窗等显式失败原因必须到达
+            # 真实消费方，不静默伪装成「无数据」或旧帧成功。
+            return _append_history_metadata(
+                {"error": f"Daily history unavailable for {stock_code}: {source}"},
+                metadata,
+            )
         return _append_history_metadata(
             {"error": f"No historical data available for {stock_code}"},
             metadata,

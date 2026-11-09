@@ -402,3 +402,288 @@ def test_no_source_baseline_has_no_daily_bullet(template):
     # v2 的「当前结构」行以有效 perspective 为前提；双轨模板无条件渲染。
     if template == "deep_research_dual_track.j2":
         assert any(line.startswith("- 当前结构：") for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# PR87 R12：扩窗拒绝在最终报告边界的真实呈现（reconcile→render 全链）
+# ---------------------------------------------------------------------------
+def _report_harness(monkeypatch, frames, *, days: int = 90, prior_days: int = 30):
+    """真实 loader→run→_safe_history→reconcile→render；仅替换外部 manager/DB。"""
+    import socket as _socket
+
+    from tests.ifind_daily_testutil import enabled_config, std_frame, strict_calendar
+    from tests.test_ifind_daily_cache import _FakeDb, _FakeManager, _install
+    from src.core.research_run import ResearchRun, current_research
+
+    def _connect(*_args, **_kwargs):
+        raise AssertionError("network forbidden in offline report regression")
+
+    monkeypatch.setattr(_socket.socket, "connect", _connect)
+    strict_calendar(monkeypatch)
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(monkeypatch, db, _FakeManager(frames))
+    run = ResearchRun(timeout_seconds=60)
+    research_token = current_research.set(run)
+    if prior_days:
+        from src.services import history_loader as H
+
+        H.load_history_df("600519", days=prior_days)  # 任务先采用保留帧
+    ctx = SharedContext("600519", "贵州茅台", "2026-11-08T10:00:00")
+    return run, research_token, manager, ctx, days
+
+
+def _assemble(ctx, dims=None):
+    from src.agent.deep_research.orchestrator import _reconcile_shared_history
+
+    dims = dims if dims is not None else _all_default_dims()
+    dims["data"] = build_data_dim(ctx)
+    calls_before = None  # 由调用方自行断言 manager.calls
+    _reconcile_shared_history(ctx, dims)
+    markdown = render_markdown(
+        build_view(ctx.stock_name, ctx.stock_code, ctx.as_of, ctx.limitations, dims, [])
+    )
+    return dims, markdown, calls_before
+
+
+def test_report_keeps_rejection_note_after_reconcile_changed_source(monkeypatch):
+    """root 反例：换源扩窗被拒后 reconcile 复用旧帧，拒绝原因必须留在成文。"""
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import _safe_history
+    from src.services import history_loader as H
+
+    frames = [std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]
+    run, research_token, manager, ctx, days = _report_harness(monkeypatch, frames)
+    try:
+        ctx.history = _safe_history("600519", days, ctx)
+        assert not ctx.history
+        dims, markdown, _ = _assemble(ctx)
+        assert len(ctx.history) == 40 and ctx.history_source == "IfindDailyFetcher"
+        assert dims["data"].status == "ok"  # 保留帧的短期事实照常可用
+        assert "daily window expansion rejected" in markdown
+        assert "EfinanceFetcher" in markdown and "IfindDailyFetcher" in markdown
+        assert "来源 **IfindDailyFetcher**" in markdown  # 事实与拒绝同时在场
+        unmet = run.unmet_daily_history_snapshot()
+        assert list(unmet) == ["2026-11-06|90"] and "expansion rejected" in unmet["2026-11-06|90"]
+        assert len(manager.calls) == 2  # reconcile/render 不取数
+        # 更短已满足需求复用保留帧，0 网络
+        df, source = H.load_history_df("600519", days=30)
+        assert len(df) == 40 and source == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+    finally:
+        current_research.reset(research_token)
+
+
+def test_report_keeps_rejection_note_after_reconcile_overlap_conflict(monkeypatch):
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import _safe_history
+
+    frames = [std_frame(rows=40), std_frame(rows=120, close=55.5)]
+    run, research_token, manager, ctx, days = _report_harness(monkeypatch, frames)
+    try:
+        ctx.history = _safe_history("600519", days, ctx)
+        assert not ctx.history
+        dims, markdown, _ = _assemble(ctx)
+        assert len(ctx.history) == 40
+        assert dims["data"].status == "ok"
+        assert "conflicts with adopted window" in markdown
+        assert "来源 **IfindDailyFetcher**" in markdown
+        assert "2026-11-06|90" in run.unmet_daily_history_snapshot()
+        assert len(manager.calls) == 2
+    finally:
+        current_research.reset(research_token)
+
+
+def test_report_rejection_note_clears_when_same_demand_satisfied(monkeypatch):
+    """后续一致更长帧实际满足同一需求后，警告在成文清除，无假未解决警报。"""
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import _safe_history
+    from src.services import history_loader as H
+
+    frames = [
+        std_frame(rows=40),
+        (std_frame(rows=120), "EfinanceFetcher"),
+        std_frame(rows=120),  # 后续一致更长窗口（同源重叠一致）
+    ]
+    run, research_token, manager, ctx, days = _report_harness(monkeypatch, frames)
+    try:
+        ctx.history = _safe_history("600519", days, ctx)
+        assert not ctx.history
+        assert "2026-11-06|90" in run.unmet_daily_history_snapshot()
+        df, _source = H.load_history_df("600519", days=120)  # 后续需求触发一致扩展
+        assert len(df) == 120
+        assert run.unmet_daily_history_snapshot() == {}  # 同一 90 天需求已被实际覆盖满足
+        dims, markdown, _ = _assemble(ctx)
+        assert "daily window expansion rejected" not in markdown
+        assert len(ctx.history) == 120 and dims["data"].status == "ok"
+        assert "来源 **IfindDailyFetcher**" in markdown
+        calls = len(manager.calls)
+        assert calls == 3  # reconcile/render 零额外取数
+        df_short, short_source = H.load_history_df("600519", days=30)
+        assert len(df_short) == 120 and short_source == "IfindDailyFetcher"
+        assert len(manager.calls) == calls  # 更短需求 0 网络
+    finally:
+        current_research.reset(research_token)
+
+
+def test_report_genuine_short_history_has_no_rejection_note(monkeypatch):
+    """真实短历史（IPO/原源首取）不成文拒绝：无扩窗注记，短窗事实保留。"""
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import _safe_history
+
+    run, research_token, manager, ctx, days = _report_harness(
+        monkeypatch, [std_frame(rows=10)], prior_days=0
+    )
+    try:
+        ctx.history = _safe_history("600519", days, ctx)
+        assert len(ctx.history) == 10  # 供应商确实只有 10 行：照常采纳
+        dims, markdown, _ = _assemble(ctx)
+        assert "daily window expansion rejected" not in markdown
+        assert "日线历史数据缺失" not in markdown
+        assert run.unmet_daily_history_snapshot() == {}
+        assert dims["data"].daily_history_source == "IfindDailyFetcher"  # 短窗事实保留
+        assert "来源 **IfindDailyFetcher**" in markdown
+    finally:
+        current_research.reset(research_token)
+
+
+def test_report_generic_missing_note_clears_on_adoption(monkeypatch):
+    """通用缺失注记（非拒绝形）在采纳斯照常清除：既有恢复语义不变。"""
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import HISTORY_MISSING_NOTE, _safe_history
+    from src.services import history_loader as H
+
+    run, research_token, manager, ctx, days = _report_harness(
+        monkeypatch, [std_frame(rows=40)], prior_days=0,
+    )
+    original_call = manager.get_daily_data
+
+    def fail_first(*args, **kwargs):
+        if not fail_first.done:  # type: ignore[attr-defined]
+            fail_first.done = True  # type: ignore[attr-defined]
+            raise _FakeManagerError("供应商失败")
+        return original_call(*args, **kwargs)
+
+    fail_first.done = False  # type: ignore[attr-defined]
+    manager.get_daily_data = fail_first
+    try:
+        ctx.history = _safe_history("600519", days, ctx)
+        assert not ctx.history
+        assert any(note.startswith(HISTORY_MISSING_NOTE) for note in ctx.limitations)
+        assert run.unmet_daily_history_snapshot() == {}  # 通用失败不记未满足扩窗
+        H.load_history_df("600519", days=30)  # 后续需求取得并发布窗口
+        dims, markdown, _ = _assemble(ctx)
+        assert "日线历史数据缺失" not in markdown
+        assert len(ctx.history) == 40 and dims["data"].status == "ok"
+    finally:
+        current_research.reset(research_token)
+
+
+class _FakeManagerError(Exception):
+    pass
+
+
+def test_interrupted_report_retains_facts_and_unresolved_rejection(monkeypatch):
+    """取消中断：已取得事实（保留帧+溯源）与未解决拒绝注记同时随部分报告留存。"""
+    from tests.ifind_daily_testutil import std_frame
+    from src.agent.deep_research.orchestrator import _interrupted_result
+    from src.core.research_run import current_research
+    from src.deep_research_dims.context import _safe_history
+    from src.services import history_loader as H
+
+    frames = [std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]
+    run, research_token, manager, ctx, days = _report_harness(monkeypatch, frames)
+    try:
+        H.load_history_df("600519", days=30)
+        ctx.history = _safe_history("600519", days, ctx)
+        dims, _markdown, _ = _assemble(ctx)  # wave1 对齐：复用保留帧
+        run.context = ctx
+        run.stop("cancelled")
+        result = _interrupted_result(run, "600519", "贵州茅台", {"data"}, None)
+        assert result.status == "partial"
+        assert "daily window expansion rejected" in result.markdown
+        assert "来源 **IfindDailyFetcher**" in result.markdown
+        data = result.dims["data"]
+        assert data.daily_history_source == "IfindDailyFetcher"
+        assert data.daily_history_as_of == "2026-11-06"
+        assert "2026-11-06|90" in run.unmet_daily_history_snapshot()  # 未解决：不假装满足
+        assert len(manager.calls) == 2  # 中断渲染不取数
+    finally:
+        current_research.reset(research_token)
+
+
+# ---------------------------------------------------------------------------
+# PR87 R13：迟到拒绝不复活已解决状态（真实 loader 交错 → 最终成文）
+# ---------------------------------------------------------------------------
+def test_late_rejection_after_satisfied_adoption_no_false_warning(monkeypatch):
+    """root 竞态 2：B 一致采纳 120 后，A 的迟到拒绝不得污染最终报告。
+
+    真实采纳入口决策不被替换；仅在真实 adopt 返回后调度 A 的外向恢复。
+    终态：权威帧 120、未满足状态为空、真实 90 天读取返回 120、最终 MD 无
+    假未解决警告且 120 行事实/溯源在场。
+    """
+    from threading import Event
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests.ifind_daily_testutil import std_frame
+    from src.core.research_run import current_research
+    from src.services import history_loader as H
+
+    frames = [
+        std_frame(rows=40),
+        (std_frame(rows=120), "EfinanceFetcher"),
+        std_frame(rows=120),
+    ]
+    run, research_token, manager, ctx, days = _report_harness(monkeypatch, frames)
+    rejected_snapshot = Event()
+    release_rejection = Event()
+    original_adopt = run.adopt_daily_history
+
+    def scheduled_adopt(as_of, records, source):
+        result = original_adopt(as_of, records, source)  # 真实原子采纳先完成
+        if source == "EfinanceFetcher":
+            rejected_snapshot.set()
+            assert release_rejection.wait(10), "successful extension did not finish"
+        return result
+
+    monkeypatch.setattr(run, "adopt_daily_history", scheduled_adopt)
+
+    def rejected_load():
+        thread_token = current_research.set(run)
+        try:
+            frame, source = H.load_history_df("600519", days=90)
+            return {"records": 0 if frame is None else len(frame), "source": source}
+        finally:
+            current_research.reset(thread_token)
+
+    try:
+        H.load_history_df("600519", days=30)  # call1：采用 40 行 iFinD
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            late = pool.submit(rejected_load)
+            assert rejected_snapshot.wait(10), "conflicting expansion did not reach adoption"
+            accepted, source = H.load_history_df("600519", days=120)  # call3 前的 call2 已发生
+            assert len(accepted) == 120 and source == "IfindDailyFetcher"
+            assert run.unmet_daily_history_snapshot() == {}  # 采纳即消解（尚无记录）
+            release_rejection.set()
+            late_result = late.result(timeout=10)
+        # A 的迟到拒绝如实返回给该次需求，但不复活已解决状态
+        assert late_result["records"] == 0
+        assert "daily window expansion rejected" in late_result["source"]
+        assert run.unmet_daily_history_snapshot() == {}
+        current, current_source = H.load_history_df("600519", days=90)  # 缓存复用：120
+        assert len(current) == 120 and current_source == "IfindDailyFetcher"
+        assert not ctx.history  # 与 root 证明同形：空历史交给真实 reconcile 采纳
+        dims, markdown, _ = _assemble(ctx)
+        assert len(ctx.history) == 120  # reconcile 采纳完整权威槽
+        assert "daily window expansion rejected" not in markdown  # 无假未解决警告
+        assert "来源 **IfindDailyFetcher**" in markdown
+        assert dims["data"].status == "ok"
+        assert len(manager.calls) == 3  # 缓存复用/reconcile/render 零取数
+    finally:
+        release_rejection.set()
+        current_research.reset(research_token)

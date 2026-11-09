@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """issue #86：共享窗口作用域、持久缓存权威边界与 revision-2 污染守卫（离线）。
 
-覆盖：启用范围内 DB 命中不作依据、失败/迟到结果不覆盖已采用帧、换源扩窗
-降级保留、并发同需求只完整获取一次、深研 run 槽位复用、关闭/未启用模式下
-仅含 iFinD 遗留行的窗口被拒而纯旧源混存缓存保持原命中规则、普通 pipeline
-fetch/趋势/今日昨日上下文/Agent 历史共用同一合格窗口。
+覆盖：启用范围内 DB 命中不作依据、失败/迟到结果不覆盖已采用帧、换源/重叠
+冲突扩窗显式失败并保留已采用帧、并发同需求只完整获取一次、深研 run 槽位
+复用、关闭/未启用模式下仅含 iFinD 遗留行的窗口被拒而纯旧源混存缓存保持原
+命中规则、普通 pipeline fetch/趋势/今日昨日上下文/Agent 历史共用同一合格窗口。
 """
 from __future__ import annotations
 
@@ -224,12 +224,22 @@ def test_scope_consumed_window_not_replaced_by_other_source(monkeypatch, offline
     ifind_frame = std_frame(rows=40)
     em_frame = std_frame(rows=120)
     manager = _install(monkeypatch, db, _FakeManager([ifind_frame, (em_frame, "EfinanceFetcher")]))
-    token, _scope = _open_scope()
+    token, scope = _open_scope()
     try:
         _df1, source1 = H.load_history_df("600519", days=30)  # 消费 iFinD 窗口
         df2, source2 = H.load_history_df("600519", days=90)   # iFinD 失败→东财更长
-        assert (source1, source2) == ("IfindDailyFetcher", "IfindDailyFetcher")
-        assert len(df2) == 40  # 换源扩窗降级：保留已采用窗口，不把旧趋势重标新来源
+        assert source1 == "IfindDailyFetcher"
+        # 换源扩窗不再静默当作成功：该次需求显式失败并携带原因，旧帧保留。
+        assert df2 is None
+        assert "daily window expansion rejected" in source2
+        assert "IfindDailyFetcher" in source2 and "EfinanceFetcher" in source2
+        assert len(manager.calls) == 2
+        assert scope.peek() is not None
+        assert scope.peek().source == "IfindDailyFetcher"
+        assert len(scope.peek().records) == 40
+        # 更短的已满足需求复用旧帧，0 网络
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 40 and source3 == "IfindDailyFetcher"
         assert len(manager.calls) == 2
     finally:
         H.close_current_stock_scope(token)
@@ -256,12 +266,22 @@ def test_scope_overlap_conflict_retains_adopted_frame(monkeypatch, offline):
     first = std_frame(rows=40)
     conflicting = std_frame(rows=120, close=55.5)  # 同源但重叠值冲突（口径漂移）
     manager = _install(monkeypatch, db, _FakeManager([first, conflicting]))
-    token, _scope = _open_scope()
+    token, scope = _open_scope()
     try:
         _df1, _s1 = H.load_history_df("600519", days=30)
-        df2, _s2 = H.load_history_df("600519", days=90)
-        assert len(df2) == 40
-        assert float(df2.iloc[0]["close"]) == pytest.approx(10.0)
+        df2, source2 = H.load_history_df("600519", days=90)
+        # 同源重叠冲突同样显式失败；已采用帧原样保留。
+        assert df2 is None
+        assert "daily window expansion rejected" in source2
+        assert "conflicts with adopted window" in source2
+        frame = scope.peek()
+        assert frame is not None
+        assert len(frame.records) == 40
+        assert float(frame.records[0]["close"]) == pytest.approx(10.0)
+        # 更短需求复用旧帧，0 网络
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 40 and source3 == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
     finally:
         H.close_current_stock_scope(token)
 
@@ -275,7 +295,9 @@ def test_scope_failure_memo_prevents_repeat_fetch(monkeypatch, offline):
     try:
         df1, s1 = H.load_history_df("600519", days=30)
         df2, s2 = H.load_history_df("600519", days=30)
-        assert (df1, s1) == (None, "none") and (df2, s2) == (None, "none")
+        # 启用路径失败返回显式原因（首取与 memo 复用同值），同任务同需求只获取一次
+        assert df1 is None and df2 is None
+        assert s1 == s2 == "RuntimeError: 所有数据源获取失败"
         assert len(manager.calls) == 1  # 同任务同需求失败只获取一次
     finally:
         H.close_current_stock_scope(token)
@@ -358,10 +380,19 @@ def test_run_slot_consumed_not_replaced_by_other_source(monkeypatch, offline):
     try:
         _df1, source1 = H.load_history_df("600519", days=60)
         df2, source2 = H.load_history_df("600519", days=90)
-        assert source1 == source2 == "IfindDailyFetcher"
-        assert len(df2) == 60  # 保留已消费深研窗口
-        slot = run.published_daily_history()
+        assert source1 == "IfindDailyFetcher"
+        # run 槽同样不静默：换源扩窗显式失败，已消费深研窗口保留。
+        assert df2 is None
+        assert "daily window expansion rejected" in source2
+        slot = run.daily_history
         assert slot is not None and slot["source"] == "IfindDailyFetcher"
+        assert len(slot["records"]) == 60
+        # 同失败需求复用（single_fetch 去重）+ 更短需求复用，均 0 网络
+        df2b, source2b = H.load_history_df("600519", days=90)
+        assert df2b is None and source2b == source2
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 60 and source3 == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
     finally:
         current_research.reset(research_token)
 
@@ -960,7 +991,7 @@ def test_concurrent_different_source_keeps_adopted_frame(monkeypatch, offline):
             if days == 40:
                 small_returned.set()
                 barrier.wait(timeout=3)
-            return len(out[0]), out[1]
+            return (len(out[0]), out[1]) if out[0] is not None else (None, out[1])
         finally:
             current_research.reset(token)
 
@@ -968,8 +999,11 @@ def test_concurrent_different_source_keeps_adopted_frame(monkeypatch, offline):
         first = pool.submit(worker, 40, "IfindDailyFetcher")
         second = pool.submit(worker, 120, "EfinanceFetcher")
         assert first.result() == (40, "IfindDailyFetcher")
-        assert second.result() == (40, "IfindDailyFetcher")
+        rejected = second.result()
+        assert rejected[0] is None
+        assert "daily window expansion rejected" in rejected[1]
     assert run.daily_history["source"] == "IfindDailyFetcher"
+    assert len(run.daily_history["records"]) == 40
 
 
 def test_scope_conflicting_extension_returns_one_adopted_frame():
@@ -1227,3 +1261,293 @@ def test_run_slot_lock_expired_deadline_propagates(monkeypatch, offline):
         worker.join()
         eastmoney_patch.request_deadline.reset(deadline)
         current_research.reset(research_token)
+
+
+# ---------------------------------------------------------------------------
+# 修正组7（PR87 spec）：换源/重叠冲突扩窗显式失败，旧帧保留不静默
+# ---------------------------------------------------------------------------
+def _block_network(monkeypatch):
+    """出站 socket 一律断言失败：0 网络断言不靠 mock 下层挡住真实路径。"""
+    import socket as _socket
+
+    def _connect(*_args, **_kwargs):
+        raise AssertionError("network forbidden in offline regression")
+
+    monkeypatch.setattr(_socket.socket, "connect", _connect)
+
+
+def test_scope_rejected_demand_replays_failure_without_refetch(monkeypatch, offline):
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    token, _scope = _open_scope()
+    try:
+        _df1, _s1 = H.load_history_df("600519", days=30)
+        df2, reason = H.load_history_df("600519", days=90)
+        assert df2 is None and "daily window expansion rejected" in reason
+        assert len(manager.calls) == 2
+        _block_network(monkeypatch)
+        df2b, reason2 = H.load_history_df("600519", days=90)
+        assert df2b is None and reason2 == reason  # 同失败需求复用原因，不再出网
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_scope_genuine_short_history_first_demand_adopted(monkeypatch, offline):
+    """真实短历史（IPO/原源首取）不被 rows<days 全局拒绝。"""
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager([std_frame(rows=10), std_frame(rows=10)])
+    _install(monkeypatch, db, manager)
+    token, _scope = _open_scope()
+    try:
+        df1, source1 = H.load_history_df("600519", days=90)
+        assert df1 is not None and len(df1) == 10
+        assert source1 == "IfindDailyFetcher"
+        # 供应商确实只有 10 行：新的更短需求真实重取后仍同源一致不更长，
+        # 照常服务已采纳的可得窗口，不算拒绝（区别于冲突/换源）。
+        df2, source2 = H.load_history_df("600519", days=60)
+        assert df2 is not None and len(df2) == 10
+        assert source2 == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_run_conflicting_overlap_expansion_fails_explicitly(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=60), std_frame(rows=120, close=55.5)]),
+    )
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        _df1, _s1 = H.load_history_df("600519", days=60)
+        df2, source2 = H.load_history_df("600519", days=90)
+        assert df2 is None
+        assert "conflicts with adopted window" in source2
+        slot = run.daily_history
+        assert slot is not None and slot["source"] == "IfindDailyFetcher"
+        assert len(slot["records"]) == 60
+        assert float(slot["records"][0]["close"]) == pytest.approx(10.0)
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_rejected_expansion_then_stop_keeps_control_signal(monkeypatch, offline):
+    """拒绝之后取消：更短需求必须传出停止信号，不被失败原因掩盖。"""
+    from src.core.research_run import ResearchRun, ResearchStopped, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=60), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    run = ResearchRun(timeout_seconds=60)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        df2, _reason = H.load_history_df("600519", days=90)
+        assert df2 is None
+        run.stop("cancelled")
+        with pytest.raises(ResearchStopped):
+            H.load_history_df("600519", days=30)
+        assert len(manager.calls) == 2
+    finally:
+        current_research.reset(research_token)
+
+
+def test_scope_rejection_memo_still_propagates_expired_deadline(monkeypatch, offline):
+    """失败 memo 复用前先过控制复查：外层 deadline 耗尽必须传出，不被原因掩盖。"""
+    from time import monotonic
+
+    from src.patches import eastmoney_patch
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    token, _scope = _open_scope()
+    try:
+        H.load_history_df("600519", days=30)
+        df2, reason = H.load_history_df("600519", days=90)
+        assert df2 is None and "daily window expansion rejected" in reason
+        deadline_token = eastmoney_patch.request_deadline.set(monotonic() - 1)
+        try:
+            with pytest.raises(TimeoutError):
+                H.load_history_df("600519", days=90)  # memo 复用前先过控制复查
+        finally:
+            eastmoney_patch.request_deadline.reset(deadline_token)
+        assert len(manager.calls) == 2  # 控制信号没有触发重复获取
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_agent_tool_reports_explicit_rejection_after_prior_ifind_window(monkeypatch, offline):
+    """root spec 证明的精确反例（普通作用域身份）：拒绝必须到达工具输出。"""
+    from src.agent.tools import data_tools
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    monkeypatch.setattr(data_tools, "_get_db", lambda: db)
+    token, _scope = _open_scope()
+    try:
+        H.load_history_df("600519", days=30)  # 任务先采用 40 行 iFinD 窗口
+        output = data_tools._handle_get_daily_history("600519", days=90)
+        assert "error" in output
+        assert "daily window expansion rejected" in output["error"]
+        assert "IfindDailyFetcher" in output["error"] and "EfinanceFetcher" in output["error"]
+        assert "actual_records" not in output  # 不再伪装成部分成功
+        db.save_daily_data.assert_not_called()  # 拒绝的候选不落库
+        assert len(manager.calls) == 2
+        # 更短需求复用已采用帧：成功返回真实 40 行，0 网络
+        _block_network(monkeypatch)
+        shorter = data_tools._handle_get_daily_history("600519", days=30)
+        assert "error" not in shorter
+        assert shorter["actual_records"] == 30  # 40 行已采用帧按请求截取
+        assert shorter["source"] == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+        db.save_daily_data.assert_called_once()  # 仅成功帧照常存档
+        # 今日/昨日上下文仍从保留帧派生（报告链不受该次拒绝影响）
+        context = H.qualified_analysis_context("600519", db)
+        assert context is not None
+        assert context["daily_history_source"] == "IfindDailyFetcher"
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_agent_tool_run_identity_reports_explicit_rejection(monkeypatch, offline):
+    """run 身份同样不静默：拒绝到达工具输出，槽位保留给更短需求。"""
+    from src.agent.tools import data_tools
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=60), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    monkeypatch.setattr(data_tools, "_get_db", lambda: db)
+    run = ResearchRun(timeout_seconds=60)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        output = data_tools._handle_get_daily_history("600519", days=90)
+        assert "error" in output
+        assert "daily window expansion rejected" in output["error"]
+        db.save_daily_data.assert_not_called()
+        _block_network(monkeypatch)
+        shorter = data_tools._handle_get_daily_history("600519", days=60)
+        assert "error" not in shorter
+        assert shorter["actual_records"] == 60
+        assert shorter["source"] == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+        slot = run.daily_history
+        assert slot is not None and slot["source"] == "IfindDailyFetcher"
+        assert len(slot["records"]) == 60
+    finally:
+        current_research.reset(research_token)
+
+
+def test_stage0_history_rejection_degrades_report_with_reason(monkeypatch, offline):
+    """报告链：拒绝后阶段 0 历史缺失注记携带原因，溯源字段不冒充。"""
+    from src.deep_research_dims.context import HISTORY_MISSING_NOTE, SharedContext, _safe_history
+    from src.deep_research_dims.data_dim import daily_provenance
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), (std_frame(rows=120), "EfinanceFetcher")]),
+    )
+    token, _scope = _open_scope()
+    try:
+        H.load_history_df("600519", days=30)
+        ctx = SharedContext(stock_code="600519", stock_name="贵州茅台", as_of="2026-11-09T02:03:13")
+        records = _safe_history("600519", 90, ctx)
+        assert records == []
+        assert any(
+            note.startswith(HISTORY_MISSING_NOTE) and "daily window expansion rejected" in note
+            for note in ctx.limitations
+        )
+        provenance = daily_provenance(ctx)
+        assert provenance["daily_history_source"] is None  # 拒绝不产生伪溯源
+    finally:
+        H.close_current_stock_scope(token)
+
+
+# ---------------------------------------------------------------------------
+# 修正组8（PR87 R13）：未满足扩窗状态的 run 锁所有权（并发幂等/不复活）
+# ---------------------------------------------------------------------------
+def test_concurrent_owner_resolution_and_recording_is_idempotent(monkeypatch, offline):
+    """并发记录/采纳消解/快照全走真实 owner 方法：无异常、终态确定、无残留。
+
+    真实覆盖判定不被替换；仅在外向方法返回后协调线程交错（锁外 barrier）。
+    无论顺序如何：记录发生在采纳前则被消解，发生在采纳后则被当前帧复核
+    拒绝——终态必然为空（R12 竞态 1 的所有权收口）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from src.core.research_run import ResearchRun
+
+    run = ResearchRun(timeout_seconds=60)
+    run.adopt_daily_history(
+        LATEST_SESSION.isoformat(),
+        std_frame(rows=40).to_dict(orient="records"),
+        "IfindDailyFetcher",
+    )
+    run.record_unmet_daily_window(
+        LATEST_SESSION.isoformat(), 90, "daily window expansion rejected: retained IfindDailyFetcher window kept, candidate source EfinanceFetcher not adopted",
+    )
+    assert list(run.unmet_daily_history_snapshot()) == ["2026-11-06|90"]
+
+    long_records = std_frame(rows=120).to_dict(orient="records")
+    start = Barrier(6)
+    outcomes: list = []
+    lock = threading.Lock()
+
+    def _adopt():
+        start.wait(timeout=5)
+        return run.adopt_daily_history(LATEST_SESSION.isoformat(), long_records, "IfindDailyFetcher")
+
+    def _record():
+        start.wait(timeout=5)
+        run.record_unmet_daily_window(
+            LATEST_SESSION.isoformat(), 90,
+            "daily window expansion rejected: retained IfindDailyFetcher window kept, candidate source EfinanceFetcher not adopted",
+        )
+        return None
+
+    def _snapshot():
+        start.wait(timeout=5)
+        return run.unmet_daily_history_snapshot()
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_adopt), pool.submit(_adopt), pool.submit(_record), pool.submit(_record), pool.submit(_snapshot), pool.submit(_snapshot)]
+        for future in futures:
+            outcomes.append(future.result(timeout=10))
+
+    with lock:
+        assert all(outcome is not None for outcome in outcomes[:2])  # 两次真实采纳都成功
+        for snapshot in outcomes[4:]:
+            assert isinstance(snapshot, dict)
+        final = run.unmet_daily_history_snapshot()
+        assert final == {}, final  # 无 KeyError、无残留、无丢失
+        frame = run.daily_history
+        assert frame is not None and frame["source"] == "IfindDailyFetcher"
+        assert len(frame["records"]) == 120  # 权威帧未被并发记录覆盖

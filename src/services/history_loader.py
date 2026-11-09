@@ -5,7 +5,9 @@ Provides:
 - ``load_history_df``: read from DB first, DataFetcherManager fallback
 - issue #86: current-stock task window scope (ContextVar, same lifecycle as
   frozen target_date) so enabled eligible reads share one complete same-source
-  window per task instead of stitching fresh tails onto old DB rows.
+  window per task instead of stitching fresh tails onto old DB rows. A
+  changed-source or overlap-conflicting expansion fails that demand explicitly
+  (the returned *source* carries the reason); the adopted frame is retained.
 
 Fixes #1066 – eliminates 45+ redundant HTTP requests per stock in Agent mode.
 """
@@ -269,6 +271,32 @@ def _overlap_consistent(old_records: List[Dict[str, Any]], new_records: List[Dic
                 if old_value != new_value:
                     return False
     return True
+
+
+def _expansion_rejection(
+    served_source: str,
+    served_records: List[Dict[str, Any]],
+    candidate_source: str,
+    candidate_records: List[Dict[str, Any]],
+) -> Optional[str]:
+    """未被采纳的扩窗候选的显式拒绝原因；同源一致候选返回 None（照常服务旧帧）。
+
+    采纳入口（作用域/run 槽）只负责保留权威帧；这里在权威帧上分类：换源或
+    重叠值冲突的候选说明本次扩窗无法被诚实地满足——返回拒绝原因，由调用方
+    让该次需求显式失败并共享失败，已采用帧留给已满足的更短需求复用。同源
+    且重叠一致的候选是供应商真实可得短历史（如 IPO/首取原源），不算拒绝。
+    """
+    if served_source == candidate_source and _overlap_consistent(served_records, candidate_records):
+        return None
+    if served_source != candidate_source:
+        return (
+            f"daily window expansion rejected: retained {served_source} window kept, "
+            f"candidate source {candidate_source} not adopted"
+        )
+    return (
+        f"daily window expansion rejected: retained {served_source} window kept, "
+        "candidate conflicts with adopted window on overlapping rows"
+    )
 
 
 _current_stock_window: contextvars.ContextVar[Optional[_StockWindowScope]] = contextvars.ContextVar(
@@ -650,7 +678,14 @@ def load_history_df(
 
     Returns ``(df, source)`` where *source* is ``"db_cache"`` on DB hit or the
     actual provider name on network fallback.  Returns ``(None, "none")`` when
-    both paths fail.
+    both paths fail in the legacy (non-enabled) path.  In the enabled window
+    path every failure returns ``(None, <explicit reason>)`` instead — a
+    changed-source or overlap-conflicting expansion of an already adopted
+    window fails that demand explicitly (e.g. ``"daily window expansion
+    rejected: ..."``) while the adopted frame is retained for later satisfied
+    shorter needs; a genuine same-source short window (IPO/original source) is
+    served as-is and is never rejected merely for having fewer rows than
+    requested.
 
     ``min_records`` raises the DB-cache hit threshold for callers that need a
     longer window (e.g. weekly resampling needs ~1000 bars): without it a DB
@@ -659,11 +694,13 @@ def load_history_df(
 
     issue #86：启用范围内的合格沪深普通股读取不采纳持久 DB 命中——同一股票
     任务内先复用当前共享窗口（或深研 run 槽位），不足则经真实目标截止日完整
-    重取并按同源一致规则整窗替换；失败在同一作用域内复用，不跨任务缓存失败。
+    重取并按同源一致规则整窗替换；换源/重叠冲突的扩窗对该次需求显式失败并
+    携带原因，已采用帧不换源；失败在同一作用域内复用，不跨任务缓存失败。
     任何模式下，读取范围含本票遗留 iFinD 行（含 iFinD/旧源混合）的 DB 窗口
     都被拒绝并走原链；纯旧源混存缓存保持既有命中规则。
     """
     from data_provider.ifind_daily_adapter import ifind_daily_read_scope
+    from src.core.research_run import daily_demand_span_start
     from src.storage import get_db
 
     if target_date is not None:
@@ -672,7 +709,7 @@ def load_history_df(
         required = cache_session_date(stock_code, frozen)
     else:
         required = cache_session_date(stock_code)
-    start = required - timedelta(days=int(days * 1.8) + 10)
+    start = daily_demand_span_start(required, days)
     if min_records is not None:
         required_records = min(int(min_records), days)
     else:
@@ -811,35 +848,49 @@ def _enabled_network_window(
             need += "|forced"
         prior_failure = None if force_refresh else scope.failure_for(need)
         if prior_failure is not None:
+            # 失败复用也要先过控制复查：取消/外层 deadline 不因命中 memo 被吞。
+            refuse_stopped_or_expired()
             logger.info(
                 "load_history_df(%s): 同任务同需求此前已失败（%s），不再重复获取",
                 stock_code, prior_failure,
             )
-            return None, "none"
+            return None, prior_failure
         try:
             df, source = scope.fetch_once(need, fetch)
         except ResearchStopped:
             raise
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
-            scope.note_failure(need, f"{type(exc).__name__}: {exc}")
+            reason = f"TimeoutError: {exc}"
+            scope.note_failure(need, reason)
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
-            return None, "none"
+            return None, reason
         except Exception as e:
-            scope.note_failure(need, f"{type(e).__name__}: {e}")
+            reason = f"{type(e).__name__}: {e}"
+            scope.note_failure(need, reason)
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
-            return None, "none"
+            return None, reason
         if df is None or df.empty:
             scope.note_failure(need, "empty result")
             logger.warning("load_history_df(%s): 网络返回空窗口", stock_code)
-            return None, "none"
+            return None, "empty result"
         _stop_or_expired()
         records = _trim_or_fail(df, source)
         if records is None:
-            scope.note_failure(need, f"no rows on or before {required.isoformat()}")
-            return None, "none"
+            reason = f"no rows on or before {required.isoformat()}"
+            scope.note_failure(need, reason)
+            return None, reason
         _stop_or_expired()
         served_df, served_source = scope.adopt_and_serve(records, source)
+        rejection = _expansion_rejection(
+            served_source, _history_records(served_df), source, records,
+        )
+        if rejection is not None:
+            # 换源/重叠冲突扩窗：本次需求显式失败（原因随 source 传出），已采用
+            # 帧保留，同需求失败共享，不重复获取。
+            scope.note_failure(need, rejection)
+            logger.warning("load_history_df(%s): %s", stock_code, rejection)
+            return None, rejection
         return served_df, served_source
 
     if run is not None:
@@ -861,23 +912,33 @@ def _enabled_network_window(
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
-            return None, "none"
+            return None, f"TimeoutError: {exc}"
         except Exception as e:
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
-            return None, "none"
+            return None, f"{type(e).__name__}: {e}"
         if df is None or df.empty:
             logger.warning("load_history_df(%s): 网络返回空窗口", stock_code)
-            return None, "none"
+            return None, "empty result"
         _stop_or_expired()
         records = _trim_or_fail(df, source)
         if records is None:
-            return None, "none"
+            return None, f"no rows on or before {required.isoformat()}"
         _stop_or_expired()
         adopted_slot = run.adopt_daily_history(required.isoformat(), records, source)
         if adopted_slot is None:
             raise ResearchStopped("research stopped before daily window adoption")
-        served = _frame_to_df(list(adopted_slot.get("records") or []))
-        return served, str(adopted_slot.get("source") or source)
+        served_records = [dict(row) for row in adopted_slot.get("records") or []]
+        served_source = str(adopted_slot.get("source") or source)
+        rejection = _expansion_rejection(served_source, served_records, source, records)
+        if rejection is not None:
+            # 换源/重叠冲突扩窗：该次需求显式失败；run 内同需求取数已被 single_fetch
+            # 去重，失败不换健康记账，权威槽原样保留给已满足的更短需求。未满足
+            # 需求经 owner 方法记录：run 锁内按当前权威帧复核，迟到拒绝不复活
+            # 已被并发一致采纳满足的状态；采纳侧在同一把锁内消解已覆盖需求。
+            run.record_unmet_daily_window(required.isoformat(), days, rejection)
+            logger.warning("load_history_df(%s): %s", stock_code, rejection)
+            return None, rejection
+        return _frame_to_df(served_records), served_source
 
     # 无 run 无作用域的直接入口：本次调用临时作用域（含并发去重），finally 清理。
     temp_token, temp_scope = open_current_stock_scope(stock_code, target_date=required)
@@ -892,19 +953,25 @@ def _enabled_network_window(
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
-            return None, "none"
+            return None, f"TimeoutError: {exc}"
         except Exception as e:
             logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
-            return None, "none"
+            return None, f"{type(e).__name__}: {e}"
         if df is None or df.empty:
             logger.warning("load_history_df(%s): 网络返回空窗口", stock_code)
-            return None, "none"
+            return None, "empty result"
         _stop_or_expired()
         records = _trim_or_fail(df, source)
         if records is None:
-            return None, "none"
+            return None, f"no rows on or before {required.isoformat()}"
         _stop_or_expired()
-        adopted = temp_scope.adopt_and_serve(records, source)
-        return adopted
+        served_df, served_source = temp_scope.adopt_and_serve(records, source)
+        rejection = _expansion_rejection(
+            served_source, _history_records(served_df), source, records,
+        )
+        if rejection is not None:
+            logger.warning("load_history_df(%s): %s", stock_code, rejection)
+            return None, rejection
+        return served_df, served_source
     finally:
         close_current_stock_scope(temp_token)

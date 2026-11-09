@@ -296,6 +296,10 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     return False, f"获取数据失败: {e}"
                 if df is None or df.empty:
+                    # issue #86（PR87 spec）：换源/重叠冲突扩窗等显式失败原因随
+                    # source 传出，取数失败如实报告，不伪装成普通空数据。
+                    if source_name and source_name != "none":
+                        return False, f"获取数据为空: {source_name}"
                     return False, "获取数据为空"
                 from src.services.history_loader import refuse_stopped_or_expired
 
@@ -1215,6 +1219,12 @@ class StockAnalysisPipeline:
                     logger.info(
                         "[%s] Prefetched %d rows of shared-window history for agent (source: %s)",
                         code, len(df), source,
+                    )
+                else:
+                    # 预取边界如实记录显式失败原因（如换源扩窗被拒）。
+                    logger.info(
+                        "[%s] Agent history prefetch: shared window demand unavailable: %s",
+                        code, source,
                     )
             except ResearchStopped:
                 raise

@@ -1122,6 +1122,10 @@ def _run_dual_track(
 
     # ---- 成文 ----
     _emit(progress_callback, {"type": "thinking", "step": 4, "message": "生成双轨投研报告（模板直灌）..."})
+    # 成文前按 run 实际需求状态对齐未满足扩窗注记（波次内被一致采纳满足的清除）。
+    from src.deep_research_dims.context import sync_unmet_history_notes
+
+    sync_unmet_history_notes(ctx)
     view = build_view(
         stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events,
         report_id=report_id or "",
@@ -1242,6 +1246,7 @@ def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
         HISTORY_FAILED_NOTE_PREFIX,
         HISTORY_MISSING_NOTE,
         STAGE_TIMEOUT_NOTE_SUFFIX,
+        sync_unmet_history_notes,
     )
     from src.services.history_loader import adopt_published_history
 
@@ -1253,6 +1258,9 @@ def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
         note for note in ctx.limitations
         if not (note.startswith(history_note) or note.startswith(HISTORY_MISSING_NOTE) or note.startswith(HISTORY_FAILED_NOTE_PREFIX))
     ]
+    # 换源/重叠冲突的未满足扩窗按 run 实际需求状态对齐：仍未满足的拒绝注记
+    # 在复用保留帧的同时如实保留（PR87 R12），已被一致采纳满足的不残留。
+    sync_unmet_history_notes(ctx)
     data = dims.get("data")
     if data is not None and data.status == "degraded":
         dims["data"] = build_data_dim(ctx)
@@ -1430,6 +1438,10 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
     events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})
     dims = {key: parse_dim(key, value) for key, value in adjusted.items()}
+    # 中断渲染前同样按 run 实际需求状态对齐未满足扩窗注记（不取数）。
+    from src.deep_research_dims.context import sync_unmet_history_notes
+
+    sync_unmet_history_notes(ctx, run)
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")
     markdown = render_markdown(view)
     valid = _has_useful_data(dims)

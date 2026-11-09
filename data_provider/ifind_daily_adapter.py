@@ -89,17 +89,17 @@ class IfindDailyBar(BaseModel):
 
 
 @require(
-    lambda o, h, l, c: l <= min(o, c) and max(o, c) <= h and l > 0,
-    "cash-qfq daily bar must satisfy low <= min(open, close) <= max(open, close) <= high with positive low",
-)
-@require(
-    lambda o, h, l, c, v, a: v > 0 and a > 0,
-    "daily volume and amount must be positive on an adopted session",
+    lambda o, h, l, c: l <= min(o, c) and max(o, c) <= h,
+    "cash-qfq daily bar must satisfy low <= min(open, close) <= max(open, close) <= high",
 )
 def _daily_bar(
     session: str, o: Decimal, h: Decimal, l: Decimal, c: Decimal, v: Decimal, a: Decimal
 ) -> IfindDailyBar:
-    """跨字段不变式（icontract 层）：价格钳制关系与正量额合格后才成行。"""
+    """跨字段不变式（icontract 层）：价格钳制关系成立才成行。
+
+    单字段正值范围（open/high/low/close/volume/amount > 0）归 Layer 3 的
+    ``IfindDailyBar`` 严格字段校验所有，契约层不重复检查（AGENTS §1.4）。
+    """
     return IfindDailyBar(
         date=session, open=float(o), high=float(h), low=float(l), close=float(c),
         volume=float(v), amount=float(a),
