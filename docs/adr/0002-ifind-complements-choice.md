@@ -4,6 +4,8 @@ status: superseded-in-part
 
 # iFinD 与 Choice 的有限双源协作
 
+2026-11-08 修订（[Issue #86](https://github.com/SkillingX/daily_stock_analysis/issues/86)）：日线 K 线范围更新——前文「行情沿用原渠道」对 A 股日线不再完整。`DATA_SOURCE_PROFILE=choice` + `ENABLE_IFIND_MCP=true` 且配置有效时，沪深普通股「截至当前最新已完成交易日」的现金分红前复权日线优先经 iFinD MCP 获取（`IfindDailyFetcher` 复用既有 MCP 客户端/预算/单飞）：四个价格字段逐字段现金分红复权元数据、量（股）/额（元）单位、严格交易日历整窗六字段齐备才采纳；IPO 泛复权、停牌量额缺失、截断、冲突重复整窗拒绝并按既有候选相对次序兜底。显式历史目标与未资格证券（含指数/ETF/B 股/北交所）在任何 iFinD 出站前走原路由。完整 CSV 导出与 MCP 共享同一次尝试的有限绝对 deadline，仅允许 `o.thsi.cn` 已验证结果缓存路径（唯一 HTTP→HTTPS 协议升级），使用禁用 ambient 凭据发现的隔离传输。启用范围内持久 DB 不作为分析读缓存（当前股票任务共享窗口 + 深研 ResearchRun 槽位复用完整同源窗口）；任何模式下含本票遗留 iFinD 行（含混合）的 DB 窗口被拒绝走原链，纯旧源混存缓存保持既有规则。实时行情、分钟线与其他市场不在本修订范围。关闭日线 iFinD 不能只关 `ENABLE_IFIND_MCP`：若 `FINANCIAL_PRIMARY_SOURCE=ifind`，必须同时改回 `choice` 再关闭开关并重启，该组合也会把既有财务 iFinD 切回 Choice。语义与边界详见[接入说明](../ifind-mcp-integration.md) issue #86 一节。
+
 2026-11-02 修订（[Issue #73](https://github.com/SkillingX/daily_stock_analysis/issues/73)）：iFinD 主源深度投研在深研身份（深研 run 上下文 + 深研 scope 开关）内实现零 Choice 出站——Choice header/六字段/资产负债/估值/目标价/公司补查/独立核验与资金失败回退全部不再发起，公司事实与公司名称由 iFinD 提供，目标价以「未查询」语义走获准的非估值分析；非深研消费者与 `choice` 主源的 Choice 补充/目标价/公司行为不变。语义与边界详见[接入说明](../ifind-mcp-integration.md) issue #73 一节。
 
 2026-11-01 修订（[Issue #71](https://github.com/SkillingX/daily_stock_analysis/issues/71)）：`FINANCIAL_PRIMARY_SOURCE=ifind` 时，当前财务快照（六字段+同财期资产负债）、当前估值/市值、正式申万一级行业与个股资金 1/5/10 日窗口迁移至 iFinD 主源，Choice 降为有界补充；完整年报与机构目标价仍由 Choice 提供，交易日历以本地严格日历为准（不以 Choice 登录兜底）。语义与边界详见[接入说明](../ifind-mcp-integration.md) issue #71 一节。

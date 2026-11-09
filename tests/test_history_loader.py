@@ -77,7 +77,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
 
         self.assertIsNotNone(df)
         self.assertEqual(source, "eastmoney")
-        mock_fm.get_daily_data.assert_called_once_with("600519", days=60)
+        mock_fm.get_daily_data.assert_called_once_with("600519", days=60, end_date="2026-04-17")
 
     # ------------------------------------------------------------------
     # ContextVar integration
@@ -183,7 +183,7 @@ class HistoryLoaderTestCase(unittest.TestCase):
 
         self.assertEqual(source, "eastmoney")  # 260 条 < 1000 门槛 → 不命中 db_cache
         self.assertEqual(len(df), 1050)
-        mock_fm.get_daily_data.assert_called_once_with("600519", days=1200)
+        mock_fm.get_daily_data.assert_called_once_with("600519", days=1200, end_date="2026-04-17")
 
     @patch("src.storage.get_db")
     def test_min_records_satisfied_by_db_keeps_cache_hit(self, mock_get_db):

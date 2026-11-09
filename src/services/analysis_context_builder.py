@@ -181,11 +181,18 @@ def _build_daily_bars_block(
 ) -> AnalysisContextBlock:
     context = artifacts.base_context or {}
     date_value = context.get("date")
+    # issue #86：日线块来源随上下文真实来源标注——共享窗口/iFinD 现金分红
+    # 前复权窗口不再是固定的 storage 标签；无来源标注时保持既有标签。
+    history_source = str(context.get("daily_history_source") or "") or "storage.get_analysis_context"
+    price_mode = str(context.get("daily_price_mode") or "")
+    as_of = str(context.get("daily_history_as_of") or "")
     metadata = {
         key: value
         for key, value in {
             "date": date_value,
             "data_missing": bool(context.get("data_missing")),
+            "daily_price_mode": price_mode,
+            "daily_history_as_of": as_of,
         }.items()
         if value not in (None, "")
     }
@@ -205,7 +212,7 @@ def _build_daily_bars_block(
                     missing_reason="daily_bars_missing",
                 ),
             },
-            source="storage.get_analysis_context",
+            source=history_source,
             metadata=metadata,
         )
 
@@ -217,14 +224,14 @@ def _build_daily_bars_block(
             if value
             else ContextFieldStatus.MISSING,
             value=value or None,
-            source="storage.get_analysis_context",
+            source=history_source,
             missing_reason=None if value else f"{key}_missing",
         )
     if date_value:
         items["date"] = AnalysisContextItem(
             status=ContextFieldStatus.AVAILABLE,
             value=date_value,
-            source="storage.get_analysis_context",
+            source=history_source,
             metadata={"date": date_value},
         )
 
@@ -238,7 +245,7 @@ def _build_daily_bars_block(
     return AnalysisContextBlock(
         status=block_status,
         items=items,
-        source="storage.get_analysis_context",
+        source=history_source,
         metadata=metadata,
     )
 

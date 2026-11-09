@@ -633,6 +633,17 @@ def _daily_budget_exhausted(deadline: Optional[float]) -> bool:
     return deadline is not None and deadline <= time.monotonic()
 
 
+def _raise_if_original_control_exhausted(outer_deadline: Optional[float]) -> None:
+    """iFinD 日线专用：外层控制预算已尽则在健康记账之前传出，不记源失败。"""
+    from src.core.research_run import current_research
+
+    run = current_research.get()
+    if run is not None:
+        run.check()
+    if _daily_budget_exhausted(outer_deadline):
+        raise TimeoutError("daily window deadline exhausted")
+
+
 _CHOICE_GROWTH_INDICATORS = {
     "revenue": "OPERATEREVENEW",
     "net_profit": "PARENTNETPROFITNEW",
@@ -1728,6 +1739,45 @@ class DataFetcherManager:
             self._fetchers.sort(key=lambda f: f.priority)
             self._refresh_fetcher_indexes_locked()
 
+    def _prepare_ifind_daily_attempt(
+        self, raw_stock_code: str, end_date: Optional[str]
+    ) -> Optional[Tuple[BaseFetcher, str, str]]:
+        """issue #86：iFinD 日线尝试的准备边界（不注册进通用 fetcher 列表）。
+
+        返回 ``(fetcher, 合格身份, 约束后结束日)``；未启用、证券/日历/时间不
+        合格时返回 None（在出站前跳过，不消耗健康计数）。只在 Choice profile +
+        ``ENABLE_IFIND_MCP`` + 有效配置下创建一次适配器实例。
+        """
+        import math
+
+        from src.config import get_config
+
+        config = get_config()
+        if config.data_source_profile != "choice" or not config.enable_ifind_mcp:
+            return None
+        endpoint = (getattr(config, "ifind_mcp_endpoint", None) or "").strip()
+        token = (getattr(config, "ifind_mcp_token", None) or "").strip()
+        timeout = float(getattr(config, "ifind_mcp_timeout_seconds", 0) or 0)
+        if not endpoint or not token or not math.isfinite(timeout) or timeout <= 0:
+            return None
+        from data_provider.ifind_daily_adapter import daily_routing
+
+        routing = daily_routing(raw_stock_code, end_date)
+        if routing is None:
+            return None
+        identity, clamped_end = routing
+        self._ensure_concurrency_guards()
+        if getattr(self, "_ifind_daily_fetcher", None) is None:
+            with self._fetchers_lock:
+                if getattr(self, "_ifind_daily_fetcher", None) is None:
+                    from data_provider.ifind_daily_adapter import IfindDailyFetcher
+
+                    self._ifind_daily_fetcher = IfindDailyFetcher()
+        fetcher = self._ifind_daily_fetcher
+        if fetcher is None or not getattr(fetcher, "available", False):
+            return None
+        return fetcher, identity, clamped_end
+
     def get_daily_data(
         self,
         stock_code: str,
@@ -1760,6 +1810,10 @@ class DataFetcherManager:
         from .us_index_mapping import is_us_index_code, is_us_stock_code
         from src.patches.eastmoney_patch import request_deadline
 
+        # issue #86：资格判定在规范化之前——显式交易所身份（000001.SH 指数 vs
+        # 000001.SZ 银行）只有原始输入才保留；ETF/指数/B 股/北交所/港美股/格式
+        # 错误不出站、不计供应商故障，继续原路由。
+        raw_stock_code = stock_code
         stock_code = normalize_stock_code(stock_code)
         outer_daily_deadline = request_deadline.get()
 
@@ -1924,6 +1978,93 @@ class DataFetcherManager:
                 f"[数据源终止] {stock_code} 获取失败: elapsed={elapsed:.2f}s\n{error_summary}"
             )
             raise DataFetchError(error_summary)
+
+        # issue #86：启用且合格（证券 + 日历 + 当前最新已完成交易日口径）时，
+        # iFinD 现金分红前复权日线在既有候选链之前尝试一次；失败/不合格/日历
+        # 不可用/历史目标均不打乱既有候选相对次序，真实原因保留在 errors。
+        if market == "cn":
+            ifind_attempt = self._prepare_ifind_daily_attempt(raw_stock_code, end_date)
+            if ifind_attempt is not None:
+                ifind_fetcher, identity, clamped_end = ifind_attempt
+                _raise_if_original_control_exhausted(outer_daily_deadline)
+                if not self._is_daily_source_available(ifind_fetcher, market):
+                    errors.append(self._daily_source_unavailable_error(ifind_fetcher))
+                else:
+                    attempt_start = time.time()
+                    try:
+                        logger.info(
+                            f"[数据源尝试 iFinD] [{ifind_fetcher.name}] 获取 {stock_code} "
+                            f"现金分红前复权日线（窗口截止 {clamped_end}）..."
+                        )
+                        record_provider_run_started(
+                            data_type="daily_data",
+                            provider=ifind_fetcher.name,
+                            operation="get_daily_data",
+                        )
+                        with daily_attempt_budget(reserve_fallback=True):
+                            df = self._call_fetcher_method(
+                                ifind_fetcher,
+                                "get_daily_data",
+                                stock_code=identity,
+                                start_date=start_date,
+                                end_date=clamped_end,
+                                days=days,
+                            )
+                        _raise_if_original_control_exhausted(outer_daily_deadline)
+                        if df is not None and not df.empty:
+                            duration_ms = int((time.time() - attempt_start) * 1000)
+                            record_provider_run(
+                                data_type="daily_data",
+                                provider=ifind_fetcher.name,
+                                operation="get_daily_data",
+                                success=True,
+                                latency_ms=duration_ms,
+                                record_count=len(df),
+                            )
+                            elapsed = time.time() - request_start
+                            logger.info(
+                                f"[数据源完成] {stock_code} 使用 [{ifind_fetcher.name}] 获取成功: "
+                                f"rows={len(df)}, elapsed={elapsed:.2f}s"
+                            )
+                            self._record_daily_source_success(ifind_fetcher, market)
+                            return df, ifind_fetcher.name
+                        duration_ms = int((time.time() - attempt_start) * 1000)
+                        record_provider_run(
+                            data_type="daily_data",
+                            provider=ifind_fetcher.name,
+                            operation="get_daily_data",
+                            success=False,
+                            latency_ms=duration_ms,
+                            error_type="empty",
+                            error_message="empty result",
+                            fallback_to=fetchers[0].name if fetchers else None,
+                            record_count=0,
+                        )
+                        if df is not None and df.empty:
+                            self._record_daily_source_success(ifind_fetcher, market)
+                            errors.append(f"[{ifind_fetcher.name}] (empty) iFinD 日线返回空窗口")
+                    except ResearchStopped:
+                        raise
+                    except Exception as e:
+                        _raise_if_original_control_exhausted(outer_daily_deadline)
+                        error_type, error_reason = summarize_exception(e)
+                        duration_ms = int((time.time() - attempt_start) * 1000)
+                        record_provider_run(
+                            data_type="daily_data",
+                            provider=ifind_fetcher.name,
+                            operation="get_daily_data",
+                            success=False,
+                            latency_ms=duration_ms,
+                            error_type=error_type,
+                            error_message=error_reason,
+                            fallback_to=fetchers[0].name if fetchers else None,
+                        )
+                        logger.warning(
+                            f"[数据源失败 iFinD] [{ifind_fetcher.name}] {stock_code}: "
+                            f"error_type={error_type}, reason={error_reason}，继续既有候选"
+                        )
+                        self._record_daily_source_failure(ifind_fetcher, market, error_reason)
+                        errors.append(f"[{ifind_fetcher.name}] ({error_type}) {error_reason}")
 
         for attempt, fetcher in enumerate(fetchers, start=1):
             if _daily_budget_exhausted(outer_daily_deadline):

@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 from pydantic import ValidationError
 
@@ -92,16 +92,53 @@ def adopt_concept_membership(ctx: SharedContext) -> Optional[ConceptMembership]:
         return None
 
 
+class DailyProvenance(TypedDict):
+    """DataDim 日线溯源三字段的显式窄化映射（issue #86）。"""
+
+    daily_history_source: Optional[str]
+    daily_price_mode: Optional[str]
+    daily_history_as_of: Optional[str]
+
+
+def daily_provenance(ctx: SharedContext) -> DailyProvenance:
+    """从同一已采用共享帧确定性提取日线溯源（issue #86）。
+
+    来源优先取 ctx.history_source（阶段 0 装配/同 run 采纳都写入）；无来源
+    标签时退回最后一条记录的 data_source。截止日是已采用 bar 的最后一日；
+    口径只对 iFinD 现金分红前复权窗口存在，原源兜底不发明口径。没有日线
+    时三个字段均为 None，渲染层据此省略整行。
+    """
+    source = str(ctx.history_source or "").strip()
+    if not source and ctx.history:
+        last = ctx.history[-1]
+        source = str(last.get("data_source") or "").strip()
+    if not source or not ctx.history:
+        return DailyProvenance(
+            daily_history_source=None, daily_price_mode=None, daily_history_as_of=None,
+        )
+    from data_provider.ifind_daily_adapter import is_ifind_daily_source
+
+    mode: Optional[str] = "前复权(现金分红)" if is_ifind_daily_source(source) else None
+    as_of = str(ctx.history[-1].get("date") or "")[:10] or None
+    return DailyProvenance(
+        daily_history_source=source,
+        daily_price_mode=mode,
+        daily_history_as_of=as_of,
+    )
+
+
 def build_data_dim(ctx: SharedContext) -> DataDim:
     """S2：从快照装配数据透视。history 不足时维度降级。"""
     # 概念归属是独立的已验证事实（issue #51），不随历史不足降级丢失。
     concept = adopt_concept_membership(ctx)
+    provenance = daily_provenance(ctx)
     closes = _closes(ctx.history)
     if len(closes) < 20:
         return DataDim(
             status="degraded",
             degraded_reason="日线历史不足 20 条，无法计算均线与点位",
             concept_membership=concept,
+            **provenance,
         )
 
     current = ctx.quote.get("price") or closes[-1]
@@ -151,6 +188,7 @@ def build_data_dim(ctx: SharedContext) -> DataDim:
         ma250_deviation_pct=ma250_dev,
         distance_from_52w_high_pct=dist_high,
         concept_membership=concept,
+        **provenance,
         narrative=(
             f"均线{alignment}；{price_order}。偏离 MA5 {bias}%，"
             f"距 52 周高点 {dist_high}%。" if dist_high is not None else f"均线{alignment}。"

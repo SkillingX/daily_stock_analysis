@@ -3184,7 +3184,10 @@ class Config:
     def data_source_contract(self) -> str:
         if self.data_source_profile == "choice":
             from data_provider.choice_adapter import ChoiceAdapter
-            return ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
+            contract = ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
+            # issue #86：iFinD 现金分红前复权日线进入同一启用开关；日线口径/缓存
+            # 语义变化纳入契约身份，旧成功报告不沿用新日线窗口。
+            return contract + ("-ifind-daily-cashqfq-v1" if self.enable_ifind_mcp else "")
         return "legacy"
 
     def get_effective_news_window_days(self) -> int:

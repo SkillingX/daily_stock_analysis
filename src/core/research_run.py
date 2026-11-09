@@ -85,6 +85,32 @@ def carries_fatal_group_member(exc: BaseException) -> bool:
     return exc.subgroup((KeyboardInterrupt, SystemExit)) is not None
 
 
+def _same_source_extension(current: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """True only for a longer same-source window whose overlap agrees."""
+    if current.get("source") != candidate.get("source"):
+        return False
+    old_records = list(current.get("records") or [])
+    new_records = list(candidate.get("records") or [])
+    if len(new_records) <= len(old_records):
+        return False
+    old_by_date = {str(row.get("date"))[:10]: row for row in old_records}
+    for row in new_records:
+        previous = old_by_date.get(str(row.get("date"))[:10])
+        if previous is None:
+            continue
+        for key in ("open", "high", "low", "close", "volume", "amount"):
+            old_value, new_value = previous.get(key), row.get(key)
+            if old_value is None and new_value is None:
+                continue
+            try:
+                if abs(float(old_value) - float(new_value)) > 1e-6:
+                    return False
+            except (TypeError, ValueError):
+                if old_value != new_value:
+                    return False
+    return True
+
+
 @dataclass
 class ResearchRun:
     timeout_seconds: float
@@ -212,23 +238,66 @@ class ResearchRun:
         with self._lock:
             self.attempts.append(attempt)
 
-    def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
-        """Share one completed session inside this run. Does not touch a returned context."""
+    def adopt_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> dict[str, Any] | None:
+        """Atomically qualify and adopt one same-report window. Returns a copy.
+
+        Stopped/expired runs adopt nothing. A consumed window is not replaced
+        by another source, a conflicting overlap or a shorter late result;
+        a longer same-source window with consistent overlap may extend it.
+        Callers must use the returned frame, not the candidate they fetched.
+        """
+        import copy
+
         with self._lock:
             if self.finalized or self.stop_reason or self.remaining() <= 0 or not records:
-                return
+                return None
+            from time import monotonic
+
+            from src.patches.eastmoney_patch import request_deadline
+
+            deadline = request_deadline.get()
+            if deadline is not None and deadline <= monotonic():
+                raise TimeoutError("daily window deadline exhausted before adoption")
             current = self.daily_history
-            if current and current.get("as_of") != as_of:
-                return
-            if current and len(current.get("records") or []) >= len(records):
-                return
-            self.daily_history = {"as_of": as_of, "records": [dict(row) for row in records], "source": source}
+            candidate = {
+                "as_of": as_of,
+                "records": [dict(row) for row in records],
+                "source": source,
+                "consumed": True,
+            }
+            if current is None:
+                self.daily_history = candidate
+            elif current.get("as_of") != as_of:
+                pass
+            elif _same_source_extension(current, candidate):
+                self.daily_history = candidate
+            if self.daily_history is None:
+                return None
+            self.daily_history["consumed"] = True
+            return copy.deepcopy(self.daily_history)
+
+    def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
+        """Share one completed session inside this run. Does not touch a returned context."""
+        self.adopt_daily_history(as_of, records, source)
 
     def published_daily_history(self) -> dict[str, Any] | None:
+        """Read a copy of this run's shared window; reading marks it consumed."""
+        import copy
+
         with self._lock:
             if self.finalized or self.stop_reason or self.remaining() <= 0:
                 return None
-            return self.daily_history
+            from time import monotonic
+
+            from src.patches.eastmoney_patch import request_deadline
+
+            deadline = request_deadline.get()
+            if deadline is not None and deadline <= monotonic():
+                raise TimeoutError("daily window deadline exhausted before adoption")
+            if self.daily_history is None:
+                return None
+            self.daily_history["consumed"] = True
+            return copy.deepcopy(self.daily_history)
 
     def single_fetch(self, key: str, fetch: Callable[[], _T], *, timeout: float | None = None) -> _T:
         """One outbound per report for the same need; failures are shared too.

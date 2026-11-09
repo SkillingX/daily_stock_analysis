@@ -116,6 +116,9 @@
 
 {{ section_narrative('market') or data.narrative or '（数据维度未产出叙述）' }}
 
+{% if data.daily_history_source %}
+- 日线窗口：来源 **{{ data.daily_history_source }}**{% if data.daily_price_mode %}｜口径 {{ data.daily_price_mode }}{% endif %}{% if data.daily_history_as_of %}｜日线实际截止 {{ data.daily_history_as_of }}{% endif +%}
+{% endif %}
 {% if data.perspective and data.perspective.trend_status %}
 - 当前结构：**{{ data.perspective.trend_status.ma_alignment or '数据不足' }}**
 {% endif %}

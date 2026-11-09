@@ -13,10 +13,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
+from datetime import date, datetime
 from typing import ClassVar, Annotated, Any, Dict, Iterable, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import to_json
 
 from data_provider.cross_source_validator import AnchorQuality, AnchorReading
@@ -209,6 +210,27 @@ class SignalDim(DimEnvelope):
     narrative: str = ""
 
 
+# issue #86：本报告实际采用的日线窗口溯源（同一共享帧的确定性事实）。
+# 来源为空表示未取得日线；口径只在 iFinD 现金分红前复权窗口存在；
+# 截止日是已采用 bar 的最后一日，不是阶段 0 装配时间或供应商 baseDate。
+# 旧载荷缺字段解析为 None，不回填、不补查。三个新 I/O 字段严格校验
+# （AGENTS §1.4 Layer 3）：来源非空非空白严格字符串、口径为受支持
+# Literal、截止日为真实日历日期；既有旧字段的宽松语义不变。
+DAILY_CASH_QFQ_MODE = "前复权(现金分红)"
+
+
+def _validate_daily_as_of(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return value
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("daily_history_as_of must be YYYY-MM-DD")
+    try:
+        date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("daily_history_as_of is not a real calendar date") from exc
+    return value
+
+
 class DataDim(DimEnvelope):
     """S2 数据透视：趋势/价格/量能，纯规则装配。"""
 
@@ -219,7 +241,15 @@ class DataDim(DimEnvelope):
     # 个股最新概念归属（issue #51）：阶段 0 已验证供应商结果的确定性采纳，
     # 不依赖模型复述；历史载荷缺该字段解析为 None，不触发任何补查。
     concept_membership: Optional[ConceptMembership] = None
+    daily_history_source: Optional[Annotated[str, Field(strict=True, pattern=r"\S+")]] = None
+    daily_price_mode: Optional[Literal["前复权(现金分红)"]] = None
+    daily_history_as_of: Optional[Annotated[str, Field(strict=True)]] = None
     narrative: str = ""
+
+    @field_validator("daily_history_as_of")
+    @classmethod
+    def _check_daily_as_of(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_daily_as_of(value)
 
 
 class RootCause(BaseModel):
