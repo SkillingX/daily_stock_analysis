@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+import re
 import socket
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from time import monotonic
@@ -267,15 +269,33 @@ def test_stream_wraps_transport_failure(loopback_server):
 
 def test_duplicate_critical_headers_rejected_before_collapse(loopback_server):
     base, _records = loopback_server
-    with pytest.raises(DataFetchError, match="content-length"):
-        A.stream_export_csv(f"{base}/dup-length")
-    with pytest.raises(DataFetchError, match="content-length"):
-        A.stream_export_csv(f"{base}/dup-length-good-bad")
-    with pytest.raises(DataFetchError, match="content-encoding"):
-        A.stream_export_csv(f"{base}/dup-encoding")
-    with pytest.raises(DataFetchError, match="content-encoding"):
-        A.stream_export_csv(f"{base}/dup-encoding-good-bad")
+    _assert_fail_closed(lambda: A.stream_export_csv(f"{base}/dup-length"), r"content-length")
+    _assert_fail_closed(lambda: A.stream_export_csv(f"{base}/dup-length-good-bad"), r"content-length")
+    _assert_fail_closed(lambda: A.stream_export_csv(f"{base}/dup-encoding"), r"content-encoding")
+    _assert_fail_closed(lambda: A.stream_export_csv(f"{base}/dup-encoding-good-bad"), r"content-encoding")
     assert A.stream_export_csv(f"{base}/equal-length") == "a\n1\n"
+
+
+# 畸形/冲突关键头的失败关闭有两层，断言只接受这两层的精确签名：
+# - 本仓解析器在折叠前给出的具体原因（content-length/content-encoding/
+#   transfer-encoding/framing），适用于把原始头透传给我们的 curl（已实测
+#   ubuntu-24.04 镜像 curl 8.5.0 与 macOS 8.7.1，见 ci-fix-r2/root-cause.md）。
+# - curl 更早中止的提前拒绝：唯一额外许可是与上游 CI 实际观察文本**完整相等**
+#   的 "ifind export headers truncated"（字符串相等，非子串）。上游失败运行
+#   在 ubuntu-26.04 镜像（预装 curl 8.18.0）上，且仅首个畸形头样例到达此
+#   签名；curl 8.18 对其余样例是否同样提前中止属推断，未经实测。
+# 连接拒绝（curl exit 7）、TLS/超时（exit 28/60）、信号终止（signal N）等
+# 一般传输失败不属于该提前拒绝路径，必须被拒绝（控制反例见
+# test_fail_closed_helper_rejects_unrelated_transport_failures）。
+
+
+def _assert_fail_closed(fetch: Callable[[], str], parser_reason: str) -> None:
+    with pytest.raises(DataFetchError) as excinfo:
+        fetch()
+    message = str(excinfo.value)
+    assert (
+        message == "ifind export headers truncated" or re.search(parser_reason, message)
+    ), message
 
 
 def test_raw_loopback_rejects_malformed_length_and_repeated_framing():
@@ -322,10 +342,134 @@ def test_raw_loopback_rejects_malformed_length_and_repeated_framing():
             thread.join(2)
 
     for payload, match in cases.items():
-        with pytest.raises(DataFetchError, match=match):
-            serve(payload)
+        _assert_fail_closed(lambda payload=payload: serve(payload), match)
     for payload, expected in positives.items():
         assert serve(payload) == expected
+
+
+def test_parser_rejects_malformed_critical_headers_independent_of_curl():
+    """独立解析器覆盖（不经 curl，环境无关）：具体原因逐例钉死。
+
+    无论运行环境的 curl 透传（8.5.0/8.7.1 实测）还是在头阶段提前中止
+    （上游 ubuntu-26.04 运行的推断），解析器契约由本测试确定性锁定：
+    重复/冲突/非法 Content-Length、重复 Content-Encoding、TE 顺序歧义与
+    CL+TE 组合全部在折叠前以具体原因拒绝；等值重复 CL、单 CL、纯 chunked
+    正例照常解析。
+    """
+    malformed = {
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 100\r\nContent-Length: 4\r\n\r\na\n1\n": "content-length conflict",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Length: 100\r\n\r\na\n1\n": "content-length conflict",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: +4\r\nContent-Length: 4\r\n\r\na\n1\n": "content-length invalid",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Length: +4\r\n\r\na\n1\n": "content-length invalid",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 0_4\r\nContent-Length: 4\r\n\r\na\n1\n": "content-length invalid",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Length: 0_4\r\n\r\na\n1\n": "content-length invalid",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: +4\r\n\r\na\n1\n": "content-length invalid",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Encoding: identity\r\nContent-Encoding: gzip\r\n\r\na\n1\n": "content-encoding conflict",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Encoding: gzip\r\nContent-Encoding: identity\r\n\r\na\n1\n": "content-encoding conflict",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n4\r\na\n1\n\r\n0\r\n\r\n": "transfer-encoding rejected",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n4\r\na\n1\n\r\n0\r\n\r\n": "transfer-encoding rejected",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\na\n1\n\r\n0\r\n\r\n": "framing ambiguous",
+    }
+    for raw, reason in malformed.items():
+        with pytest.raises(DataFetchError, match=reason):
+            A._split_included_http(raw)
+
+    status, headers, body = A._split_included_http(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\n\r\na\n1\n"
+    )
+    assert status == 200 and headers["content-length"] == "4" and body == b"a\n1\n"
+    status, headers, body = A._split_included_http(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\na\n1\n"
+    )
+    assert headers["content-length"] == "4" and body == b"a\n1\n"
+    status, headers, body = A._split_included_http(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/csv\r\nTransfer-Encoding: chunked\r\n\r\n4\r\na\n1\n\r\n0\r\n\r\n"
+    )
+    assert status == 200 and headers["transfer-encoding"] == "chunked"
+    assert body == b"4\r\na\n1\n\r\n0\r\n\r\n"  # 拆分器不解码 chunked；解码归 curl
+
+
+def test_early_transport_abort_is_fail_closed_signature():
+    """不完整头块断开（任何 curl 版本确定性复现）→ 精确完整签名直接断言。
+
+    该测试证明的是：头未写完时传输层失败关闭为完整文本
+    "ifind export headers truncated"，正文不被采纳，且双签名断言只接受这个
+    精确文本。它与上游 CI 首个失败样例看到的签名一致；不宣称复现 curl 8.18
+    对畸形头的具体行为（那是推断，见 ci-fix-r2/root-cause.md）。
+    有限回收契约：只发起一次网络连接；helper 一致性用捕获消息的合成回放
+    验证；任何失败路径（首断言失败、连接前失败）都经显式关闭监听使 accept
+    有限失败，线程与监听零遗留（见 ci-fix-r3/ 两个失败模式探针）。
+    """
+    import socket
+    import threading
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.settimeout(0.2)  # accept 有界唤醒：任意失败路径都能在停止后 ≤0.2s 退出
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    stop = threading.Event()
+
+    def accept_one():
+        try:
+            while not stop.is_set():
+                try:
+                    conn, _addr = listener.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    conn.settimeout(5.0)
+                    conn.recv(8192)
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 100")
+                    conn.close()  # 头块未完成即断开
+                return
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=accept_one)
+    thread.start()
+    try:
+        with pytest.raises(DataFetchError) as excinfo:
+            A.stream_export_csv(f"http://127.0.0.1:{port}/")
+        assert str(excinfo.value) == "ifind export headers truncated"
+        observed = str(excinfo.value)
+
+        def replay() -> str:
+            raise DataFetchError(observed)
+
+        _assert_fail_closed(replay, r"content-length")
+    finally:
+        stop.set()  # 连接从未发生/首断言失败时：accept 循环有界退出
+        thread.join(2)
+        assert not thread.is_alive(), "abort server 线程必须有限回收"
+
+
+def test_fail_closed_helper_rejects_unrelated_transport_failures():
+    """控制反例：一般传输失败不得被当作畸形头提前拒绝而通过。
+
+    真实 curl exit 7（回环连接拒绝，未收到任何 HTTP 头）与合成 exit 28/60、
+    signal 9 文本都不是 "ifind export headers truncated"，也不是解析器的
+    具体拒绝原因；断言 helper 必须拒绝它们（80305947 旧版曾误接受，
+    见 ci-fix-r2/counterexample-fail-before.txt）。
+    """
+    with pytest.raises(DataFetchError, match=r"transport failed: curl exit 7"):
+        A.stream_export_csv("http://127.0.0.1:1/ok")
+    with pytest.raises(AssertionError):
+        _assert_fail_closed(
+            lambda: A.stream_export_csv("http://127.0.0.1:1/ok"), r"content-length"
+        )
+    for unrelated in (
+        "ifind export transport failed: curl exit 7",
+        "ifind export transport failed: curl exit 28",
+        "ifind export transport failed: curl exit 60",
+        "ifind export transport failed: signal 9",
+    ):
+
+        def synthetic(unrelated=unrelated) -> str:
+            raise DataFetchError(unrelated)
+
+        with pytest.raises(AssertionError):
+            _assert_fail_closed(synthetic, r"content-length")
 
 
 # ---------------------------------------------------------------------------
