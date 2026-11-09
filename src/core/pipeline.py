@@ -78,6 +78,7 @@ from src.services.decision_signal_extractor import (
 )
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
+from src.core.research_run import ResearchStopped
 from src.core.trading_calendar import (
     build_market_phase_context,
     get_effective_trading_date,
@@ -267,12 +268,64 @@ class StockAnalysisPipeline:
                 code, current_time=current_time
             )
 
-            # 断点续传检查：如果最新可复用交易日的数据已存在，则跳过
-            if not force_refresh and self.db.has_today_data(code, target_date):
+            # issue #86：启用范围内（choice + ENABLE_IFIND_MCP + 合格沪深普通股）
+            # 不再做「DB 有当日数据就跳过」的断点续传捷径——整个完整同源窗口经
+            # 共享入口一次取得并照常落库存档；未启用/不合格标的保持原行为。
+            from data_provider.ifind_daily_adapter import ifind_daily_read_scope
+
+            if ifind_daily_read_scope(code):
                 logger.info(
-                    f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
+                    f"{stock_name}({code}) 启用 iFinD 日线读取范围，经共享窗口入口获取完整窗口"
+                )
+                try:
+                    from src.services.history_loader import load_history_df
+
+                    df, source_name = load_history_df(
+                        code,
+                        days=90,  # 覆盖趋势 MA60 与今日/昨日上下文的完整窗口
+                        target_date=target_date,
+                        force_refresh=force_refresh,
+                    )
+                except ResearchStopped:
+                    raise
+                except TimeoutError as exc:
+                    from src.services.history_loader import propagate_if_control_exhausted
+
+                    propagate_if_control_exhausted(exc)
+                    return False, f"获取数据失败: {exc}"
+                except Exception as e:
+                    return False, f"获取数据失败: {e}"
+                if df is None or df.empty:
+                    # issue #86（PR87 spec）：换源/重叠冲突扩窗等显式失败原因随
+                    # source 传出，取数失败如实报告，不伪装成普通空数据。
+                    if source_name and source_name != "none":
+                        return False, f"获取数据为空: {source_name}"
+                    return False, "获取数据为空"
+                from src.services.history_loader import refuse_stopped_or_expired
+
+                refuse_stopped_or_expired()
+                saved_count = self.db.save_daily_data(df, code, source_name)
+                logger.info(
+                    f"{stock_name}({code}) 数据保存成功（来源: {source_name}，新增 {saved_count} 条）"
                 )
                 return True, None
+
+            # 断点续传检查：如果最新可复用交易日的数据已存在，则跳过。
+            # issue #86 revision-2：断点续传同样过 iFinD 遗留行资格边界——目标日
+            # 行含本票 iFinD 来源时不走捷径，整窗经原链重取；纯旧源保持原规则。
+            if not force_refresh and self.db.has_today_data(code, target_date):
+                from src.services.history_loader import db_bars_carry_ifind
+
+                resume_rows = self.db.get_data_range(code, target_date, target_date)
+                if resume_rows and db_bars_carry_ifind(resume_rows):
+                    logger.info(
+                        f"{stock_name}({code}) {target_date} DB 行含遗留 iFinD 来源，拒绝断点续传并整窗重取"
+                    )
+                else:
+                    logger.info(
+                        f"{stock_name}({code}) {target_date} 数据已存在，跳过获取（断点续传）"
+                    )
+                    return True, None
 
             # 从数据源获取数据
             logger.info(f"{stock_name}({code}) 开始从数据源获取数据...")
@@ -289,7 +342,12 @@ class StockAnalysisPipeline:
 
             return True, None
 
+        except ResearchStopped:
+            raise
         except Exception as e:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(e)
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
@@ -456,29 +514,7 @@ class StockAnalysisPipeline:
                 logger.debug(f"{stock_name}({code}) 基本面快照写入失败: {e}")
 
             # Step 3: 趋势分析（基于交易理念）— 在 Agent 分支之前执行，供两条路径共用
-            trend_result: Optional[TrendAnalysisResult] = None
-            try:
-                from src.services.history_loader import get_frozen_target_date
-
-                _mkt = get_market_for_stock(normalize_stock_code(code))
-                frozen = get_frozen_target_date()
-                end_date = frozen if frozen else get_market_now(_mkt).date()
-                start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
-                historical_bars = self.db.get_data_range(code, start_date, end_date)
-                if historical_bars:
-                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
-                    # Issue #234: Augment with realtime for intraday MA calculation
-                    if self.config.enable_realtime_quote and realtime_quote:
-                        df = self._augment_historical_with_realtime(
-                            df, realtime_quote, code
-                        )
-                    trend_result = self.trend_analyzer.analyze(df, code)
-                    logger.info(
-                        f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
-                        f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}"
-                    )
-            except Exception as e:
-                logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
+            trend_result = self._compute_trend(code, stock_name, realtime_quote)
 
             if use_agent:
                 logger.info(f"{stock_name}({code}) 启用 Agent 模式进行分析")
@@ -543,7 +579,14 @@ class StockAnalysisPipeline:
 
             # Step 5: 获取分析上下文（技术面数据）
             self._emit_progress(58, f"{stock_name}：正在整理分析上下文")
-            context = self.db.get_analysis_context(code)
+            # issue #86：统一资格入口——启用范围内从本次共享窗口派生（同源同
+            # 口径并携带真实日线来源）；未启用走 DB 但经 iFinD 遗留行污染判定，
+            # 被污染窗口整窗原链重取，获取失败不回退被污染旧行。
+            from src.services.history_loader import qualified_analysis_context
+
+            context = qualified_analysis_context(
+                code, self.db, analyze_ma=self.db._analyze_ma_status
+            )
 
             if context is None:
                 logger.warning(
@@ -783,7 +826,12 @@ class StockAnalysisPipeline:
 
             return result
 
+        except ResearchStopped:
+            raise
         except Exception as e:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(e)
             logger.error(f"{stock_name}({code}) 分析失败: {e}")
             logger.exception(f"{stock_name}({code}) 详细错误信息:")
             return None
@@ -1135,14 +1183,63 @@ class StockAnalysisPipeline:
 
     def _ensure_agent_history(self, code: str, min_days: int = 240) -> None:
         """Ensure at least *min_days* of K-line history is in DB for agent tools."""
-        from src.services.history_loader import get_frozen_target_date
+        from src.services.history_loader import (
+            db_bars_carry_ifind,
+            get_frozen_target_date,
+            current_window_frame,
+            load_history_df,
+        )
 
         target = get_frozen_target_date()
         if target is None:
             target = self._resolve_resume_target_date(code)
+        # issue #86：启用范围内按共享窗口覆盖判断与有界扩窗（同源一致才整窗替换），
+        # 不再仅按 DB 行数判足（旧行可能来自旧源/旧基点）。
+        from data_provider.ifind_daily_adapter import ifind_daily_read_scope
+
+        if ifind_daily_read_scope(code):
+            try:
+                if current_window_frame(code, min_rows=min_days) is not None:
+                    logger.debug("[%s] Agent history: shared window covers %d rows", code, min_days)
+                    return
+            except ResearchStopped:
+                raise
+            except Exception as e:
+                from src.services.history_loader import propagate_if_control_exhausted
+
+                propagate_if_control_exhausted(e)
+                logger.debug("[%s] shared window coverage check failed: %s", code, e)
+            try:
+                df, source = load_history_df(code, days=min_days, target_date=target)
+                from src.services.history_loader import refuse_stopped_or_expired
+
+                refuse_stopped_or_expired()
+                if df is not None and not df.empty:
+                    self.db.save_daily_data(df, code, source)
+                    logger.info(
+                        "[%s] Prefetched %d rows of shared-window history for agent (source: %s)",
+                        code, len(df), source,
+                    )
+                else:
+                    # 预取边界如实记录显式失败原因（如换源扩窗被拒）。
+                    logger.info(
+                        "[%s] Agent history prefetch: shared window demand unavailable: %s",
+                        code, source,
+                    )
+            except ResearchStopped:
+                raise
+            except Exception as e:
+                from src.services.history_loader import propagate_if_control_exhausted
+
+                propagate_if_control_exhausted(e)
+                logger.warning("[%s] Agent history prefetch failed: %s", code, e)
+            return
         start = target - timedelta(days=int(min_days * 1.8))
         bars = self.db.get_data_range(code, start, target)
-        if bars and len(bars) >= min(min_days, 200):
+        # issue #86 revision-2：DB 行数判足同样过 iFinD 遗留行资格边界——含
+        # iFinD 行（含混合）不视为充足，整窗走原链重取；纯旧源保持原规则。
+        sufficient = bool(bars) and len(bars) >= min(min_days, 200) and not db_bars_carry_ifind(bars)
+        if sufficient:
             logger.debug(
                 "[%s] Agent history: %d bars in DB, sufficient", code, len(bars)
             )
@@ -1157,8 +1254,79 @@ class StockAnalysisPipeline:
                     len(df),
                     source,
                 )
+        except ResearchStopped:
+            raise
         except Exception as e:
             logger.warning("[%s] Agent history prefetch failed: %s", code, e)
+
+    def _compute_trend(
+        self, code: str, stock_name: str, realtime_quote
+    ) -> Optional[TrendAnalysisResult]:
+        """趋势分析：启用范围内只从本次共享完整窗口构造（issue #86）。
+
+        启用且合格的证券在共享窗口获取失败/缺失时**不回退旧 DB**（旧行可能
+        来自旧源/旧基点，不能与新失败拼算）；未启用/不合格标的回退既有 DB
+        读取（89 自然日），但读取范围含本票遗留 iFinD 行时拒绝该缓存并经
+        ``load_history_df`` 整窗走原链重取（纯旧源混存保持既有规则）。
+        """
+        try:
+            from src.services.history_loader import (
+                db_bars_carry_ifind,
+                get_frozen_target_date,
+                current_window_frame,
+                load_history_df,
+            )
+
+            _mkt = get_market_for_stock(normalize_stock_code(code))
+            frozen = get_frozen_target_date()
+            end_date = frozen if frozen else get_market_now(_mkt).date()
+            start_date = end_date - timedelta(days=89)  # ~60 trading days for MA60
+            df: Optional[pd.DataFrame] = None
+            from data_provider.ifind_daily_adapter import ifind_daily_read_scope
+
+            enabled_read = ifind_daily_read_scope(code)
+            if enabled_read:
+                try:
+                    window = current_window_frame(code, min_rows=60)
+                    if window is not None:
+                        df = window[0]
+                except ResearchStopped:
+                    raise
+                except Exception as e:
+                    from src.services.history_loader import propagate_if_control_exhausted
+
+                    propagate_if_control_exhausted(e)
+                    logger.debug(f"{stock_name}({code}) 共享窗口趋势数据不可用: {e}")
+                # 启用范围内共享窗口缺失即趋势缺失：不以旧 DB 行复活。
+            else:
+                historical_bars = self.db.get_data_range(code, start_date, end_date)
+                if historical_bars and db_bars_carry_ifind(historical_bars):
+                    logger.info(
+                        f"{stock_name}({code}) 趋势 DB 窗口含遗留 iFinD 行，整窗走原链重取"
+                    )
+                    fresh_df, _fresh_source = load_history_df(code, days=60, target_date=end_date)
+                    if fresh_df is not None and not fresh_df.empty:
+                        df = fresh_df
+                elif historical_bars:
+                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
+            if df is not None and not df.empty:
+                # Issue #234: Augment with realtime for intraday MA calculation
+                if self.config.enable_realtime_quote and realtime_quote:
+                    df = self._augment_historical_with_realtime(df, realtime_quote, code)
+                trend_result = self.trend_analyzer.analyze(df, code)
+                logger.info(
+                    f"{stock_name}({code}) 趋势分析: {trend_result.trend_status.value}, "
+                    f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}"
+                )
+                return trend_result
+        except ResearchStopped:
+            raise
+        except Exception as e:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(e)
+            logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
+        return None
 
     def _analyze_with_agent(
         self,
@@ -1478,7 +1646,12 @@ class StockAnalysisPipeline:
 
             return result
 
+        except ResearchStopped:
+            raise
         except Exception as e:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(e)
             logger.error(f"[{code}] Agent 分析失败: {e}")
             logger.exception(f"[{code}] Agent 详细错误信息:")
             return None
@@ -1487,22 +1660,28 @@ class StockAnalysisPipeline:
         self, code: str, stock_name: str
     ) -> Dict[str, Any]:
         """Load daily-bar context for Agent pack summaries without blocking analysis."""
+        # issue #86 revision-2：统一资格入口（共享窗口优先；DB 经 iFinD 遗留行
+        # 污染判定，被污染窗口整窗原链重取；获取失败不回退被污染旧行）。
         try:
-            context = self.db.get_analysis_context(code)
-        except Exception as exc:
-            logger.warning(
-                "[%s] Agent analysis context load failed; daily_bars will be marked missing: %s",
-                code,
-                exc,
-            )
-            context = None
+            from src.services.history_loader import qualified_analysis_context
 
-        if isinstance(context, dict) and context:
-            enriched = dict(context)
-            enriched.setdefault("code", code)
-            if stock_name:
-                enriched.setdefault("stock_name", stock_name)
-            return enriched
+            shared = qualified_analysis_context(
+                code, self.db, analyze_ma=self.db._analyze_ma_status
+            )
+            if isinstance(shared, dict):
+                shared.setdefault("code", code)
+                if stock_name:
+                    shared.setdefault("stock_name", stock_name)
+                return shared
+        except ResearchStopped:
+            raise
+        except Exception as exc:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(exc)
+            logger.debug(
+                "[%s] qualified analysis context unavailable: %s", code, exc
+            )
 
         return {
             "code": code,
@@ -2912,10 +3091,19 @@ class StockAnalysisPipeline:
         from src.services.history_loader import (
             set_frozen_target_date,
             reset_frozen_target_date,
+            open_current_stock_scope,
+            close_current_stock_scope,
         )
 
         frozen_td = self._resolve_resume_target_date(code, current_time=current_time)
         token = set_frozen_target_date(frozen_td)
+        # issue #86：启用且合格的沪深普通股打开当前任务共享窗口作用域，随
+        # frozen_target_date 同生命周期初始化/清理；未启用时不改变既有行为。
+        from data_provider.ifind_daily_adapter import ifind_daily_read_scope
+
+        scope_token = None
+        if ifind_daily_read_scope(code):
+            scope_token = open_current_stock_scope(code, target_date=frozen_td)[0]
         effective_query_id = (
             analysis_query_id or getattr(self, "query_id", None) or uuid.uuid4().hex
         )
@@ -2971,12 +3159,19 @@ class StockAnalysisPipeline:
 
             return result
 
+        except ResearchStopped:
+            raise
         except Exception as e:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(e)
             # 捕获所有异常，确保单股失败不影响整体
             logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
             return None
         finally:
             reset_run_diagnostic_context(diag_token)
+            if scope_token is not None:
+                close_current_stock_scope(scope_token)
             reset_frozen_target_date(token)
 
     def run(

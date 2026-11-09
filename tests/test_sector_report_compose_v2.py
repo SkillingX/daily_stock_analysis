@@ -653,7 +653,7 @@ class TestComposeReport:
                 "summary": None, "claims": [], "uncertainty_note": None,
                 "rejected_count": 0, "provider": None, "model": None,
                 "observed_at": "2026-11-05T14:00:04",
-                "gaps": ["证据化综合：模型结论均未通过定性/引用/结构校验"],
+                "gaps": ["证据化综合：模型结论均未通过结论/引用/结构与量值边界校验"],
             }
 
         svc._synthesis_pillar = _all_invalid_stub  # type: ignore[assignment]

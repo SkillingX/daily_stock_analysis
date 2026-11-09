@@ -8,6 +8,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, TimeoutError as FutureTi
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Literal, TypeVar, cast
 from uuid import uuid4
@@ -16,6 +17,29 @@ if TYPE_CHECKING:
     from src.llm.attempt import ModelAttempt
 
 _T = TypeVar("_T")
+
+
+def daily_demand_span_start(required: date, days: int) -> date:
+    """日线扩窗请求的跨度起点（``load_history_df`` 窗口起点同一公式，单一来源）。"""
+    return required - timedelta(days=int(days * 1.8) + 10)
+
+
+def _records_cover_demand(records: list[dict[str, Any]], as_of: str, days: int) -> bool:
+    """权威帧记录是否实际满足某需求：行数足额，或帧起点已到请求跨度起点。
+
+    与 ``history_loader._frame_covers`` 同一覆盖语义（rows OR 请求跨度起点），
+    供 run 锁内的未满足需求记录/消解复用；不取数、不判源（权威帧即同一性）。
+    """
+    if not records:
+        return False
+    if len(records) >= max(1, days):
+        return True
+    try:
+        required = datetime.strptime(as_of, "%Y-%m-%d").date()
+        start = datetime.strptime(str(records[0].get("date"))[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return start <= daily_demand_span_start(required, days)
 
 
 def supplier_need_key(supplier: str, contract: str, need: str, qualifier: str, refresh: str = "") -> str:
@@ -85,6 +109,32 @@ def carries_fatal_group_member(exc: BaseException) -> bool:
     return exc.subgroup((KeyboardInterrupt, SystemExit)) is not None
 
 
+def _same_source_extension(current: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """True only for a longer same-source window whose overlap agrees."""
+    if current.get("source") != candidate.get("source"):
+        return False
+    old_records = list(current.get("records") or [])
+    new_records = list(candidate.get("records") or [])
+    if len(new_records) <= len(old_records):
+        return False
+    old_by_date = {str(row.get("date"))[:10]: row for row in old_records}
+    for row in new_records:
+        previous = old_by_date.get(str(row.get("date"))[:10])
+        if previous is None:
+            continue
+        for key in ("open", "high", "low", "close", "volume", "amount"):
+            old_value, new_value = previous.get(key), row.get(key)
+            if old_value is None and new_value is None:
+                continue
+            try:
+                if abs(float(old_value) - float(new_value)) > 1e-6:
+                    return False
+            except (TypeError, ValueError):
+                if old_value != new_value:
+                    return False
+    return True
+
+
 @dataclass
 class ResearchRun:
     timeout_seconds: float
@@ -99,6 +149,12 @@ class ResearchRun:
     facts: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     vendor_research: dict[str, dict[str, Any]] = field(default_factory=dict)
     daily_history: dict[str, Any] | None = None
+    # issue #86（PR87 R13）：本报告内未满足的日线扩窗需求（"as_of|days" → 拒绝
+    # 原因）。私有状态：记录/消解/快照全部在本 run 既有 _lock 内经
+    # record_unmet_daily_window / _resolve_covered_unmet_locked /
+    # unmet_daily_history_snapshot 进行，模块外不得直接读写；不持久化、不跨
+    # 报告，仅供最终成文如实披露（停止后部分报告仍可读取）。
+    _daily_history_unmet: dict[str, str] = field(default_factory=dict)
     # Model attempt ledger (issue #55): one entry per admission attempt.
     # Appends survive finish/cancel so a late in-flight usage stays recorded.
     attempts: list[ModelAttempt] = field(default_factory=list, repr=False)
@@ -212,23 +268,113 @@ class ResearchRun:
         with self._lock:
             self.attempts.append(attempt)
 
-    def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
-        """Share one completed session inside this run. Does not touch a returned context."""
+    def adopt_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> dict[str, Any] | None:
+        """Atomically qualify and adopt one same-report window. Returns a copy.
+
+        Stopped/expired runs adopt nothing. A consumed window is not replaced
+        by another source, a conflicting overlap or a shorter late result;
+        a longer same-source window with consistent overlap may extend it.
+        Callers must use the returned frame, not the candidate they fetched.
+        同一把锁内：采纳后立即把当前权威帧实际覆盖的未满足需求消解掉
+        （PR87 R13）——并发重复消解幂等，迟到采纳不会留下已解决残留。
+        """
+        import copy
+
         with self._lock:
             if self.finalized or self.stop_reason or self.remaining() <= 0 or not records:
-                return
+                return None
+            from time import monotonic
+
+            from src.patches.eastmoney_patch import request_deadline
+
+            deadline = request_deadline.get()
+            if deadline is not None and deadline <= monotonic():
+                raise TimeoutError("daily window deadline exhausted before adoption")
             current = self.daily_history
-            if current and current.get("as_of") != as_of:
-                return
-            if current and len(current.get("records") or []) >= len(records):
-                return
-            self.daily_history = {"as_of": as_of, "records": [dict(row) for row in records], "source": source}
+            candidate = {
+                "as_of": as_of,
+                "records": [dict(row) for row in records],
+                "source": source,
+                "consumed": True,
+            }
+            if current is None:
+                self.daily_history = candidate
+            elif current.get("as_of") != as_of:
+                pass
+            elif _same_source_extension(current, candidate):
+                self.daily_history = candidate
+            if self.daily_history is None:
+                return None
+            self.daily_history["consumed"] = True
+            self._resolve_covered_unmet_locked()
+            return copy.deepcopy(self.daily_history)
+
+    def record_unmet_daily_window(self, as_of: str, days: int, reason: str) -> None:
+        """换源/重叠冲突拒绝后的未满足需求记录（run 锁内对当前权威帧复核）。
+
+        迟到拒绝不得复活已解决状态：当前权威帧已按同一覆盖语义（行数或请求
+        跨度起点、同一 as_of）实际满足该需求时不记录。纯状态更新，不取数；
+        停止/预算后的部分报告仍可经快照读取既有状态。
+        """
+        key = f"{as_of}|{days}"
+        with self._lock:
+            frame = self.daily_history
+            if frame is not None:
+                frame_as_of = str(frame.get("as_of") or "")
+                if frame_as_of == as_of and _records_cover_demand(
+                    list(frame.get("records") or []), as_of, days
+                ):
+                    return
+            self._daily_history_unmet[key] = reason
+
+    def unmet_daily_history_snapshot(self) -> dict[str, str]:
+        """未满足扩窗需求的隔离快照（同一把锁；停止后部分报告仍可读取）。"""
+        with self._lock:
+            return dict(self._daily_history_unmet)
+
+    def _resolve_covered_unmet_locked(self) -> None:
+        """锁内（调用方已持有 ``self._lock``）：当前权威帧实际覆盖的需求清除。
+
+        幂等：锁内单方迭代快照键，并发重复消解不会相互踩踏（无 KeyError）。
+        """
+        frame = self.daily_history
+        if frame is None or not self._daily_history_unmet:
+            return
+        as_of = str(frame.get("as_of") or "")
+        records = list(frame.get("records") or [])
+        for key in list(self._daily_history_unmet):
+            parts = key.split("|")
+            if len(parts) != 2 or parts[0] != as_of:
+                continue
+            try:
+                days = int(parts[1])
+            except ValueError:
+                continue
+            if _records_cover_demand(records, as_of, days):
+                del self._daily_history_unmet[key]
+
+    def publish_daily_history(self, as_of: str, records: list[dict[str, Any]], source: str) -> None:
+        """Share one completed session inside this run. Does not touch a returned context."""
+        self.adopt_daily_history(as_of, records, source)
 
     def published_daily_history(self) -> dict[str, Any] | None:
+        """Read a copy of this run's shared window; reading marks it consumed."""
+        import copy
+
         with self._lock:
             if self.finalized or self.stop_reason or self.remaining() <= 0:
                 return None
-            return self.daily_history
+            from time import monotonic
+
+            from src.patches.eastmoney_patch import request_deadline
+
+            deadline = request_deadline.get()
+            if deadline is not None and deadline <= monotonic():
+                raise TimeoutError("daily window deadline exhausted before adoption")
+            if self.daily_history is None:
+                return None
+            self.daily_history["consumed"] = True
+            return copy.deepcopy(self.daily_history)
 
     def single_fetch(self, key: str, fetch: Callable[[], _T], *, timeout: float | None = None) -> _T:
         """One outbound per report for the same need; failures are shared too.

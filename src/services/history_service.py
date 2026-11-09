@@ -867,7 +867,8 @@ class HistoryService:
 
         # Generate Markdown report
         try:
-            return self._generate_single_stock_markdown(result, record)
+            daily_provenance = self._extract_daily_provenance(record)
+            return self._generate_single_stock_markdown(result, record, daily_provenance)
         except Exception as e:
             logger.error(
                 f"get_markdown_report: failed to generate markdown for {record_id}: {e}",
@@ -876,6 +877,19 @@ class HistoryService:
             raise MarkdownReportGenerationError(
                 f"Failed to generate markdown report: {str(e)}", record_id=record_id
             ) from e
+
+    def _extract_daily_provenance(self, record) -> Dict[str, Optional[str]]:
+        """从已保存 context_snapshot 读日线三字段（issue #86），不补查不推断。"""
+        snapshot = parse_json_field(getattr(record, "context_snapshot", None))
+        enhanced = snapshot.get("enhanced_context") if isinstance(snapshot, dict) else None
+        if not isinstance(enhanced, dict):
+            return {}
+        provenance: Dict[str, Optional[str]] = {}
+        for key in ("daily_history_source", "daily_price_mode", "daily_history_as_of"):
+            value = enhanced.get(key)
+            if isinstance(value, str) and value.strip():
+                provenance[key] = value.strip()
+        return provenance
 
     def _rebuild_analysis_result(
         self, raw_result: Dict[str, Any], record
@@ -949,7 +963,9 @@ class HistoryService:
             logger.error(f"Failed to rebuild AnalysisResult: {e}", exc_info=True)
             return None
 
-    def _generate_single_stock_markdown(self, result: AnalysisResult, record) -> str:
+    def _generate_single_stock_markdown(
+        self, result: AnalysisResult, record, daily_provenance: Optional[Dict[str, Optional[str]]] = None
+    ) -> str:
         """
         Generate a Markdown report for a single stock analysis.
 
@@ -959,6 +975,7 @@ class HistoryService:
         Args:
             result: The AnalysisResult object
             record: The AnalysisHistory ORM record
+            daily_provenance: 已保存快照中的日线溯源三字段；缺省/为空保持旧内容
 
         Returns:
             Markdown formatted report string
@@ -1007,9 +1024,26 @@ class HistoryService:
             "",
             f"> {analysis_date_label}: **{report_date}** | {report_time_label}: {report_time}",
             "",
-            "---",
-            "",
         ]
+
+        # issue #86：已保存快照里的实际日线溯源（来源/口径/日线实际截止）。
+        # 只呈现已存字段：原源兜底无口径字段即不发明；旧记录无元数据保持旧内容。
+        source = (daily_provenance or {}).get("daily_history_source")
+        if source:
+            parts = [f"{labels['daily_source_label']} **{source}**"]
+            mode = (daily_provenance or {}).get("daily_price_mode")
+            if mode:
+                parts.append(f"{labels['daily_mode_label']} {mode}")
+            as_of = (daily_provenance or {}).get("daily_history_as_of")
+            if as_of:
+                parts.append(f"{labels['daily_cutoff_label']} {as_of}")
+            report_lines.extend(
+                [
+                    f"> {labels['daily_history_heading']}: {'｜'.join(parts)}",
+                    "",
+                ]
+            )
+        report_lines.extend(["---", ""])
 
         # ========== 舆情与基本面概览（放在最前面）==========
         intel = dashboard.get("intelligence", {}) if dashboard else {}

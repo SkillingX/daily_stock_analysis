@@ -81,7 +81,9 @@ class FinancialAnalysis(_StrictBase):
     np_yoy / scissors / cash_quality / ocf / np / valuation）。
     """
 
-    data_contract: Annotated[str, Field(pattern=r"^(legacy|choice-v[0-9]+(?:-ifind-financial-v[0-9]+(?:-primary-ifind-v[0-9]+)?)?)$")] = "legacy"
+    # issue #86：契约串新增 `-ifind-daily-cashqfq-v1` 日线段（ENABLE_IFIND_MCP 下），
+    # 旧成功报告不沿用新日线窗口；历史段顺序保持兼容读取。
+    data_contract: Annotated[str, Field(pattern=r"^(legacy|choice-v[0-9]+(?:-ifind-financial-v[0-9]+(?:-primary-ifind-v[0-9]+)?)?(?:-ifind-daily-cashqfq-v[0-9]+)?)$")] = "legacy"
     financial_snapshot: dict[str, FinancialFieldQuality] = Field(default_factory=dict)
     verification_errors: list[str] = Field(default_factory=list)
     analysis_version: Annotated[int, Field(ge=1)] = 1

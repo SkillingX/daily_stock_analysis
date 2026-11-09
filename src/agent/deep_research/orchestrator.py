@@ -33,7 +33,11 @@ from src.agent.deep_research.explore_agents import (  # noqa: F401
 from src.deep_research_dims.bayesian_dim import build_bayesian_dim
 from src.deep_research_dims.conclusion_dim import build_conclusion_dim
 from src.deep_research_dims.context import SharedContext, build_shared_context
-from src.deep_research_dims.data_dim import adopt_concept_membership, build_data_dim
+from src.deep_research_dims.data_dim import (
+    adopt_concept_membership,
+    build_data_dim,
+    daily_provenance,
+)
 from src.deep_research_dims.dim_cache import quote_market_identity
 from src.deep_research_dims.fundamental_dim import build_fundamental_dim, nonvaluation_financial_inputs_ok
 from src.deep_research_dims.manager_writeup import DIRECTIVE_WORDS, mask_research_role_terms
@@ -1118,6 +1122,10 @@ def _run_dual_track(
 
     # ---- 成文 ----
     _emit(progress_callback, {"type": "thinking", "step": 4, "message": "生成双轨投研报告（模板直灌）..."})
+    # 成文前按 run 实际需求状态对齐未满足扩窗注记（波次内被一致采纳满足的清除）。
+    from src.deep_research_dims.context import sync_unmet_history_notes
+
+    sync_unmet_history_notes(ctx)
     view = build_view(
         stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events,
         report_id=report_id or "",
@@ -1238,6 +1246,7 @@ def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
         HISTORY_FAILED_NOTE_PREFIX,
         HISTORY_MISSING_NOTE,
         STAGE_TIMEOUT_NOTE_SUFFIX,
+        sync_unmet_history_notes,
     )
     from src.services.history_loader import adopt_published_history
 
@@ -1249,6 +1258,9 @@ def _reconcile_shared_history(ctx: SharedContext, dims: dict[str, Any]) -> None:
         note for note in ctx.limitations
         if not (note.startswith(history_note) or note.startswith(HISTORY_MISSING_NOTE) or note.startswith(HISTORY_FAILED_NOTE_PREFIX))
     ]
+    # 换源/重叠冲突的未满足扩窗按 run 实际需求状态对齐：仍未满足的拒绝注记
+    # 在复用保留帧的同时如实保留（PR87 R12），已被一致采纳满足的不残留。
+    sync_unmet_history_notes(ctx)
     data = dims.get("data")
     if data is not None and data.status == "degraded":
         dims["data"] = build_data_dim(ctx)
@@ -1344,12 +1356,14 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         from src.core.research_run import retained_tool_facts
         facts = retained_tool_facts("get_realtime_quote", ctx.quote)
         facts += retained_tool_facts("get_daily_history", {"data": ctx.history})
-        # 中断报告同样保留阶段 0 已取得的概念归属（issue #51）。
+        # 中断报告同样保留阶段 0 已取得的概念归属（issue #51）；已采用的
+        # 日线窗口经同一规范投影携带来源/口径/实际截止（issue #86），不重取。
         dims["data"] = DIM_MODELS["data"](
             status="degraded",
             degraded_reason=run.reason_text,
             retained_facts=facts,
             concept_membership=adopt_concept_membership(ctx),
+            **daily_provenance(ctx),
         )
     if "capital" in selected:
         # issue #71：取消早于资金研究员启动时，阶段 0 早批已取得的合格资金块
@@ -1424,6 +1438,10 @@ def _interrupted_result(run: ResearchRun, stock_code: str, stock_name: str, sele
         dims[dim_id] = restore_vendor_facts(dim_id, dims[dim_id], research)
     events, adjusted = apply_guardrails({key: value.model_dump() for key, value in dims.items()})
     dims = {key: parse_dim(key, value) for key, value in adjusted.items()}
+    # 中断渲染前同样按 run 实际需求状态对齐未满足扩窗注记（不取数）。
+    from src.deep_research_dims.context import sync_unmet_history_notes
+
+    sync_unmet_history_notes(ctx, run)
     view = build_view(stock_name, stock_code, ctx.as_of, ctx.limitations, dims, events, report_id=report_id or "")
     markdown = render_markdown(view)
     valid = _has_useful_data(dims)

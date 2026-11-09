@@ -220,6 +220,39 @@ def recent_completed_trading_sessions(
         return None
 
 
+def trading_sessions_between(
+    market: str,
+    start: date,
+    end: date,
+    *,
+    current_time: Optional[datetime] = None,
+) -> Optional[List[date]]:
+    """Strictly enumerate trading sessions in ``[start, end]``, oldest first.
+
+    Like :func:`recent_completed_trading_sessions`, this returns ``None`` when
+    exchange calendars are unavailable or the range is out of bounds: complete
+    daily windows must never be qualified from natural/weekday fallback dates
+    (issue #86). Sessions that have not closed yet are excluded.
+    """
+    if market not in MARKET_EXCHANGE or market not in MARKET_TIMEZONE:
+        return None
+    if not _XCALS_AVAILABLE or end < start:
+        return None
+    latest = recent_completed_trading_sessions(market, 1, current_time=current_time)
+    if not latest:
+        return None
+    try:
+        cal = xcals.get_calendar(MARKET_EXCHANGE[market])  # type: ignore[union-attr]
+        bound = min(end, latest[0])
+        if start > bound:
+            return []
+        sessions = cal.sessions_in_range(pd.Timestamp(start), pd.Timestamp(bound))
+        return [item.date() for item in sessions]
+    except Exception as exc:
+        logger.warning("trading_calendar.trading_sessions_between unavailable: %s", exc)
+        return None
+
+
 def get_effective_trading_date(
     market: Optional[str], current_time: Optional[datetime] = None
 ) -> date:

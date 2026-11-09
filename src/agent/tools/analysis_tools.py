@@ -113,16 +113,16 @@ def _merge_today_realtime_bar(
     return merged
 
 
-def _fetch_trend_data(stock_code: str) -> Any:
+def _fetch_trend_data(stock_code: str) -> tuple[Any, str]:
     """Fetch historical OHLCV (DataFrame) for trend analysis. DB first, then DataFetcher fallback.
 
     盘中会合并今日实时行情 bar（见 _merge_today_realtime_bar），避免 current_price
-    使用过时的昨收价。
+    使用过时的昨收价。返回 (df, source)；启用窗口路径失败时 source 携带显式原因。
     """
     from src.services.history_loader import load_history_df
 
-    df, _ = load_history_df(stock_code, days=60)
-    return _merge_today_realtime_bar(stock_code, df)
+    df, source = load_history_df(stock_code, days=60)
+    return _merge_today_realtime_bar(stock_code, df), source
 
 
 def _handle_analyze_trend(stock_code: str) -> dict[str, Any]:
@@ -134,8 +134,15 @@ def _handle_analyze_trend(stock_code: str) -> dict[str, Any]:
     if not (stock_code and str(stock_code).strip()):
         return {"error": "stock_code is required"}
 
-    df = _fetch_trend_data(stock_code)
+    df, history_source = _fetch_trend_data(stock_code)
     if df is None or df.empty:
+        if history_source and history_source != "none":
+            # issue #86（PR87 spec）：换源/重叠冲突扩窗的显式拒绝原因到达工具消费方。
+            return {
+                "error": (
+                    f"No historical data available for trend analysis on {stock_code}: {history_source}"
+                )
+            }
         return {
             "error": f"No historical data available for trend analysis on {stock_code}"
         }
@@ -226,6 +233,8 @@ def _handle_calculate_ma(
     df, source = load_history_df(stock_code, days=days)
 
     if df is None or df.empty:
+        if source and source != "none":
+            return {"error": f"No historical data for {stock_code}: {source}"}
         return {"error": f"No historical data for {stock_code}"}
 
     # Parse requested periods (default: 5,10,20,30,60,120,250)
@@ -325,6 +334,8 @@ def _handle_get_volume_analysis(stock_code: str, days: int = 30) -> dict[str, An
     df, source = load_history_df(stock_code, days=max(days + 20, 60))
 
     if df is None or df.empty:
+        if source and source != "none":
+            return {"error": f"No historical data for {stock_code}: {source}"}
         return {"error": f"No historical data for {stock_code}"}
 
     df = df.tail(days).copy()
@@ -460,6 +471,8 @@ def _handle_analyze_pattern(stock_code: str, days: int = 60) -> dict[str, Any]:
     df, source = load_history_df(stock_code, days=max(days, 120))
 
     if df is None or df.empty:
+        if source and source != "none":
+            return {"error": f"No historical data for {stock_code}: {source}"}
         return {"error": f"No historical data for {stock_code}"}
 
     df = df.tail(days).copy().reset_index(drop=True)

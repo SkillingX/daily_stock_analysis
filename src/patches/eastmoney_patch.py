@@ -1,5 +1,6 @@
 import hashlib
 import random
+import re
 import secrets
 import socket
 import threading
@@ -10,15 +11,77 @@ import uuid
 import logging
 from contextvars import ContextVar
 from typing import Any, Optional
+from urllib.parse import urlparse
 from fake_useragent import UserAgent
 
 logger = logging.getLogger(__name__)
 
 request_deadline: ContextVar[Optional[float]] = ContextVar("fundamental_request_deadline", default=None)
+# 板块专项东财公共行情出站代理（opt-in）：仅 sector 数据 worker 在线程内 bind
+# （submit 不继承调用方 ContextVar），值=已校验代理 URL；未 bind 时所有请求
+# 走既有直连/环境路径。patched_request 只按本 ContextVar + 主机精确匹配路由，
+# 不因「正在生成板块报告」而路由全部请求。
+sector_eastmoney_proxy: ContextVar[Optional[str]] = ContextVar("sector_eastmoney_proxy_url", default=None)
+
 _auth_patch_enabled = False
 _read_budget_installed = False
 _patch_lock = threading.Lock()
 original_request = requests.Session.request
+
+# 板块分析实际使用的东财公共行情/历史主机（精确主机匹配，不做子串/后缀放宽）：
+# push2.eastmoney.com、push2his.eastmoney.com 及其数字分片子域（如 17.push2、
+# 7.push2his）。datacenter/anonflow2/quote 等其他东财主机不在此列，保持既有路径。
+_SECTOR_QUOTE_HOST_RE = re.compile(r"(?:\d{1,3}\.)?push2(?:his)?\.eastmoney\.com")
+
+
+def is_scoped_sector_quote_url(url: Any) -> bool:
+    """URL 主机是否属于板块专项代理 allowlist（正确解析主机，防子串/后缀欺骗）。
+
+    ``evilpush2.eastmoney.com``、``push2.eastmoney.com.attacker.com``、
+    ``datacenter.eastmoney.com`` 均不匹配；解析失败按不匹配处理（不路由比
+    错误路由安全）。hostname 已做小写规范化。
+    """
+    try:
+        host = urlparse(str(url)).hostname
+    except ValueError:
+        return False
+    return bool(host and _SECTOR_QUOTE_HOST_RE.fullmatch(host))
+
+
+class SectorScopedRedirectError(requests.RequestException):
+    """scoped 代理下的东财行情接口返回 3xx：不跟随重定向、不采纳响应体。
+
+    消息只含状态码与语义，不含代理地址/Location——重定向目标可能是其他域，
+    自动跟随会把 scoped 路径泄漏给第三方；合法形状的响应体也不得被业务采纳。
+    归入 requests.RequestException 家族以复用既有「供应商显式失败」缺口语义。
+    """
+
+
+def _reject_scoped_http_status(response: "requests.Response") -> Optional[requests.RequestException]:
+    """scoped 请求 3xx/4xx/5xx 在**共享传输边界**转为显式供应商失败（供 SDK 解析体之前）。
+
+    已安装的 AkShare ``stock_board_industry_hist_em`` 等多个公共接口解析
+    ``r.json()`` 前不调 ``raise_for_status``：HTTP 4xx/5xx + 合法形状响应体
+    会被直接采为业务数据。此处在响应回到任何 SDK 之前按状态码拒绝：3xx 保持 ``SectorScopedRedirectError``（不跟随重定向）；
+    4xx/5xx 归入 requests 既有 ``HTTPError`` 类别（RequestException 家族，
+    供应商显式失败缺口语义不变）。失败响应一律 close（连接/缓冲不悬挂）。
+    消息只含状态码与语义，不含任何 URL（代理地址部署敏感，目标 URL 亦不必
+    进异常文案）。返回待抛异常；状态正常返回 None。
+    """
+    status = response.status_code
+    if 300 <= status < 400:
+        return SectorScopedRedirectError(
+            f"sector scoped proxy: HTTP {status} redirect "
+            "not followed (explicit supplier failure)"
+        )
+    if status >= 400:
+        return requests.HTTPError(
+            f"sector scoped proxy: HTTP {status} error rejected before "
+            "supplier parsing (explicit supplier failure)",
+            response=response,
+        )
+    return None
+
 
 ua = UserAgent()
 
@@ -259,7 +322,27 @@ def eastmoney_patch(*, budget_only: bool = False) -> None:
                 raise ScheduledStopRequested(
                     "scheduler stop requested; HTTP dispatch suppressed after auth/throttle"
                 )
-            return request_before_patch(self, method, url, **kwargs)
+            # 板块专项 scoped 代理路由（opt-in）：显式 proxies 覆盖环境
+            # HTTP(S)_PROXY/NO_PROXY 合并结果（requests 请求级 proxies 优先），
+            # 不改进程环境变量、Session 全局默认与原 SDK 优先级；目标主机不在
+            # allowlist 时（datacenter F10/搜索/腾讯/iFinD/LLM 等一切非板块
+            # 行情出站）保持既有路径。scoped 请求不跟随重定向（3xx 不把
+            # scoped 路径泄漏到其他域，合法形状响应体也不采纳）；3xx/4xx/5xx
+            # 在任何 SDK 解析响应体之前按显式供应商失败拒绝（多个 AkShare/
+            # Efinance 公共接口解析前不查状态码，502 + 合法形状体会被采为
+            # 业务数据）。
+            scoped_proxy = sector_eastmoney_proxy.get()
+            scoped = bool(scoped_proxy) and is_scoped_sector_quote_url(url)
+            if scoped:
+                kwargs["proxies"] = {"http": scoped_proxy, "https": scoped_proxy}
+                kwargs["allow_redirects"] = False
+            response = request_before_patch(self, method, url, **kwargs)
+            if scoped:
+                rejection = _reject_scoped_http_status(response)
+                if rejection is not None:
+                    response.close()
+                    raise rejection
+            return response
 
         requests.Session.request = patched_request  # type: ignore[assignment]
         _patch_sign.set_patch(True)

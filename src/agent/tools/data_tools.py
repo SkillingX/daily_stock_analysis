@@ -464,8 +464,19 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]
     from src.services.history_loader import load_history_df
 
     df, source = load_history_df(stock_code, days=effective_days)
+    from src.core.research_run import ResearchStopped
+    from src.services.history_loader import refuse_stopped_or_expired
+
+    refuse_stopped_or_expired()
 
     if df is None or df.empty:
+        if source and source != "none":
+            # issue #86（PR87 spec）：换源/重叠冲突扩窗等显式失败原因必须到达
+            # 真实消费方，不静默伪装成「无数据」或旧帧成功。
+            return _append_history_metadata(
+                {"error": f"Daily history unavailable for {stock_code}: {source}"},
+                metadata,
+            )
         return _append_history_metadata(
             {"error": f"No historical data available for {stock_code}"},
             metadata,
@@ -474,6 +485,7 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]
     if source != "db_cache":
         _, normalized_code = _history_code_candidates(stock_code)
         try:
+            refuse_stopped_or_expired()
             saved_count = _get_db().save_daily_data(df, normalized_code, source)
             logger.info(
                 "Agent daily history persisted for %s (source=%s, new_records=%s)",
@@ -481,7 +493,12 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]
                 source,
                 saved_count,
             )
+        except ResearchStopped:
+            raise
         except Exception as exc:
+            from src.services.history_loader import propagate_if_control_exhausted
+
+            propagate_if_control_exhausted(exc)
             logger.warning(
                 "Agent daily history persistence failed for %s: %s",
                 normalized_code,
@@ -499,6 +516,7 @@ def _handle_get_daily_history(stock_code: str, days: int = 60) -> dict[str, Any]
     if source == "db_cache" and records:
         response_code = records[-1].get("code") or response_code
 
+    refuse_stopped_or_expired()
     return _append_history_metadata(
         {
             "code": response_code,
@@ -545,11 +563,29 @@ get_daily_history_tool = ToolDefinition(
 
 def _handle_get_analysis_context(stock_code: str) -> dict[str, Any]:
     """Get stored analysis context from database."""
-    db = _get_db()
-    context = db.get_analysis_context(stock_code)
+    # issue #86 revision-2：统一资格入口——共享窗口优先（启用范围，携带真实
+    # 日线来源），DB 路径经 iFinD 遗留行污染判定，被污染窗口整窗原链重取。
+    context: Optional[Dict[str, Any]] = None
+    from src.core.research_run import ResearchStopped
 
-    if context is None:
+    try:
+        from src.services.history_loader import qualified_analysis_context
+
+        context = qualified_analysis_context(stock_code, _get_db())
+    except ResearchStopped:
+        raise
+    except Exception as exc:
+        from src.services.history_loader import propagate_if_control_exhausted
+
+        propagate_if_control_exhausted(exc)
+        logger.debug("qualified analysis context unavailable for %s: %s", stock_code, exc)
+
+    if not isinstance(context, dict) or not context:
         return {"error": f"No analysis context in DB for {stock_code}"}
+
+    from src.services.history_loader import refuse_stopped_or_expired
+
+    refuse_stopped_or_expired()
 
     # Return safely serializable version (remove raw_data to save tokens)
     safe_context: Dict[str, Any] = {}
