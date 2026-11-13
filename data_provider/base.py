@@ -1784,6 +1784,7 @@ class DataFetcherManager:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30,
+        constraint_source: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         获取日线数据（自动切换数据源）
@@ -1800,6 +1801,13 @@ class DataFetcherManager:
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
+            constraint_source: 来源约束（issue #94）。已采用日线窗口未被替换前，
+                换源候选注定被上层跨源整窗一致性保护拒绝；约束生效时只有同名
+                数据源（含 iFinD 预置尝试仅当约束为 ``IfindDailyFetcher``）出站，
+                其余候选跳过并在错误摘要中如实记录「未出站」。尝试级预算预留、
+                fallback_to / 数据源切换 / 剩余未尝试计数等预算与诊断均按受约束
+                后的真实候选链计算，不为被排除候选预留或报告。不改变任何候选
+                的相对次序、采纳语义与可用性判定；默认 None 保持原行为。
 
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
@@ -1829,11 +1837,23 @@ class DataFetcherManager:
         is_us = is_us_index or is_us_stock_code(stock_code)
         is_hk = (not is_us) and _is_hk_market(stock_code)
         market = "us" if is_us else "hk" if is_hk else "cn"
+        if constraint_source and market != "cn":
+            # 来源约束只服务于 A 股已采用窗口的扩窗需求；不适用市场显式失败
+            # 而不是静默忽略约束，避免语义含混的出站。
+            raise DataFetchError(
+                f"{stock_code} 获取失败: 来源约束 [{constraint_source}] 不适用于该市场路由"
+            )
         if is_hk:
             fetchers = self._filter_daily_fetchers_for_market(fetchers, "hk")
         fetchers = self._filter_fetchers_by_capability(
             fetchers, capability="daily_data"
         )
+        if constraint_source:
+            logger.info(
+                "[数据源约束] %s: 仅尝试同源候选 [%s]，其余数据源不再出站"
+                "（已采用窗口的扩窗需求只能采纳同源整窗候选）",
+                stock_code, constraint_source,
+            )
         total_fetchers = len(fetchers)
 
         if total_fetchers == 0:
@@ -1982,7 +2002,10 @@ class DataFetcherManager:
         # issue #86：启用且合格（证券 + 日历 + 当前最新已完成交易日口径）时，
         # iFinD 现金分红前复权日线在既有候选链之前尝试一次；失败/不合格/日历
         # 不可用/历史目标均不打乱既有候选相对次序，真实原因保留在 errors。
-        if market == "cn":
+        # issue #94：来源约束为 IfindDailyFetcher 时才参与，其余约束跳过预置尝试。
+        if market == "cn" and (
+            not constraint_source or constraint_source == "IfindDailyFetcher"
+        ):
             ifind_attempt = self._prepare_ifind_daily_attempt(raw_stock_code, end_date)
             if ifind_attempt is not None:
                 ifind_fetcher, identity, clamped_end = ifind_attempt
@@ -1991,6 +2014,15 @@ class DataFetcherManager:
                     errors.append(self._daily_source_unavailable_error(ifind_fetcher))
                 else:
                     attempt_start = time.time()
+                    # issue #94：预算与 fallback 诊断按受约束后的真实候选链计算。
+                    # 约束为 iFinD 时通用链无任何同源候选——不为幻影 fallback
+                    # 预留尝试预算（否则仅剩 iFinD 可尝试时，剩余 20 秒会被
+                    # 预留 min(8, 20×0.3)=6 秒提前截断），失败诊断也不把将被
+                    # 跳过的来源报告为 fallback 目标。
+                    ifind_has_fallback = not constraint_source
+                    ifind_fallback_to = (
+                        fetchers[0].name if (fetchers and ifind_has_fallback) else None
+                    )
                     try:
                         logger.info(
                             f"[数据源尝试 iFinD] [{ifind_fetcher.name}] 获取 {stock_code} "
@@ -2001,7 +2033,7 @@ class DataFetcherManager:
                             provider=ifind_fetcher.name,
                             operation="get_daily_data",
                         )
-                        with daily_attempt_budget(reserve_fallback=True):
+                        with daily_attempt_budget(reserve_fallback=ifind_has_fallback):
                             df = self._call_fetcher_method(
                                 ifind_fetcher,
                                 "get_daily_data",
@@ -2037,7 +2069,7 @@ class DataFetcherManager:
                             latency_ms=duration_ms,
                             error_type="empty",
                             error_message="empty result",
-                            fallback_to=fetchers[0].name if fetchers else None,
+                            fallback_to=ifind_fallback_to,
                             record_count=0,
                         )
                         if df is not None and df.empty:
@@ -2057,19 +2089,42 @@ class DataFetcherManager:
                             latency_ms=duration_ms,
                             error_type=error_type,
                             error_message=error_reason,
-                            fallback_to=fetchers[0].name if fetchers else None,
+                            fallback_to=ifind_fallback_to,
                         )
                         logger.warning(
                             f"[数据源失败 iFinD] [{ifind_fetcher.name}] {stock_code}: "
-                            f"error_type={error_type}, reason={error_reason}，继续既有候选"
+                            f"error_type={error_type}, reason={error_reason}"
+                            + ("，继续既有候选" if ifind_has_fallback else "")
                         )
                         self._record_daily_source_failure(ifind_fetcher, market, error_reason)
                         errors.append(f"[{ifind_fetcher.name}] ({error_type}) {error_reason}")
 
+        # issue #94：预算与 fallback 诊断按受约束后的真实候选链计算——被约束
+        # 排除的候选不出站，不应获得预留预算、被报告为 fallback 目标，也不
+        # 计入「未尝试」剩余数。无约束时两式与原始列表逐位等价，行为不变。
+        def _next_eligible_name(after_index: int) -> Optional[str]:
+            for candidate in fetchers[after_index + 1:]:
+                if not constraint_source or candidate.name == constraint_source:
+                    return candidate.name
+            return None
+
+        def _remaining_eligible_count(from_index: int) -> int:
+            return sum(
+                1 for candidate in fetchers[from_index:]
+                if not constraint_source or candidate.name == constraint_source
+            )
+
         for attempt, fetcher in enumerate(fetchers, start=1):
+            if constraint_source and fetcher.name != constraint_source:
+                # issue #94：换源候选注定被上层跨源整窗一致性保护拒绝，不出站；
+                # 如实记录跳过原因，不冒充供应商故障。
+                errors.append(
+                    f"[skip] [{fetcher.name}] 受来源约束跳过（仅尝试 {constraint_source}），未出站"
+                )
+                continue
             if _daily_budget_exhausted(outer_daily_deadline):
                 errors.append(
-                    f"[budget] 外层预算已耗尽，剩余 {total_fetchers - attempt + 1} 个数据源未尝试"
+                    f"[budget] 外层预算已耗尽，剩余 {_remaining_eligible_count(attempt - 1)} 个数据源未尝试"
                 )
                 logger.warning("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
                 break
@@ -2077,7 +2132,7 @@ class DataFetcherManager:
                 errors.append(self._daily_source_unavailable_error(fetcher))
                 continue
             attempt_start = time.time()
-            fallback_to = fetchers[attempt].name if attempt < total_fetchers else None
+            fallback_to = _next_eligible_name(attempt - 1)
             try:
                 logger.info(
                     f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}..."
@@ -2087,7 +2142,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_daily_data",
                 )
-                with daily_attempt_budget(attempt < total_fetchers):
+                with daily_attempt_budget(fallback_to is not None):
                     df = self._call_fetcher_method(
                         fetcher,
                         "get_daily_data",
@@ -2151,10 +2206,9 @@ class DataFetcherManager:
                 )
                 self._record_daily_source_failure(fetcher, market, error_reason)
                 errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = fetchers[attempt]
+                if fallback_to:
                     logger.info(
-                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]"
+                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{fallback_to}]"
                     )
                 # 继续尝试下一个数据源
                 continue
