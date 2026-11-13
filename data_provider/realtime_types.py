@@ -15,6 +15,7 @@
 """
 
 import logging
+import math
 import time
 from threading import RLock
 from dataclasses import dataclass, field
@@ -203,13 +204,35 @@ class UnifiedRealtimeQuote:
         return self.volume_ratio is not None or self.turnover_rate is not None
 
 
+QUOTE_ANCHOR_READINGS: Dict[str, str] = {
+    "current_price": "price",
+    "pe_ratio": "pe_ratio",
+    "pb_ratio": "pb_ratio",
+    "total_mv": "total_mv",
+    "circ_mv": "circ_mv",
+}
+QUOTE_ANCHOR_FIELDS = frozenset(QUOTE_ANCHOR_READINGS)
+
+# 非锚点补充字段及其量纲：主源投影与合并采纳共用同一契约（issue #93）。
+QUOTE_SUPPLEMENT_FIELD_UNITS: Dict[str, str] = {
+    "volume_ratio": "multiple",
+    "turnover_rate": "percentage_point",
+    "amplitude": "percentage_point",
+}
+
+
 def quote_field_records(quote: UnifiedRealtimeQuote) -> Dict[str, Dict[str, Any]]:
-    """Keep field provenance when a unified quote is merged or projected to a tool."""
+    """Keep field provenance when a unified quote is merged or projected to a tool.
+
+    锚点字段经资格投影生成 ``rule_eligible`` 记录；量比/换手/振幅投影
+    主源自身的来源与时间记录（复审反例 1），合并采纳的 ``quote_supplement``
+    记录保留补充源身份不被覆盖；无效标量（bool/非数值/非有限值）不产生记录。
+    """
     from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
     records = dict(getattr(quote, "field_meta", {}) or {})
     raw_source = getattr(quote, "source", "unknown")
     source = raw_source.value if hasattr(raw_source, "value") else str(raw_source)
-    for anchor, attribute in {"current_price": "price", "pe_ratio": "pe_ratio", "pb_ratio": "pb_ratio", "total_mv": "total_mv", "circ_mv": "circ_mv"}.items():
+    for anchor, attribute in QUOTE_ANCHOR_READINGS.items():
         value = getattr(quote, attribute, None)
         metadata = records.get(anchor) or {}
         reading = reading_from_field_record(value, {
@@ -220,6 +243,23 @@ def quote_field_records(quote: UnifiedRealtimeQuote) -> Dict[str, Dict[str, Any]
         if reading is None:
             continue
         records[anchor] = adopted_field_record(anchor, reading, previous_record=metadata, selection_reason=str(metadata.get("selection_reason") or "primary"))
+    for supplement_field in QUOTE_SUPPLEMENT_FIELD_UNITS:
+        existing = records.get(supplement_field)
+        if existing is not None and existing.get("selection_reason") == "quote_supplement":
+            continue  # 合并采纳时已写入补充源溯源，不得用 quote 级来源覆盖
+        value = getattr(quote, supplement_field, None)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            continue
+        records[supplement_field] = {
+            "field": supplement_field,
+            "value": value,
+            "source": source,
+            "unit": QUOTE_SUPPLEMENT_FIELD_UNITS[supplement_field],
+            "observed_at": getattr(quote, "provider_timestamp", None),
+            "fetched_at": getattr(quote, "fetched_at", None),
+            "is_stale": getattr(quote, "is_stale", None),
+            "selection_reason": "primary",
+        }
     return records
 
 

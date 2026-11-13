@@ -2415,16 +2415,19 @@ class DataFetcherManager:
         ttl = realtime_cache_ttl if realtime_cache_ttl is not None else 600
         setattr(quote, "stale_seconds", stale_seconds)
         setattr(quote, "is_stale", stale_seconds > int(ttl))
-        from data_provider.realtime_types import quote_field_records
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
         from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
         records = quote_field_records(quote)
         for field, record in records.items():
             observed = self._parse_realtime_timestamp(record.get("observed_at"))
             if observed is not None:
                 record["is_stale"] = (fetched_dt - observed).total_seconds() > int(ttl)
-                reading = reading_from_field_record(record.get("value"), record)
-                if reading is not None:
-                    records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
+                # 锚点字段经资格投影重算 rule_eligible；补充字段（量比/换手/振幅）
+                # 无锚点语义，只如实更新 is_stale，保留采纳时的来源与时间（issue #93）。
+                if field in QUOTE_ANCHOR_FIELDS:
+                    reading = reading_from_field_record(record.get("value"), record)
+                    if reading is not None:
+                        records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
         quote.field_meta = records
         return quote
 
@@ -2654,15 +2657,16 @@ class DataFetcherManager:
                         logger.debug(
                             f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充"
                         )
-                        supplement_attempts = 0
                     else:
-                        # Supplement missing fields from this source (limit attempts)
-                        supplement_attempts += 1  # type: ignore[reportPossiblyUnboundVariable]
-                        if supplement_attempts > 1:
-                            logger.debug(
-                                f"[实时行情] {stock_code} 补充尝试已达上限，停止继续"
-                            )
-                            break
+                        # Supplement missing fields entry-by-entry, bounded by the
+                        # configured priority list (each list entry is dispatched
+                        # at most once per call; duplicates in a custom order are
+                        # each attempted as configured). Only still-missing
+                        # qualified fields are filled; an entry with nothing
+                        # adoptable neither blocks later fallback entries nor
+                        # leaves records behind (the default order keeps Eastmoney
+                        # last, issue #93 review round 4). Stop as soon as all
+                        # key fields are filled.
                         merged = self._merge_quote_fields(primary_quote, quote)
                         if merged:
                             logger.info(
@@ -2755,27 +2759,91 @@ class DataFetcherManager:
         """
         Copy non-None fields from *secondary* into *primary* where
         *primary* has None. Returns list of field names that were filled.
+
+        锚点字段经 rule_eligible 资格门控；量比/换手/振幅等非锚点补充字段
+        与锚点同契约拒绝已知过期源，并在采纳时写入自身来源与时间的字段
+        记录（issue #93：禁止过期数据冒充有效值、逐字段可核实来源）。
         """
         filled = []
-        from data_provider.realtime_types import quote_field_records
+        import math
+
+        from data_provider.realtime_types import quote_field_records, QUOTE_SUPPLEMENT_FIELD_UNITS
         primary.field_meta = quote_field_records(primary)
         secondary_meta = quote_field_records(secondary)
         known_currencies = {record.get("currency") for key, record in primary.field_meta.items() if key in {"current_price", "total_mv", "circ_mv"} and record.get("currency")}
         if getattr(primary, "currency", None):
             known_currencies.add(primary.currency)
+        from src.config import get_config
+
+        ttl_config = getattr(get_config(), "realtime_cache_ttl", None)
+        ttl = int(ttl_config) if ttl_config is not None else 600
+        secondary_source = getattr(secondary.source, "value", None) or str(getattr(secondary, "source", "unknown"))
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
-                if val is not None:
-                    if f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"} and not (secondary_meta.get(f) or {}).get("rule_eligible"):
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                    continue  # None/bool/非有限值不采纳、不留记录（与锚点 invalid_value 同契约）
+                is_anchor = f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"}
+                record: Optional[Dict[str, Any]] = None
+                if is_anchor:
+                    if not (secondary_meta.get(f) or {}).get("rule_eligible"):
                         continue
-                    if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
-                        continue
-                    setattr(primary, f, val)
                     if f in secondary_meta:
-                        primary.field_meta[f] = {**secondary_meta[f], "selection_reason": "quote_supplement"}
-                    filled.append(f)
+                        record = {**secondary_meta[f], "selection_reason": "quote_supplement"}
+                else:
+                    # 非锚点补充字段：与锚点同契约拒绝时间不合格源（已知过期或
+                    # 未来值），时间未知不判定不合格、由记录如实披露。
+                    staleness = cls._supplement_source_staleness(secondary, ttl)
+                    if staleness is True:
+                        continue
+                    record = {
+                        "field": f,
+                        "value": val,
+                        "source": secondary_source,
+                        "unit": QUOTE_SUPPLEMENT_FIELD_UNITS[f],
+                        "observed_at": getattr(secondary, "provider_timestamp", None),
+                        "fetched_at": getattr(secondary, "fetched_at", None),
+                        "is_stale": False if staleness is False else None,
+                        "selection_reason": "quote_supplement",
+                    }
+                if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
+                    continue
+                setattr(primary, f, val)
+                if record is not None:
+                    primary.field_meta[f] = record
+                filled.append(f)
         return filled
+
+    @staticmethod
+    def _valuation_anchor_records(quote_payload: Any) -> Dict[str, Dict[str, Any]]:
+        """估值块只承载金融锚点字段记录（issue #93 复审问题 1）。
+
+        量比/换手/振幅等非锚点行情记录进入 ``_build_fundamental_block`` 会被
+        按 pe/pb/市值语义重建并误标 unit_incompatible/rule_eligible=False，
+        污染 valuation.field_meta 与下游 financial_quality；按锚点集合过滤。
+        """
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
+        records = quote_field_records(quote_payload)
+        return {key: records[key] for key in QUOTE_ANCHOR_FIELDS if key in records}
+
+    @staticmethod
+    def _supplement_source_staleness(quote: Any, ttl: int) -> Optional[bool]:
+        """补充源的时间资格：True=已知不合格（过期或未来值）；False=已知新鲜；None=时间未知。
+
+        显式 ``is_stale=True``、可解析 provider_timestamp 超过 TTL 或晚于当前
+        时间均视为不合格（与锚点 stale/time_in_future 同契约）；时间未知不判定
+        不合格（由字段记录如实披露 observed_at=None）。
+        """
+        if getattr(quote, "is_stale", None) is True:
+            return True
+        observed = DataFetcherManager._parse_realtime_timestamp(
+            getattr(quote, "provider_timestamp", None)
+        )
+        if observed is None:
+            return None
+        now = datetime.now(timezone.utc)
+        age = (now - observed).total_seconds()
+        return age < 0 or age > int(ttl)
 
     def _longbridge_preferred(self, capability: str = "realtime_quote") -> bool:
         """Return True when Longbridge keys are configured and available.
@@ -4087,8 +4155,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -4413,8 +4480,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",

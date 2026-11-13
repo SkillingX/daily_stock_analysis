@@ -65,6 +65,8 @@ MX/Choice 属东财家族，iFinD/Fuyao 属同花顺家族；家族只限制独�
 
 manager 的 quote 合并、基本面主备源和三个数据工具通过 `field_meta` 保留每个已采用字段的真实来源、报告期、口径、单位、币种、数据时间与选择理由。旧 scalar 保留，包括 0、负数和冲突证据；核验的 `v` 使用同一个精确采用值，不因 compact 四舍五入产生另一份事实。冲突字段的 `rule_eligible=false`，不能作为普通缺项回填。PE 未证明 TTM、PB 未证明 MRQ、ROE 未证明加权口径同样不能进入相应规则。
 
+issue #93：实时行情的量比/换手率/振幅也随 `field_meta` 携带逐字段来源与时间——主源自带字段记录来源为行情源本身（`selection_reason="primary"`），按序补充采纳的字段记录补充源身份（`selection_reason="quote_supplement"`），补充源已知过期或时间在未来时不采纳、不产生记录，数据时间未知如实保留 `observed_at=None`；字段补齐即停，来源按配置的 `realtime_source_priority` 有界逐项尝试（默认顺序非东财在前、东财公开接口最后兜底；用户自定义顺序可覆盖，重复项按配置逐项尝试）。估值块与 `financial_quality` 只承载金融锚点记录（现价/PE/PB/市值），非锚点行情记录不进入金融锚点资格重建，不产生 `unit_incompatible` 伪资格。
+
 备用 Source 的 reading 不再降成 float 后丢掉出处；已取得 MX batch 与逐字段 Source 使用同一个解析入口。未知元信息明确保留未知，不把主 quote 来源或整块 `as_of` 套给补充字段。旧基本面上下文和映射缓存按版本拒读；回滚不需清理历史报告或数据库。本专题新增中文说明，没有对应英文专题文件，不修改首页 README。
 
 ## 缺项补取与阶段预算
