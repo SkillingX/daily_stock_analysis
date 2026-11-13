@@ -119,7 +119,7 @@ def test_complete_non_eastmoney_quote_makes_zero_eastmoney_calls(mock_get_config
     efinance = _EastmoneyFetcher()
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is not None
@@ -142,7 +142,7 @@ def test_second_non_eastmoney_source_succeeds_without_eastmoney_contact(mock_get
     efinance = _EastmoneyFetcher()
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is not None
@@ -154,7 +154,12 @@ def test_second_non_eastmoney_source_succeeds_without_eastmoney_contact(mock_get
 
 @patch("src.config.get_config")
 def test_timeout_falls_through_to_next_non_eastmoney_source(mock_get_config):
-    """超时按失败降级到下一个非东财源，失败证据保留。"""
+    """超时异常按失败降级到下一个非东财源，失败证据保留。
+
+    本用例验证 manager 对超时异常的既有职责：降级顺序与诊断记录。阻塞
+    I/O 的强制中断不在 manager 契约内——请求超时由各 fetcher 内部负责，
+    manager 只串行化调用并按异常降级（如实披露，不宣称可强制取消）。
+    """
     mock_get_config.return_value = _make_config()
     akshare = _MultiSourceFetcher(
         {
@@ -164,12 +169,27 @@ def test_timeout_falls_through_to_next_non_eastmoney_source(mock_get_config):
     )
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run") as mock_run:
         quote = manager.get_realtime_quote("600519")
 
     assert quote is not None
     assert quote.source == RealtimeSource.AKSHARE_SINA
     assert quote.fallback_from == "tencent"
+    # 诊断落到 base.py 实际引用的绑定：超时源记失败并指向降级目标
+    failures = [
+        call.kwargs for call in mock_run.call_args_list if not call.kwargs["success"]
+    ]
+    successes = [
+        call.kwargs for call in mock_run.call_args_list if call.kwargs["success"]
+    ]
+    assert len(failures) == 1
+    assert failures[0]["provider"] == "AkshareFetcher"
+    # summarize_exception 的真实分类：error_type 记录异常类型名
+    assert failures[0]["error_type"] == "TimeoutError"
+    assert failures[0]["error_message"] == "tencent read timeout"
+    assert failures[0]["fallback_to"] == "akshare_sina"
+    assert len(successes) == 1
+    assert successes[0]["provider"] == "AkshareFetcher"
 
 
 @patch("src.config.get_config")
@@ -186,7 +206,7 @@ def test_eastmoney_reached_only_after_non_eastmoney_sources_fail(mock_get_config
     efinance = _EastmoneyFetcher(result=_make_quote(RealtimeSource.EFINANCE))
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is not None
@@ -206,7 +226,7 @@ def test_missing_field_supplement_prefers_non_eastmoney_source(mock_get_config):
     efinance = _EastmoneyFetcher()
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is primary
@@ -240,7 +260,7 @@ def test_supplemented_field_carries_own_source_and_time(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": supplement})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     for field, value in (("volume_ratio", 1.7), ("amplitude", 3.2)):
@@ -272,7 +292,7 @@ def test_known_stale_secondary_supplies_no_field_silently(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": stale_secondary})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.volume_ratio is None  # 过期补充值不被采用
@@ -291,7 +311,7 @@ def test_explicit_stale_flag_on_secondary_blocks_supply(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": stale_secondary})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.turnover_rate is None
@@ -299,7 +319,7 @@ def test_explicit_stale_flag_on_secondary_blocks_supply(mock_get_config):
 
 
 @patch("src.config.get_config")
-def test_supplement_cap_skips_futile_second_eastmoney_fetch(mock_get_config):
+def test_partial_supplement_still_tries_eastmoney_for_remaining_gap(mock_get_config):
     """非东财部分补齐后，东财仍按序尝试剩余缺口（复审问题 2）。
 
     腾讯缺 volume_ratio 与 turnover_rate，新浪仅补到 volume_ratio；
@@ -313,7 +333,7 @@ def test_supplement_cap_skips_futile_second_eastmoney_fetch(mock_get_config):
     efinance = _EastmoneyFetcher(result=_make_quote(RealtimeSource.EFINANCE))
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.volume_ratio == 1.1  # 新浪补充
@@ -391,7 +411,7 @@ def test_failed_first_supplement_still_reaches_next_source(mock_get_config):
     efinance = _EastmoneyFetcher(result=_make_quote(RealtimeSource.EFINANCE))
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.source == RealtimeSource.TENCENT
@@ -415,7 +435,7 @@ def test_enrichment_keeps_supplement_record_semantics(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": supplement})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     record = quote.field_meta["volume_ratio"]
@@ -440,7 +460,7 @@ def test_primary_complete_quote_carries_per_field_source_and_time(mock_get_confi
     )
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     expectations = {
@@ -466,7 +486,7 @@ def test_primary_time_unknown_fields_disclose_unknown(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": _make_quote(RealtimeSource.TENCENT)})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     for field in ("volume_ratio", "turnover_rate", "amplitude"):
@@ -495,7 +515,7 @@ def test_merge_provenance_not_overwritten_by_primary_projection(mock_get_config)
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": supplement})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     record = quote.field_meta["volume_ratio"]
@@ -522,7 +542,7 @@ def test_unadoptable_supplement_does_not_block_eastmoney_fallback(mock_get_confi
     efinance = _EastmoneyFetcher(result=_make_quote(RealtimeSource.EFINANCE))
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.source == RealtimeSource.TENCENT
@@ -548,7 +568,7 @@ def test_stale_supplement_source_still_allows_eastmoney_fallback(mock_get_config
     efinance = _EastmoneyFetcher(result=_make_quote(RealtimeSource.EFINANCE))
     manager = DataFetcherManager(fetchers=[akshare, efinance])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.turnover_rate == 0.8  # efinance 合格值被采纳
@@ -570,7 +590,7 @@ def test_future_timestamped_secondary_supplies_nothing(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": future_sina})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.volume_ratio is None
@@ -586,7 +606,7 @@ def test_non_finite_supplement_values_not_adopted(mock_get_config):
     akshare = _MultiSourceFetcher({"tencent": primary, "sina": bad_sina})
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote.volume_ratio is None
@@ -603,7 +623,7 @@ def test_cancellation_after_primary_stops_new_outbound(mock_get_config):
     )
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is primary
@@ -636,7 +656,7 @@ def test_stale_provider_timestamp_is_disclosed_not_faked_fresh(mock_get_config):
     )
     manager = DataFetcherManager(fetchers=[akshare])
 
-    with patch("src.services.run_diagnostics.record_provider_run"):
+    with patch("data_provider.base.record_provider_run"):
         quote = manager.get_realtime_quote("600519")
 
     assert quote is not None

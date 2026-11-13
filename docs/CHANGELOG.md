@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 统一实时行情采纳边界的非有限数值处理——fetcher 返回的行情对象上可确认的 NaN/±inf 数值标量（`UnifiedRealtimeQuote` 全部数值字段，A 股与港美股入口同契约）在 manager 采纳判断前按缺失处理：主源价格非有限按既有来源顺序降级并保留 `fallback_from`，补充字段非有限视为缺失、由合格备源按既有顺序补齐（已知过期备源拒绝）或保持缺失，`get_realtime_quote` 工具响应不再携带 NaN/±inf。确有非法字段时采纳最小副本，fetcher 原引用（外层字段与嵌套 metadata）不被改写；有效对象原样返回。有效性判定按原生数值类型且不受 numpy errstate 影响：字符串与非数字容器不转换不判定，Decimal 用自身 `is_finite`，大整数恒有限，其它数值标量用原生比较（宽平台上表示范围超出 float64 的有限 longdouble 不误删）。已知边界如实披露：备源字段资格沿用既有 `int/float` 门控（Decimal/np.float32 备源当前不被采纳）；工具响应中 amount 携带 Decimal 等不可序列化标量属既有工具序列化边界；YfinanceFetcher 美股指数路径 fast_info 原始值直传，同样被该边界兜住。来源顺序、取消与降级/超时契约不变。
+
+- [测试] CI backend-gate 两用例的日历冻结与实时行情诊断断言修正：`offline` 作用域 teardown 把作用域内首次导入产生的 pipeline 日历别名恢复为作用域进入值（仅当别名仍指向本次实现时，外层 fixture 补丁保留）；`_pipeline` 冻结断点续传目标入口 `_resolve_resume_target_date`，两 CI 用例业务断言不变；超时用例按真实异常分类断言 `error_type`/`error_message`/`fallback_to`，名实不符用例更名，补港美股入口补充与时效场景。
+
 - [改进] issue #94：深研已采用日线窗口的扩窗需求只尝试同源数据源——已采用来源作为 `DataFetcherManager` 来源约束传入，换源候选（含非同源的 iFinD 预置尝试）不再出站，消除前置研究记录的「iFinD 长窗失败后东财真实出站、候选却被跨源整窗一致性保护拒绝」的注定冗余出站；尝试级预算预留、fallback_to/数据源切换/剩余未尝试计数等预算与诊断按受约束后的真实候选链计算，不为被排除候选预留预算或报告虚假 fallback；换源/重叠冲突拒绝语义、失败原因、超时停止与整窗资格校验不变，候选相对次序不变，约束不适用市场显式失败，不新增配置。标准 HTTP CPS=6 候选因供应商量单位契约未取得暂不启用，实时主行情与产业链行业涨跌排行保持原路由。
 
 - [修复] issue #94：来源约束下的真实同源长窗失败（manager 错误、源级超时、空窗口、截止裁剪失败）经新增 owner 方法 `record_failed_daily_expansion` 进入持久未满足记录——run 锁内按权威帧复核，无已采纳帧的首取失败不误标、已覆盖需求不记录、取消照常传播不误标，披露以锁内当前帧来源包装成与换源拒绝同形的诚实原因（含真实失败信息）；失败原因在捕获点经既有诊断脱敏规范 `sanitize_diagnostic_text` 统一脱敏限长（loader 三个失败分支的返回值/日志/失败 memo、unmet 两个 owner 写入方法、报告历史装配注记两个入口），保留可诊断错误类型与安全上下文，合成密钥全链路测试覆盖、无敏感数据普通错误回归钉住原文保留；短窗恢复后报告注记按快照重建不丢失、不伪装长窗已满足，后续真正长窗同源采纳在同一把锁内消解（复用既有存储/快照/消解机制，与换源拒绝记录同键空间）。

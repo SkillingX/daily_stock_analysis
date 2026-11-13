@@ -116,8 +116,37 @@ class _FakeManager:
 
 @pytest.fixture()
 def offline(monkeypatch):
+    import sys
+
+    from src.core import trading_calendar as tc
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    # 各自保存进入值：tc 原引用（外层 fixture 已有 patch 时是外层 sentinel）；
+    # pipeline 的 from-import 别名进入值（未导入时 None，恢复目标回退 tc 进入值）。
+    entered_tc_effective = tc.get_effective_trading_date
+    pipeline_module = sys.modules.get("src.core.pipeline")
+    entered_pipeline_alias = (
+        pipeline_module.get_effective_trading_date
+        if pipeline_module is not None
+        else None
+    )
     strict_calendar(monkeypatch)
+    # 立即保存本次安装的精确引用：同一作用域内后续的二次 patch 会改变 tc
+    # 的当时值，teardown 的条件恢复必须比对安装值而非当时值。
+    scope_effective = tc.get_effective_trading_date
     monkeypatch.setattr(H, "_fetcher_singleton", None)
+    yield
+    # teardown（先于 monkeypatch.undo）：pipeline 的 from-import 别名若在
+    # 本作用域内完成首次导入会绑死本次安装值、undo 恢复不了——仅当别名
+    # 仍指向安装值时恢复为别名自己的进入值（外层 pipeline sentinel 得以
+    # 保留；别名未导入过时恢复目标回退 tc 进入值）；之后 monkeypatch.undo
+    # 把 tc 恢复为其进入值。
+    restore_target = (
+        entered_pipeline_alias
+        if entered_pipeline_alias is not None
+        else entered_tc_effective
+    )
+    restore_pipeline_alias_if_scoped(scope_effective, restore_target)
 
 
 def _install(monkeypatch, db: _FakeDb, manager: _FakeManager):
@@ -915,6 +944,14 @@ def _pipeline(monkeypatch, db, manager, *, enabled=True):
 
     enabled_config(monkeypatch, enabled=enabled)
     _install(monkeypatch, db, manager)
+    # 本文件 pipeline 用例消费 pipeline 时间入口的唯一活跃路径是断点续传
+    # 目标日：局部确定性冻结该类方法（进入值恒为真实方法，成对恢复），
+    # 不依赖模块别名的导入时序。
+    monkeypatch.setattr(
+        StockAnalysisPipeline,
+        "_resolve_resume_target_date",
+        staticmethod(lambda code, current_time=None: LATEST_SESSION),
+    )
     pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
     pipeline.db = db
     pipeline.fetcher_manager = manager
@@ -2043,3 +2080,190 @@ def test_concurrent_owner_resolution_and_recording_is_idempotent(monkeypatch, of
         frame = run.daily_history
         assert frame is not None and frame["source"] == "IfindDailyFetcher"
         assert len(frame["records"]) == 120  # 权威帧未被并发记录覆盖
+
+
+# ---------------------------------------------------------------------------
+# offline 作用域的 pipeline 日历别名契约：局部所有权、条件恢复、真实调用等值
+# ---------------------------------------------------------------------------
+def test_pipeline_resume_target_frozen_with_outer_tc_patch():
+    """外层 fixture 尚有 tc patch 时：构造期冻结成立且只恢复自己的改动。
+
+    外层 monkeypatch（模拟其它 fixture 的既有 patch）先把 tc 日历入口换
+    成 sentinel，strict_calendar 用独立实例在其上叠加冻结；_pipeline 只
+    冻结类方法 ``_resolve_resume_target_date``（进入值恒为真实方法）。
+    内层 undo 后方法回到真实实现、tc 回到外层 sentinel；pipeline 的
+    from-import 别名在此进程先导入场景下绑定真实函数、不属于本作用域
+    写入，条件恢复不得误改它（保持进入值）——不覆盖外层 patch、无跨
+    fixture 全局状态。全程使用独立 MonkeyPatch 实例，不触碰 pytest 共享
+    monkeypatch（不提前撤销其它 fixture 的补丁）。
+    """
+    from pytest import MonkeyPatch
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+    from src.core.pipeline import StockAnalysisPipeline
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    real_method = StockAnalysisPipeline._resolve_resume_target_date
+    entered_alias = pipeline_module.get_effective_trading_date
+    mp = MonkeyPatch()
+    outer_mp = MonkeyPatch()
+    outer_sentinel = lambda market, current_time=None: LATEST_SESSION  # noqa: E731
+    outer_mp.setattr(tc, "get_effective_trading_date", outer_sentinel)
+    try:
+        entered_tc = tc.get_effective_trading_date  # 外层 sentinel（tc 进入值）
+        scope_effective = strict_calendar(mp)
+        pipeline = _pipeline(
+            mp, _FakeDb([]), _FakeManager([std_frame(rows=40)]), enabled=True
+        )
+        assert pipeline._resolve_resume_target_date("600519") == LATEST_SESSION
+        mp.undo()
+        assert StockAnalysisPipeline._resolve_resume_target_date is real_method
+        assert tc.get_effective_trading_date is outer_sentinel
+        # 别名不属于本作用域写入（先导入绑定真实函数）→ 条件恢复不误改
+        restore_pipeline_alias_if_scoped(scope_effective, entered_tc)
+        assert pipeline_module.get_effective_trading_date is entered_alias
+    finally:
+        pipeline_module.get_effective_trading_date = entered_alias
+        mp.undo()
+        outer_mp.undo()
+    assert StockAnalysisPipeline._resolve_resume_target_date is real_method
+    assert pipeline_module.get_effective_trading_date is entered_alias
+
+
+def test_scope_restore_keeps_outer_sentinel():
+    """作用域恢复以别名自身进入值为目标：外层 tc/pipeline sentinel 都保留。
+
+    外层分别 patch tc 与 pipeline 别名（两个 sentinel）→ strict_calendar
+    叠加 → 构造作用域内导入后的状态（别名指向本次实现）→ 条件恢复为
+    pipeline 别名的进入值（外层 pipeline sentinel，不落回真实函数、不
+    被覆盖）→ undo 后 tc 回到外层 tc sentinel——真实调用同值。
+    """
+    from datetime import date
+
+    from pytest import MonkeyPatch
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    mp = MonkeyPatch()
+    outer_mp = MonkeyPatch()
+    pipeline_outer_mp = MonkeyPatch()
+    tc_sentinel = lambda market, current_time=None: date(2020, 1, 1)  # noqa: E731
+    pipeline_sentinel = lambda market, current_time=None: date(2021, 2, 2)  # noqa: E731
+    pre_test_alias = pipeline_module.get_effective_trading_date  # 测试前状态
+    outer_mp.setattr(tc, "get_effective_trading_date", tc_sentinel)
+    pipeline_outer_mp.setattr(
+        pipeline_module, "get_effective_trading_date", pipeline_sentinel
+    )
+    try:
+        entered_alias = pipeline_module.get_effective_trading_date
+        assert entered_alias is pipeline_sentinel  # 外层 pipeline sentinel（进入值）
+        strict_calendar(mp)
+        scope_effective = tc.get_effective_trading_date  # 本次作用域写入的实现
+        # 构造「作用域内首次导入」的终态：别名指向本次实现
+        pipeline_module.get_effective_trading_date = scope_effective
+        assert pipeline_module.get_effective_trading_date("cn") == LATEST_SESSION
+        restore_pipeline_alias_if_scoped(scope_effective, entered_alias)
+        mp.undo()
+        assert pipeline_module.get_effective_trading_date is pipeline_sentinel
+        assert pipeline_module.get_effective_trading_date("cn") == date(2021, 2, 2)
+        assert tc.get_effective_trading_date is tc_sentinel
+    finally:
+        mp.undo()
+        outer_mp.undo()
+        pipeline_outer_mp.undo()
+        # 各实例 undo 之后恢复测试前状态，不向同进程后续测试泄漏任何 sentinel
+        pipeline_module.get_effective_trading_date = pre_test_alias
+    assert pipeline_module.get_effective_trading_date is pre_test_alias
+
+
+def test_offline_scope_survives_second_tc_patch_in_same_scope(monkeypatch, offline):
+    """同作用域二次 patch：teardown 按 strict_calendar 安装值恢复别名。
+
+    offline 激活 → 构造 pipeline 绑定本次安装值（作用域内首次导入的等价
+    终态）→ 同一 monkeypatch 再把 tc 换成 sentinel（teardown 时刻 tc 的
+    当时值已不是安装值）→ teardown 用保存的安装值引用条件恢复 → undo 后
+    tc 恢复进入值；后继测试 test_offline_scope_restores_pipeline_alias_
+    after_teardown 断言两侧一致且真实调用同值（旧实现读当时值会漏恢复）。
+    """
+    from datetime import date
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+
+    scope_effective = tc.get_effective_trading_date  # strict_calendar 刚安装的值
+    # 构造 pipeline 绑定安装值（作用域内首次导入的等价终态）
+    pipeline_module.get_effective_trading_date = scope_effective
+    assert pipeline_module.get_effective_trading_date("cn") == LATEST_SESSION
+    # 同一 monkeypatch 二次 patch：teardown 时刻 tc 的当时值变为 sentinel
+    sentinel = lambda market, current_time=None: date(2020, 1, 1)  # noqa: E731
+    monkeypatch.setattr(tc, "get_effective_trading_date", sentinel)
+    assert tc.get_effective_trading_date is sentinel
+    assert pipeline_module.get_effective_trading_date is not sentinel
+    # 测试结束 → offline teardown 按保存的安装值恢复 → undo → tc 回进入值
+
+
+def test_offline_scope_restores_pipeline_alias_after_teardown():
+    """offline 作用域结束后：pipeline 日历别名与 tc 当前实现一致且真实调用同值。
+
+    无论 pipeline 是本进程先导入（恢复条件不匹配、别名保持进入值）还是
+    在 offline 作用域内首次导入（条件恢复为进入值），teardown + undo 后
+    两侧实现一致；无外层补丁时即真实交易日，不再固定 2026-11-06。
+    """
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+
+    assert pipeline_module.get_effective_trading_date is tc.get_effective_trading_date
+    assert pipeline_module.get_effective_trading_date("cn") == (
+        tc.get_effective_trading_date("cn")
+    )
+
+
+def test_offline_lifecycle_failed_then_retried_import():
+    """子进程跑真实 offline fixture 生命周期：导入失败→解除→重试成功。
+
+    阶段 1：litellm stub（非 package）使 pipeline 无法导入时，offline 的
+    非 pipeline 用例照常通过（strict_calendar 不导入 pipeline）；阶段 2：
+    解除 stub 后同进程重跑，pipeline 首次导入发生在 offline 作用域内，
+    业务断言通过且 teardown 恢复别名——pytest.main 全部结束后别名与 tc
+    当前实现一致并真实调用同值（审查员反例的完整序列）。子进程零网络。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    code = "\n".join(
+        [
+            "import sys, types",
+            "import pytest",
+            "stub = types.ModuleType('litellm')",
+            "stub.__dsa_test_stub__ = True",
+            "sys.modules['litellm'] = stub  # 非 package：pipeline 导入链失败",
+            "target = 'tests/test_ifind_daily_cache.py'",
+            "rc1 = pytest.main(['-q', '-p', 'no:cacheprovider',",
+            "    target + '::test_disabled_mode_pure_legacy_mixed_cache_still_hits'])",
+            "assert rc1 == 0, 'offline non-pipeline case must pass under stub'",
+            "sys.modules.pop('litellm', None)  # 条件解除（重试）",
+            "rc2 = pytest.main(['-q', '-p', 'no:cacheprovider',",
+            "    target + '::test_disabled_resume_rejects_ifind_target_row',",
+            "    target + '::test_offline_scope_restores_pipeline_alias_after_teardown'])",
+            "assert rc2 == 0, 'retry + post-teardown alias assertions must pass'",
+            "import src.core.pipeline as p",
+            "from src.core import trading_calendar as tc",
+            "assert p.get_effective_trading_date is tc.get_effective_trading_date",
+            "assert p.get_effective_trading_date('cn') == tc.get_effective_trading_date('cn')",
+            "print('OK')",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout

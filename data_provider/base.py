@@ -47,7 +47,7 @@ from .ifind_fundamental_adapter import IfindFetcher, IfindSource
 from .tushare_ifind_fundamental_adapter import TushareIfindFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .mx_data_adapter import MXSource, _cn_period_to_yyyymmdd
-from .realtime_types import CircuitBreaker
+from .realtime_types import CircuitBreaker, sanitize_non_finite_quote_scalars
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -2623,6 +2623,11 @@ class DataFetcherManager:
 
                 provider_name = fetcher.name if fetcher is not None else source
 
+                # 可确认的 NaN/±inf 标量在采纳判断前按缺失处理（price=+inf
+                # 能通过 price>0，必须在 has_basic_data 之前清理，issue #93
+                # 契约）；确有非法字段时返回副本，fetcher 持有的原引用不被改。
+                if quote is not None:
+                    quote = sanitize_non_finite_quote_scalars(quote)
                 if quote is not None and quote.has_basic_data():
                     record_provider_run(
                         data_type="realtime_quote",
@@ -2882,6 +2887,10 @@ class DataFetcherManager:
             q = self._call_fetcher_method(
                 fetcher, "get_realtime_quote", stock_code, **kw
             )
+            # 与 A 股循环同契约：异常数值标量先按缺失处理再判基本可用性，
+            # 确有非法字段时采纳副本、不改 fetcher 持有的原引用。
+            if q is not None:
+                q = sanitize_non_finite_quote_scalars(q)
             if q is not None and q.has_basic_data():
                 record_provider_run(
                     data_type="realtime_quote",

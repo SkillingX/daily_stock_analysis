@@ -14,9 +14,11 @@
 - CircuitBreaker 管理各数据源的熔断状态
 """
 
+import copy
 import logging
 import math
 import time
+from decimal import Decimal
 from threading import RLock
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
@@ -212,6 +214,90 @@ QUOTE_ANCHOR_READINGS: Dict[str, str] = {
     "circ_mv": "circ_mv",
 }
 QUOTE_ANCHOR_FIELDS = frozenset(QUOTE_ANCHOR_READINGS)
+
+# UnifiedRealtimeQuote 实际暴露的全部数值标量（与 to_dict 可选字段一致）；
+# manager 采纳边界的异常值清理只针对这些字段，不递归处理第三方元数据。
+QUOTE_NUMERIC_FIELDS: tuple[str, ...] = (
+    "price", "change_pct", "change_amount", "volume", "amount",
+    "volume_ratio", "turnover_rate", "amplitude",
+    "open_price", "high", "low", "pre_close",
+    "pe_ratio", "pb_ratio", "total_mv", "circ_mv",
+    "change_60d", "high_52w", "low_52w",
+)
+
+# 标量字段名 -> field_meta 记录键（锚点记录键与标量名不同，如 price/current_price）。
+_QUOTE_SCALAR_RECORD_KEYS: Dict[str, str] = {
+    scalar: key for key, scalar in QUOTE_ANCHOR_READINGS.items()
+}
+
+
+def is_non_finite_number(value: Any) -> bool:
+    """True 仅当 value 可确认为 NaN/±inf。
+
+    bool 与非数值标量返回 False；字符串不转换、不判定（"inf"/"nan" 等非
+    数值元数据保持原样）；非数字容器（list/dict 等）不是数值，一律 False；
+    Decimal 按自身 ``is_finite`` 判定（覆盖 NaN/sNaN/±Inf 与有限大值）；
+    int 恒有限（含超出 float 范围的大整数）；float（含 np.float64 子类）
+    按 isfinite 判定；其它数值类型（NumPy float32/longdouble 等）用原生
+    比较判定——NaN 与自身不等、±Inf 与 float("inf") 精确相等——不经
+    float64 饱和转换，比较运算不依赖算术副作用（numpy 全局 errstate 不
+    影响），平台上表示范围更大的有限 longdouble 保留；判定失败按有限
+    处理，不因转换错误拒绝数据源。
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    if isinstance(value, int):
+        return False
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, (str, bytes)):
+        return False
+    try:
+        if value != value:  # NaN 与自身不等（quiet NaN 比较无算术副作用）
+            return True
+        positive_infinity = float("inf")
+        return bool(value == positive_infinity or value == -positive_infinity)
+    except (TypeError, ValueError, ArithmeticError):
+        return False
+
+
+def sanitize_non_finite_quote_scalars(
+    quote: UnifiedRealtimeQuote,
+) -> UnifiedRealtimeQuote:
+    """行情对象上可确认的 NaN/±inf 数值标量按缺失处理后返回。
+
+    在 manager 采纳判断（``has_basic_data``）之前调用：``price=+inf`` 能通过
+    现有 ``price > 0`` 判断，必须在边界先清理。无非法字段时原样返回同一对象
+    （兼容既有行为，不复制）；确有非法字段时返回最小浅副本——fetcher 可能
+    持有并复用返回对象，原引用不被修改——副本上的非法标量置为缺失，并同步
+    移除对应 field_meta 记录（含 ``price`` 的 ``current_price`` 别名键与
+    ``quote_supplement`` 记录）；保留记录做浅复制——下游 enrich 会原地改写
+    ``record["is_stale"]``，不复制会把改动传染给 fetcher 持有的原对象嵌套
+    metadata；合法 Decimal/NumPy 数值、0 与有限负值保持原样。
+    """
+    cleared = [
+        f
+        for f in QUOTE_NUMERIC_FIELDS
+        if (value := getattr(quote, f, None)) is not None
+        and is_non_finite_number(value)
+    ]
+    if not cleared:
+        return quote
+    cleaned = copy.copy(quote)
+    for f in cleared:
+        setattr(cleaned, f, None)
+    meta = getattr(cleaned, "field_meta", None)
+    if meta:
+        drop = {_QUOTE_SCALAR_RECORD_KEYS.get(f, f) for f in cleared}
+        cleaned.field_meta = {
+            k: dict(rec) if isinstance(rec, dict) else rec
+            for k, rec in meta.items()
+            if k not in drop
+        }
+    return cleaned
+
 
 # 非锚点补充字段及其量纲：主源投影与合并采纳共用同一契约（issue #93）。
 QUOTE_SUPPLEMENT_FIELD_UNITS: Dict[str, str] = {
