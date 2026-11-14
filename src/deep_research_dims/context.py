@@ -70,14 +70,21 @@ def sync_unmet_history_notes(ctx: SharedContext, run: "ResearchRun | None" = Non
 def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, Any]]:
     try:
         from src.services.history_loader import load_history_df
+        from src.services.run_diagnostics import sanitize_diagnostic_text
 
         df, source = load_history_df(code, days=days)
         ctx.history_source = str(source or "")
         if df is None or df.empty:
             if source and source != "none":
                 # issue #86（PR87 spec）：换源/重叠冲突扩窗的显式拒绝原因进
-                # 限制注记（同前缀，后续同 run 采纳仍会清理）。
-                ctx.limitation(f"{HISTORY_MISSING_NOTE}: {source}")
+                # 限制注记（同前缀，后续同 run 采纳仍会清理）。报告披露边界
+                # 统一脱敏限长（issue #94 复审收敛）：loader 返回值已是脱敏
+                # 原因，此处按同一规范再入库，防其他入口传入原始异常串。
+                reason_text = (
+                    sanitize_diagnostic_text(source, max_length=300)
+                    or "failure reason unavailable"
+                )
+                ctx.limitation(f"{HISTORY_MISSING_NOTE}: {reason_text}")
             else:
                 ctx.limitation(HISTORY_MISSING_NOTE)
             return []
@@ -87,8 +94,14 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
                 r["date"] = str(r["date"])
         return records
     except Exception as exc:  # noqa: BLE001 - 阶段0装配失败只降级
-        logger.warning("[DualTrack] 历史数据装配失败 %s: %s", code, exc)
-        ctx.limitation(f"{HISTORY_FAILED_NOTE_PREFIX}: {exc}")
+        from src.services.run_diagnostics import sanitize_diagnostic_text
+
+        safe_reason = (
+            sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", max_length=300)
+            or type(exc).__name__
+        )
+        logger.warning("[DualTrack] 历史数据装配失败 %s: %s", code, safe_reason)
+        ctx.limitation(f"{HISTORY_FAILED_NOTE_PREFIX}: {safe_reason}")
         return []
 
 

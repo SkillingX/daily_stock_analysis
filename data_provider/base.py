@@ -47,7 +47,7 @@ from .ifind_fundamental_adapter import IfindFetcher, IfindSource
 from .tushare_ifind_fundamental_adapter import TushareIfindFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .mx_data_adapter import MXSource, _cn_period_to_yyyymmdd
-from .realtime_types import CircuitBreaker
+from .realtime_types import CircuitBreaker, sanitize_non_finite_quote_scalars
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -1784,6 +1784,7 @@ class DataFetcherManager:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30,
+        constraint_source: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         获取日线数据（自动切换数据源）
@@ -1800,6 +1801,13 @@ class DataFetcherManager:
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
+            constraint_source: 来源约束（issue #94）。已采用日线窗口未被替换前，
+                换源候选注定被上层跨源整窗一致性保护拒绝；约束生效时只有同名
+                数据源（含 iFinD 预置尝试仅当约束为 ``IfindDailyFetcher``）出站，
+                其余候选跳过并在错误摘要中如实记录「未出站」。尝试级预算预留、
+                fallback_to / 数据源切换 / 剩余未尝试计数等预算与诊断均按受约束
+                后的真实候选链计算，不为被排除候选预留或报告。不改变任何候选
+                的相对次序、采纳语义与可用性判定；默认 None 保持原行为。
 
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
@@ -1829,11 +1837,23 @@ class DataFetcherManager:
         is_us = is_us_index or is_us_stock_code(stock_code)
         is_hk = (not is_us) and _is_hk_market(stock_code)
         market = "us" if is_us else "hk" if is_hk else "cn"
+        if constraint_source and market != "cn":
+            # 来源约束只服务于 A 股已采用窗口的扩窗需求；不适用市场显式失败
+            # 而不是静默忽略约束，避免语义含混的出站。
+            raise DataFetchError(
+                f"{stock_code} 获取失败: 来源约束 [{constraint_source}] 不适用于该市场路由"
+            )
         if is_hk:
             fetchers = self._filter_daily_fetchers_for_market(fetchers, "hk")
         fetchers = self._filter_fetchers_by_capability(
             fetchers, capability="daily_data"
         )
+        if constraint_source:
+            logger.info(
+                "[数据源约束] %s: 仅尝试同源候选 [%s]，其余数据源不再出站"
+                "（已采用窗口的扩窗需求只能采纳同源整窗候选）",
+                stock_code, constraint_source,
+            )
         total_fetchers = len(fetchers)
 
         if total_fetchers == 0:
@@ -1982,7 +2002,10 @@ class DataFetcherManager:
         # issue #86：启用且合格（证券 + 日历 + 当前最新已完成交易日口径）时，
         # iFinD 现金分红前复权日线在既有候选链之前尝试一次；失败/不合格/日历
         # 不可用/历史目标均不打乱既有候选相对次序，真实原因保留在 errors。
-        if market == "cn":
+        # issue #94：来源约束为 IfindDailyFetcher 时才参与，其余约束跳过预置尝试。
+        if market == "cn" and (
+            not constraint_source or constraint_source == "IfindDailyFetcher"
+        ):
             ifind_attempt = self._prepare_ifind_daily_attempt(raw_stock_code, end_date)
             if ifind_attempt is not None:
                 ifind_fetcher, identity, clamped_end = ifind_attempt
@@ -1991,6 +2014,15 @@ class DataFetcherManager:
                     errors.append(self._daily_source_unavailable_error(ifind_fetcher))
                 else:
                     attempt_start = time.time()
+                    # issue #94：预算与 fallback 诊断按受约束后的真实候选链计算。
+                    # 约束为 iFinD 时通用链无任何同源候选——不为幻影 fallback
+                    # 预留尝试预算（否则仅剩 iFinD 可尝试时，剩余 20 秒会被
+                    # 预留 min(8, 20×0.3)=6 秒提前截断），失败诊断也不把将被
+                    # 跳过的来源报告为 fallback 目标。
+                    ifind_has_fallback = not constraint_source
+                    ifind_fallback_to = (
+                        fetchers[0].name if (fetchers and ifind_has_fallback) else None
+                    )
                     try:
                         logger.info(
                             f"[数据源尝试 iFinD] [{ifind_fetcher.name}] 获取 {stock_code} "
@@ -2001,7 +2033,7 @@ class DataFetcherManager:
                             provider=ifind_fetcher.name,
                             operation="get_daily_data",
                         )
-                        with daily_attempt_budget(reserve_fallback=True):
+                        with daily_attempt_budget(reserve_fallback=ifind_has_fallback):
                             df = self._call_fetcher_method(
                                 ifind_fetcher,
                                 "get_daily_data",
@@ -2037,7 +2069,7 @@ class DataFetcherManager:
                             latency_ms=duration_ms,
                             error_type="empty",
                             error_message="empty result",
-                            fallback_to=fetchers[0].name if fetchers else None,
+                            fallback_to=ifind_fallback_to,
                             record_count=0,
                         )
                         if df is not None and df.empty:
@@ -2057,19 +2089,42 @@ class DataFetcherManager:
                             latency_ms=duration_ms,
                             error_type=error_type,
                             error_message=error_reason,
-                            fallback_to=fetchers[0].name if fetchers else None,
+                            fallback_to=ifind_fallback_to,
                         )
                         logger.warning(
                             f"[数据源失败 iFinD] [{ifind_fetcher.name}] {stock_code}: "
-                            f"error_type={error_type}, reason={error_reason}，继续既有候选"
+                            f"error_type={error_type}, reason={error_reason}"
+                            + ("，继续既有候选" if ifind_has_fallback else "")
                         )
                         self._record_daily_source_failure(ifind_fetcher, market, error_reason)
                         errors.append(f"[{ifind_fetcher.name}] ({error_type}) {error_reason}")
 
+        # issue #94：预算与 fallback 诊断按受约束后的真实候选链计算——被约束
+        # 排除的候选不出站，不应获得预留预算、被报告为 fallback 目标，也不
+        # 计入「未尝试」剩余数。无约束时两式与原始列表逐位等价，行为不变。
+        def _next_eligible_name(after_index: int) -> Optional[str]:
+            for candidate in fetchers[after_index + 1:]:
+                if not constraint_source or candidate.name == constraint_source:
+                    return candidate.name
+            return None
+
+        def _remaining_eligible_count(from_index: int) -> int:
+            return sum(
+                1 for candidate in fetchers[from_index:]
+                if not constraint_source or candidate.name == constraint_source
+            )
+
         for attempt, fetcher in enumerate(fetchers, start=1):
+            if constraint_source and fetcher.name != constraint_source:
+                # issue #94：换源候选注定被上层跨源整窗一致性保护拒绝，不出站；
+                # 如实记录跳过原因，不冒充供应商故障。
+                errors.append(
+                    f"[skip] [{fetcher.name}] 受来源约束跳过（仅尝试 {constraint_source}），未出站"
+                )
+                continue
             if _daily_budget_exhausted(outer_daily_deadline):
                 errors.append(
-                    f"[budget] 外层预算已耗尽，剩余 {total_fetchers - attempt + 1} 个数据源未尝试"
+                    f"[budget] 外层预算已耗尽，剩余 {_remaining_eligible_count(attempt - 1)} 个数据源未尝试"
                 )
                 logger.warning("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
                 break
@@ -2077,7 +2132,7 @@ class DataFetcherManager:
                 errors.append(self._daily_source_unavailable_error(fetcher))
                 continue
             attempt_start = time.time()
-            fallback_to = fetchers[attempt].name if attempt < total_fetchers else None
+            fallback_to = _next_eligible_name(attempt - 1)
             try:
                 logger.info(
                     f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}..."
@@ -2087,7 +2142,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_daily_data",
                 )
-                with daily_attempt_budget(attempt < total_fetchers):
+                with daily_attempt_budget(fallback_to is not None):
                     df = self._call_fetcher_method(
                         fetcher,
                         "get_daily_data",
@@ -2151,10 +2206,9 @@ class DataFetcherManager:
                 )
                 self._record_daily_source_failure(fetcher, market, error_reason)
                 errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = fetchers[attempt]
+                if fallback_to:
                     logger.info(
-                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]"
+                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{fallback_to}]"
                     )
                 # 继续尝试下一个数据源
                 continue
@@ -2361,16 +2415,19 @@ class DataFetcherManager:
         ttl = realtime_cache_ttl if realtime_cache_ttl is not None else 600
         setattr(quote, "stale_seconds", stale_seconds)
         setattr(quote, "is_stale", stale_seconds > int(ttl))
-        from data_provider.realtime_types import quote_field_records
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
         from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
         records = quote_field_records(quote)
         for field, record in records.items():
             observed = self._parse_realtime_timestamp(record.get("observed_at"))
             if observed is not None:
                 record["is_stale"] = (fetched_dt - observed).total_seconds() > int(ttl)
-                reading = reading_from_field_record(record.get("value"), record)
-                if reading is not None:
-                    records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
+                # 锚点字段经资格投影重算 rule_eligible；补充字段（量比/换手/振幅）
+                # 无锚点语义，只如实更新 is_stale，保留采纳时的来源与时间（issue #93）。
+                if field in QUOTE_ANCHOR_FIELDS:
+                    reading = reading_from_field_record(record.get("value"), record)
+                    if reading is not None:
+                        records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
         quote.field_meta = records
         return quote
 
@@ -2566,6 +2623,11 @@ class DataFetcherManager:
 
                 provider_name = fetcher.name if fetcher is not None else source
 
+                # 可确认的 NaN/±inf 标量在采纳判断前按缺失处理（price=+inf
+                # 能通过 price>0，必须在 has_basic_data 之前清理，issue #93
+                # 契约）；确有非法字段时返回副本，fetcher 持有的原引用不被改。
+                if quote is not None:
+                    quote = sanitize_non_finite_quote_scalars(quote)
                 if quote is not None and quote.has_basic_data():
                     record_provider_run(
                         data_type="realtime_quote",
@@ -2600,15 +2662,16 @@ class DataFetcherManager:
                         logger.debug(
                             f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充"
                         )
-                        supplement_attempts = 0
                     else:
-                        # Supplement missing fields from this source (limit attempts)
-                        supplement_attempts += 1  # type: ignore[reportPossiblyUnboundVariable]
-                        if supplement_attempts > 1:
-                            logger.debug(
-                                f"[实时行情] {stock_code} 补充尝试已达上限，停止继续"
-                            )
-                            break
+                        # Supplement missing fields entry-by-entry, bounded by the
+                        # configured priority list (each list entry is dispatched
+                        # at most once per call; duplicates in a custom order are
+                        # each attempted as configured). Only still-missing
+                        # qualified fields are filled; an entry with nothing
+                        # adoptable neither blocks later fallback entries nor
+                        # leaves records behind (the default order keeps Eastmoney
+                        # last, issue #93 review round 4). Stop as soon as all
+                        # key fields are filled.
                         merged = self._merge_quote_fields(primary_quote, quote)
                         if merged:
                             logger.info(
@@ -2701,27 +2764,91 @@ class DataFetcherManager:
         """
         Copy non-None fields from *secondary* into *primary* where
         *primary* has None. Returns list of field names that were filled.
+
+        锚点字段经 rule_eligible 资格门控；量比/换手/振幅等非锚点补充字段
+        与锚点同契约拒绝已知过期源，并在采纳时写入自身来源与时间的字段
+        记录（issue #93：禁止过期数据冒充有效值、逐字段可核实来源）。
         """
         filled = []
-        from data_provider.realtime_types import quote_field_records
+        import math
+
+        from data_provider.realtime_types import quote_field_records, QUOTE_SUPPLEMENT_FIELD_UNITS
         primary.field_meta = quote_field_records(primary)
         secondary_meta = quote_field_records(secondary)
         known_currencies = {record.get("currency") for key, record in primary.field_meta.items() if key in {"current_price", "total_mv", "circ_mv"} and record.get("currency")}
         if getattr(primary, "currency", None):
             known_currencies.add(primary.currency)
+        from src.config import get_config
+
+        ttl_config = getattr(get_config(), "realtime_cache_ttl", None)
+        ttl = int(ttl_config) if ttl_config is not None else 600
+        secondary_source = getattr(secondary.source, "value", None) or str(getattr(secondary, "source", "unknown"))
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
-                if val is not None:
-                    if f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"} and not (secondary_meta.get(f) or {}).get("rule_eligible"):
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                    continue  # None/bool/非有限值不采纳、不留记录（与锚点 invalid_value 同契约）
+                is_anchor = f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"}
+                record: Optional[Dict[str, Any]] = None
+                if is_anchor:
+                    if not (secondary_meta.get(f) or {}).get("rule_eligible"):
                         continue
-                    if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
-                        continue
-                    setattr(primary, f, val)
                     if f in secondary_meta:
-                        primary.field_meta[f] = {**secondary_meta[f], "selection_reason": "quote_supplement"}
-                    filled.append(f)
+                        record = {**secondary_meta[f], "selection_reason": "quote_supplement"}
+                else:
+                    # 非锚点补充字段：与锚点同契约拒绝时间不合格源（已知过期或
+                    # 未来值），时间未知不判定不合格、由记录如实披露。
+                    staleness = cls._supplement_source_staleness(secondary, ttl)
+                    if staleness is True:
+                        continue
+                    record = {
+                        "field": f,
+                        "value": val,
+                        "source": secondary_source,
+                        "unit": QUOTE_SUPPLEMENT_FIELD_UNITS[f],
+                        "observed_at": getattr(secondary, "provider_timestamp", None),
+                        "fetched_at": getattr(secondary, "fetched_at", None),
+                        "is_stale": False if staleness is False else None,
+                        "selection_reason": "quote_supplement",
+                    }
+                if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
+                    continue
+                setattr(primary, f, val)
+                if record is not None:
+                    primary.field_meta[f] = record
+                filled.append(f)
         return filled
+
+    @staticmethod
+    def _valuation_anchor_records(quote_payload: Any) -> Dict[str, Dict[str, Any]]:
+        """估值块只承载金融锚点字段记录（issue #93 复审问题 1）。
+
+        量比/换手/振幅等非锚点行情记录进入 ``_build_fundamental_block`` 会被
+        按 pe/pb/市值语义重建并误标 unit_incompatible/rule_eligible=False，
+        污染 valuation.field_meta 与下游 financial_quality；按锚点集合过滤。
+        """
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
+        records = quote_field_records(quote_payload)
+        return {key: records[key] for key in QUOTE_ANCHOR_FIELDS if key in records}
+
+    @staticmethod
+    def _supplement_source_staleness(quote: Any, ttl: int) -> Optional[bool]:
+        """补充源的时间资格：True=已知不合格（过期或未来值）；False=已知新鲜；None=时间未知。
+
+        显式 ``is_stale=True``、可解析 provider_timestamp 超过 TTL 或晚于当前
+        时间均视为不合格（与锚点 stale/time_in_future 同契约）；时间未知不判定
+        不合格（由字段记录如实披露 observed_at=None）。
+        """
+        if getattr(quote, "is_stale", None) is True:
+            return True
+        observed = DataFetcherManager._parse_realtime_timestamp(
+            getattr(quote, "provider_timestamp", None)
+        )
+        if observed is None:
+            return None
+        now = datetime.now(timezone.utc)
+        age = (now - observed).total_seconds()
+        return age < 0 or age > int(ttl)
 
     def _longbridge_preferred(self, capability: str = "realtime_quote") -> bool:
         """Return True when Longbridge keys are configured and available.
@@ -2760,6 +2887,10 @@ class DataFetcherManager:
             q = self._call_fetcher_method(
                 fetcher, "get_realtime_quote", stock_code, **kw
             )
+            # 与 A 股循环同契约：异常数值标量先按缺失处理再判基本可用性，
+            # 确有非法字段时采纳副本、不改 fetcher 持有的原引用。
+            if q is not None:
+                q = sanitize_non_finite_quote_scalars(q)
             if q is not None and q.has_basic_data():
                 record_provider_run(
                     data_type="realtime_quote",
@@ -4033,8 +4164,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -4359,8 +4489,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",

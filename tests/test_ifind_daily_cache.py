@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.services import history_loader as H
+from data_provider.base import DataFetchError
 from tests.ifind_daily_testutil import (
     LATEST_SESSION,
     enabled_config,
@@ -82,21 +83,30 @@ class _FakeDb:
 
 
 class _FakeManager:
-    def __init__(self, frames, delay: float = 0.0, error: Exception | None = None) -> None:
+    def __init__(
+        self, frames, delay: float = 0.0, error: Exception | None = None,
+        errors: list[Exception | None] | None = None,
+    ) -> None:
         self.get_stock_name = lambda code, allow_realtime=False: code
         self.frames = list(frames)
         self.delay = delay
         self.error = error
+        self.errors = list(errors) if errors is not None else None
         self.calls: list[dict] = []
 
-    def get_daily_data(self, stock_code, start_date=None, end_date=None, days=30):
+    def get_daily_data(self, stock_code, start_date=None, end_date=None, days=30, constraint_source=None):
         self.calls.append({
             "stock_code": stock_code, "start_date": start_date,
             "end_date": end_date, "days": days,
+            "constraint_source": constraint_source,
         })
         if self.delay:
             threading.Event().wait(self.delay)
-        if self.error is not None:
+        if self.errors is not None:
+            per_call = self.errors.pop(0) if self.errors else None
+            if per_call is not None:
+                raise per_call
+        elif self.error is not None:
             raise self.error
         entry = self.frames.pop(0) if self.frames else std_frame()
         if isinstance(entry, tuple):
@@ -106,8 +116,37 @@ class _FakeManager:
 
 @pytest.fixture()
 def offline(monkeypatch):
+    import sys
+
+    from src.core import trading_calendar as tc
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    # 各自保存进入值：tc 原引用（外层 fixture 已有 patch 时是外层 sentinel）；
+    # pipeline 的 from-import 别名进入值（未导入时 None，恢复目标回退 tc 进入值）。
+    entered_tc_effective = tc.get_effective_trading_date
+    pipeline_module = sys.modules.get("src.core.pipeline")
+    entered_pipeline_alias = (
+        pipeline_module.get_effective_trading_date
+        if pipeline_module is not None
+        else None
+    )
     strict_calendar(monkeypatch)
+    # 立即保存本次安装的精确引用：同一作用域内后续的二次 patch 会改变 tc
+    # 的当时值，teardown 的条件恢复必须比对安装值而非当时值。
+    scope_effective = tc.get_effective_trading_date
     monkeypatch.setattr(H, "_fetcher_singleton", None)
+    yield
+    # teardown（先于 monkeypatch.undo）：pipeline 的 from-import 别名若在
+    # 本作用域内完成首次导入会绑死本次安装值、undo 恢复不了——仅当别名
+    # 仍指向安装值时恢复为别名自己的进入值（外层 pipeline sentinel 得以
+    # 保留；别名未导入过时恢复目标回退 tc 进入值）；之后 monkeypatch.undo
+    # 把 tc 恢复为其进入值。
+    restore_target = (
+        entered_pipeline_alias
+        if entered_pipeline_alias is not None
+        else entered_tc_effective
+    )
+    restore_pipeline_alias_if_scoped(scope_effective, restore_target)
 
 
 def _install(monkeypatch, db: _FakeDb, manager: _FakeManager):
@@ -243,6 +282,488 @@ def test_scope_consumed_window_not_replaced_by_other_source(monkeypatch, offline
         assert len(manager.calls) == 2
     finally:
         H.close_current_stock_scope(token)
+
+
+# ---------------------------------------------------------------------------
+# issue #94：扩窗需求把已采用来源作为 manager 约束传递，换源候选不出站
+# ---------------------------------------------------------------------------
+def test_scope_first_fetch_carries_no_source_constraint(monkeypatch, offline):
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(monkeypatch, db, _FakeManager([std_frame(rows=40)]))
+    token, _scope = _open_scope()
+    try:
+        _df, source = H.load_history_df("600519", days=30)
+        assert source == "IfindDailyFetcher"
+        assert manager.calls[0]["constraint_source"] is None
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_scope_expansion_constrained_to_retained_source(monkeypatch, offline):
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    skip_summary = (
+        "所有数据源获取 600519 失败:\n[IfindDailyFetcher] (DataFetchError) 完整窗口缺少交易日\n"
+        "[skip] [EfinanceFetcher] 受来源约束跳过（仅尝试 IfindDailyFetcher），未出站"
+    )
+    manager = _FakeManager(
+        [std_frame(rows=40)],
+        errors=[None, DataFetchError(skip_summary)],
+    )
+    _install(monkeypatch, db, manager)
+    token, scope = _open_scope()
+    try:
+        _df1, source1 = H.load_history_df("600519", days=30)
+        df2, reason2 = H.load_history_df("600519", days=90)
+        assert source1 == "IfindDailyFetcher"
+        # 扩窗需求携带已采用来源约束；同源失败即显式失败，换源候选未出站。
+        assert manager.calls[1]["constraint_source"] == "IfindDailyFetcher"
+        assert df2 is None
+        assert "IfindDailyFetcher" in reason2 and "未出站" in reason2
+        # 已采用帧保留，更短需求继续复用，0 网络。
+        assert scope.peek() is not None and len(scope.peek().records) == 40
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 40 and source3 == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_scope_expansion_non_ifind_retained_constrains_same_source(monkeypatch, offline):
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager([
+        (std_frame(rows=40), "EfinanceFetcher"),
+        (std_frame(rows=120), "EfinanceFetcher"),
+    ])
+    _install(monkeypatch, db, manager)
+    token, _scope = _open_scope()
+    try:
+        _df1, source1 = H.load_history_df("600519", days=30)
+        df2, source2 = H.load_history_df("600519", days=90)
+        assert source1 == "EfinanceFetcher"
+        # 已采用东财窗口时，约束同样指向该来源；同源一致更长窗口照常采纳。
+        assert manager.calls[1]["constraint_source"] == "EfinanceFetcher"
+        assert len(df2) == 120 and source2 == "EfinanceFetcher"
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_scope_force_refresh_keeps_retained_source_constraint(monkeypatch, offline):
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=40), std_frame(rows=40)],
+    )
+    _install(monkeypatch, db, manager)
+    token, _scope = _open_scope()
+    try:
+        _df1, _source1 = H.load_history_df("600519", days=30)
+        _df2, _source2 = H.load_history_df("600519", days=30, force_refresh=True)
+        # 强制刷新绕过复用，但不绕过同源采纳契约：约束照常传递。
+        assert manager.calls[1]["constraint_source"] == "IfindDailyFetcher"
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_run_slot_expansion_constrained_to_slot_source(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    skip_summary = (
+        "所有数据源获取 600519 失败:\n[IfindDailyFetcher] (DataFetchError) 导出连接关闭\n"
+        "[skip] [EfinanceFetcher] 受来源约束跳过（仅尝试 IfindDailyFetcher），未出站"
+    )
+    manager = _FakeManager(
+        [std_frame(rows=60)],
+        errors=[None, DataFetchError(skip_summary)],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        _df1, source1 = H.load_history_df("600519", days=60)
+        df2, reason2 = H.load_history_df("600519", days=90)
+        assert source1 == "IfindDailyFetcher"
+        assert manager.calls[1]["constraint_source"] == "IfindDailyFetcher"
+        assert df2 is None
+        assert "IfindDailyFetcher" in reason2 and "未出站" in reason2
+        slot = run.daily_history
+        assert slot is not None and slot["source"] == "IfindDailyFetcher"
+        assert len(slot["records"]) == 60
+        # 同失败需求共享（single_fetch 去重），更短需求复用，均 0 网络。
+        df2b, source2b = H.load_history_df("600519", days=90)
+        assert df2b is None and source2b == reason2
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 60 and source3 == "IfindDailyFetcher"
+        assert len(manager.calls) == 2
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_manager_failure_records_unmet_expansion(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    skip_summary = (
+        "所有数据源获取 600519 失败:\n[IfindDailyFetcher] (DataFetchError) 导出连接关闭\n"
+        "[skip] [EfinanceFetcher] 受来源约束跳过（仅尝试 IfindDailyFetcher），未出站"
+    )
+    manager = _FakeManager(
+        [std_frame(rows=60)],
+        errors=[None, DataFetchError(skip_summary)],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        _df1, source1 = H.load_history_df("600519", days=60)
+        df2, reason2 = H.load_history_df("600519", days=90)
+        assert source1 == "IfindDailyFetcher"
+        assert df2 is None
+        # 来源约束下的真实 manager 失败同样进入持久未满足记录：报告注记不丢失。
+        unmet = run.unmet_daily_history_snapshot()
+        assert set(unmet) == {"2026-11-06|90"}
+        recorded = unmet["2026-11-06|90"]
+        assert "daily window expansion rejected" in recorded
+        assert "IfindDailyFetcher" in recorded and "未出站" in recorded
+        # 短需求继续复用保留帧，0 网络；同需求失败共享，snapshot 仍只有一条。
+        df3, source3 = H.load_history_df("600519", days=30)
+        assert len(df3) == 60 and source3 == "IfindDailyFetcher"
+        df2b, reason2b = H.load_history_df("600519", days=90)
+        assert df2b is None and reason2b == reason2
+        assert set(run.unmet_daily_history_snapshot()) == {"2026-11-06|90"}
+        assert len(manager.calls) == 2
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_unmet_expansion_resolved_by_later_adoption(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=60), (std_frame(rows=120), "IfindDailyFetcher")],
+        errors=[None, DataFetchError("iFinD 同源长窗失败")],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        _df2, _reason2 = H.load_history_df("600519", days=90)
+        assert set(run.unmet_daily_history_snapshot()) == {"2026-11-06|90"}
+        # 后续真正长窗同源采纳（强制刷新重取）消解该未满足记录。
+        df3, source3 = H.load_history_df("600519", days=90, force_refresh=True)
+        assert len(df3) == 120 and source3 == "IfindDailyFetcher"
+        assert run.unmet_daily_history_snapshot() == {}
+        slot = run.daily_history
+        assert slot is not None and len(slot["records"]) == 120
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_first_fetch_failure_not_marked_unmet(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager([], error=RuntimeError("所有数据源获取失败"))
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        df, reason = H.load_history_df("600519", days=60)
+        assert df is None
+        # 无已采纳帧的首取失败走通用缺项语义，不得伪装成「已采纳短窗上的扩窗失败」。
+        assert run.unmet_daily_history_snapshot() == {}
+        assert "RuntimeError" in reason
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_stop_propagates_without_unmet_mark(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, ResearchStopped, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=60)],
+        errors=[None, ResearchStopped("用户已取消本次研究")],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        with pytest.raises(ResearchStopped):
+            H.load_history_df("600519", days=90)
+        # 取消不是扩窗失败：不进入持久未满足记录。
+        assert run.unmet_daily_history_snapshot() == {}
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_source_timeout_records_unmet_expansion(monkeypatch, offline):
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=60)],
+        errors=[None, TimeoutError("daily attempt deadline exhausted")],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        df, reason = H.load_history_df("600519", days=90)
+        assert df is None and "TimeoutError" in reason
+        recorded = run.unmet_daily_history_snapshot()["2026-11-06|90"]
+        assert "daily window expansion rejected" in recorded
+        assert "IfindDailyFetcher" in recorded
+    finally:
+        current_research.reset(research_token)
+
+
+def test_run_unmet_note_survives_short_window_recovery_then_resolves(monkeypatch, offline):
+    """真实失败→报告注记→短窗恢复不清除→真正长窗采纳后消解的完整闭环。"""
+    from src.core.research_run import ResearchRun, current_research
+    from src.deep_research_dims.context import HISTORY_MISSING_NOTE, SharedContext, sync_unmet_history_notes
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=60), (std_frame(rows=120), "IfindDailyFetcher")],
+        errors=[None, DataFetchError("iFinD 同源长窗失败")],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        _df, _reason = H.load_history_df("600519", days=90)
+        ctx = SharedContext(
+            stock_code="600519", stock_name="贵州茅台", as_of="2026-11-06T10:00:00+08:00",
+        )
+        sync_unmet_history_notes(ctx, run)
+        notes = [note for note in ctx.limitations if note.startswith(HISTORY_MISSING_NOTE)]
+        assert len(notes) == 1
+        assert "daily window expansion rejected" in notes[0]
+        assert "IfindDailyFetcher" in notes[0]
+        # 短窗恢复（复用保留帧成功）触发通用缺项清理后，sync 按快照重建该注记。
+        ctx.limitations[:] = [
+            note for note in ctx.limitations if not note.startswith(HISTORY_MISSING_NOTE)
+        ]
+        sync_unmet_history_notes(ctx, run)
+        assert any("daily window expansion rejected" in note for note in ctx.limitations)
+        # 后续真正长窗同源采纳消解后，注记不再重建。
+        _df3, _source3 = H.load_history_df("600519", days=90, force_refresh=True)
+        assert run.unmet_daily_history_snapshot() == {}
+        sync_unmet_history_notes(ctx, run)
+        assert not any("daily window expansion rejected" in note for note in ctx.limitations)
+    finally:
+        current_research.reset(research_token)
+
+
+# ---------------------------------------------------------------------------
+# issue #94 复审收敛 2：扩窗失败原因在捕获点统一脱敏与限长（非单一显示点）。
+# 反例：manager 异常串经 loader 进日志、失败 memo、直接返回值、run 持久
+# 未满足、报告 limitations；异常含 token/凭据 URL 时将被持久披露。
+# 以下密钥均为合成值，非真实凭据。
+# ---------------------------------------------------------------------------
+_SYNTHETIC_TOKEN_URL = "https://mcp.example.invalid/mcp?token=SYNTHETIC-LEAKED-TOKEN-0123456789"
+_SYNTHETIC_BEARER = "Bearer sk-synthetic-abcdef1234567890"
+_SYNTHETIC_KEY = "api_key=SYNTHETIC-SECRET-VALUE-99"
+
+
+def test_run_expansion_failure_reason_sanitized_end_to_end(monkeypatch, offline, caplog):
+    """真实调用链：异常串经返回值/持久未满足/报告注记/日志全链路不含合成密钥。"""
+    from src.core.research_run import ResearchRun, current_research
+    from src.deep_research_dims.context import (
+        HISTORY_MISSING_NOTE,
+        SharedContext,
+        sync_unmet_history_notes,
+    )
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    leak = DataFetchError(
+        f"iFinD MCP 请求失败: {_SYNTHETIC_TOKEN_URL}"
+        f" Authorization: {_SYNTHETIC_BEARER} {_SYNTHETIC_KEY}"
+    )
+    manager = _FakeManager([std_frame(rows=60)], errors=[None, leak])
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        _df1, source1 = H.load_history_df("600519", days=60)
+        df2, reason2 = H.load_history_df("600519", days=90)
+        assert source1 == "IfindDailyFetcher" and df2 is None
+        # 直接返回值：保留可诊断类型名，不含合成密钥
+        assert "DataFetchError" in reason2 and "SYNTHETIC" not in reason2
+        # 持久未满足记录：包装前缀上下文保留，合成密钥不披露
+        recorded = run.unmet_daily_history_snapshot()["2026-11-06|90"]
+        assert "daily window expansion rejected" in recorded
+        assert "IfindDailyFetcher" in recorded
+        assert "SYNTHETIC" not in recorded and "sk-synthetic" not in recorded
+        # 报告注记链路（成文前 sync 对齐）同样不含合成密钥
+        ctx = SharedContext(
+            stock_code="600519", stock_name="贵州茅台", as_of="2026-11-06T10:00:00+08:00",
+        )
+        sync_unmet_history_notes(ctx, run)
+        notes = [note for note in ctx.limitations if note.startswith(HISTORY_MISSING_NOTE)]
+        assert len(notes) == 1 and "daily window expansion rejected" in notes[0]
+        assert "SYNTHETIC" not in notes[0]
+        # 日志与同需求失败 memo 复用（0 网络）同样脱敏
+        assert "SYNTHETIC" not in caplog.text
+        caplog.clear()
+        df2b, reason2b = H.load_history_df("600519", days=90)
+        assert df2b is None and reason2b == reason2
+        assert "SYNTHETIC" not in caplog.text
+    finally:
+        current_research.reset(research_token)
+
+
+def test_scope_failure_reason_sanitized_for_return_and_memo(monkeypatch, offline):
+    """scope 路径：失败原因进直接返回值与失败 memo（复用）前统一脱敏。"""
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    leak = DataFetchError(f"iFinD MCP 请求失败: {_SYNTHETIC_TOKEN_URL} {_SYNTHETIC_KEY}")
+    manager = _FakeManager([std_frame(rows=40)], errors=[None, leak])
+    _install(monkeypatch, db, manager)
+    token, scope = _open_scope()
+    try:
+        _df1, source1 = H.load_history_df("600519", days=30)
+        df2, reason2 = H.load_history_df("600519", days=90)
+        assert source1 == "IfindDailyFetcher" and df2 is None
+        assert "DataFetchError" in reason2 and "SYNTHETIC" not in reason2
+        # 同需求失败 memo 复用（0 网络）返回脱敏后的同一原因
+        df2b, reason2b = H.load_history_df("600519", days=90)
+        assert df2b is None and reason2b == reason2
+        assert "SYNTHETIC" not in reason2b
+        assert len(manager.calls) == 2
+        assert scope.peek() is not None
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_unmet_store_sanitizes_reasons_at_owner_boundary(monkeypatch, offline):
+    """owner 两个写入方法在持久边界统一脱敏，防未来调用方传入原始异常串。"""
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager([std_frame(rows=60)])
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)  # 采纳短窗权威帧
+        run.record_unmet_daily_window(
+            "2026-11-06", 200, f"换源拒绝 {_SYNTHETIC_TOKEN_URL} {_SYNTHETIC_KEY}",
+        )
+        run.record_failed_daily_expansion(
+            "2026-11-06", 300,
+            f"TimeoutError: connect timeout {_SYNTHETIC_TOKEN_URL} {_SYNTHETIC_BEARER}",
+        )
+        unmet = run.unmet_daily_history_snapshot()
+        assert set(unmet) == {"2026-11-06|200", "2026-11-06|300"}
+        for value in unmet.values():
+            assert "SYNTHETIC" not in value and "sk-synthetic" not in value
+        # 可诊断类型名与拒绝标识保留
+        assert "TimeoutError" in unmet["2026-11-06|300"]
+        assert "daily window expansion rejected" in unmet["2026-11-06|300"]
+    finally:
+        current_research.reset(research_token)
+
+
+def test_unmet_store_truncates_overlong_reason(monkeypatch, offline):
+    """超长失败原因按既有诊断规范限长，防报告注记无限膨胀。"""
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager([std_frame(rows=60)])
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        long_reason = "iFinD 导出通道重试失败 " + ("x" * 600)
+        run.record_unmet_daily_window("2026-11-06", 200, long_reason)
+        stored = run.unmet_daily_history_snapshot()["2026-11-06|200"]
+        assert stored.startswith("iFinD 导出通道重试失败")
+        assert stored.endswith("...")
+        assert len(stored) <= 310
+    finally:
+        current_research.reset(research_token)
+
+
+def test_safe_history_notes_sanitized_for_both_entry_points(monkeypatch, offline):
+    """_safe_history 两个报告入口（缺失原因注记与装配异常注记）统一脱敏。"""
+    from src.deep_research_dims.context import (
+        HISTORY_FAILED_NOTE_PREFIX,
+        HISTORY_MISSING_NOTE,
+        SharedContext,
+        _safe_history,
+    )
+
+    def _missing(code, days=60, target_date=None, force_refresh=False):
+        return None, f"DataFetchError: 扩窗失败 {_SYNTHETIC_TOKEN_URL}"
+
+    def _boom(code, days=60, target_date=None, force_refresh=False):
+        raise RuntimeError(f"装配链失败 {_SYNTHETIC_TOKEN_URL} {_SYNTHETIC_KEY}")
+
+    ctx = SharedContext(
+        stock_code="600519", stock_name="贵州茅台", as_of="2026-11-06T10:00:00+08:00",
+    )
+    monkeypatch.setattr("src.services.history_loader.load_history_df", _missing)
+    assert _safe_history("600519", 60, ctx) == []
+    missing_notes = [
+        note for note in ctx.limitations if note.startswith(HISTORY_MISSING_NOTE)
+    ]
+    assert len(missing_notes) == 1
+    assert "SYNTHETIC" not in missing_notes[0]
+    assert "DataFetchError" in missing_notes[0]
+
+    monkeypatch.setattr("src.services.history_loader.load_history_df", _boom)
+    assert _safe_history("600519", 60, ctx) == []
+    failed_notes = [
+        note for note in ctx.limitations if note.startswith(HISTORY_FAILED_NOTE_PREFIX)
+    ]
+    assert len(failed_notes) == 1
+    assert "RuntimeError" in failed_notes[0] and "SYNTHETIC" not in failed_notes[0]
+
+
+def test_expansion_failure_without_secrets_keeps_diagnosable_text(monkeypatch, offline):
+    """普通无敏感数据错误的回归：类型名与原文保留，语义与形状不变。"""
+    from src.core.research_run import ResearchRun, current_research
+
+    enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _FakeManager(
+        [std_frame(rows=60)],
+        errors=[None, DataFetchError("iFinD 完整窗口缺少交易日")],
+    )
+    _install(monkeypatch, db, manager)
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        H.load_history_df("600519", days=60)
+        _df2, reason2 = H.load_history_df("600519", days=90)
+        assert "DataFetchError" in reason2
+        assert "iFinD 完整窗口缺少交易日" in reason2
+        recorded = run.unmet_daily_history_snapshot()["2026-11-06|90"]
+        assert "daily window expansion rejected" in recorded
+        assert "iFinD 完整窗口缺少交易日" in recorded
+    finally:
+        current_research.reset(research_token)
 
 
 def test_scope_late_shorter_same_source_never_overwrites(monkeypatch, offline):
@@ -423,6 +944,14 @@ def _pipeline(monkeypatch, db, manager, *, enabled=True):
 
     enabled_config(monkeypatch, enabled=enabled)
     _install(monkeypatch, db, manager)
+    # 本文件 pipeline 用例消费 pipeline 时间入口的唯一活跃路径是断点续传
+    # 目标日：局部确定性冻结该类方法（进入值恒为真实方法，成对恢复），
+    # 不依赖模块别名的导入时序。
+    monkeypatch.setattr(
+        StockAnalysisPipeline,
+        "_resolve_resume_target_date",
+        staticmethod(lambda code, current_time=None: LATEST_SESSION),
+    )
     pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)
     pipeline.db = db
     pipeline.fetcher_manager = manager
@@ -794,7 +1323,7 @@ def test_scope_owner_success_after_stop_not_published_or_cached(monkeypatch, off
     original_call = manager.get_daily_data
     run = ResearchRun(timeout_seconds=60)
 
-    def fetch_then_stop(stock_code, start_date=None, end_date=None, days=30):
+    def fetch_then_stop(stock_code, start_date=None, end_date=None, days=30, constraint_source=None):
         result = original_call(stock_code, start_date=start_date, end_date=end_date, days=days)
         run.stop("cancelled")  # fetch 完成前用户取消
         return result
@@ -1551,3 +2080,190 @@ def test_concurrent_owner_resolution_and_recording_is_idempotent(monkeypatch, of
         frame = run.daily_history
         assert frame is not None and frame["source"] == "IfindDailyFetcher"
         assert len(frame["records"]) == 120  # 权威帧未被并发记录覆盖
+
+
+# ---------------------------------------------------------------------------
+# offline 作用域的 pipeline 日历别名契约：局部所有权、条件恢复、真实调用等值
+# ---------------------------------------------------------------------------
+def test_pipeline_resume_target_frozen_with_outer_tc_patch():
+    """外层 fixture 尚有 tc patch 时：构造期冻结成立且只恢复自己的改动。
+
+    外层 monkeypatch（模拟其它 fixture 的既有 patch）先把 tc 日历入口换
+    成 sentinel，strict_calendar 用独立实例在其上叠加冻结；_pipeline 只
+    冻结类方法 ``_resolve_resume_target_date``（进入值恒为真实方法）。
+    内层 undo 后方法回到真实实现、tc 回到外层 sentinel；pipeline 的
+    from-import 别名在此进程先导入场景下绑定真实函数、不属于本作用域
+    写入，条件恢复不得误改它（保持进入值）——不覆盖外层 patch、无跨
+    fixture 全局状态。全程使用独立 MonkeyPatch 实例，不触碰 pytest 共享
+    monkeypatch（不提前撤销其它 fixture 的补丁）。
+    """
+    from pytest import MonkeyPatch
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+    from src.core.pipeline import StockAnalysisPipeline
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    real_method = StockAnalysisPipeline._resolve_resume_target_date
+    entered_alias = pipeline_module.get_effective_trading_date
+    mp = MonkeyPatch()
+    outer_mp = MonkeyPatch()
+    outer_sentinel = lambda market, current_time=None: LATEST_SESSION  # noqa: E731
+    outer_mp.setattr(tc, "get_effective_trading_date", outer_sentinel)
+    try:
+        entered_tc = tc.get_effective_trading_date  # 外层 sentinel（tc 进入值）
+        scope_effective = strict_calendar(mp)
+        pipeline = _pipeline(
+            mp, _FakeDb([]), _FakeManager([std_frame(rows=40)]), enabled=True
+        )
+        assert pipeline._resolve_resume_target_date("600519") == LATEST_SESSION
+        mp.undo()
+        assert StockAnalysisPipeline._resolve_resume_target_date is real_method
+        assert tc.get_effective_trading_date is outer_sentinel
+        # 别名不属于本作用域写入（先导入绑定真实函数）→ 条件恢复不误改
+        restore_pipeline_alias_if_scoped(scope_effective, entered_tc)
+        assert pipeline_module.get_effective_trading_date is entered_alias
+    finally:
+        pipeline_module.get_effective_trading_date = entered_alias
+        mp.undo()
+        outer_mp.undo()
+    assert StockAnalysisPipeline._resolve_resume_target_date is real_method
+    assert pipeline_module.get_effective_trading_date is entered_alias
+
+
+def test_scope_restore_keeps_outer_sentinel():
+    """作用域恢复以别名自身进入值为目标：外层 tc/pipeline sentinel 都保留。
+
+    外层分别 patch tc 与 pipeline 别名（两个 sentinel）→ strict_calendar
+    叠加 → 构造作用域内导入后的状态（别名指向本次实现）→ 条件恢复为
+    pipeline 别名的进入值（外层 pipeline sentinel，不落回真实函数、不
+    被覆盖）→ undo 后 tc 回到外层 tc sentinel——真实调用同值。
+    """
+    from datetime import date
+
+    from pytest import MonkeyPatch
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+    from tests.ifind_daily_testutil import restore_pipeline_alias_if_scoped
+
+    mp = MonkeyPatch()
+    outer_mp = MonkeyPatch()
+    pipeline_outer_mp = MonkeyPatch()
+    tc_sentinel = lambda market, current_time=None: date(2020, 1, 1)  # noqa: E731
+    pipeline_sentinel = lambda market, current_time=None: date(2021, 2, 2)  # noqa: E731
+    pre_test_alias = pipeline_module.get_effective_trading_date  # 测试前状态
+    outer_mp.setattr(tc, "get_effective_trading_date", tc_sentinel)
+    pipeline_outer_mp.setattr(
+        pipeline_module, "get_effective_trading_date", pipeline_sentinel
+    )
+    try:
+        entered_alias = pipeline_module.get_effective_trading_date
+        assert entered_alias is pipeline_sentinel  # 外层 pipeline sentinel（进入值）
+        strict_calendar(mp)
+        scope_effective = tc.get_effective_trading_date  # 本次作用域写入的实现
+        # 构造「作用域内首次导入」的终态：别名指向本次实现
+        pipeline_module.get_effective_trading_date = scope_effective
+        assert pipeline_module.get_effective_trading_date("cn") == LATEST_SESSION
+        restore_pipeline_alias_if_scoped(scope_effective, entered_alias)
+        mp.undo()
+        assert pipeline_module.get_effective_trading_date is pipeline_sentinel
+        assert pipeline_module.get_effective_trading_date("cn") == date(2021, 2, 2)
+        assert tc.get_effective_trading_date is tc_sentinel
+    finally:
+        mp.undo()
+        outer_mp.undo()
+        pipeline_outer_mp.undo()
+        # 各实例 undo 之后恢复测试前状态，不向同进程后续测试泄漏任何 sentinel
+        pipeline_module.get_effective_trading_date = pre_test_alias
+    assert pipeline_module.get_effective_trading_date is pre_test_alias
+
+
+def test_offline_scope_survives_second_tc_patch_in_same_scope(monkeypatch, offline):
+    """同作用域二次 patch：teardown 按 strict_calendar 安装值恢复别名。
+
+    offline 激活 → 构造 pipeline 绑定本次安装值（作用域内首次导入的等价
+    终态）→ 同一 monkeypatch 再把 tc 换成 sentinel（teardown 时刻 tc 的
+    当时值已不是安装值）→ teardown 用保存的安装值引用条件恢复 → undo 后
+    tc 恢复进入值；后继测试 test_offline_scope_restores_pipeline_alias_
+    after_teardown 断言两侧一致且真实调用同值（旧实现读当时值会漏恢复）。
+    """
+    from datetime import date
+
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+
+    scope_effective = tc.get_effective_trading_date  # strict_calendar 刚安装的值
+    # 构造 pipeline 绑定安装值（作用域内首次导入的等价终态）
+    pipeline_module.get_effective_trading_date = scope_effective
+    assert pipeline_module.get_effective_trading_date("cn") == LATEST_SESSION
+    # 同一 monkeypatch 二次 patch：teardown 时刻 tc 的当时值变为 sentinel
+    sentinel = lambda market, current_time=None: date(2020, 1, 1)  # noqa: E731
+    monkeypatch.setattr(tc, "get_effective_trading_date", sentinel)
+    assert tc.get_effective_trading_date is sentinel
+    assert pipeline_module.get_effective_trading_date is not sentinel
+    # 测试结束 → offline teardown 按保存的安装值恢复 → undo → tc 回进入值
+
+
+def test_offline_scope_restores_pipeline_alias_after_teardown():
+    """offline 作用域结束后：pipeline 日历别名与 tc 当前实现一致且真实调用同值。
+
+    无论 pipeline 是本进程先导入（恢复条件不匹配、别名保持进入值）还是
+    在 offline 作用域内首次导入（条件恢复为进入值），teardown + undo 后
+    两侧实现一致；无外层补丁时即真实交易日，不再固定 2026-11-06。
+    """
+    import src.core.pipeline as pipeline_module
+    from src.core import trading_calendar as tc
+
+    assert pipeline_module.get_effective_trading_date is tc.get_effective_trading_date
+    assert pipeline_module.get_effective_trading_date("cn") == (
+        tc.get_effective_trading_date("cn")
+    )
+
+
+def test_offline_lifecycle_failed_then_retried_import():
+    """子进程跑真实 offline fixture 生命周期：导入失败→解除→重试成功。
+
+    阶段 1：litellm stub（非 package）使 pipeline 无法导入时，offline 的
+    非 pipeline 用例照常通过（strict_calendar 不导入 pipeline）；阶段 2：
+    解除 stub 后同进程重跑，pipeline 首次导入发生在 offline 作用域内，
+    业务断言通过且 teardown 恢复别名——pytest.main 全部结束后别名与 tc
+    当前实现一致并真实调用同值（审查员反例的完整序列）。子进程零网络。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    code = "\n".join(
+        [
+            "import sys, types",
+            "import pytest",
+            "stub = types.ModuleType('litellm')",
+            "stub.__dsa_test_stub__ = True",
+            "sys.modules['litellm'] = stub  # 非 package：pipeline 导入链失败",
+            "target = 'tests/test_ifind_daily_cache.py'",
+            "rc1 = pytest.main(['-q', '-p', 'no:cacheprovider',",
+            "    target + '::test_disabled_mode_pure_legacy_mixed_cache_still_hits'])",
+            "assert rc1 == 0, 'offline non-pipeline case must pass under stub'",
+            "sys.modules.pop('litellm', None)  # 条件解除（重试）",
+            "rc2 = pytest.main(['-q', '-p', 'no:cacheprovider',",
+            "    target + '::test_disabled_resume_rejects_ifind_target_row',",
+            "    target + '::test_offline_scope_restores_pipeline_alias_after_teardown'])",
+            "assert rc2 == 0, 'retry + post-teardown alias assertions must pass'",
+            "import src.core.pipeline as p",
+            "from src.core import trading_calendar as tc",
+            "assert p.get_effective_trading_date is tc.get_effective_trading_date",
+            "assert p.get_effective_trading_date('cn') == tc.get_effective_trading_date('cn')",
+            "print('OK')",
+        ]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout
