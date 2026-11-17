@@ -288,9 +288,13 @@ def test_undated_ifind_candidates_do_not_overwrite_qualified_choice(choice_trans
     )
 
     def native(method, args, options, deadline):
+        from datetime import date as _d, timedelta as _td
         indicators = args[1] if len(args) > 1 else ""
         if method == "tradedates":
-            return {"data": ["2026-10-30"]}
+            # 动态窗口内日期（completed_day()-14 ~ completed_day() 随真实时钟
+            # 滑动）：固定 stub 日期会随时间滑出窗口被 invalid_response 拒绝
+            # （时间腐化）。today-1 在两种 completed_day（今天/昨天）下均在窗口内。
+            return {"data": [(_d.today() - _td(days=1)).isoformat()]}
         if indicators == "NAME,LATESTREPORTNEW":
             return {"codes": ["688183.SH"], "indicators": ["NAME", "LATESTREPORTNEW"],
                     "dates": [], "data": {"688183.SH": ["生益电子", "2026/09/30"]}}
@@ -1902,9 +1906,13 @@ def test_healthy_choice_valuation_not_polluted_by_rejected_ifind(choice_transpor
     )
 
     def native(method, args, options, deadline):
+        from datetime import date as _d, timedelta as _td
         indicators = args[1] if len(args) > 1 else ""
         if method == "tradedates":
-            return {"data": ["2026-10-30"]}
+            # 动态窗口内日期（completed_day()-14 ~ completed_day() 随真实时钟
+            # 滑动）：固定 stub 日期会随时间滑出窗口被 invalid_response 拒绝
+            # （时间腐化）。today-1 在两种 completed_day（今天/昨天）下均在窗口内。
+            return {"data": [(_d.today() - _td(days=1)).isoformat()]}
         if indicators == "NAME,LATESTREPORTNEW":
             return {"codes": [args[0]], "indicators": ["NAME", "LATESTREPORTNEW"],
                     "dates": [], "data": {args[0]: ["生益电子", "2026/09/30"]}}

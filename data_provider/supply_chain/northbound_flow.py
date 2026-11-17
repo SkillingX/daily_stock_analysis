@@ -6,6 +6,7 @@ Fetches northbound flow (沪深港通) and margin balance data.
 """
 
 import logging
+from types import ModuleType
 from typing import Dict, Any, List, Optional, cast
 from datetime import datetime, timedelta
 
@@ -23,7 +24,7 @@ class NorthboundFlowProvider:
     """
 
     def __init__(self):
-        self._ak = None
+        self._ak: Optional[ModuleType] = None
         self._init_akshare()
 
     def _init_akshare(self):

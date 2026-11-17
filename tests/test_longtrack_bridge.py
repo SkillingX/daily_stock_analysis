@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from src.schemas.deep_research_dims import ACTIVE_DIM_IDS, DIM_IDS
 from typing import Any, Dict, List
 
+import pytest
+
 
 @dataclass
 class _FakeResult:
@@ -290,14 +292,42 @@ class TestLongtrackBridge:
 class TestCacheHygieneRegressions:
     """审计 B1/B2 回归：缓存命中的 emit/TTL 语义 + 批量空叙述缓存污染。"""
 
-    def _seed_scenarios_cache(self, tmp_path, monkeypatch) -> str:
-        """预置一个带 saved_at 的 scenarios 缓存，返回路径。"""
+    def _install_bridge_config(self, monkeypatch, *, http: bool) -> None:
+        """长桥测试态配置：HTTP 开/关两态（合法配置——开态带凭据与超时）。
+
+        供应商面由 ``_isolate_offline_suppliers`` 断供（manager 返回空），HTTP
+        候选因此零真实出站；配置只决定缓存身份的参与段（``_httpfin``/``_plain``）。
+        """
+        from src.config import Config
+
+        cfg = Config(enable_fundamental_pipeline=False, deep_research_cross_validate=False)
+        cfg.data_source_profile = "choice"
+        cfg.enable_ifind_mcp = False  # 仅决定缓存参与段，不引入 MCP 出站面
+        cfg.financial_primary_source = "choice"
+        cfg.enable_ifind_http_api = http
+        cfg.ifind_http_refresh_token = "test-refresh" if http else None
+        cfg.ifind_http_timeout_seconds = 30.0
+        monkeypatch.setattr(Config, "_instance", cfg)
+
+    def _run_identity_path(self, dim: str) -> str:
+        """与实际 run **相同上下文身份**的缓存路径（ResearchRun 绑定内求值——
+        ``_cache_path`` 的参与段按 cfg 资格 + run 上下文动态生成；无 run 求值
+        在 HTTP 开态会错取 ``_plain``，与 run 实际读写的 ``_httpfin`` 不一致）。
+        """
+        from src.core.research_run import ResearchRun
+        from src.deep_research_dims import dim_cache
+
+        with ResearchRun(120).bind():
+            return dim_cache._cache_path("600519", dim)
+
+    def _seed_scenarios_cache(self, tmp_path, monkeypatch, *, http: bool) -> str:
+        """按态预置带 saved_at 的 scenarios 缓存，返回**同身份**路径。"""
         import json
-        import os
         from datetime import datetime, timedelta
 
         from src.deep_research_dims import dim_cache
 
+        self._install_bridge_config(monkeypatch, http=http)
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
         payload = {
             "dim": "scenarios",
@@ -306,8 +336,10 @@ class TestCacheHygieneRegressions:
             "probability_sum": 1.0,
             "narrative": "缓存里已有的叙述",
         }
-        dim_cache.save_cached_dim("600519", "scenarios", payload)
-        path = os.path.join(str(tmp_path), "600519_scenarios.json")
+        from src.core.research_run import ResearchRun
+        with ResearchRun(120).bind():
+            dim_cache.save_cached_dim("600519", "scenarios", payload)
+            path = dim_cache._cache_path("600519", "scenarios")
         record = json.loads(open(path, encoding="utf-8").read())
         record["saved_at"] = (datetime.now() - timedelta(hours=1)).isoformat()
         open(path, "w", encoding="utf-8").write(json.dumps(record))
@@ -341,38 +373,58 @@ class TestCacheHygieneRegressions:
         )
         return result, events
 
-    def test_scenarios_cache_hit_single_emit_and_no_ttl_refresh(self, monkeypatch, tmp_path):
-        """B1：缓存命中的 scenarios 只 emit 一次，且 saved_at 不被刷新（TTL 不滑动）。"""
+    @pytest.mark.parametrize("http", [False, True], ids=["http_off", "http_on"])
+    def test_scenarios_recomputed_single_emit_and_seed_untouched(self, monkeypatch, tmp_path, http):
+        """B1 如实语义（HTTP 关/开两态，同身份种子）：orchestrator 的
+        ``try_cache`` 将 scenarios 列入 context dims（依赖本报告行情上下文，
+        **不跨报告缓存命中**——995 行命中分支不可达），每报告重算——
+        runner 必须被调用、emit 恰一次、同身份种子文件不被命中也不被
+        刷新/覆盖（saved_at 与内容不变）。若未来语义恢复命中，本用例的
+        runner 计数断言会失败提醒同步更新。"""
         import json
 
-        path = self._seed_scenarios_cache(tmp_path, monkeypatch)
-        before = json.loads(open(path, encoding="utf-8").read())["saved_at"]
+        from src.agent.deep_research import orchestrator as orch
 
+        path = self._seed_scenarios_cache(tmp_path, monkeypatch, http=http)
+        before_record = json.loads(open(path, encoding="utf-8").read())
+        runner_calls: list[int] = []
+        real_runner = orch.build_scenarios_dim
+
+        def _counting_runner(*a, **k):
+            runner_calls.append(1)
+            return real_runner(*a, **k)
+
+        monkeypatch.setattr(orch, "build_scenarios_dim", _counting_runner)
         _result, events = self._run_offline(monkeypatch, tmp_path)
 
+        assert runner_calls, "context dim 语义：scenarios 每报告重算（runner 必须执行）"
         scen_emits = [e for e in events if e.get("type") == "dim_done" and e.get("dim") == "scenarios"]
-        assert len(scen_emits) == 1, f"缓存命中应恰好 1 次 emit，实际 {len(scen_emits)}"
-        after = json.loads(open(path, encoding="utf-8").read())["saved_at"]
-        assert after == before, "缓存命中不得刷新 saved_at（TTL 滑动语义）"
+        assert len(scen_emits) == 1, f"重算完成应恰好 1 次 emit，实际 {len(scen_emits)}"
+        after_record = json.loads(open(self._run_identity_path("scenarios"), encoding="utf-8").read())
+        assert after_record == before_record, "种子文件不得被命中路径改写或 saved_at 刷新"
 
-    def test_cache_exclude_skips_scenarios_but_writes_others(self, monkeypatch, tmp_path):
-        """探索资料仍缓存，依赖本次行情的评分/情景重新计算。"""
+    @pytest.mark.parametrize("http", [False, True], ids=["http_off", "http_on"])
+    def test_cache_exclude_skips_scenarios_but_writes_others(self, monkeypatch, tmp_path, http):
+        """探索资料仍缓存，依赖本次行情的评分/情景重新计算（HTTP 关/开两态，
+        文件断言按与实际 run 相同身份定位——run 结束后以 run 绑定求值）。"""
         import json
         import os
 
         from src.deep_research_dims import dim_cache
 
+        self._install_bridge_config(monkeypatch, http=http)
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
         _result, _events = self._run_offline(
             monkeypatch, tmp_path, force_refresh=True, skip_narrations=True,
             cache_exclude=frozenset({"scenarios"}),
         )
         names = set(os.listdir(str(tmp_path)))
-        assert "600519_scenarios.json" not in names, "被排除维度不得写缓存"
-        assert "600519_supply_chain.json" in names, "探索维度照写（次日命中省探索 Agent）"
-        assert "600519_six_dim.json" not in names, "行情派生评分不固化为下次输入"
+        # 断言按与实际 run 相同上下文身份的路径（HTTP 开态为 _httpfin）。
+        assert os.path.basename(self._run_identity_path("scenarios")) not in names, "被排除维度不得写缓存"
+        assert os.path.basename(self._run_identity_path("supply_chain")) in names, "探索维度照写（次日命中省探索 Agent）"
+        assert os.path.basename(self._run_identity_path("six_dim")) not in names, "行情派生评分不固化为下次输入"
         # 写出的 supply_chain payload 叙述无关（skip_narrations 不污染）
-        sc = json.loads(open(os.path.join(str(tmp_path), "600519_supply_chain.json"), encoding="utf-8").read())
+        sc = json.loads(open(self._run_identity_path("supply_chain"), encoding="utf-8").read())
         assert sc["payload"]["supply_chain"]["company_position"] == "白酒"
 
 

@@ -23,7 +23,7 @@ import re
 from datetime import date as _date, datetime
 from decimal import Decimal, DecimalException
 from time import monotonic
-from typing import Annotated, Dict, List, Optional, Tuple
+from typing import Annotated, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 from icontract import require
@@ -184,18 +184,51 @@ def ifind_daily_enabled() -> bool:
 
 
 def ifind_daily_read_scope(raw_code: str) -> bool:
-    """启用且证券合格的读取范围：持久 DB 命中不作为分析依据。"""
-    return ifind_daily_enabled() and qualified_daily_identity(raw_code) is not None
+    """任一 iFinD 日线传输对其**各自证券资格范围**内标的的读取范围。
+
+    读取范围语义（共享窗口权威、持久 DB 命中不作依据、整窗同源扩窗）由
+    窗口实际来源标签承载（``is_ifind_daily_source`` 按子串覆盖
+    ``IfindDailyFetcher`` 与 ``IfindHttpDailyFetcher``）。判定按 MCP/HTTP
+    **各自证券资格求并集**（第十二轮）：MCP 启用 → 全普通股范围（供应商
+    元数据回显校验单位，既有语义保持原样，第二十二轮不加调用方门限）；
+    仅 HTTP 启用 → HTTP 候选资格段（第十九轮段级方案后与普通股资格一致）
+    **且须处于个股深研执行上下文**（第二十二轮：``http_preset_scope_active``，
+    预警/回测/罗盘/定时任务等非深研调用不由 HTTP 贡献读取范围——否则
+    scope True 会跳过旧 DB 命中而 HTTP 又不预置，造成不自洽退化；深研内
+    行为与段级方案一致）。资格外标的保持原有候选与旧 DB 行为。函数内延迟
+    import 避免循环依赖。
+    """
+    if qualified_daily_identity(raw_code) is None:
+        return False
+    if ifind_daily_enabled():
+        return True
+    from .ifind_http_daily_adapter import (
+        http_preset_scope_active,
+        http_qualified_identity,
+        ifind_http_daily_enabled,
+    )
+
+    if not ifind_http_daily_enabled() or not http_preset_scope_active():
+        return False
+    return http_qualified_identity(raw_code) is not None
 
 
-def daily_routing(raw_code: str, end_date: Optional[str]) -> Optional[Tuple[str, str]]:
+def daily_routing(
+    raw_code: str,
+    end_date: Optional[str],
+    *,
+    enabled: Optional[Callable[[], bool]] = None,
+) -> Optional[Tuple[str, str]]:
     """管理器级路由决策：返回 ``(合格身份, 约束后的结束日)`` 或 None（走原链）。
 
     任何 iFinD 出站之前完成：证券资格、日历可用性与时间资格。显式历史目标
     （结束日早于当前最新已完成交易日）直接跳过 iFinD；未来/当日结束日约束到
     最新已完成交易日。日历不可用时明确跳过（不退成 weekday 日历）。
+    ``enabled`` 供标准 HTTP 候选（issue #91）注入自己的启用条件；缺省仍是
+    既有 MCP 启用判定，既有调用方行为不变。
     """
-    if not ifind_daily_enabled():
+    enabled_check = ifind_daily_enabled if enabled is None else enabled
+    if not enabled_check():
         return None
     identity = qualified_daily_identity(raw_code)
     if identity is None:
@@ -781,6 +814,22 @@ def _require_decimal(
     return value
 
 
+def standardize_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """把六字段中文列 DataFrame 规范成既有日线消费契约（含 pct_chg）。
+
+    MCP（issue #86）与标准 HTTP（issue #91）两个传输路径共用同一标准化，
+    保证采纳窗口对下游消费者形状一致。
+    """
+    normalized = df.copy()
+    normalized = normalized.rename(columns={
+        "日期": "date", "开盘价": "open", "最高价": "high", "最低价": "low",
+        "收盘价": "close", "成交量": "volume", "成交额": "amount",
+    })
+    normalized["pct_chg"] = normalized["close"].pct_change().fillna(0.0) * 100
+    columns = ["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
+    return normalized.reindex(columns=columns)
+
+
 class IfindDailyFetcher(BaseFetcher):
     """iFinD 现金分红前复权日线 Fetcher（issue #86）。
 
@@ -891,14 +940,7 @@ class IfindDailyFetcher(BaseFetcher):
             raise DataFetchError("unexpected MCP transport cancellation") from exc
 
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
-        normalized = df.copy()
-        normalized = normalized.rename(columns={
-            "日期": "date", "开盘价": "open", "最高价": "high", "最低价": "low",
-            "收盘价": "close", "成交量": "volume", "成交额": "amount",
-        })
-        normalized["pct_chg"] = normalized["close"].pct_change().fillna(0.0) * 100
-        columns = ["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
-        return normalized.reindex(columns=columns)
+        return standardize_daily_frame(df)
 
 
 def _sanitize_export_url(url: str) -> str:

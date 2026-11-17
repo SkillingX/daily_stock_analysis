@@ -4175,6 +4175,11 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         - 按 `(code, date)` 做批量 UPSERT，已存在记录会覆盖更新
         - 同一批次内若存在重复日期，以最后一条记录为准
         - SQLite 分支按 chunk 写入以避免绑定参数上限
+        - 标准 HTTP 日线来源（``IfindHttpDailyFetcher``）不落本表（第二十四轮
+          共享表契约）：跨业务共享 ``StockDaily`` 的行保持旧源/MCP 语义，深研
+          HTTP 窗口仅在内存共享作用域内复用。过滤在存储层统一生效，覆盖全部
+          现有与后续写入入口；判定为
+          ``is_ifind_http_daily_source``（精确匹配，MCP 来源不受影响）。
 
         Args:
             df: 包含日线数据的 DataFrame
@@ -4184,6 +4189,19 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
         Returns:
             本次实际新增的记录数（不含更新）
         """
+        if data_source:
+            from data_provider.ifind_http_daily_adapter import (
+                is_ifind_http_daily_source,
+            )
+
+            if is_ifind_http_daily_source(data_source):
+                logger.info(
+                    "save_daily_data[%s]: 标准 HTTP 日线来源不入共享 StockDaily 表"
+                    "（深研窗口仅内存复用），跳过 %d 行",
+                    code,
+                    0 if df is None else len(df),
+                )
+                return 0
         if df is None or df.empty:
             logger.warning(f"保存数据为空，跳过 {code}")
             return 0

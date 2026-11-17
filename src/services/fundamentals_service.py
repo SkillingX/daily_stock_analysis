@@ -129,7 +129,9 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                 full = db.get_fundamentals_report(r["id"])
                 if full:
                     from src.config import get_config
-                    contract = get_config().data_source_contract
+                    # 第二十四轮：财务报告身份过滤用 financial_cache_contract，
+                    # 不随 HTTP 日线开关翻转失效。
+                    contract = get_config().financial_cache_contract
                     if contract != "legacy" and json.loads(full.get("dims_json") or "{}").get("_data_contract") != contract:
                         continue
                     dims = json.loads(full.get("dims_json") or "{}")
@@ -221,7 +223,7 @@ def generate_fundamentals_report(raw_code: str, raw_name: Optional[str] = None, 
         "financial": _rule_dim("fundamental", code, name, ctx),
     }
     from src.config import get_config
-    dims["_data_contract"] = get_config().data_source_contract
+    dims["_data_contract"] = get_config().financial_cache_contract
     as_of = datetime.now().isoformat(timespec="seconds")
     rid = _resolve_unique_id(_ID_PATTERN.format(ts=created_at))
     md = _render_markdown(name, code, as_of, dims, rid)
