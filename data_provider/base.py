@@ -47,7 +47,7 @@ from .ifind_fundamental_adapter import IfindFetcher, IfindSource
 from .tushare_ifind_fundamental_adapter import TushareIfindFundamentalAdapter
 from .yfinance_fundamental_adapter import YfinanceFundamentalAdapter
 from .mx_data_adapter import MXSource, _cn_period_to_yyyymmdd
-from .realtime_types import CircuitBreaker
+from .realtime_types import CircuitBreaker, sanitize_non_finite_quote_scalars
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -924,7 +924,14 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
         # （替代被收敛的 Choice 公司补查）；置于必要财务/估值/资金之后同一
         # deadline 内的有界可选出站，失败/取消照常保留证据，不重试。
         try:
-            profile = fetcher.company_profile(code, deadline=deadline)
+            from data_provider.ifind_http_daily_adapter import company_profile_with_fallback
+
+            profile = company_profile_with_fallback(
+                code, deadline=deadline,
+                mcp_endpoint=config.ifind_mcp_endpoint,
+                mcp_token=config.ifind_mcp_token,
+                mcp_timeout=config.ifind_mcp_timeout_seconds,
+            )
             company_payload: Dict[str, Any] = {}
             for key, indicator in (("profile", "COMPROFILE"), ("main_business", "MAINBUSINESS"),
                                    ("main_products", "MAINPRODUCT"), ("controller", "AHOLDER"),
@@ -939,6 +946,13 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
                 company_payload["NAME"] = name_fact.value
                 if name_fact.observed_at:
                     company_payload.setdefault("field_dates", {})["NAME"] = name_fact.observed_at
+            if profile.errors:
+                # 第五十九轮：API 部分成功+MCP 补缺的 errors 随返回对象传播
+                # （原错误披露不丢失——与既有 except 分支同构落到 errors）。
+                errors.extend(
+                    f"ifind:company:{item}" if not item.startswith("ifind:") else item
+                    for item in profile.errors
+                )
             if company_payload:
                 payload["company"] = company_payload
         except SourceReadError as exc:
@@ -1778,12 +1792,153 @@ class DataFetcherManager:
             return None
         return fetcher, identity, clamped_end
 
+    def _prepare_ifind_http_daily_attempt(
+        self, raw_stock_code: str, end_date: Optional[str]
+    ) -> Optional[Tuple[BaseFetcher, str, str]]:
+        """issue #91：标准 HTTP 日线候选的准备边界（与 MCP 准备边界同构）。
+
+        独立启用条件（``ENABLE_IFIND_HTTP_API`` + refresh_token，与 MCP
+        凭据互不混用）；证券资格走 ``http_daily_routing``——沪深普通股
+        资格段（第十九轮段级方案，逐股白名单已删除；范围外保持原有候选）。
+        预置参与范围另受个股深研执行上下文门限（第二十二轮，见调用点）。
+        """
+        from data_provider.ifind_http_daily_adapter import (
+            IfindHttpDailyFetcher,
+            http_daily_routing,
+            ifind_http_daily_enabled,
+        )
+
+        if not ifind_http_daily_enabled():
+            return None
+        routing = http_daily_routing(raw_stock_code, end_date)
+        if routing is None:
+            return None
+        identity, clamped_end = routing
+        self._ensure_concurrency_guards()
+        if getattr(self, "_ifind_http_daily_fetcher", None) is None:
+            with self._fetchers_lock:
+                if getattr(self, "_ifind_http_daily_fetcher", None) is None:
+                    self._ifind_http_daily_fetcher = IfindHttpDailyFetcher()
+        fetcher = self._ifind_http_daily_fetcher
+        if fetcher is None or not getattr(fetcher, "available", False):
+            return None
+        return fetcher, identity, clamped_end
+
+    def _attempt_preset_daily_source(
+        self,
+        fetcher: BaseFetcher,
+        identity: str,
+        start_date: Optional[str],
+        clamped_end: str,
+        days: int,
+        errors: List[str],
+        market: str,
+        outer_daily_deadline: Optional[float],
+        fetchers: Optional[List[BaseFetcher]] = None,
+        *,
+        has_fallback: bool,
+        attempt_label: str,
+        fallback_to: Optional[str],
+    ) -> Optional[Tuple[pd.DataFrame, str]]:
+        """一次 iFinD 预置候选尝试（MCP issue #86 与标准 HTTP issue #91 共用）。
+
+        预算与 fallback 诊断按受约束后的真实候选链计算（issue #94）：约束
+        生效时通用链无同源候选，不为幻影 fallback 预留尝试预算，失败诊断
+        不把将被跳过的来源报告为 fallback 目标。``fallback_to`` 由调用方
+        按真实候选次序显式传入（预置源不在 ``fetchers`` 通用链内，函数内
+        无法推断 MCP 失败后的实际下一跳是标准 HTTP 预置尝试——第五轮修正
+        此前一律取通用首源的错误标记）。成功返回 ``(df, 源名)``；空/失败
+        记录原因后返回 None（不打乱既有候选相对次序）。
+        """
+        _raise_if_original_control_exhausted(outer_daily_deadline)
+        if not self._is_daily_source_available(fetcher, market):
+            errors.append(self._daily_source_unavailable_error(fetcher))
+            return None
+        attempt_start = time.time()
+        try:
+            logger.info(
+                f"[数据源尝试 iFinD] [{fetcher.name}] 获取 {identity} "
+                f"{attempt_label}..."
+            )
+            record_provider_run_started(
+                data_type="daily_data",
+                provider=fetcher.name,
+                operation="get_daily_data",
+            )
+            with daily_attempt_budget(reserve_fallback=has_fallback):
+                df = self._call_fetcher_method(
+                    fetcher,
+                    "get_daily_data",
+                    stock_code=identity,
+                    start_date=start_date,
+                    end_date=clamped_end,
+                    days=days,
+                )
+            _raise_if_original_control_exhausted(outer_daily_deadline)
+            if df is not None and not df.empty:
+                duration_ms = int((time.time() - attempt_start) * 1000)
+                record_provider_run(
+                    data_type="daily_data",
+                    provider=fetcher.name,
+                    operation="get_daily_data",
+                    success=True,
+                    latency_ms=duration_ms,
+                    record_count=len(df),
+                )
+                elapsed = time.time() - attempt_start
+                logger.info(
+                    f"[数据源完成] {identity} 使用 [{fetcher.name}] 获取成功: "
+                    f"rows={len(df)}, elapsed={elapsed:.2f}s"
+                )
+                self._record_daily_source_success(fetcher, market)
+                return df, fetcher.name
+            duration_ms = int((time.time() - attempt_start) * 1000)
+            record_provider_run(
+                data_type="daily_data",
+                provider=fetcher.name,
+                operation="get_daily_data",
+                success=False,
+                latency_ms=duration_ms,
+                error_type="empty",
+                error_message="empty result",
+                fallback_to=fallback_to,
+                record_count=0,
+            )
+            if df is not None and df.empty:
+                self._record_daily_source_success(fetcher, market)
+                errors.append(f"[{fetcher.name}] (empty) iFinD 日线返回空窗口")
+        except ResearchStopped:
+            raise
+        except Exception as e:
+            _raise_if_original_control_exhausted(outer_daily_deadline)
+            error_type, error_reason = summarize_exception(e)
+            duration_ms = int((time.time() - attempt_start) * 1000)
+            record_provider_run(
+                data_type="daily_data",
+                provider=fetcher.name,
+                operation="get_daily_data",
+                success=False,
+                latency_ms=duration_ms,
+                error_type=error_type,
+                error_message=error_reason,
+                fallback_to=fallback_to,
+            )
+            logger.warning(
+                f"[数据源失败 iFinD] [{fetcher.name}] {identity}: "
+                f"error_type={error_type}, reason={error_reason}"
+                + ("，继续既有候选" if has_fallback else "")
+            )
+            self._record_daily_source_failure(fetcher, market, error_reason)
+            errors.append(f"[{fetcher.name}] ({error_type}) {error_reason}")
+        return None
+
     def get_daily_data(
         self,
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         days: int = 30,
+        constraint_source: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         获取日线数据（自动切换数据源）
@@ -1800,6 +1955,13 @@ class DataFetcherManager:
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
+            constraint_source: 来源约束（issue #94）。已采用日线窗口未被替换前，
+                换源候选注定被上层跨源整窗一致性保护拒绝；约束生效时只有同名
+                数据源（含 iFinD 预置尝试仅当约束为 ``IfindDailyFetcher``）出站，
+                其余候选跳过并在错误摘要中如实记录「未出站」。尝试级预算预留、
+                fallback_to / 数据源切换 / 剩余未尝试计数等预算与诊断均按受约束
+                后的真实候选链计算，不为被排除候选预留或报告。不改变任何候选
+                的相对次序、采纳语义与可用性判定；默认 None 保持原行为。
 
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
@@ -1829,11 +1991,23 @@ class DataFetcherManager:
         is_us = is_us_index or is_us_stock_code(stock_code)
         is_hk = (not is_us) and _is_hk_market(stock_code)
         market = "us" if is_us else "hk" if is_hk else "cn"
+        if constraint_source and market != "cn":
+            # 来源约束只服务于 A 股已采用窗口的扩窗需求；不适用市场显式失败
+            # 而不是静默忽略约束，避免语义含混的出站。
+            raise DataFetchError(
+                f"{stock_code} 获取失败: 来源约束 [{constraint_source}] 不适用于该市场路由"
+            )
         if is_hk:
             fetchers = self._filter_daily_fetchers_for_market(fetchers, "hk")
         fetchers = self._filter_fetchers_by_capability(
             fetchers, capability="daily_data"
         )
+        if constraint_source:
+            logger.info(
+                "[数据源约束] %s: 仅尝试同源候选 [%s]，其余数据源不再出站"
+                "（已采用窗口的扩窗需求只能采纳同源整窗候选）",
+                stock_code, constraint_source,
+            )
         total_fetchers = len(fetchers)
 
         if total_fetchers == 0:
@@ -1982,94 +2156,108 @@ class DataFetcherManager:
         # issue #86：启用且合格（证券 + 日历 + 当前最新已完成交易日口径）时，
         # iFinD 现金分红前复权日线在既有候选链之前尝试一次；失败/不合格/日历
         # 不可用/历史目标均不打乱既有候选相对次序，真实原因保留在 errors。
-        if market == "cn":
+        # issue #94：来源约束为 IfindDailyFetcher 时才参与，其余约束跳过预置尝试。
+        # issue #91：MCP 预置尝试失败后，标准 HTTP 同口径候选在既有候选链
+        # （东财优先）之前作为第二预置尝试；约束语义与预算诊断与 MCP 相同。
+        # 第十三轮：HTTP 候选的 prepare 提前到 MCP 尝试之前——MCP 失败诊断
+        # 的下一跳按**当前证券（第十九轮段级后为沪深普通股资格段）+ 截止日
+        # 期 + 实际候选可用性（含健康熔断）**计算，非资格证券不误写「下一跳
+        # HTTP」。
+        # 第十四轮：可用性观察改用 `peek_available`（纯读、不消耗 HALF_OPEN
+        # 探测名额）——诊断不得为观察预消费有副作用的出站配额；真正出站的
+        # 取号只发生在 `_attempt_preset_daily_source` 内的一次 `is_available`。
+        http_attempt = None
+        from .ifind_http_daily_adapter import http_preset_scope_active
+
+        # 第二十二轮：HTTP 预置仅个股深研执行上下文参与（`current_research`
+        # 活跃；预警/回测/罗盘/定时任务等非深研调用保持既有候选顺序，零
+        # HTTP 出站）。MCP 预置保持既有行为不动；扩窗换源约束只发生在深研
+        # 上下文内，无「非深研 + 显式约束」的生产调用（已核实），门不构成
+        # 约束路径绕过。
+        if (
+            market == "cn"
+            and http_preset_scope_active()
+            and (
+                not constraint_source or constraint_source == "IfindHttpDailyFetcher"
+            )
+        ):
+            http_attempt = self._prepare_ifind_http_daily_attempt(raw_stock_code, end_date)
+        http_ready = (
+            http_attempt is not None
+            and self._daily_source_health.peek_available(
+                self._daily_health_key(http_attempt[0], market)
+            )
+        )
+        if market == "cn" and (
+            not constraint_source or constraint_source == "IfindDailyFetcher"
+        ):
             ifind_attempt = self._prepare_ifind_daily_attempt(raw_stock_code, end_date)
             if ifind_attempt is not None:
-                ifind_fetcher, identity, clamped_end = ifind_attempt
-                _raise_if_original_control_exhausted(outer_daily_deadline)
-                if not self._is_daily_source_available(ifind_fetcher, market):
-                    errors.append(self._daily_source_unavailable_error(ifind_fetcher))
+                # MCP 失败后的实际下一跳（第五轮修正 + 第十三轮精确化）：无
+                # 约束且 HTTP 候选真实可参与（深研上下文 + prepare 通过 +
+                # 熔断可用）时是 HTTP 预置尝试，否则是通用链首源（HTTP 关闭/
+                # 非资格/非深研/熔断时的既有语义）；约束生效时无兜底，不虚构
+                # fallback。
+                if not constraint_source:
+                    mcp_fallback = (
+                        "IfindHttpDailyFetcher"
+                        if http_ready
+                        else (fetchers[0].name if fetchers else None)
+                    )
                 else:
-                    attempt_start = time.time()
-                    try:
-                        logger.info(
-                            f"[数据源尝试 iFinD] [{ifind_fetcher.name}] 获取 {stock_code} "
-                            f"现金分红前复权日线（窗口截止 {clamped_end}）..."
-                        )
-                        record_provider_run_started(
-                            data_type="daily_data",
-                            provider=ifind_fetcher.name,
-                            operation="get_daily_data",
-                        )
-                        with daily_attempt_budget(reserve_fallback=True):
-                            df = self._call_fetcher_method(
-                                ifind_fetcher,
-                                "get_daily_data",
-                                stock_code=identity,
-                                start_date=start_date,
-                                end_date=clamped_end,
-                                days=days,
-                            )
-                        _raise_if_original_control_exhausted(outer_daily_deadline)
-                        if df is not None and not df.empty:
-                            duration_ms = int((time.time() - attempt_start) * 1000)
-                            record_provider_run(
-                                data_type="daily_data",
-                                provider=ifind_fetcher.name,
-                                operation="get_daily_data",
-                                success=True,
-                                latency_ms=duration_ms,
-                                record_count=len(df),
-                            )
-                            elapsed = time.time() - request_start
-                            logger.info(
-                                f"[数据源完成] {stock_code} 使用 [{ifind_fetcher.name}] 获取成功: "
-                                f"rows={len(df)}, elapsed={elapsed:.2f}s"
-                            )
-                            self._record_daily_source_success(ifind_fetcher, market)
-                            return df, ifind_fetcher.name
-                        duration_ms = int((time.time() - attempt_start) * 1000)
-                        record_provider_run(
-                            data_type="daily_data",
-                            provider=ifind_fetcher.name,
-                            operation="get_daily_data",
-                            success=False,
-                            latency_ms=duration_ms,
-                            error_type="empty",
-                            error_message="empty result",
-                            fallback_to=fetchers[0].name if fetchers else None,
-                            record_count=0,
-                        )
-                        if df is not None and df.empty:
-                            self._record_daily_source_success(ifind_fetcher, market)
-                            errors.append(f"[{ifind_fetcher.name}] (empty) iFinD 日线返回空窗口")
-                    except ResearchStopped:
-                        raise
-                    except Exception as e:
-                        _raise_if_original_control_exhausted(outer_daily_deadline)
-                        error_type, error_reason = summarize_exception(e)
-                        duration_ms = int((time.time() - attempt_start) * 1000)
-                        record_provider_run(
-                            data_type="daily_data",
-                            provider=ifind_fetcher.name,
-                            operation="get_daily_data",
-                            success=False,
-                            latency_ms=duration_ms,
-                            error_type=error_type,
-                            error_message=error_reason,
-                            fallback_to=fetchers[0].name if fetchers else None,
-                        )
-                        logger.warning(
-                            f"[数据源失败 iFinD] [{ifind_fetcher.name}] {stock_code}: "
-                            f"error_type={error_type}, reason={error_reason}，继续既有候选"
-                        )
-                        self._record_daily_source_failure(ifind_fetcher, market, error_reason)
-                        errors.append(f"[{ifind_fetcher.name}] ({error_type}) {error_reason}")
+                    mcp_fallback = None
+                adopted = self._attempt_preset_daily_source(
+                    ifind_attempt[0], ifind_attempt[1], start_date, ifind_attempt[2],
+                    days, errors, market, outer_daily_deadline, fetchers=fetchers,
+                    has_fallback=not constraint_source,
+                    attempt_label=f"现金分红前复权日线（窗口截止 {ifind_attempt[2]}）",
+                    fallback_to=mcp_fallback,
+                )
+                if adopted is not None:
+                    return adopted
+        if http_attempt is not None:
+            # HTTP 失败后的实际下一跳是通用链首源；约束生效时无兜底。
+            http_fallback = (
+                (fetchers[0].name if fetchers else None)
+                if not constraint_source
+                else None
+            )
+            adopted = self._attempt_preset_daily_source(
+                http_attempt[0], http_attempt[1], start_date, http_attempt[2],
+                days, errors, market, outer_daily_deadline, fetchers=fetchers,
+                has_fallback=not constraint_source,
+                attempt_label=f"标准 HTTP 现金分红前复权日线（窗口截止 {http_attempt[2]}）",
+                fallback_to=http_fallback,
+            )
+            if adopted is not None:
+                return adopted
+
+        # issue #94：预算与 fallback 诊断按受约束后的真实候选链计算——被约束
+        # 排除的候选不出站，不应获得预留预算、被报告为 fallback 目标，也不
+        # 计入「未尝试」剩余数。无约束时两式与原始列表逐位等价，行为不变。
+        def _next_eligible_name(after_index: int) -> Optional[str]:
+            for candidate in fetchers[after_index + 1:]:
+                if not constraint_source or candidate.name == constraint_source:
+                    return candidate.name
+            return None
+
+        def _remaining_eligible_count(from_index: int) -> int:
+            return sum(
+                1 for candidate in fetchers[from_index:]
+                if not constraint_source or candidate.name == constraint_source
+            )
 
         for attempt, fetcher in enumerate(fetchers, start=1):
+            if constraint_source and fetcher.name != constraint_source:
+                # issue #94：换源候选注定被上层跨源整窗一致性保护拒绝，不出站；
+                # 如实记录跳过原因，不冒充供应商故障。
+                errors.append(
+                    f"[skip] [{fetcher.name}] 受来源约束跳过（仅尝试 {constraint_source}），未出站"
+                )
+                continue
             if _daily_budget_exhausted(outer_daily_deadline):
                 errors.append(
-                    f"[budget] 外层预算已耗尽，剩余 {total_fetchers - attempt + 1} 个数据源未尝试"
+                    f"[budget] 外层预算已耗尽，剩余 {_remaining_eligible_count(attempt - 1)} 个数据源未尝试"
                 )
                 logger.warning("[数据源终止] %s: 外层预算已耗尽，停止剩余数据源尝试", stock_code)
                 break
@@ -2077,7 +2265,7 @@ class DataFetcherManager:
                 errors.append(self._daily_source_unavailable_error(fetcher))
                 continue
             attempt_start = time.time()
-            fallback_to = fetchers[attempt].name if attempt < total_fetchers else None
+            fallback_to = _next_eligible_name(attempt - 1)
             try:
                 logger.info(
                     f"[数据源尝试 {attempt}/{total_fetchers}] [{fetcher.name}] 获取 {stock_code}..."
@@ -2087,7 +2275,7 @@ class DataFetcherManager:
                     provider=fetcher.name,
                     operation="get_daily_data",
                 )
-                with daily_attempt_budget(attempt < total_fetchers):
+                with daily_attempt_budget(fallback_to is not None):
                     df = self._call_fetcher_method(
                         fetcher,
                         "get_daily_data",
@@ -2151,10 +2339,9 @@ class DataFetcherManager:
                 )
                 self._record_daily_source_failure(fetcher, market, error_reason)
                 errors.append(error_msg)
-                if attempt < total_fetchers:
-                    next_fetcher = fetchers[attempt]
+                if fallback_to:
                     logger.info(
-                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{next_fetcher.name}]"
+                        f"[数据源切换] {stock_code}: [{fetcher.name}] -> [{fallback_to}]"
                     )
                 # 继续尝试下一个数据源
                 continue
@@ -2361,16 +2548,19 @@ class DataFetcherManager:
         ttl = realtime_cache_ttl if realtime_cache_ttl is not None else 600
         setattr(quote, "stale_seconds", stale_seconds)
         setattr(quote, "is_stale", stale_seconds > int(ttl))
-        from data_provider.realtime_types import quote_field_records
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
         from data_provider.cross_source_validator import adopted_field_record, reading_from_field_record
         records = quote_field_records(quote)
         for field, record in records.items():
             observed = self._parse_realtime_timestamp(record.get("observed_at"))
             if observed is not None:
                 record["is_stale"] = (fetched_dt - observed).total_seconds() > int(ttl)
-                reading = reading_from_field_record(record.get("value"), record)
-                if reading is not None:
-                    records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
+                # 锚点字段经资格投影重算 rule_eligible；补充字段（量比/换手/振幅）
+                # 无锚点语义，只如实更新 is_stale，保留采纳时的来源与时间（issue #93）。
+                if field in QUOTE_ANCHOR_FIELDS:
+                    reading = reading_from_field_record(record.get("value"), record)
+                    if reading is not None:
+                        records[field] = adopted_field_record(field, reading, selection_reason=record.get("selection_reason", "primary"), previous_record=record)
         quote.field_meta = records
         return quote
 
@@ -2566,6 +2756,11 @@ class DataFetcherManager:
 
                 provider_name = fetcher.name if fetcher is not None else source
 
+                # 可确认的 NaN/±inf 标量在采纳判断前按缺失处理（price=+inf
+                # 能通过 price>0，必须在 has_basic_data 之前清理，issue #93
+                # 契约）；确有非法字段时返回副本，fetcher 持有的原引用不被改。
+                if quote is not None:
+                    quote = sanitize_non_finite_quote_scalars(quote)
                 if quote is not None and quote.has_basic_data():
                     record_provider_run(
                         data_type="realtime_quote",
@@ -2600,15 +2795,16 @@ class DataFetcherManager:
                         logger.debug(
                             f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充"
                         )
-                        supplement_attempts = 0
                     else:
-                        # Supplement missing fields from this source (limit attempts)
-                        supplement_attempts += 1  # type: ignore[reportPossiblyUnboundVariable]
-                        if supplement_attempts > 1:
-                            logger.debug(
-                                f"[实时行情] {stock_code} 补充尝试已达上限，停止继续"
-                            )
-                            break
+                        # Supplement missing fields entry-by-entry, bounded by the
+                        # configured priority list (each list entry is dispatched
+                        # at most once per call; duplicates in a custom order are
+                        # each attempted as configured). Only still-missing
+                        # qualified fields are filled; an entry with nothing
+                        # adoptable neither blocks later fallback entries nor
+                        # leaves records behind (the default order keeps Eastmoney
+                        # last, issue #93 review round 4). Stop as soon as all
+                        # key fields are filled.
                         merged = self._merge_quote_fields(primary_quote, quote)
                         if merged:
                             logger.info(
@@ -2701,27 +2897,91 @@ class DataFetcherManager:
         """
         Copy non-None fields from *secondary* into *primary* where
         *primary* has None. Returns list of field names that were filled.
+
+        锚点字段经 rule_eligible 资格门控；量比/换手/振幅等非锚点补充字段
+        与锚点同契约拒绝已知过期源，并在采纳时写入自身来源与时间的字段
+        记录（issue #93：禁止过期数据冒充有效值、逐字段可核实来源）。
         """
         filled = []
-        from data_provider.realtime_types import quote_field_records
+        import math
+
+        from data_provider.realtime_types import quote_field_records, QUOTE_SUPPLEMENT_FIELD_UNITS
         primary.field_meta = quote_field_records(primary)
         secondary_meta = quote_field_records(secondary)
         known_currencies = {record.get("currency") for key, record in primary.field_meta.items() if key in {"current_price", "total_mv", "circ_mv"} and record.get("currency")}
         if getattr(primary, "currency", None):
             known_currencies.add(primary.currency)
+        from src.config import get_config
+
+        ttl_config = getattr(get_config(), "realtime_cache_ttl", None)
+        ttl = int(ttl_config) if ttl_config is not None else 600
+        secondary_source = getattr(secondary.source, "value", None) or str(getattr(secondary, "source", "unknown"))
         for f in cls._SUPPLEMENT_FIELDS:
             if getattr(primary, f, None) is None:
                 val = getattr(secondary, f, None)
-                if val is not None:
-                    if f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"} and not (secondary_meta.get(f) or {}).get("rule_eligible"):
+                if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                    continue  # None/bool/非有限值不采纳、不留记录（与锚点 invalid_value 同契约）
+                is_anchor = f in {"pe_ratio", "pb_ratio", "total_mv", "circ_mv"}
+                record: Optional[Dict[str, Any]] = None
+                if is_anchor:
+                    if not (secondary_meta.get(f) or {}).get("rule_eligible"):
                         continue
-                    if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
-                        continue
-                    setattr(primary, f, val)
                     if f in secondary_meta:
-                        primary.field_meta[f] = {**secondary_meta[f], "selection_reason": "quote_supplement"}
-                    filled.append(f)
+                        record = {**secondary_meta[f], "selection_reason": "quote_supplement"}
+                else:
+                    # 非锚点补充字段：与锚点同契约拒绝时间不合格源（已知过期或
+                    # 未来值），时间未知不判定不合格、由记录如实披露。
+                    staleness = cls._supplement_source_staleness(secondary, ttl)
+                    if staleness is True:
+                        continue
+                    record = {
+                        "field": f,
+                        "value": val,
+                        "source": secondary_source,
+                        "unit": QUOTE_SUPPLEMENT_FIELD_UNITS[f],
+                        "observed_at": getattr(secondary, "provider_timestamp", None),
+                        "fetched_at": getattr(secondary, "fetched_at", None),
+                        "is_stale": False if staleness is False else None,
+                        "selection_reason": "quote_supplement",
+                    }
+                if f in {"total_mv", "circ_mv"} and known_currencies and known_currencies != {(secondary_meta.get(f) or {}).get("currency")}:
+                    continue
+                setattr(primary, f, val)
+                if record is not None:
+                    primary.field_meta[f] = record
+                filled.append(f)
         return filled
+
+    @staticmethod
+    def _valuation_anchor_records(quote_payload: Any) -> Dict[str, Dict[str, Any]]:
+        """估值块只承载金融锚点字段记录（issue #93 复审问题 1）。
+
+        量比/换手/振幅等非锚点行情记录进入 ``_build_fundamental_block`` 会被
+        按 pe/pb/市值语义重建并误标 unit_incompatible/rule_eligible=False，
+        污染 valuation.field_meta 与下游 financial_quality；按锚点集合过滤。
+        """
+        from data_provider.realtime_types import quote_field_records, QUOTE_ANCHOR_FIELDS
+        records = quote_field_records(quote_payload)
+        return {key: records[key] for key in QUOTE_ANCHOR_FIELDS if key in records}
+
+    @staticmethod
+    def _supplement_source_staleness(quote: Any, ttl: int) -> Optional[bool]:
+        """补充源的时间资格：True=已知不合格（过期或未来值）；False=已知新鲜；None=时间未知。
+
+        显式 ``is_stale=True``、可解析 provider_timestamp 超过 TTL 或晚于当前
+        时间均视为不合格（与锚点 stale/time_in_future 同契约）；时间未知不判定
+        不合格（由字段记录如实披露 observed_at=None）。
+        """
+        if getattr(quote, "is_stale", None) is True:
+            return True
+        observed = DataFetcherManager._parse_realtime_timestamp(
+            getattr(quote, "provider_timestamp", None)
+        )
+        if observed is None:
+            return None
+        now = datetime.now(timezone.utc)
+        age = (now - observed).total_seconds()
+        return age < 0 or age > int(ttl)
 
     def _longbridge_preferred(self, capability: str = "realtime_quote") -> bool:
         """Return True when Longbridge keys are configured and available.
@@ -2760,6 +3020,10 @@ class DataFetcherManager:
             q = self._call_fetcher_method(
                 fetcher, "get_realtime_quote", stock_code, **kw
             )
+            # 与 A 股循环同契约：异常数值标量先按缺失处理再判基本可用性，
+            # 确有非法字段时采纳副本、不改 fetcher 持有的原引用。
+            if q is not None:
+                q = sanitize_non_finite_quote_scalars(q)
             if q is not None and q.has_basic_data():
                 record_provider_run(
                     data_type="realtime_quote",
@@ -4033,8 +4297,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -4359,8 +4622,7 @@ class DataFetcherManager:
             else None,
         }
         if quote_payload is not None:
-            from data_provider.realtime_types import quote_field_records
-            valuation_payload["field_meta"] = quote_field_records(quote_payload)
+            valuation_payload["field_meta"] = self._valuation_anchor_records(quote_payload)
         valuation_status = self._infer_block_status(
             valuation_payload,
             "partial" if quote_payload is not None else "not_supported",
@@ -4861,6 +5123,7 @@ class DataFetcherManager:
     def _build_choice_fundamental_context(self, code: str, budget_seconds: Optional[float], include_sector_flows: bool = True) -> Dict[str, Any]:
         from src.config import get_config
         from data_provider.mx_data_adapter import financial_refresh
+        from data_provider.ifind_http_daily_adapter import http_financial_participation_active
         from src.core.research_run import current_research, supplier_need_key
         run = current_research.get()
         config = get_config()
@@ -4869,7 +5132,15 @@ class DataFetcherManager:
         # 非深研 false-scope（独立专项服务，完整聚合含 Choice）与深研 false-scope
         # （零 Choice）在同一 contract/budget/sf 下不得互串缓存或共享出站结果。
         deep_scope_key = ifind_deep_research_scope_active(include_sector_flows)
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(deep_scope_key)}"
+        # 第二十四轮：财务聚合缓存身份不含 HTTP 日线开关段（与日线口径无关，
+        # 开关翻转不再触发财务重取）；深研维度/报告缓存身份保持完整契约。
+        # 本轮审查收敛：HTTP 财务快照仅个股深研执行上下文出站——参与形态的
+        # 缓存键附加 HTTP 段（来源随开关变化），非深研键不受开关影响（段用
+        # 统一参与判定 ``http_financial_participation_active``，与阶段 0 持久
+        # 快照/维度持久缓存一致）。
+        key = f"{config.financial_cache_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(deep_scope_key)}"
+        if http_financial_participation_active():
+            key += "-http-fin-v1"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         if not (refresh and refresh[0] == code):
@@ -4890,13 +5161,14 @@ class DataFetcherManager:
             need = "fundamental_full" if include_sector_flows else "fundamental_full:no_sector"
             if deep_scope_key:
                 need = f"{need}:deep"
-            run_key = supplier_need_key("choice", config.data_source_contract, need, code, refresh[1] if refresh else "")
+            run_key = supplier_need_key("choice", config.financial_cache_contract, need, code, refresh[1] if refresh else "")
             return run.single_fetch(run_key, lambda: self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows), timeout=max(0.0, budget))
         return self._build_choice_fundamental_context_uncached(code, budget_seconds, run, include_sector_flows=include_sector_flows)
 
     def _build_choice_fundamental_context_uncached(self, code: str, budget_seconds: Optional[float], run: Any, include_sector_flows: bool = True) -> Dict[str, Any]:
         from src.config import get_config
         from data_provider.choice_adapter import ChoiceAdapter
+        from data_provider.ifind_http_daily_adapter import http_financial_participation_active
         from src.core.research_run import current_research, ResearchStopped
         if run is None:
             run = current_research.get()
@@ -4904,17 +5176,35 @@ class DataFetcherManager:
         budget = max(0.0, config.fundamental_stage_timeout_seconds if budget_seconds is None else budget_seconds)
         deadline = time.monotonic() + budget
         # issue #73（v3 返修）：写入键与读取键同一深研身份段（两处必须一致，
-        # 否则深研/非深研结果互串）。
-        key = f"{config.data_source_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(ifind_deep_research_scope_active(include_sector_flows))}"
+        # 否则深研/非深研结果互串）。HTTP 段用统一参与判定（与读取键/阶段 0
+        # 快照/维度缓存一致），非深研键不受开关影响。
+        key = f"{config.financial_cache_contract}|{self._get_fundamental_cache_key(code, budget_seconds, include_sector_flows=include_sector_flows)}|d{int(ifind_deep_research_scope_active(include_sector_flows))}"
+        if http_financial_participation_active():
+            key += "-http-fin-v1"
         from data_provider.cross_source_validator import AnchorQuality, AnchorReading, SourceReadError, adopted_field_record, normalize_report_period, p1_single_source_eligible, reading_input_reasons
         prefer_ifind = config.financial_primary_source == "ifind"
         readings: dict[str, AnchorReading] = {}
         source_error = None
         if prefer_ifind:
             try:
-                readings = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).financial_snapshot(
-                    code, None, deadline=deadline - budget / 2,
-                )
+                if http_financial_participation_active():
+                    # 标准 HTTP 财务快照仅在「开关+个股深研执行上下文」同时
+                    # 成立时参与（与缓存身份段同判定）；普通基本面专项不因
+                    # 该开关改变数据源。
+                    from data_provider.ifind_http_daily_adapter import financial_snapshot_with_fallback
+
+                    readings = financial_snapshot_with_fallback(
+                        code, None, deadline=deadline - budget / 2,
+                        mcp_endpoint=config.ifind_mcp_endpoint,
+                        mcp_token=config.ifind_mcp_token,
+                        mcp_timeout=config.ifind_mcp_timeout_seconds,
+                    )
+                else:
+                    # 非深研保持 MCP 原路径（HTTP 接入前的旧行为，等价于
+                    # fallback 的 MCP 分支：同一 deadline、同一期次语义）。
+                    readings = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).financial_snapshot(
+                        code, None, deadline=deadline - budget / 2,
+                    )
             except SourceReadError as exc:
                 source_error = exc.reason_code
             except ResearchStopped:
@@ -4987,7 +5277,27 @@ class DataFetcherManager:
                         and not run.stop_reason and not run.finalized
                         and not stage0_ctx.fundamental.get("capital_flow")):
                     stage0_ctx.fundamental["capital_flow"] = ifind_capital_flow
-        verification_budget = min(config.ifind_mcp_timeout_seconds, budget / 2) if config.enable_ifind_mcp and not prefer_ifind else 0.0
+        # 第四十六轮：预留按真正合格的 iFinD 候选能力；第四十八轮修正——
+        # 只按**实际开启且合格**的候选计算（HTTP 关闭时不得引入默认
+        # http_timeout 虚占：Choice 主源+MCP on(8)+HTTP off+预算 60 的旧
+        # 语义 Choice 可用 52 秒，无条件 max 会只剩 30 秒致既有正常请求
+        # 超时；HTTP 开启但凭据/资格不满足同样不虚占）。预留自总 deadline
+        # 划出，不延长总上限。
+        eligible_timeouts: List[float] = []
+        from data_provider.ifind_http_daily_adapter import ifind_http_daily_enabled
+
+        if config.enable_ifind_mcp:
+            eligible_timeouts.append(float(config.ifind_mcp_timeout_seconds))
+        # HTTP 交叉验证份额仅实际参与形态计入（``http_financial_participation_
+        # active`` 已含资格收敛：开关+深研上下文+profile+凭据+timeout）——
+        # 非深研、HTTP 关闭或凭据不满足时不虚占。
+        if http_financial_participation_active():
+            eligible_timeouts.append(float(config.ifind_http_timeout_seconds))
+        verification_budget = (
+            min(max(eligible_timeouts), budget / 2)
+            if eligible_timeouts and not prefer_ifind
+            else 0.0
+        )
         # issue #73：零 Choice 收敛只在获准的 iFinD 主源深研身份内生效（深研 run
         # 上下文 + issue #64 的 false-scope 开关同时成立）；独立专项服务等非深研
         # 调用者走同一 false-scope 入口时保持既有完整聚合（Choice 补充/目标价/
@@ -5003,7 +5313,7 @@ class DataFetcherManager:
             from data_provider.mx_data_adapter import financial_refresh as _pb_refresh
             from src.core.research_run import supplier_need_key as _pb_supplier_need_key
             _refresh = _pb_refresh.get()
-            pb_key = _pb_supplier_need_key("ifind", config.data_source_contract, "directed_pb", code, _refresh[1] if _refresh else "")
+            pb_key = _pb_supplier_need_key("ifind", config.financial_cache_contract, "directed_pb", code, _refresh[1] if _refresh else "")
 
             def _directed_pb() -> Dict[str, Any]:
                 return IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).directed_pb_snapshot(code, deadline=deadline)
@@ -5175,18 +5485,46 @@ class DataFetcherManager:
             except ResearchStopped:
                 pass
         cross_validation = None
-        if config.enable_ifind_mcp:
+        # 第三十一/四十四轮 + 本轮审查收敛：标准 HTTP API 财务快照仅在个股
+        # 深研执行上下文参与（``http_preset_scope_active``，与概念候选门同
+        # 语义）——深研身份下 MCP 关闭（choice 主源 + ENABLE_IFIND_HTTP_API）
+        # 时 API 仍是合法次源补充候选（经 fallback：API 优先 → MCP 兜底
+        # [未配置即跳过] → 既有同期补充契约）；非深研普通业务保持 MCP 原路径
+        # （HTTP 接入前旧行为：段门仅 enable_ifind_mcp、readings 走 MCP 快照
+        # 直调），不因 HTTP 开关改变数据源。
+        _http_scope_active = http_financial_participation_active()
+        if config.enable_ifind_mcp or _http_scope_active:
             from data_provider.cross_source_validator import CrossSourceValidator, SnapshotSource, adopted_field_record, reading_from_field_record, reading_input_reasons, select_current_financials
             from src.agent.tools.cross_validation_helpers import build_cross_validation_block, field_record_from_validation
             fetcher = IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds)
             if not prefer_ifind and not (run and (run.stop_reason or run.finalized)):
-                try:
-                    readings = fetcher.financial_snapshot(code, snapshot.get("report_date"), deadline=deadline)
-                except SourceReadError as exc:
-                    source_error = exc.reason_code
-                    errors.append(str(exc))
-                except ResearchStopped:
-                    pass
+                if _http_scope_active:
+                    try:
+                        from data_provider.ifind_http_daily_adapter import financial_snapshot_with_fallback
+
+                        readings = financial_snapshot_with_fallback(
+                            code, snapshot.get("report_date"), deadline=deadline,
+                            mcp_endpoint=config.ifind_mcp_endpoint,
+                            mcp_token=config.ifind_mcp_token,
+                            mcp_timeout=config.ifind_mcp_timeout_seconds,
+                        )
+                    except SourceReadError as exc:
+                        source_error = exc.reason_code
+                        errors.append(str(exc))
+                    except ResearchStopped:
+                        pass
+                else:
+                    # 非深研：MCP 快照直调（旧行为）；MCP 未配置时
+                    # SourceReadError(invalid_configuration) 走同一 except 隔离。
+                    try:
+                        readings = fetcher.financial_snapshot(
+                            code, snapshot.get("report_date"), deadline=deadline,
+                        )
+                    except SourceReadError as exc:
+                        source_error = exc.reason_code
+                        errors.append(str(exc))
+                    except ResearchStopped:
+                        pass
             primary = {}
             choice_readings = {}
             candidate_periods = {reading.period for reading in readings.values() if reading.period}
@@ -5270,7 +5608,7 @@ class DataFetcherManager:
                             and selected.get("selection_reason") != "ifind_published_single_source"):
                         # issue #71 P1：单源公布值采纳记录的未知口径标注不被核验候选覆盖
                         snapshot["field_meta"][field] = record
-        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.data_source_contract,
+        result: Dict[str, Any] = {"market": "cn", "as_of": snapshot.get("as_of"), "data_contract": config.financial_cache_contract,
                                   "stock_name": snapshot.get("stock_name"), "research": snapshot.get("research", {}), "errors": errors, "source_chain": [], "coverage": {}}
         if cross_validation:
             result["cross_validation"] = cross_validation
@@ -5350,7 +5688,7 @@ class DataFetcherManager:
         if config.data_source_profile != "choice" or not config.enable_ifind_mcp:
             return {}
         stock_code = normalize_stock_code(stock_code)
-        key = f"{config.data_source_contract}|ifind_{section}|{stock_code}|{period or 'latest_annual'}"
+        key = f"{config.financial_cache_contract}|ifind_{section}|{stock_code}|{period or 'latest_annual'}"
         refresh = financial_refresh.get()
         self._prune_fundamental_cache(config.fundamental_cache_ttl_seconds, config.fundamental_cache_max_entries)
         with self._fundamental_cache_lock:

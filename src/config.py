@@ -926,6 +926,13 @@ class Config:
     ifind_mcp_endpoint: Optional[str] = None  # 同花顺 iFinD MCP endpoint
     ifind_mcp_token: Optional[str] = None  # iFinD MCP Authorization token
     ifind_mcp_timeout_seconds: float = 30.0  # iFinD MCP 调用超时
+    # iFinD 标准 HTTP API 日线候选（issue #91）：MCP 日线失败后、东财兜底之前
+    # 的同口径整窗候选。凭据与 MCP token 独立，互不混用；默认关。唯一凭据
+    # IFIND_HTTP_REFRESH_TOKEN（长期有效，网页版超级命令账号详情可获取）：
+    # 进程内自动获取/缓存/过期续用 access_token（官方 get_access_token 端点）。
+    enable_ifind_http_api: bool = False  # ENABLE_IFIND_HTTP_API（标准 HTTP 日线候选总开关）
+    ifind_http_refresh_token: Optional[str] = None  # IFIND_HTTP_REFRESH_TOKEN（标准 API refresh_token，长期有效）
+    ifind_http_timeout_seconds: float = 30.0  # IFIND_HTTP_TIMEOUT_SECONDS
     deep_research_cross_validate: bool = False  # 深度投研锚点双源验证开关
     mx_call_budget: int = 50  # 单次报告 MX 调用上限（控配额）
 
@@ -1460,6 +1467,13 @@ class Config:
                 raise ValueError("ENABLE_IFIND_MCP requires IFIND_MCP_ENDPOINT and IFIND_MCP_TOKEN")
             if not math.isfinite(self.ifind_mcp_timeout_seconds) or self.ifind_mcp_timeout_seconds <= 0:
                 raise ValueError("IFIND_MCP_TIMEOUT_SECONDS must be finite and positive")
+        if self.enable_ifind_http_api:
+            if self.data_source_profile != "choice":
+                raise ValueError("ENABLE_IFIND_HTTP_API requires DATA_SOURCE_PROFILE=choice")
+            if not (self.ifind_http_refresh_token or '').strip():
+                raise ValueError("ENABLE_IFIND_HTTP_API requires IFIND_HTTP_REFRESH_TOKEN")
+            if not math.isfinite(self.ifind_http_timeout_seconds) or self.ifind_http_timeout_seconds <= 0:
+                raise ValueError("IFIND_HTTP_TIMEOUT_SECONDS must be finite and positive")
         if not self.enabled_markets or set(self.enabled_markets) - {"cn", "hk", "us"}:
             raise ValueError("ENABLED_MARKETS must be a nonempty subset of cn,hk,us")
         if self.agent_arch not in self._VALID_AGENT_ARCH:
@@ -1974,6 +1988,11 @@ class Config:
             ifind_mcp_token=os.getenv("IFIND_MCP_TOKEN") or None,
             ifind_mcp_timeout_seconds=float(
                 os.getenv("IFIND_MCP_TIMEOUT_SECONDS") or "30.0"
+            ),
+            enable_ifind_http_api=parse_env_bool(os.getenv("ENABLE_IFIND_HTTP_API"), default=False),
+            ifind_http_refresh_token=os.getenv("IFIND_HTTP_REFRESH_TOKEN") or None,
+            ifind_http_timeout_seconds=float(
+                os.getenv("IFIND_HTTP_TIMEOUT_SECONDS") or "30.0"
             ),
             deep_research_cross_validate=parse_env_bool(
                 os.getenv("DEEP_RESEARCH_CROSS_VALIDATE"), default=False
@@ -3181,13 +3200,44 @@ class Config:
         return normalized
 
     @property
+    def _choice_contract_base(self) -> str:
+        """choice 主源契约的基础段（不含日线启用开关扩展段）。"""
+        from data_provider.choice_adapter import ChoiceAdapter
+        contract = ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
+        # issue #86：iFinD 现金分红前复权日线进入同一启用开关；日线口径/缓存
+        # 语义变化纳入契约身份，旧成功报告不沿用新日线窗口。
+        contract = contract + ("-ifind-daily-cashqfq-v1" if self.enable_ifind_mcp else "")
+        return contract
+
+    @property
     def data_source_contract(self) -> str:
         if self.data_source_profile == "choice":
-            from data_provider.choice_adapter import ChoiceAdapter
-            contract = ChoiceAdapter.contract_version + ("-ifind-financial-v1" if self.enable_ifind_mcp else "") + ("-primary-ifind-v1" if self.financial_primary_source == "ifind" else "")
-            # issue #86：iFinD 现金分红前复权日线进入同一启用开关；日线口径/缓存
-            # 语义变化纳入契约身份，旧成功报告不沿用新日线窗口。
-            return contract + ("-ifind-daily-cashqfq-v1" if self.enable_ifind_mcp else "")
+            contract = self._choice_contract_base
+            # issue #91 第十轮：标准 HTTP 日线行为纳入缓存身份——MCP on/off ×
+            # HTTP on/off 四象限身份互不相同，HTTP 开启后普通非强刷不再复用
+            # HTTP 关闭期的旧成功报告/维度缓存（会零新源请求），重新获取让新
+            # 源真实出站；历史报告保留可读，仅不再作为当前身份命中。
+            # 第二十四轮：该 HTTP 段仅保留在全局契约（深研报告/维度缓存身份
+            # 不变）；与日线口径无关的普通财务缓存身份见
+            # ``financial_cache_contract``，不再随 HTTP 开关翻转失效。
+            return contract + ("-ifind-http-daily-v1" if self.enable_ifind_http_api else "")
+        return "legacy"
+
+    @property
+    def financial_cache_contract(self) -> str:
+        """财务/基本面缓存身份（本轮审查收敛：不再含 HTTP 开关段）。
+
+        标准 HTTP 财务/公司快照仅在个股深研授权上下文出站（非深研普通
+        基本面专项保持 MCP/Choice 原路径）——非深研的财务来源与 HTTP 开关
+        无关，本身份不再随开关翻转（非深研调用、预算、缓存均不被该开关
+        改变）。深研身份的 HTTP 段由消费键的深研段承载（base.py 深研缓存
+        键 ``|d1`` 在开关开启时附加 ``-http-fin-v1``）；深研报告/维度缓存
+        继续使用含 HTTP 段的完整 ``data_source_contract``。写入与读取两侧
+        必须同用本属性。开关翻转/本收敛落地时既有按旧身份写入的财务缓存
+        一次性失效重取（保留可读不命中，既有回滚语义不变）。
+        """
+        if self.data_source_profile == "choice":
+            return self._choice_contract_base
         return "legacy"
 
     def get_effective_news_window_days(self) -> int:

@@ -541,11 +541,9 @@ class TestDimCache:
         import os
         from datetime import datetime, timedelta
 
-        # 缓存文件名随 data_source_contract 后缀派生，批量运行时同进程 Config
-        # 可能已被其他测试改为 choice 契约；按当前契约动态定位实际文件。
-        contract = get_config().data_source_contract
-        suffix = "" if contract == "legacy" else f"_{contract}"
-        path = os.path.join(str(tmp_path), f"600519{suffix}_data.json")
+        # 文件定位走公开路径构造（缓存身份含 contract 与参与段——手拼
+        # 文件名会随身份段演进漂移，第十七轮起统一 ``_cache_path``）。
+        path = dim_cache._cache_path("600519", "data")
         record = json.loads(open(path, encoding="utf-8").read())
         record["saved_at"] = (datetime.now() - timedelta(hours=25)).isoformat()
         open(path, "w", encoding="utf-8").write(json.dumps(record))
@@ -623,13 +621,10 @@ class TestSnapshotCache:
 
         monkeypatch.setattr(dim_cache, "_CACHE_DIR", str(tmp_path))
         # 固定早返回前置条件（批量运行时同进程 Config 可能已被其他测试改动），
-        # 快照键按当前契约动态构造，与 _safe_fundamental 的键生成保持一致。
+        # 快照键走公开构造（含 _d/_h 身份段——手拼键已随参与段演进失效）。
         cfg = get_config()
         monkeypatch.setattr(cfg, "deep_research_cross_validate", False)
-        key = (
-            f"stage0_fund_{cfg.data_source_contract}"
-            f"_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_600519"
-        )
+        key = ctx_mod.stage0_fundamental_cache_key(cfg, "600519")
         dim_cache.save_snapshot(key, {
             "pe_ttm": 19.09, "pb": 2.0, "roe": 18.0, "gross_margin": 40.0,
             "revenue_growth": 10.0, "net_profit_yoy": 10.0, "market_cap": 10000.0,

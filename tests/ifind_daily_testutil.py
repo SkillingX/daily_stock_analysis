@@ -43,8 +43,37 @@ def enabled_config(monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True, pro
     return config
 
 
+def http_enabled_config(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool = True,
+    mcp_enabled: bool = False,
+):
+    """标准 HTTP 日线候选（issue #91）的启用配置；凭据与 MCP 互不混用。
+
+    默认关掉 MCP 候选，使 HTTP 预置次序可被单独观测；``mcp_enabled=True``
+    保留 MCP 候选以覆盖两段预置尝试的组合语义。唯一凭据形态为
+    ``IFIND_HTTP_REFRESH_TOKEN``（第八轮移除静态 access_token 双模式）。
+    """
+    from src.config import Config
+
+    config = enabled_config(monkeypatch, enabled=mcp_enabled)
+    config.enable_ifind_http_api = enabled
+    config.ifind_http_refresh_token = "long-lived-refresh-token" if enabled else None
+    config.ifind_http_timeout_seconds = 30.0
+    monkeypatch.setattr(Config, "_instance", config)
+    return config
+
+
 def strict_calendar(monkeypatch: pytest.MonkeyPatch):
-    """确定性严格日历：会话枚举走真实实现，参考时间固定为 NOW。"""
+    """确定性严格日历：会话枚举走真实实现，参考时间固定为 NOW。
+
+    只 patch tc 模块属性（三个入口），返回 tc 模块本身（既有契约，调用者
+    如 test_ifind_daily_adapter 以 ``tc = strict_calendar(...)`` 取模块）。
+    消费 pipeline 时间的 offline fixture（test_ifind_daily_cache）在
+    teardown 用 ``tc.get_effective_trading_date`` 的当前值识别本作用域
+    写入的实现，对 pipeline 的 from-import 别名做条件恢复。
+    """
     from src.core import trading_calendar as tc
 
     real_between = tc.trading_sessions_between
@@ -66,6 +95,25 @@ def strict_calendar(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(tc, "get_effective_trading_date", _effective)
     monkeypatch.setattr(tc, "trading_sessions_between", _sessions)
     return tc
+
+
+def restore_pipeline_alias_if_scoped(scope_effective, entered_effective) -> None:
+    """仅当已导入 pipeline 的日历别名仍指向 *scope_effective* 时恢复为进入值。
+
+    pipeline 经 from-import 在导入时快照 tc 属性：若首次导入发生在某
+    strict_calendar 作用域内，别名绑定该作用域实现，monkeypatch.undo 恢复
+    tc 后别名仍留在旧引用上。此恢复只精确处理这一种情况——别名已被其它
+    逻辑（外层 fixture、后续作用域）改写时不无条件覆盖，外层 sentinel 得以
+    保留；无导入时为 no-op。
+    """
+    import sys
+
+    pipeline_module = sys.modules.get("src.core.pipeline")
+    if (
+        pipeline_module is not None
+        and pipeline_module.get_effective_trading_date is scope_effective
+    ):
+        pipeline_module.get_effective_trading_date = entered_effective
 
 
 class RecordingIfindStub:

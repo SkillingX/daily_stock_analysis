@@ -70,14 +70,21 @@ def sync_unmet_history_notes(ctx: SharedContext, run: "ResearchRun | None" = Non
 def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, Any]]:
     try:
         from src.services.history_loader import load_history_df
+        from src.services.run_diagnostics import sanitize_diagnostic_text
 
         df, source = load_history_df(code, days=days)
         ctx.history_source = str(source or "")
         if df is None or df.empty:
             if source and source != "none":
                 # issue #86（PR87 spec）：换源/重叠冲突扩窗的显式拒绝原因进
-                # 限制注记（同前缀，后续同 run 采纳仍会清理）。
-                ctx.limitation(f"{HISTORY_MISSING_NOTE}: {source}")
+                # 限制注记（同前缀，后续同 run 采纳仍会清理）。报告披露边界
+                # 统一脱敏限长（issue #94 复审收敛）：loader 返回值已是脱敏
+                # 原因，此处按同一规范再入库，防其他入口传入原始异常串。
+                reason_text = (
+                    sanitize_diagnostic_text(source, max_length=300)
+                    or "failure reason unavailable"
+                )
+                ctx.limitation(f"{HISTORY_MISSING_NOTE}: {reason_text}")
             else:
                 ctx.limitation(HISTORY_MISSING_NOTE)
             return []
@@ -87,8 +94,14 @@ def _safe_history(code: str, days: int, ctx: SharedContext) -> List[Dict[str, An
                 r["date"] = str(r["date"])
         return records
     except Exception as exc:  # noqa: BLE001 - 阶段0装配失败只降级
-        logger.warning("[DualTrack] 历史数据装配失败 %s: %s", code, exc)
-        ctx.limitation(f"{HISTORY_FAILED_NOTE_PREFIX}: {exc}")
+        from src.services.run_diagnostics import sanitize_diagnostic_text
+
+        safe_reason = (
+            sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", max_length=300)
+            or type(exc).__name__
+        )
+        logger.warning("[DualTrack] 历史数据装配失败 %s: %s", code, safe_reason)
+        ctx.limitation(f"{HISTORY_FAILED_NOTE_PREFIX}: {safe_reason}")
         return []
 
 
@@ -150,6 +163,28 @@ def industry_hint_from_research(research: Dict[str, Any], boards: Any) -> str:
     return hint
 
 
+def stage0_fundamental_cache_key(config: Any, code: str) -> str:
+    """阶段 0 基本面持久快照键（公开构造：写入/读取/测试共用）。
+
+    身份段：完整 ``data_source_contract``（含 HTTP 开关段——阶段 0 随开关
+    一次性失效重取）+ mapping/cv 版本 + ``_d``（零 Choice 收敛身份，Choice
+    主源恒 0）+ ``_h``（HTTP 财务参与段——Choice 主源深研（HTTP 参与）与
+    普通专项（不参与）必须隔离，否则双向串缓存）。手拼此键的测试曾因参与
+    段引入而全部失效——统一走本构造防再漂移。
+    """
+    from data_provider.base import ifind_deep_research_scope_active
+    from data_provider.ifind_http_daily_adapter import http_financial_participation_active
+    from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION
+
+    deep_scope_cached = ifind_deep_research_scope_active(include_sector_flows=False)
+    http_participating = http_financial_participation_active()
+    return (
+        f"stage0_fund_{config.data_source_contract}"
+        f"_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(config.deep_research_cross_validate))}"
+        f"_d{int(deep_scope_cached)}_h{int(http_participating)}_{code}"
+    )
+
+
 def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     """基本面快照：日内不变，走 24h 快照缓存（实测抓取 25s，为阶段 0 最慢一路）。
 
@@ -162,7 +197,7 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
     独立服务保持既有完整聚合（Choice 补充/目标价/公司）不变，快照缓存
     按深研身份分段互不串用。
     """
-    from src.deep_research_dims.dim_cache import FUNDAMENTAL_MAPPING_VERSION, load_snapshot, save_snapshot
+    from src.deep_research_dims.dim_cache import load_snapshot, save_snapshot
     from src.config import get_config
     from src.core.research_run import current_research, ResearchStopped
 
@@ -174,9 +209,10 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         deadline = min(deadline, outer_deadline)
     # issue #73：深研身份进入缓存身份——深研 run（零 Choice）与独立专项服务的
     # 完整聚合快照互不串用，不把完整聚合的 Choice 证据经缓存带进深研报告。
-    from data_provider.base import ifind_deep_research_scope_active
-    deep_scope_cached = ifind_deep_research_scope_active(include_sector_flows=False)
-    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_d{int(deep_scope_cached)}_{code}"
+    # 本轮审查收敛：HTTP 财务参与的来源差异同样进入缓存身份（见
+    # ``stage0_fundamental_cache_key``——写入/读取与测试共用同一公开构造，
+    # 防手拼键漂移）。
+    cache_key = stage0_fundamental_cache_key(config, code)
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
     refresh = financial_refresh.get()

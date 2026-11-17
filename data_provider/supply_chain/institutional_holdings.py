@@ -10,6 +10,7 @@ Fetches institutional holdings data using akshare:
 """
 
 import logging
+from types import ModuleType
 from typing import Dict, Any, List, Optional, Tuple, cast
 from datetime import datetime
 
@@ -27,7 +28,7 @@ class InstitutionalHoldingsProvider:
     """
 
     def __init__(self):
-        self._ak = None
+        self._ak: Optional[ModuleType] = None
         self._init_akshare()
 
     def _init_akshare(self):

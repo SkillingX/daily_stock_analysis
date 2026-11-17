@@ -53,9 +53,18 @@ def _run_minimax(monkeypatch: pytest.MonkeyPatch, organic: List[Any], *,
     return provider._do_search(query, "synthetic-key", 10)
 
 
+def _recent_date() -> str:
+    """生成处于默认搜索时间窗口内的样本日期。"""
+    from datetime import date as _date, timedelta as _td
+
+    return (_date.today() - _td(days=2)).isoformat()
+
+
 def _good(title: str, link: str, *, snippet: str = "白酒行业新规落地",
-          date: Any = "2026-11-06") -> Dict[str, Any]:
-    return {"title": title, "snippet": snippet, "link": link, "date": date}
+          date: Any = None) -> Dict[str, Any]:
+    # 调用时计算，避免固定日期或模块导入时的日期随时间过期。
+    return {"title": title, "snippet": snippet, "link": link,
+            "date": _recent_date() if date is None else date}
 
 
 class TestMiniMaxRowTypeContract:
@@ -161,10 +170,12 @@ class TestMiniMaxRowTypeContract:
         assert resp.malformed_rows == 0
 
     def test_normal_rows_behavior_unchanged(self, monkeypatch):
-        # 正常行解析行为不变：标题/摘要切片/域名提取/日期透传
+        # 正常行解析行为不变：标题/摘要切片/域名提取/日期透传（近期样本
+        # 动态生成——日期值等值断言保留，值本身相对当前时钟在窗口内）
+        recent = _recent_date()
         resp = _run_minimax(monkeypatch, [
             _good("白酒行业新政策", "https://news.example.com/baijiu/1",
-                  snippet="摘要" * 300, date="2026-11-06"),
+                  snippet="摘要" * 300, date=recent),
         ])
         assert resp.success is True
         assert resp.malformed_rows == 0
@@ -172,7 +183,7 @@ class TestMiniMaxRowTypeContract:
         assert item.title == "白酒行业新政策"
         assert len(item.snippet) == 500  # 既有 500 字符切片保留
         assert item.url == "https://news.example.com/baijiu/1"
-        assert item.published_date == "2026-11-06"
+        assert item.published_date == recent
 
     def test_offwindow_good_row_still_time_filtered_not_malformed(
             self, monkeypatch):
@@ -185,6 +196,13 @@ class TestMiniMaxRowTypeContract:
         assert resp.success is True
         assert resp.results == []
         assert resp.malformed_rows == 0
+
+    def test_recent_sample_within_window_and_old_outside(self):
+        """日期边界证明（真实生产过滤函数直判，非 mock）：动态近期样本
+        （today-2）在默认 7 天窗（+1 buffer）内、固定远期样本在窗外——
+        ``_good`` 默认值与旧闻过滤用例的时效前提由此锚定。"""
+        assert MiniMaxSearchProvider._is_within_days(_recent_date(), 7) is True
+        assert MiniMaxSearchProvider._is_within_days("2020-01-01", 7) is False
 
 
 class TestSearchResponseMetadataPreservation:

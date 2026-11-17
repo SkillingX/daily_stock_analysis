@@ -135,6 +135,19 @@ def _same_source_extension(current: dict[str, Any], candidate: dict[str, Any]) -
     return True
 
 
+def _sanitize_unmet_reason(reason: str) -> str:
+    """未满足记录在持久边界统一脱敏限长（issue #94 复审收敛）。
+
+    unmet 存储经快照进入报告 limitations 持久披露；即使调用方传入原始异常串
+    （含 token/凭据 URL），入库前也按既有诊断脱敏规范处理（与供应商诊断同一
+    标准），保留可诊断的错误类型与安全上下文。
+    """
+    from src.services.run_diagnostics import sanitize_diagnostic_text
+
+    sanitized = sanitize_diagnostic_text(reason, max_length=300)
+    return sanitized or "failure reason unavailable"
+
+
 @dataclass
 class ResearchRun:
     timeout_seconds: float
@@ -313,8 +326,9 @@ class ResearchRun:
         """换源/重叠冲突拒绝后的未满足需求记录（run 锁内对当前权威帧复核）。
 
         迟到拒绝不得复活已解决状态：当前权威帧已按同一覆盖语义（行数或请求
-        跨度起点、同一 as_of）实际满足该需求时不记录。纯状态更新，不取数；
-        停止/预算后的部分报告仍可经快照读取既有状态。
+        跨度起点、同一 as_of）实际满足该需求时不记录。原因在持久边界统一脱敏
+        限长（``_sanitize_unmet_reason``）。纯状态更新，不取数；停止/预算后的
+        部分报告仍可经快照读取既有状态。
         """
         key = f"{as_of}|{days}"
         with self._lock:
@@ -325,7 +339,39 @@ class ResearchRun:
                     list(frame.get("records") or []), as_of, days
                 ):
                     return
-            self._daily_history_unmet[key] = reason
+            self._daily_history_unmet[key] = _sanitize_unmet_reason(reason)
+
+    def record_failed_daily_expansion(self, as_of: str, days: int, reason: str) -> None:
+        """已采纳帧上失败的长窗扩窗需求记录（来源约束等 manager 真实失败）。
+
+        与 ``record_unmet_daily_window`` 共享同一存储与消解机制（同 ``as_of|days``
+        键、采纳锁内按覆盖消解）；差别只在记录条件与披露形状：
+
+        - 无已采纳帧（通用首取失败）不记录——通用缺项注记语义不变，不把首取
+          失败伪装成「已采纳短窗上的扩窗失败」。
+        - 当前权威帧已实际覆盖该需求时不记录（幂等；迟到失败不复活已解决状态）。
+        - 记录时以锁内当前帧来源包装成与换源拒绝同形的披露（含 ``daily window
+          expansion rejected`` 标识），附经统一脱敏限长的失败原因（保留可诊断
+          错误类型与安全上下文）；报告 sync 的清除/重建闭环照常工作，后续真正
+          长窗采纳在同一把锁内消解。
+
+        纯状态更新，不取数；停止/预算后的部分报告仍可经快照读取既有状态。
+        """
+        key = f"{as_of}|{days}"
+        with self._lock:
+            frame = self.daily_history
+            if frame is None:
+                return
+            frame_as_of = str(frame.get("as_of") or "")
+            if frame_as_of == as_of and _records_cover_demand(
+                list(frame.get("records") or []), as_of, days
+            ):
+                return
+            frame_source = str(frame.get("source") or "")
+            self._daily_history_unmet[key] = (
+                f"daily window expansion rejected: retained {frame_source} window kept, "
+                f"longer demand failed: {_sanitize_unmet_reason(reason)}"
+            )
 
     def unmet_daily_history_snapshot(self) -> dict[str, str]:
         """未满足扩窗需求的隔离快照（同一把锁；停止后部分报告仍可读取）。"""

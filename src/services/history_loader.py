@@ -273,6 +273,20 @@ def _overlap_consistent(old_records: List[Dict[str, Any]], new_records: List[Dic
     return True
 
 
+def _failure_reason(exc: BaseException) -> str:
+    """可诊断的失败原因：保留异常类型名，消息统一走既有诊断脱敏规范。
+
+    issue #94 复审收敛：manager 异常串会经返回值、失败 memo、日志与 run 持久
+    未满足记录进入报告披露，因此在构造处（而非单一显示点）统一脱敏并限长
+    （``run_diagnostics.sanitize_diagnostic_text``，与供应商诊断同一标准），
+    保留可诊断的错误类型与安全上下文。
+    """
+    from src.services.run_diagnostics import sanitize_diagnostic_text
+
+    sanitized = sanitize_diagnostic_text(f"{type(exc).__name__}: {exc}", max_length=300)
+    return sanitized or type(exc).__name__
+
+
 def _expansion_rejection(
     served_source: str,
     served_records: List[Dict[str, Any]],
@@ -725,38 +739,51 @@ def load_history_df(
 
     def _fetch_via_manager() -> Tuple[pd.DataFrame, str]:
         # 真实目标截止日传入 manager：历史冻结目标走原源时不再「先取今日再裁剪」。
+        # issue #94：已采用窗口未被替换前，换源候选注定被跨源整窗一致性保护
+        # 拒绝；把已采用来源作为 manager 约束传入，只尝试同源候选，消除注定
+        # 失败的东财等冗余出站。采纳语义与失败原因不变，保护原样保留。
         result: Tuple[pd.DataFrame, str] = _get_fetcher_manager().get_daily_data(
-            stock_code, days=days, end_date=required.isoformat()
+            stock_code, days=days, end_date=required.isoformat(),
+            constraint_source=constraint_source,
         )
         return result
 
+    constraint_source: Optional[str] = None
     # 1) 活跃 ResearchRun 的历史槽是唯一权威帧，即使同时存在股票作用域。
-    if enabled_read and active_run is not None and not force_refresh:
+    if enabled_read and active_run is not None:
         refuse_stopped_or_expired()
         slot = active_run.published_daily_history()
-        if slot and slot.get("as_of") == required.isoformat():
-            slot_records = [dict(row) for row in slot.get("records") or []]
+        if slot:
+            constraint_source = str(slot.get("source") or "") or None
             slot_frame = _WindowFrame(
                 source=str(slot.get("source") or ""), as_of=str(slot.get("as_of")),
-                records=slot_records, consumed=True,
+                records=[dict(row) for row in slot.get("records") or []], consumed=True,
             )
-            if _frame_covers(slot_frame, days, start):
+            if (
+                not force_refresh
+                and slot_frame.as_of == required.isoformat()
+                and _frame_covers(slot_frame, days, start)
+            ):
                 refuse_stopped_or_expired()
-                return _frame_to_df(slot_records), slot_frame.source
+                return _frame_to_df(slot_frame.records), slot_frame.source
 
     # 2) 无 run 时，当前股票任务作用域才持有帧。
-    if enabled_read and active_run is None and scope is not None and not force_refresh:
-        reused = scope.read(days, start)
-        if reused is not None:
-            refuse_stopped_or_expired()
-            df, source = reused
-            _publish_history(df, source, required)
-            refuse_stopped_or_expired()
-            logger.debug(
-                "load_history_df(%s): %d bars from shared task window through %s",
-                stock_code, len(df), required.isoformat(),
-            )
-            return df, source
+    if enabled_read and active_run is None and scope is not None:
+        retained = scope.peek()
+        if retained is not None:
+            constraint_source = retained.source or None
+            if not force_refresh:
+                reused = scope.read(days, start)
+                if reused is not None:
+                    refuse_stopped_or_expired()
+                    df, source = reused
+                    _publish_history(df, source, required)
+                    refuse_stopped_or_expired()
+                    logger.debug(
+                        "load_history_df(%s): %d bars from shared task window through %s",
+                        stock_code, len(df), required.isoformat(),
+                    )
+                    return df, source
 
     # 3) 持久 DB：启用范围不作为命中依据；其余模式沿用既有规则，仅拒绝含
     #    本票遗留 iFinD 行的窗口（含混合），纯旧源混存缓存保持原行为。
@@ -861,14 +888,14 @@ def _enabled_network_window(
             raise
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
-            reason = f"TimeoutError: {exc}"
+            reason = _failure_reason(exc)
             scope.note_failure(need, reason)
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
             return None, reason
         except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
+            reason = _failure_reason(e)
             scope.note_failure(need, reason)
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
             return None, reason
         if df is None or df.empty:
             scope.note_failure(need, "empty result")
@@ -908,21 +935,32 @@ def _enabled_network_window(
         try:
             df, source = run.single_fetch(key, fetch)
         except ResearchStopped:
+            # 取消不是扩窗失败：直接传播，不进入持久未满足记录。
             raise
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
-            return None, f"TimeoutError: {exc}"
+            reason = _failure_reason(exc)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
+            # issue #94：来源约束下的真实同源失败（含源级超时）同样要留下持久
+            # 未满足记录；owner 锁内按权威帧复核，首取失败/已覆盖不误标；
+            # 失败原因在 owner 持久边界再次统一脱敏限长。
+            run.record_failed_daily_expansion(required.isoformat(), days, reason)
+            return None, reason
         except Exception as e:
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
-            return None, f"{type(e).__name__}: {e}"
+            reason = _failure_reason(e)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
+            run.record_failed_daily_expansion(required.isoformat(), days, reason)
+            return None, reason
         if df is None or df.empty:
             logger.warning("load_history_df(%s): 网络返回空窗口", stock_code)
+            run.record_failed_daily_expansion(required.isoformat(), days, "empty result")
             return None, "empty result"
         _stop_or_expired()
         records = _trim_or_fail(df, source)
         if records is None:
-            return None, f"no rows on or before {required.isoformat()}"
+            no_rows = f"no rows on or before {required.isoformat()}"
+            run.record_failed_daily_expansion(required.isoformat(), days, no_rows)
+            return None, no_rows
         _stop_or_expired()
         adopted_slot = run.adopt_daily_history(required.isoformat(), records, source)
         if adopted_slot is None:
@@ -952,11 +990,13 @@ def _enabled_network_window(
             raise
         except TimeoutError as exc:
             propagate_if_control_exhausted(exc)
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, exc)
-            return None, f"TimeoutError: {exc}"
+            reason = _failure_reason(exc)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
+            return None, reason
         except Exception as e:
-            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, e)
-            return None, f"{type(e).__name__}: {e}"
+            reason = _failure_reason(e)
+            logger.warning("load_history_df(%s): DataFetcherManager failed: %s", stock_code, reason)
+            return None, reason
         if df is None or df.empty:
             logger.warning("load_history_df(%s): 网络返回空窗口", stock_code)
             return None, "empty result"

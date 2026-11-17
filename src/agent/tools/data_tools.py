@@ -676,13 +676,31 @@ def _concept_membership(stock_code: str, deadline: float) -> dict[str, Any]:
     from src.core.research_run import ResearchStopped
 
     config = get_config()
-    if not config.enable_ifind_mcp:
+    # 第五十六轮：HTTP 概念候选仅在授权深研上下文参与（current_research 活跃
+    # ——与公司资料/财务快照的深研限定同语义）。第五十二轮补充：非深研 +
+    # HTTP 开 + MCP 关 = 零出站（ifind_disabled——不直调已关闭的 MCP，遗留
+    # 凭据也不出站）；非深研 + MCP 开 = MCP 既有行为不变。
+    from src.core.research_run import current_research
+
+    http_authorized = config.enable_ifind_http_api and current_research.get() is not None
+    if not config.enable_ifind_mcp and not http_authorized:
+        # 双关（或 HTTP 开但非深研）：零出站——不直调已关闭的 MCP。
         return {"concepts": [], "source": "ifind", "as_of_nature": "latest", "error": "ifind_disabled"}
 
     try:
-        membership = IfindFetcher(
-            config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds,
-        ).concept_membership(stock_code, deadline=deadline)
+        if http_authorized:
+            from data_provider.ifind_http_daily_adapter import concept_membership_with_fallback
+
+            membership = concept_membership_with_fallback(
+                stock_code, deadline=deadline,
+                mcp_endpoint=config.ifind_mcp_endpoint,
+                mcp_token=config.ifind_mcp_token,
+                mcp_timeout=config.ifind_mcp_timeout_seconds,
+            )
+        else:
+            membership = IfindFetcher(
+                config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds,
+            ).concept_membership(stock_code, deadline=deadline)
     except ResearchStopped:
         raise
     except SourceReadError as exc:

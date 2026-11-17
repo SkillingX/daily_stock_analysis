@@ -55,7 +55,9 @@ def _same_day_dedup_report(code: str) -> Optional[Dict[str, Any]]:
                 full = db.get_financial_analysis_report(r["id"])
                 if full:
                     from src.config import get_config
-                    contract = get_config().data_source_contract
+                    # 第二十四轮：财务分析报告身份过滤用 financial_cache_contract，
+                    # 不随 HTTP 日线开关翻转失效。
+                    contract = get_config().financial_cache_contract
                     analysis = json.loads(full.get("analysis_json") or "{}")
                     if analysis.get("data_contract", "legacy") != contract:
                         continue
@@ -321,7 +323,7 @@ def _score_dims(series: Dict[str, Any], fund: Dict[str, Any]) -> Dict[str, Any]:
         "financial_snapshot": snapshot,
         "verification_errors": verification_errors,
         "analysis_version": _ANALYSIS_VERSION,
-        "data_contract": get_config().data_source_contract,
+        "data_contract": get_config().financial_cache_contract,
         "years": years_data,
         "rev_yoy": rev_yoy,
         "rev_yoy_fmt": rev_yoy_fmt,

@@ -6,6 +6,7 @@ Fetches concept board (概念板块) data using akshare.
 """
 
 import logging
+from types import ModuleType
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
@@ -23,7 +24,7 @@ class ConceptBoardProvider:
     """
 
     def __init__(self):
-        self._ak = None
+        self._ak: Optional[ModuleType] = None
         self._init_akshare()
 
     def _init_akshare(self):
