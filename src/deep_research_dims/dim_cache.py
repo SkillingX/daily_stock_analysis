@@ -99,8 +99,17 @@ def _cache_path(stock_code: str, dim: str) -> str:
     from src.config import get_config
     contract = get_config().data_source_contract
     suffix = "" if contract == "legacy" else f"_{contract}"
+    # 本轮审查收敛：HTTP 财务参与形态进入持久维度缓存身份——iFinD 主源下
+    # 深研（HTTP 财务）与普通（MCP 财务）的维度投影来源不同，与阶段 0 快照
+    # /manager 进程键用同一参与判定分段（``http_financial_participation_
+    # active``，含资格收敛）。**两种形态都带段**（参与 ``_httpfin``/不参与
+    # ``_plain``）：第八轮审查——旧版本 HTTP 开启期的无后缀文件可能由深研
+    # HTTP 财务产生（旧代码无深研门），若不参与形态仍读旧无后缀文件，升级
+    # 后普通可错误命中旧 HTTP 产物；新段使旧无后缀文件对两种新形态均不再
+    # 命中（一次性失效重建，24h TTL 语义内）。
+    from data_provider.ifind_http_daily_adapter import http_financial_participation_active
+    suffix += "_httpfin" if http_financial_participation_active() else "_plain"
     return os.path.join(_CACHE_DIR, f"{stock_code}{suffix}_{dim}.json")
-
 
 
 def capital_block_within_date_boundary(block: Any, *, now: Optional[Any] = None) -> bool:

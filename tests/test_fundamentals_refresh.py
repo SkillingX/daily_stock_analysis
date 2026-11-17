@@ -77,7 +77,7 @@ def test_real_source_manager_snapshot_and_same_day_caches_are_bypassed(refresh_i
     assert first["status"] == "partial" and first["dims"]["financial"]["profitability"]["roe"]["value"] is None
     assert not state["manager"]._fundamental_cache  # incomplete manager snapshots remain retryable
     before = len(state["calls"])
-    business_file = Path(dim_cache._CACHE_DIR) / "600519_business.json"
+    business_file = Path(dim_cache._cache_path("600519", "business"))
     business_bytes = business_file.read_bytes()
     state.update(roe=18.0, error=False)
     ordinary = svc.generate_fundamentals_report("600519", "样本")

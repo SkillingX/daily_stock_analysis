@@ -128,6 +128,12 @@ _FIELD_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "is_sensitive": True, "is_required": False, "is_editable": False,
         "default_value": "", "options": [], "validation": {}, "display_order": 16,
     },
+    "IFIND_HTTP_REFRESH_TOKEN": {
+        "title": "iFinD标准HTTP刷新令牌", "description": "标准 HTTP 日线候选凭据（issue #91；候选默认不出站）。长期有效（网页版超级命令账号详情可获取）；配置后进程内自动获取/缓存/过期续用 access_token（官方 get_access_token 端点）。仅本机私有.env或部署凭据注入，修改后重启进程。",
+        "category": "data_source", "data_type": "string", "ui_control": "password",
+        "is_sensitive": True, "is_required": False, "is_editable": False,
+        "default_value": "", "options": [], "validation": {}, "display_order": 16,
+    },
     "SECTOR_EASTMONEY_PROXY_URL": {
         "title": "板块东财出站代理", "description": "板块专项东财公共行情（push2/push2his 及数字分片子域）可选正向代理；空=直连行为不变；认证信息仅限本机.env或部署凭据注入，配置值部署敏感且服务端掩码显示，修改后重启进程。",
         "category": "data_source", "data_type": "string", "ui_control": "password",

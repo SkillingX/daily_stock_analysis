@@ -140,6 +140,7 @@ class SystemConfigService:
         "CHOICE_USERNAME",
         "CHOICE_PASSWORD",
         "IFIND_MCP_TOKEN",
+        "IFIND_HTTP_REFRESH_TOKEN",
         "SECTOR_EASTMONEY_PROXY_URL",
         "TAVILY_API_KEYS",
         "ALPHASIFT_INSTALL_SPEC",

@@ -398,9 +398,13 @@ class CircuitBreaker:
     def is_available(self, source: str) -> bool:
         """
         检查数据源是否可用
-        
+
         返回 True 表示可以尝试请求
         返回 False 表示应跳过该数据源
+
+        注意：半开态下本方法会**取走唯一探测名额**（预约语义，有副作用）——
+        只读观察请用 :meth:`peek_available`（第十四轮：诊断等非出站路径不得
+        为观察消耗探测配额）。
         """
         with self._lock:
             state = self._get_state_locked(source)
@@ -440,7 +444,31 @@ class CircuitBreaker:
                 return False
 
             return True
-    
+
+    def peek_available(self, source: str) -> bool:
+        """只读观察：现在出站会不会被熔断器拒绝。
+
+        与 :meth:`is_available` 的差异仅在半开/冷却到期态——``is_available``
+        会取走唯一探测名额并推进状态机（预约语义，有副作用），本方法不消耗
+        名额、不迁移状态（第十四轮：诊断等非出站路径不得为观察消耗探测配
+        额——此前 base.py 为 fallback_to 诊断提前 ``is_available`` 会在
+        HALF_OPEN 占位，导致真正的出站尝试被跳过、MCP 成功路径也无故占位）。
+        真正出站仍必须走 ``is_available``（取号）。
+        """
+        with self._lock:
+            state = self._get_state_locked(source)
+            current_time = time.time()
+            if state['state'] == self.CLOSED:
+                return True
+            if state['state'] == self.OPEN:
+                return bool((current_time - state['last_failure_time']) >= self.cooldown_seconds)
+            if state['state'] == self.HALF_OPEN:
+                if state['half_open_calls'] < self.half_open_max_calls:
+                    return True
+                # 名额用尽：冷却再次到期时 is_available 会重置并允许重新探测。
+                return bool((current_time - state['last_failure_time']) >= self.cooldown_seconds)
+            return True
+
     def record_inconclusive(self, source: str) -> None:
         """记录不确定的探测结果（如返回 None）。
 
