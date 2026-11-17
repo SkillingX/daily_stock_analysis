@@ -4,8 +4,11 @@
 第三十二轮完整收敛后锁定：
 - 主源多期语义（period=None）API 真实候选（最新已披露期探测，非直落 MCP）；
 - 每字段按官方模板出参（roe 仅 TD、毛利率/同比/披露日仅 D、四指标 D+C）；
-- statement_scope="consolidated" + adjustment="restated" + period_basis
-  annual/YTD——最终业务字段经既有采纳门（_eligible_current_financial）合格；
+- 报表口径按字段证据（第二十轮）：仅 D+C 指标（C='3' 合并报表(调整)枚举）
+  标注 consolidated/restated；d_only 指标（roe/毛利率/两同比）口径未证明
+  → None（真实未知，不伪装 restated）→ fallback 按「口径待补」交 MCP 补缺
+  （MCP 可用则真实口径拼入；不可用则消费层 unknown 资格路径如实降级）；
+  period_basis annual/YTD 不变；
 - 采纳前披露时点校验（None/晚于今日拒绝，未来披露期回退上一期）；
 - API 部分缺失由 MCP 同期补缺（逐字段来源标注忠实，期不一致不拼）；
 - 401/403 鉴权强刷重试一次（与日线 authorized 一致）；取消/双失败/关开关/
@@ -101,16 +104,23 @@ def test_api_full_snapshot_and_request_contract(finance_env, monkeypatch):
     assert params["ths_roe_wgt_publish_stock"] == [PERIOD]        # 仅 TD
     assert params["ths_gross_selling_rate_stock"] == [PERIOD]     # 仅 D
     assert params[A._FINANCE_DISCLOSED_AT_INDICATOR] == [PERIOD]  # 仅 D
-    # 最终业务字段合格：既有采纳门（issue #45）按真实契约判定通过
+    # 报表口径按字段证据（第二十轮）：D+C 指标有 C='3' 枚举证据
+    # （consolidated/restated，采纳门合格）；d_only 指标口径未证明
+    # （None 真实未知，采纳门如实拒——不伪装 restated）。
     for field, reading in readings.items():
         assert reading.source == "ifind"
         # 第三十三轮：source_family 由 post_init 从 source 自动推导 "ths"
         # （与 MCP 同供应商家族，交叉验证独立性不被误判）
         assert reading.source_family == "ths"
-        assert reading.statement_scope == "consolidated"
-        assert reading.adjustment == "restated"
         assert reading.disclosed_at == "2026-10-31"
-        assert _eligible_current_financial(reading, field) is True
+        if field in ("revenue", "net_profit", "assets", "liabilities"):
+            assert reading.statement_scope == "consolidated"
+            assert reading.adjustment == "restated"
+            assert _eligible_current_financial(reading, field) is True
+        else:
+            assert reading.statement_scope is None, f"{field} d_only 口径未证明"
+            assert reading.adjustment is None
+            assert _eligible_current_financial(reading, field) is False, "未知口径不得伪装合格（待 MCP 补缺/如实降级）"
 
 
 def test_bank_natural_missing_then_mcp_same_period_fill(finance_env, monkeypatch):
@@ -206,8 +216,8 @@ def test_period_none_latest_disclosed_probe(finance_env, monkeypatch):
         return 200, _payload()
 
     monkeypatch.setattr(A, "_http_api_curl_post", fake_curl)
-    mcp = _McpStub([])
-    mcp.install(monkeypatch)
+    from src.config import get_config
+    get_config().enable_ifind_mcp = False  # 探测语义不掺补缺（第二十轮）
     readings = A.financial_snapshot_with_fallback(
         CODE, None, deadline=_real_deadline(60.0),
         mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0,
@@ -215,7 +225,8 @@ def test_period_none_latest_disclosed_probe(finance_env, monkeypatch):
     assert readings and readings["revenue"].period == "2026-09-30"
     assert len(calls) == 1  # 首个候选（20260930）披露日已过即命中
     assert calls[0]["indipara"][0]["indiparams"][0] == "20260930"
-    assert mcp.calls == []  # 不直落 MCP
+    # d_only 口径未证明：真实 None（不伪装 restated），由补缺语义用例覆盖。
+    assert readings["roe"].statement_scope is None
 
 
 def test_future_disclosure_falls_back_to_earlier_period(finance_env, monkeypatch):
@@ -230,6 +241,8 @@ def test_future_disclosure_falls_back_to_earlier_period(finance_env, monkeypatch
         return 200, payloads[period]
 
     monkeypatch.setattr(A, "_http_api_curl_post", fake_curl)
+    from src.config import get_config
+    get_config().enable_ifind_mcp = False  # 披露日反例专注 API 探测（第二十轮）
     readings = A.financial_snapshot_with_fallback(
         CODE, None, deadline=_real_deadline(60.0),
         mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0,
@@ -792,8 +805,12 @@ def test_latest_field_level_merge_single_side_real_period(finance_env, monkeypat
     assert readings["liabilities"].period == "2026-06-30"
     assert readings["gross_margin"].period == "2026-06-30"
     assert calls == ["20260930", "20260630"]  # 逐字段探测两期
+    # 采纳门按字段口径证据（第二十轮）：D+C 指标合格；d_only 指标口径
+    # 未证明（None）→ 如实拒（本入口为 API-only 探测，补缺语义由
+    # fallback 用例覆盖）。
     for field, reading in readings.items():
-        assert _eligible_current_financial(reading, field) is True
+        expected = field in ("revenue", "net_profit", "assets", "liabilities")
+        assert _eligible_current_financial(reading, field) is expected
 
 
 def test_balance_pair_rejected_by_manager_same_period_rule(finance_env, monkeypatch):
@@ -944,3 +961,77 @@ def test_mcp_unavailable_preserves_api_failure_reasons(finance_env, monkeypatch,
                 mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0)
     for record in caplog.records:
         assert "tok_test_access" not in record.getMessage()
+
+
+def test_d_only_unknown_caliber_filled_by_mcp_when_available(finance_env, monkeypatch):
+    """第二十轮反例（MCP 可用）：d_only 四指标口径未证明（None）→ fallback
+    按「口径待补」交 MCP——MCP 同期候选携带真实合格口径拼入（期一致），
+    补入后字段口径为 MCP 真实值（不虚构）；D+C 指标保持 API 证据口径。"""
+    from src.config import get_config
+    get_config().enable_ifind_mcp = True
+    monkeypatch.setattr(A, "_http_api_curl_post", lambda *a, **k: (200, _payload()))
+    mcp_candidate = {}
+    for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        mcp_candidate[field] = AnchorReading(
+            "ifind", 77.0, period="2026-09-30", period_basis="YTD",
+            unit="percentage_point", statement_scope="consolidated",
+            adjustment="restated")
+    mcp = _McpStub([mcp_candidate])
+    mcp.install(monkeypatch)
+    readings = A.financial_snapshot_with_fallback(
+        CODE, PERIOD, deadline=_real_deadline(30.0),
+        mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0,
+    )
+    assert mcp.calls, "口径待补字段必须尝试 MCP 补缺"
+    for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        assert readings[field].value == 77.0
+        assert readings[field].statement_scope == "consolidated"
+        assert readings[field].adjustment == "restated", "补入口径为 MCP 真实值"
+    for field in ("revenue", "net_profit", "assets", "liabilities"):
+        assert readings[field].value == 123.45, "D+C 指标保持 API 值（有证据口径不待补）"
+
+
+def test_d_only_unknown_caliber_kept_unknown_when_mcp_unavailable(finance_env, monkeypatch):
+    """第二十轮反例（MCP 不可用）：d_only 四指标口径未知且 MCP 关闭——
+    API 值保留在快照、口径如实 None（不伪装 restated 不拦快照），采纳门
+    如实拒（消费层既有 unknown 资格路径降级）。"""
+    from src.config import get_config
+    from data_provider.cross_source_validator import _eligible_current_financial
+    get_config().enable_ifind_mcp = False
+    monkeypatch.setattr(A, "_http_api_curl_post", lambda *a, **k: (200, _payload()))
+    readings = A.financial_snapshot_with_fallback(
+        CODE, PERIOD, deadline=_real_deadline(30.0),
+        mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0,
+    )
+    for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        assert readings[field].value == 123.45, "值保留在快照（不拦 fallback）"
+        assert readings[field].statement_scope is None
+        assert readings[field].adjustment is None
+        assert _eligible_current_financial(readings[field], field) is False, "未知口径不得伪装合格（如实降级）"
+    for field in ("revenue", "net_profit", "assets", "liabilities"):
+        assert _eligible_current_financial(readings[field], field) is True
+
+
+def test_ineligible_mcp_candidate_no_evidence_loss(finance_env, monkeypatch):
+    """无资格 MCP 候选（口径同样未知）拼入不丢证据：值保留可追溯、期真实
+    标注（多期形态自身期）、最终按既有资格拒——不伪装、不丢 API 证据链。"""
+    from src.config import get_config
+    from data_provider.cross_source_validator import AnchorReading, _eligible_current_financial
+    from data_provider.ifind_fundamental_adapter import IfindFetcher
+    get_config().enable_ifind_mcp = True
+    monkeypatch.setattr(A, "_http_api_curl_post", lambda *a, **k: (200, _payload()))
+
+    def mcp_ineligible(self, code, period, *, deadline):
+        return {"roe": AnchorReading("ifind", 55.0, period="2025-12-31",  # 自身真实期
+                                     unit="percentage_point", statement_scope=None, adjustment=None)}
+
+    monkeypatch.setattr(IfindFetcher, "financial_snapshot", mcp_ineligible)
+    readings = A.financial_snapshot_with_fallback(
+        CODE, None, deadline=_real_deadline(30.0),  # 主源多期：候选带自身期补入
+        mcp_endpoint="e", mcp_token="t", mcp_timeout=5.0,
+    )
+    assert readings["roe"].value == 55.0 and readings["roe"].period == "2025-12-31"
+    assert readings["roe"].normalization_error is None, "拼入候选不带失败标注（补缺成功）"
+    assert _eligible_current_financial(readings["roe"], "roe") is False, "无资格候选最终如实拒"
+    for field in ("revenue", "net_profit", "assets", "liabilities"):
+        assert readings[field].value == 123.45, "D+C API 证据不受影响"

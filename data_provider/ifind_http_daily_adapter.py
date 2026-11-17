@@ -935,6 +935,13 @@ _FINANCE_FIELD_SPECS: Tuple[Tuple[str, str, str, str, str], ...] = (
     # 枚举；D=仅报告期；TD=报告期（该指标单参数变体）。多余参数不可依赖
     # 服务端忽略。caliber 对齐 MCP 解析规范值（caliber_from_label），
     # 消费方 reading_input_reasons 按此校验口径身份。
+    # 报表口径证据（第二十轮审查收敛，scope 与 adjustment 各自独立证明）：
+    # 仅 **D+C** 指标携带 C='3'（合并报表(调整)）枚举——解析标注
+    # consolidated/restated 有请求参数证据；**d_only** 指标（roe/毛利率/
+    # 两同比）请求不含报表类型参数，数值与 D+C 指标接近不构成调整口径
+    # 证据——scope/adjustment 按真实未知（None）标注，不伪装 restated，
+    # 由 ``financial_snapshot_with_fallback`` 按「口径待补」交给既有合格
+    # MCP 补缺/消费层 unknown 资格路径如实处理。
     ("revenue", "ths_revenue_stock", "currency_base", "dc", "operating_revenue"),
     ("net_profit", "ths_np_atoopc_stock", "currency_base", "dc", "parent_net_profit"),
     ("roe", "ths_roe_wgt_publish_stock", "percentage_point", "d_only", "weighted_roe"),
@@ -1066,8 +1073,12 @@ def _parse_finance_table(
     - 披露日只取披露日指标实际值；None 或晚于分析时点（本地今日，与既有
       ``confirmed_disclosed_period`` 锚一致）→ 整期拒绝（供应商可能回退
       返回未披露期数据，值本身不可信）——走 MCP 兜底而非采纳；
-    - ``statement_scope="consolidated"`` + ``adjustment="restated"``：对齐
-      MCP 合并报表(调整) 的既有合格契约（P1/主源采纳判定按此比较）。
+    - 报表口径按字段证据（第二十轮）：仅 **D+C 指标**（请求携带 C='3'
+      合并报表(调整) 枚举）标注 ``statement_scope="consolidated"`` +
+      ``adjustment="restated"``（对齐既有合格契约，P1/主源采纳判定按此
+      比较）；**d_only 指标**（roe/毛利率/两同比，请求仅日期参数）口径
+      未证明——None 真实未知，不伪装 restated，由 fallback 按「口径待补」
+      交 MCP 补缺/消费层 unknown 资格路径处理。
     """
     import logging
 
@@ -1133,7 +1144,7 @@ def _parse_finance_table(
     # 要求 basis ∈ {annual, YTD}，最终业务字段才合格。
     period_basis = "annual" if period.endswith("1231") else "YTD"
     readings: Dict[str, Any] = {}
-    for field, indicator, unit, _form, caliber in _FINANCE_FIELD_SPECS:
+    for field, indicator, unit, form, caliber in _FINANCE_FIELD_SPECS:
         cells = table.get(indicator)
         value = cells[0] if isinstance(cells, list) and cells else None
         if value is None or str(value).strip() in ("", "--"):
@@ -1168,8 +1179,12 @@ def _parse_finance_table(
             unit=unit,
             currency="CNY",
             disclosed_at=disclosed_at,
-            statement_scope="consolidated",
-            adjustment="restated",
+            # 报表口径按字段证据（第二十轮）：仅 D+C 指标（C='3' 合并报表
+            # (调整) 枚举）标注 consolidated/restated；d_only 指标请求不含
+            # 报表类型参数、口径未证明——None（真实未知），不伪装 restated，
+            # 待 MCP 补缺/消费层 unknown 资格路径处理。
+            statement_scope="consolidated" if form == "dc" else None,
+            adjustment="restated" if form == "dc" else None,
             # source_family 不显式设置：AnchorReading post_init 从
             # source="ifind" 自动推导 "ths"（与 MCP 读数同供应商家族）——
             # 同花顺 HTTP 与 MCP 是同一来源家族，不得被交叉验证误判为
@@ -1834,6 +1849,12 @@ def financial_snapshot_with_fallback(
     missing = [
         f for f, _i, _u, _form, _cal in _FINANCE_FIELD_SPECS
         if f not in api_readings or not math.isfinite(api_readings[f].value)
+        # 口径待补（第二十轮）：值在但 statement_scope/adjustment 未证明
+        # （d_only 指标无请求参数证据）的字段同样交 MCP 补缺——不把未知
+        # 口径值伪装成合格快照阻塞 fallback；MCP 候选携带自身真实口径拼入
+        # （期一致+有限既有条件不变），不可用则消费层既有 unknown 资格
+        # 路径如实降级（不虚构 restated）。
+        or api_readings[f].statement_scope is None or api_readings[f].adjustment is None
     ]
     if missing and mcp_ready:
         # 补缺财期契约按调用形态区分（第四十轮修正第三十九轮的过宽合并）：
@@ -1871,7 +1892,9 @@ def financial_snapshot_with_fallback(
                 )
                 api_readings[field] = candidate  # source/source_family/period 保持 MCP 值
         except SourceReadError as exc:
-            # 补缺失败如实保留 API 缺失/无效字段，不伪装。
+            # 补缺失败如实保留 API 缺失/无效字段，不伪装（日志保真；第二十
+            # 二轮：不借 normalization_error 扩展诊断协议——该通道承载口径
+            # 未知等原始拒因，供应商超时不覆盖之，缺失字段也不因此获因）。
             logger.warning("financial_snapshot %s MCP 补缺失败：%s", code, exc.reason_code)
         except DataFetchError as exc:
             logger.warning("financial_snapshot %s MCP 补缺传输失败：%s", code, _safe(exc))
@@ -1879,8 +1902,10 @@ def financial_snapshot_with_fallback(
             # 用户取消是 TimeoutError 子类，必须先于 TimeoutError 穿透：
             # 补缺阶段的取消同样不吞、不伪装为补缺成功。
             raise
-        except TimeoutError:
-            pass  # 补缺超时不阻断已取得的 API 快照（预算不延长）
+        except TimeoutError as exc:
+            # 补缺超时不阻断已取得的 API 快照（预算不延长）；与其他补缺
+            # 失败同按既有日志方式留痕（脱敏 warning）。
+            logger.warning("financial_snapshot %s MCP 补缺超时：%s", code, _safe(exc))
     return api_readings
 
 

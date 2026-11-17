@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 个股深研财务指标按已确认口径采纳，口径未知时尝试 MCP 补缺；补缺失败保留合格数据并记录日志。
 - [新功能] 个股深研可使用 iFinD 标准 API 获取主力资金流；当日数据未能确认定稿或请求失败时按既有规则回退。
 - [新功能] 个股深研可使用 iFinD 标准 API 获取财务快照、公司资料和概念；数据不合格或缺失时保留 MCP 等既有兜底。
 - [修复] iFinD 标准 API 日线不写入跨业务共享日线表，避免影响其他业务的数据来源。

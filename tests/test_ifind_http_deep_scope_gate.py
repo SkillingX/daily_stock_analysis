@@ -100,6 +100,21 @@ def base_env(monkeypatch):
     _stub_capital_chain(monkeypatch)
 
 
+def _d_only_qualified_candidates(period: str = "2026-09-30") -> dict:
+    """d_only 四指标的同期合格口径 MCP 候选（第二十轮：API 口径未证明 →
+    fallback 按口径待补交 MCP，MCP 携真实合格口径拼入）。"""
+    from data_provider.cross_source_validator import AnchorReading
+
+    calibers = {"roe": "weighted_roe", "gross_margin": "gross_margin",
+                "revenue_yoy": "operating_revenue_yoy", "net_profit_yoy": "parent_net_profit_yoy"}
+    return {
+        field: AnchorReading("ifind", 66.0, period=period, period_basis="YTD",
+                             unit="percentage_point", caliber=calibers[field],
+                             statement_scope="consolidated", adjustment="restated")
+        for field in calibers
+    }
+
+
 def test_ifind_primary_non_deep_zero_http_mcp_path(base_env, monkeypatch):
     """iFinD 主源非深研 + HTTP 开 + MCP 开：财务走 MCP 快照直调（旧行为），
     零标准 HTTP API 出站。"""
@@ -125,7 +140,9 @@ def test_ifind_primary_deep_http_participates(base_env, monkeypatch):
     with ResearchRun(120).bind():
         result = DataFetcherManager().get_fundamental_context(CODE, budget_seconds=60, include_sector_flows=False)
     assert "finance" in guard.calls, "深研身份 API 参与"
-    assert mcp_stub.calls == [], "API 采纳时不出 MCP 兜底"
+    # 第二十轮：d_only 口径待补 → MCP 补缺恰一次（真实合格口径拼入）；
+    # D+C 指标 API 证据口径不被覆盖。
+    assert len(mcp_stub.calls) == 1, "d_only 口径待补恰一次 MCP 补缺"
     growth = result["growth"]["data"]
     assert growth["revenue"] == 575.1, "API 快照进入财务主值"
 
@@ -379,14 +396,14 @@ def test_deep_cache_identity_isolated_by_http_toggle(choice_transport, monkeypat
     # 阶段 A（HTTP 开深研）：API 来源写入键 A（d1-http-fin-v1），零 MCP 兜底。
     with ResearchRun(120).bind():
         manager.get_fundamental_context(code, budget_seconds=60, include_sector_flows=False)
-    assert guard.calls.count("finance") == 1 and mcp_stub.calls == [], \
-        "深研 API 来源冷写（键 A）"
+    assert guard.calls.count("finance") == 1 and len(mcp_stub.calls) == 1, \
+        "深研 API 来源冷写（键 A；第二十轮：d_only 口径待补恰一次 MCP 补缺）"
     assert len(manager._fundamental_cache) == 1
     # 阶段 B（翻转关，新 run）：键 B（d1 无段）未命中 → MCP 兜底真实调用。
     get_config().enable_ifind_http_api = False
     with ResearchRun(120).bind():
         manager.get_fundamental_context(code, budget_seconds=60, include_sector_flows=False)
-    assert mcp_stub.calls, "翻转关：MCP 兜底真实调用（键 A 未命中=隔离证据）"
+    assert len(mcp_stub.calls) == 2, "翻转关：键 B 未命中 → MCP 兜底真实调用（隔离证据）"
     assert guard.calls.count("finance") == 1, "HTTP 关闭后不再发起 API 出站"
     assert len(manager._fundamental_cache) == 2, "两种形态各占独立缓存条目"
     b_mcp_calls = len(mcp_stub.calls)
@@ -772,17 +789,17 @@ def test_deep_manager_credential_toggle_rekeys(choice_transport, monkeypatch, tm
         first = manager.get_fundamental_context(code, budget_seconds=60, include_sector_flows=False)
     keys_a = [k for k in manager._fundamental_cache.keys() if "http-fin-v1" in k]
     assert len(keys_a) == 1, "参与形态键 A 独立条目"
-    assert guard.calls.count("finance") == 1 and mcp_stub.calls == [], "API 来源冷写"
+    assert guard.calls.count("finance") == 1 and len(mcp_stub.calls) == 1, \
+        "API 来源冷写（第二十轮：d_only 口径待补恰一次 MCP 补缺）"
     a_fin_calls = fin_source_calls()
     # 阶段 B（切换合法不参与配置，新 run）：键 B miss → MCP 兜底真实调用
     # （iFinD MCP 财务数据源真实调用发生=隔离直接证据）。
     get_config().enable_ifind_http_api = False
     with ResearchRun(120).bind():
         manager.get_fundamental_context(code, budget_seconds=60, include_sector_flows=False)
-    assert mcp_stub.calls, "切换不参与配置：MCP 兜底真实调用（键 A 未命中=隔离证据）"
+    assert len(mcp_stub.calls) == 2, "切换不参与配置：键 B 未命中 → MCP 兜底真实调用"
     assert guard.calls.count("finance") == 1, "不参与配置不再发起 API 出站"
     assert len(manager._fundamental_cache) == 2, "两形态各占独立缓存条目"
-    assert len(mcp_stub.calls) == 1, "键 B 真实重取计数（MCP 兜底真实调用一次）"
     # 阶段 C（切回合法参与配置，新 run）：键 A 缓存返回——iFinD 数据源零
     # 新增调用、结果与首轮一致（热命中直接证据，不以缓存条目数代替）。
     get_config().enable_ifind_http_api = True
@@ -796,6 +813,6 @@ def test_deep_manager_credential_toggle_rekeys(choice_transport, monkeypatch, tm
 
     assert strip_capital(third) == strip_capital(first), "键 A 缓存返回与首轮一致"
     assert fin_source_calls() == a_fin_calls, "切回参与配置热命中：iFinD 数据源零新增调用"
-    assert guard.calls.count("finance") == 1 and len(mcp_stub.calls) == 1, \
+    assert guard.calls.count("finance") == 1 and len(mcp_stub.calls) == 2, \
         "API/MCP 调用次数不变（同身份热命中）"
     assert len(manager._fundamental_cache) == 2, "同身份命中不新增条目"

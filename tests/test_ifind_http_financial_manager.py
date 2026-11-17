@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import pytest
-from copy import deepcopy
 from datetime import date as _date
 
 
@@ -325,20 +324,22 @@ def test_manager_missing_field_filled_by_probe_not_mcp(monkeypatch):
 
     monkeypatch.setattr(A, "_http_api_curl_post", routed_curl)
     _install_choice_native(monkeypatch, "600519.SH")
-    mcp_calls: list[str] = []
-
-    async def mcp_query(self, tool, question, *, deadline=None):
-        mcp_calls.append(tool)
-        return deepcopy(Q3)
-
-    monkeypatch.setattr(IfindFetcher, "_async_query", mcp_query, raising=False)
+    # 第二十轮：毛利率（d_only）值由 API 探测合并（Q2 真实期），但口径未
+    # 证明 → fallback 按「口径待补」交 MCP——MCP 同期（Q2）合格口径候选
+    # 拼入后经采纳门合格（值/期/口径三者真实，不伪装 restated）。
+    from data_provider.cross_source_validator import AnchorReading
+    mcp_gross = AnchorReading("ifind", 25.0, period="2026-06-30", period_basis="YTD",
+                              unit="percentage_point", caliber="gross_margin",
+                              statement_scope="consolidated", adjustment="restated")
+    mcp = _McpStub([{"gross_margin": mcp_gross}])
+    mcp.install(monkeypatch)
     with ResearchRun(120).bind():
         result = DataFetcherManager().get_fundamental_context("600519", budget_seconds=60, include_sector_flows=False)
     gross_meta = result["growth"]["data"].get("gross_margin")
     gross_record = result["growth"]["field_meta"].get("gross_margin") or {}
-    # 毛利率来自 Q2（真实期标注，protected 语义），不由 MCP 出站补
-    assert (gross_record.get("period") or gross_meta) is not None
-    assert mcp_calls == []
+    # 毛利率最终合格：Q2 真实期 + MCP 真实口径（期一致拼入）
+    assert gross_meta is not None and gross_record.get("period") == "2026-06-30"
+    assert len(mcp.calls) == 1, "d_only 口径待补恰一次 MCP 补缺"
 
 
 def test_manager_mcp_off_http_still_supplements(monkeypatch):
@@ -1373,3 +1374,41 @@ def test_concept_mixed_placeholders_filtered_per_item(monkeypatch):
     monkeypatch.setattr(A, "_http_api_curl_post", curl)
     concepts = A.ifind_http_concept_membership(CODE, deadline=A.monotonic() + 10)
     assert concepts == ["白酒"]  # 伪概念 "--"/"None" 过滤，仅合法项保留
+
+
+
+def test_manager_d_only_all_missing_and_mcp_timeout_keeps_valid_fields(monkeypatch, caplog):
+    """第二十二轮（真实 manager 深研入口，既有补缺失败契约）：API 四比率
+    全部缺失（d_only 全缺）且 MCP 补缺超时——D+C 有效字段保留、四比率如实
+    缺项不虚假成功、补缺失败日志留痕（脱敏 warning）、其他字段不受影响。"""
+    import logging as _logging
+    _install_config(monkeypatch, mcp=True, http=True, primary="ifind")
+    _freeze_calendar(monkeypatch)
+    _resolve_token_mock(monkeypatch)
+    _stub_mcp_methods(monkeypatch)
+    _stub_capital_chain(monkeypatch)
+    # API 快照：四比率全缺（None），D+C 有值。
+    values = {**Q3, "roe": None, "gross_margin": None, "revenue_yoy": None, "net_profit_yoy": None}
+    monkeypatch.setattr(A, "_http_api_curl_post",
+                        lambda *a, **k: (200, _http_payload(values, "600519.SH", "20261031")))
+    # MCP 补缺超时（TimeoutError——按既有日志方式留痕，不吞不伪装）。
+    monkeypatch.setattr(IfindFetcher, "financial_snapshot",
+                        lambda self, code, period, *, deadline: (_ for _ in ()).throw(TimeoutError("slow")))
+    monkeypatch.setattr(DataFetcherManager, "_get_sector_rankings_with_meta",
+                        lambda self, n=5: ([{"name": "stub", "change_pct": 1.0}], [], [], ""))
+    _install_choice_native(monkeypatch, "600519.SH")
+    with ResearchRun(120).bind():
+        with caplog.at_level(_logging.WARNING, logger="data_provider.ifind_http_daily_adapter"):
+            result = DataFetcherManager().get_fundamental_context("600519", budget_seconds=60, include_sector_flows=False)
+    growth = (result.get("growth") or {}).get("data") or {}
+    # D+C 有效字段保留（不受补缺失败影响）。
+    assert growth["revenue"] == 575.1 and growth["net_profit"] == 92.6
+    assert (growth.get("balance_sheet") or {}).get("assets") == 100.0
+    # 四比率如实缺项——无虚假成功（不带值、不伪装口径）。
+    for field in ("roe", "gross_margin", "revenue_yoy", "net_profit_yoy"):
+        assert growth.get(field) is None, f"{field} 缺项如实"
+        record = ((result.get("growth") or {}).get("field_meta") or {}).get(field) or {}
+        assert record.get("quality", {}).get("status") == "missing"
+    # 补缺失败日志留痕（脱敏 warning）。
+    assert any("MCP 补缺超时" in r.message for r in caplog.records), "超时按既有日志方式留痕"
+    # 资产负债等其他字段不受影响（D+C 证据照常装配，见上 balance_sheet）。
