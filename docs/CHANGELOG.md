@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 限制 AkShare 依赖版本，保留板块趋势所用的指数日线接口，避免全新安装时接口缺失。
 - [修复] 个股深研财务指标按已确认口径采纳，口径未知时尝试 MCP 补缺；补缺失败保留合格数据并记录日志。
 - [新功能] 个股深研可使用 iFinD 标准 API 获取主力资金流；当日数据未能确认定稿或请求失败时按既有规则回退。
 - [新功能] 个股深研可使用 iFinD 标准 API 获取财务快照、公司资料和概念；数据不合格或缺失时保留 MCP 等既有兜底。
