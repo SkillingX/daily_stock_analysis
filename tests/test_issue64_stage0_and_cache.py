@@ -434,7 +434,8 @@ def test_safe_fundamental_snapshot_drops_stale_capital_keeps_finance(tmp_path, m
     }
 
     def _seed(code: str, block: Dict[str, Any]) -> str:
-        key = f"stage0_fund_{cfg.data_source_contract}_v{dim_cache.FUNDAMENTAL_MAPPING_VERSION}_cv0_d0_{code}"
+        from src.deep_research_dims.context import stage0_fundamental_cache_key
+        key = stage0_fundamental_cache_key(cfg, code)
         dim_cache.save_snapshot(key, {**finance, "capital_flow": block})
         return key
 

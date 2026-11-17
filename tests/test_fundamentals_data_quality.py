@@ -110,7 +110,7 @@ def test_legacy_financial_cache_misses_without_invalidating_other_dims(
     dim_cache.save_cached_dim("600519", dim_id, {"market_cap": 100.0})
     business = {"business_model": {"说明": "保留"}, "narrative": "保留"}
     dim_cache.save_cached_dim("600519", "business", business)
-    path = Path(dim_cache._CACHE_DIR) / f"600519_{dim_id}.json"
+    path = Path(dim_cache._cache_path("600519", dim_id))
     record = json.loads(path.read_text())
     record["mapping_version"] = 2
     path.write_text(json.dumps(record))
