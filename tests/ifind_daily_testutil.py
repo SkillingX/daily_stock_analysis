@@ -43,6 +43,28 @@ def enabled_config(monkeypatch: pytest.MonkeyPatch, *, enabled: bool = True, pro
     return config
 
 
+def http_enabled_config(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool = True,
+    mcp_enabled: bool = False,
+):
+    """标准 HTTP 日线候选（issue #91）的启用配置；凭据与 MCP 互不混用。
+
+    默认关掉 MCP 候选，使 HTTP 预置次序可被单独观测；``mcp_enabled=True``
+    保留 MCP 候选以覆盖两段预置尝试的组合语义。唯一凭据形态为
+    ``IFIND_HTTP_REFRESH_TOKEN``（第八轮移除静态 access_token 双模式）。
+    """
+    from src.config import Config
+
+    config = enabled_config(monkeypatch, enabled=mcp_enabled)
+    config.enable_ifind_http_api = enabled
+    config.ifind_http_refresh_token = "long-lived-refresh-token" if enabled else None
+    config.ifind_http_timeout_seconds = 30.0
+    monkeypatch.setattr(Config, "_instance", config)
+    return config
+
+
 def strict_calendar(monkeypatch: pytest.MonkeyPatch):
     """确定性严格日历：会话枚举走真实实现，参考时间固定为 NOW。
 

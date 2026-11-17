@@ -20,6 +20,7 @@ from data_provider.base import DataFetchError
 from tests.ifind_daily_testutil import (
     LATEST_SESSION,
     enabled_config,
+    http_enabled_config,
     std_frame,
     strict_calendar,
 )
@@ -86,12 +87,14 @@ class _FakeManager:
     def __init__(
         self, frames, delay: float = 0.0, error: Exception | None = None,
         errors: list[Exception | None] | None = None,
+        source: str = "IfindDailyFetcher",
     ) -> None:
         self.get_stock_name = lambda code, allow_realtime=False: code
         self.frames = list(frames)
         self.delay = delay
         self.error = error
         self.errors = list(errors) if errors is not None else None
+        self.source = source
         self.calls: list[dict] = []
 
     def get_daily_data(self, stock_code, start_date=None, end_date=None, days=30, constraint_source=None):
@@ -111,7 +114,7 @@ class _FakeManager:
         entry = self.frames.pop(0) if self.frames else std_frame()
         if isinstance(entry, tuple):
             return entry
-        return entry, "IfindDailyFetcher"
+        return entry, self.source
 
 
 @pytest.fixture()
@@ -939,10 +942,13 @@ def test_run_slot_same_source_longer_consistent_replaces(monkeypatch, offline):
 # ---------------------------------------------------------------------------
 # 普通 pipeline：fetch/resume、趋势、今日昨日上下文、Agent 历史
 # ---------------------------------------------------------------------------
-def _pipeline(monkeypatch, db, manager, *, enabled=True):
+def _pipeline(monkeypatch, db, manager, *, enabled=True, http_only=False):
     from src.core.pipeline import StockAnalysisPipeline
 
-    enabled_config(monkeypatch, enabled=enabled)
+    if http_only:
+        http_enabled_config(monkeypatch)  # MCP 关闭、标准 HTTP 启用
+    else:
+        enabled_config(monkeypatch, enabled=enabled)
     _install(monkeypatch, db, manager)
     # 本文件 pipeline 用例消费 pipeline 时间入口的唯一活跃路径是断点续传
     # 目标日：局部确定性冻结该类方法（进入值恒为真实方法，成对恢复），
@@ -960,6 +966,19 @@ def _pipeline(monkeypatch, db, manager, *, enabled=True):
         daily_market_context_enabled=False, market_review_enabled=False,
     )
     return pipeline
+
+
+def _bind_run():
+    """将当前执行流绑定为个股深研上下文（HTTP 预置/读取范围门开启）。
+
+    第二十二轮：HTTP 预置与读取范围的 HTTP 贡献仅个股深研执行上下文参与
+    （``http_preset_scope_active``）；深研行为测试统一经此绑定，非深研行为
+    由不绑定的专门反例锁定。
+    """
+    from src.core.research_run import ResearchRun, current_research
+
+    run = ResearchRun(timeout_seconds=30)
+    return current_research.set(run)
 
 
 def test_fetch_and_save_skips_resume_shortcut_in_enabled_scope(monkeypatch, offline):
@@ -984,6 +1003,25 @@ def test_fetch_and_save_keeps_resume_shortcut_when_disabled(monkeypatch, offline
     assert ok is True
     assert manager.calls == []  # 断点续传捷径保持
     db.save_daily_data.assert_not_called()
+
+
+def test_fetch_and_save_skips_resume_shortcut_in_http_only_scope(monkeypatch, offline):
+    """HTTP-only 深研：pipeline 断点续传不走 DB 捷径，经共享窗口完整获取。"""
+    db = _FakeDb(_db_rows("600519", 40, ["EfinanceFetcher"]))
+    manager = _FakeManager([std_frame(rows=40)], source="IfindHttpDailyFetcher")
+    pipeline = _pipeline(monkeypatch, db, manager, http_only=True)
+    research_token = _bind_run()
+    token, _scope = _open_scope()
+    try:
+        ok, error = pipeline.fetch_and_save_stock_data("600519", current_time=None)
+        assert ok is True and error is None
+        assert len(manager.calls) == 1  # DB 已有当日数据仍完整获取
+        assert db.save_daily_data.call_count == 1
+    finally:
+        H.close_current_stock_scope(token)
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
 
 
 def test_trend_reads_shared_window_not_db(monkeypatch, offline):
@@ -2267,3 +2305,240 @@ def test_offline_lifecycle_failed_then_retried_import():
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# issue #91 第四轮：HTTP-only（MCP 关闭、标准 HTTP 启用）读取范围语义——
+# 与 MCP 启用共用同一读取范围判定（ifind_daily_read_scope 取两传输并集），
+# 共享窗口权威、DB 不作命中依据、同源扩窗与换源拒绝全部成立。
+# ---------------------------------------------------------------------------
+def test_http_only_read_scope_bypasses_db_authority(monkeypatch, offline):
+    """HTTP-only 深研：DB 完整缓存不作为命中依据，经 manager 真实出站取窗。"""
+    http_enabled_config(monkeypatch)  # MCP 关闭、标准 HTTP 启用
+    research_token = _bind_run()
+    try:
+        db = _FakeDb(_db_rows("600519", 60, ["EfinanceFetcher"]))
+        manager = _install(monkeypatch, db, _FakeManager([std_frame(rows=40)], source="IfindHttpDailyFetcher"))
+        df, source = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+        assert source == "IfindHttpDailyFetcher"
+        assert df is not None
+        assert len(manager.calls) == 1  # DB 完整也不再作为命中依据
+        assert manager.calls[0]["end_date"] == LATEST_SESSION.isoformat()
+        assert manager.calls[0]["constraint_source"] is None  # 首取无来源约束
+    finally:
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_http_only_ineligible_stock_keeps_db_cache(monkeypatch, offline):
+    """HTTP-only：不合格证券（ETF）不进入读取范围，保持既有 DB 命中。"""
+    http_enabled_config(monkeypatch)
+    db = _FakeDb(_db_rows("510300", 40, ["EfinanceFetcher", "AkshareFetcher"]))
+    manager = _install(monkeypatch, db, _FakeManager([std_frame()]))
+    _df, source = H.load_history_df("510300", days=30, target_date=LATEST_SESSION)
+    assert source == "db_cache"
+    assert manager.calls == []
+
+
+def test_http_only_non_qualifying_stock_keeps_legacy_behavior(monkeypatch, offline):
+    """保持性反例（第十二轮规则，第十九轮标的改写）：HTTP-only 下非资格
+    证券（510300 ETF）保持原行为。
+
+    read_scope 判定规则不变：非资格标的不进入读取范围——旧 DB 命中照常、
+    零额外出站、上下文不丢失。段级方案后普通股全部资格内（走共享窗口
+    权威语义），「范围外保持原行为」由非资格标的锁定。
+    """
+    http_enabled_config(monkeypatch)
+    db = _FakeDb(_db_rows("510300", 40, ["EfinanceFetcher", "AkshareFetcher"]))
+    manager = _install(monkeypatch, db, _FakeManager([std_frame()]))
+    # 完整旧 DB 缓存照常命中（不强制重取）。
+    df, source = H.load_history_df("510300", days=30, target_date=LATEST_SESSION)
+    assert source == "db_cache"
+    assert manager.calls == []
+
+
+def test_http_only_non_qualifying_stock_keeps_db_context(monkeypatch, offline):
+    """保持性反例（第十二轮规则，第十九轮标的改写）：非资格标的的今日/
+    昨日上下文不丢——旧 DB 上下文正常返回，不因读取范围被拒用
+    （history_loader:497 语义）。"""
+    http_enabled_config(monkeypatch)
+    db = _FakeDb(_db_rows("510300", 40, ["EfinanceFetcher", "AkshareFetcher"]))
+    db.get_analysis_context = MagicMock(return_value={"summary": "legacy-context"})
+    manager = _install(monkeypatch, db, _FakeManager([]))
+    context = H.qualified_analysis_context("510300", db)
+    assert context == {"summary": "legacy-context"}
+    assert manager.calls == []
+
+
+def test_http_only_non_qualifying_stock_keeps_resume_shortcut(monkeypatch, offline):
+    """保持性反例（第十二轮规则，第十九轮标的改写）：pipeline 断点续传捷径
+    在非资格标的保持（不强制共享窗口重取、不增加出站）。"""
+    db = _FakeDb(_db_rows("510300", 40, ["EfinanceFetcher"]))
+    manager = _FakeManager([std_frame()], source="IfindHttpDailyFetcher")
+    pipeline = _pipeline(monkeypatch, db, manager, http_only=True)
+    ok, _error = pipeline.fetch_and_save_stock_data("510300", current_time=None)
+    assert ok is True
+    assert manager.calls == []  # DB 已有当日数据：断点续传捷径保持
+    db.save_daily_data.assert_not_called()
+
+
+def test_http_only_segment_stock_uses_shared_window_semantics(monkeypatch, offline):
+    """段级正例（第十九轮，第二十二轮限定深研）：HTTP-only 深研上下文下段内
+    普通股（000002）进入读取范围，按既定共享窗口权威语义走——完整旧 DB
+    命中被跳过（scope True 不作命中依据），经 manager 网络窗口取得并按来源
+    标签落库。"""
+    http_enabled_config(monkeypatch)
+    research_token = _bind_run()
+    try:
+        db = _FakeDb(_db_rows("000002", 40, ["EfinanceFetcher", "AkshareFetcher"]))
+        manager = _FakeManager([std_frame()], source="IfindHttpDailyFetcher")
+        _install(monkeypatch, db, manager)
+        df, source = H.load_history_df("000002", days=30, target_date=LATEST_SESSION)
+        assert source == "IfindHttpDailyFetcher"
+        assert len(manager.calls) == 1  # 不以旧 DB 命中：走共享窗口权威路径
+    finally:
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_http_only_segment_stock_context_not_from_legacy_db(monkeypatch, offline):
+    """段级正例（第十九轮，第二十二轮限定深研）：HTTP-only 深研上下文下段内
+    普通股共享窗口缺失时上下文如实缺失，不以旧 DB 行复活
+    （history_loader:497 既定语义）。"""
+    http_enabled_config(monkeypatch)
+    research_token = _bind_run()
+    try:
+        db = _FakeDb(_db_rows("000002", 40, ["EfinanceFetcher", "AkshareFetcher"]))
+        db.get_analysis_context = MagicMock(return_value={"summary": "legacy-context"})
+        manager = _install(monkeypatch, db, _FakeManager([]))
+        context = H.qualified_analysis_context("000002", db)
+        assert context is None  # 资格内：窗口缺失即缺失，不回退旧 DB
+        assert manager.calls == []
+    finally:
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_http_only_scope_reuses_complete_window_and_returns_copies(monkeypatch, offline):
+    """HTTP-only 深研：当前任务作用域持有完整同源窗口，短需求复用不重复出站。"""
+    http_enabled_config(monkeypatch)
+    research_token = _bind_run()
+    db = _FakeDb([])
+    manager = _install(monkeypatch, db, _FakeManager([std_frame(rows=40)], source="IfindHttpDailyFetcher"))
+    token, _scope = _open_scope()
+    try:
+        df1, source1 = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+        df2, source2 = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+        assert source1 == source2 == "IfindHttpDailyFetcher"
+        assert len(df1) == len(df2) == 40
+        assert len(manager.calls) == 1  # 同需求共享一次窗口
+    finally:
+        H.close_current_stock_scope(token)
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_http_only_scope_same_source_longer_consistent_expansion_replaces(monkeypatch, offline):
+    """HTTP-only 深研：同源（IfindHttpDailyFetcher）更长一致扩窗整窗替换。"""
+    http_enabled_config(monkeypatch)
+    research_token = _bind_run()
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), std_frame(rows=120)], source="IfindHttpDailyFetcher"),
+    )
+    token, _scope = _open_scope()
+    try:
+        _df1, _s1 = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+        df2, _s2 = H.load_history_df("600519", days=90, target_date=LATEST_SESSION)
+        assert len(df2) == 120
+        assert len(manager.calls) == 2
+        assert manager.calls[1]["constraint_source"] == "IfindHttpDailyFetcher"
+    finally:
+        H.close_current_stock_scope(token)
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_mcp_scope_consumed_window_not_replaced_by_other_source(monkeypatch, offline):
+    """MCP 非深研语境（股票作用域机制）：已消费窗口不换源——换源/冲突扩窗
+    显式失败并保留已采用帧。第二十二轮 HTTP 门后，HTTP-only 无 run 的股票
+    作用域场景由 MCP 支撑读取范围（read_scope MCP 语义原样），scope 机制
+    （复用/已消费不换源）在该语境锁定；深研 run 槽位的同源扩窗由
+    ``test_http_only_run_slot_expansion_constrained_to_http_source`` 覆盖。"""
+    enabled_config(monkeypatch, enabled=True)  # MCP 启用（read_scope MCP 语义）
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager(
+            [std_frame(rows=40), std_frame(rows=120, close=55.5)],
+            source="IfindDailyFetcher",
+        ),
+    )
+    token, scope = _open_scope()
+    try:
+        _df1, source1 = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+        assert source1 == "IfindDailyFetcher"
+        df2, reason = H.load_history_df("600519", days=90, target_date=LATEST_SESSION)
+        assert df2 is None
+        assert "daily window expansion rejected" in reason
+        assert "IfindDailyFetcher" in reason
+        assert scope.peek() is not None
+        assert scope.peek().source == "IfindDailyFetcher"
+        assert len(scope.peek().records) == 40
+    finally:
+        H.close_current_stock_scope(token)
+
+
+def test_http_only_run_slot_expansion_constrained_to_http_source(monkeypatch, offline):
+    """HTTP-only：深研 run 槽位扩窗只尝试同源 HTTP 候选，不换源不出东财。"""
+    from src.core.research_run import ResearchRun, current_research
+
+    http_enabled_config(monkeypatch)
+    db = _FakeDb([])
+    manager = _install(
+        monkeypatch, db,
+        _FakeManager([std_frame(rows=40), std_frame(rows=120)], source="IfindHttpDailyFetcher"),
+    )
+    run = ResearchRun(timeout_seconds=30)
+    research_token = current_research.set(run)
+    try:
+        _df1, source1 = H.load_history_df("600519", days=30)
+        assert source1 == "IfindHttpDailyFetcher"
+        _df2, source2 = H.load_history_df("600519", days=90)
+        assert source2 == "IfindHttpDailyFetcher"
+        assert manager.calls[1]["constraint_source"] == "IfindHttpDailyFetcher"
+    finally:
+        current_research.reset(research_token)
+
+
+def test_http_only_qualified_context_no_window_returns_none(monkeypatch, offline):
+    """HTTP-only 深研：启用范围内共享窗口缺失即上下文缺失，不以旧 DB 行复活。"""
+    http_enabled_config(monkeypatch)
+    research_token = _bind_run()
+    try:
+        db = _FakeDb(_db_rows("600519", 40, ["EfinanceFetcher"]))
+        db.get_analysis_context = MagicMock(return_value={"summary": "legacy"})
+        manager = _install(monkeypatch, db, _FakeManager([], error=DataFetchError("HTTP 供应商失败")))
+        context = H.qualified_analysis_context("600519", db)
+        assert context is None  # 不回退旧 DB 上下文
+    finally:
+        from src.core.research_run import current_research
+
+        current_research.reset(research_token)
+
+
+def test_disabled_mode_rejects_http_ifind_contaminated_cache(monkeypatch, offline):
+    """关闭模式：含 IfindHttpDailyFetcher 遗留行的 DB 窗口同样被拒走原链。"""
+    enabled_config(monkeypatch, enabled=False)
+    rows = _db_rows("600519", 40, ["EfinanceFetcher", "IfindHttpDailyFetcher"])
+    db = _FakeDb(rows)
+    manager = _install(monkeypatch, db, _FakeManager([std_frame()], source="LegacyOneFetcher"))
+    _df, source = H.load_history_df("600519", days=30, target_date=LATEST_SESSION)
+    assert source == "LegacyOneFetcher"
+    assert len(manager.calls) == 1

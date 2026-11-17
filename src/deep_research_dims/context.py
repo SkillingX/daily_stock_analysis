@@ -187,9 +187,17 @@ def _safe_fundamental(code: str, ctx: SharedContext) -> Dict[str, Any]:
         deadline = min(deadline, outer_deadline)
     # issue #73：深研身份进入缓存身份——深研 run（零 Choice）与独立专项服务的
     # 完整聚合快照互不串用，不把完整聚合的 Choice 证据经缓存带进深研报告。
+    # 本轮审查收敛：HTTP 财务参与的来源差异同样进入缓存身份——``_d`` 段
+    # （ifind_deep_research_scope_active，零 Choice 收敛身份）在 Choice 主源
+    # 恒为 0，而 HTTP 财务参与门（http_preset_scope_active）不限主源——
+    # Choice 主源深研（HTTP 参与）与普通专项（不参与）必须经统一参与段
+    # ``_h`` 隔离，否则深研先写会被普通专项复用 HTTP 数据、普通先写又使
+    # 深研复用非 HTTP 数据（双向串缓存）。
     from data_provider.base import ifind_deep_research_scope_active
     deep_scope_cached = ifind_deep_research_scope_active(include_sector_flows=False)
-    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_d{int(deep_scope_cached)}_{code}"
+    from data_provider.ifind_http_daily_adapter import http_financial_participation_active
+    http_participating = http_financial_participation_active()
+    cache_key = f"stage0_fund_{config.data_source_contract}_v{FUNDAMENTAL_MAPPING_VERSION}_cv{int(bool(get_config().deep_research_cross_validate))}_d{int(deep_scope_cached)}_h{int(http_participating)}_{code}"
     cached = load_snapshot(cache_key, ttl_hours=24.0)
     from data_provider.mx_data_adapter import financial_refresh
     refresh = financial_refresh.get()
