@@ -318,6 +318,140 @@ def test_token_refresh_via_curl(loopback):
     assert parsed["data"]["access_token"] == "loopback-token"
 
 
+def test_finance_max_time_clamped_to_configured_cap(loopback, monkeypatch, caplog):
+    """第五十一轮返修（真实 curl argv）：finance 传输边界受该次配置上限收窄。
+
+    多期探测各期共用入口一次预留的 API 阶段截止后，出站剩余可大于单请求
+    上限（IFIND_HTTP_TIMEOUT_SECONDS=8 时 API 阶段=cap+余量-reserve=9.1s）
+    ——真实 argv 的 ``--max-time`` 必须是 8.000 而非 9.1；更短的父/共享
+    绝对 deadline 仍按剩余缩短；其他 label 行为不变；诊断并列保留
+    budget_at_start（真实剩余预算）与 max_time（实际收窄值），不互相冒充。"""
+    import logging
+    import subprocess
+
+    from src.config import get_config
+
+    monkeypatch.setattr(get_config(), "ifind_http_timeout_seconds", 8.0)
+    argv_log: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        argv_log.append(list(argv))
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    def _post(label: str, budget: float) -> None:
+        token = request_deadline.set(monotonic() + budget)
+        try:
+            H._http_api_curl_post(
+                loopback.url("/ok/data"),
+                {"Content-Type": "application/json", "access_token": "secret-token"},
+                b'{"codes":"600519.SH"}',
+                label=label,
+            )
+        finally:
+            request_deadline.reset(token)
+
+    with caplog.at_level(logging.DEBUG, logger="data_provider.ifind_http_daily_adapter"):
+        _post("finance", 9.1)  # 剩余 9.1s > cap 8：--max-time 收窄到配置上限
+        _post("history", 9.1)  # 其他 label：不受 finance 上限影响（≈9.1）
+        _post("finance", 1.5)  # 父/共享 deadline 更短：仍按剩余缩短
+
+    def _max_time(index: int) -> str:
+        return argv_log[index][argv_log[index].index("--max-time") + 1]
+
+    assert len(argv_log) == 3
+    assert _max_time(0) == "8.000", \
+        f"finance 单请求 --max-time=配置上限 8（实测 {_max_time(0)}），不得放宽到 API 阶段剩余 9.1"
+    assert float(_max_time(1)) > 9.0, \
+        f"非 finance label 不受收窄影响（实测 {_max_time(1)}）"
+    # 实时钟下 set 与出站之间有微秒级流逝：不做精确等值断言，核对落点
+    # 在 (0, 父余量] 内即可（cap=8 未参与收窄）。
+    assert 0 < float(_max_time(2)) <= 1.5, \
+        f"更短共享 deadline 仍按剩余缩短（实测 {_max_time(2)}）"
+    finance_diag = [r.getMessage() for r in caplog.records
+                    if "transport diagnostics" in r.getMessage()]
+    clamped = [line for line in finance_diag if "max_time=8.000s" in line]
+    assert clamped and any("budget_at_start=9." in line for line in clamped), \
+        f"诊断并列保留真实剩余预算（≈9.1s）与实际收窄值（8.000s）：{finance_diag}"
+
+
+def test_finance_exit28_without_headers_maps_to_timeout(loopback, monkeypatch, caplog):
+    """finance 单请求上限早于共享 deadline 硬切 curl（慢 header、无任何
+    可解析响应头）时，真实 exit 28 必须归类 curl_max_time/TimeoutError
+    （此前先经 parser 被误判成空回复 DataFetchError）；诊断保留真实退出
+    码、收窄后的 max_time 与共享剩余预算；其他 label 同形态保持既有
+    空回复语义。"""
+    import logging
+
+    from src.config import get_config
+
+    monkeypatch.setattr(get_config(), "ifind_http_timeout_seconds", 0.3)
+    with caplog.at_level(logging.WARNING, logger="data_provider.ifind_http_daily_adapter"):
+        token = request_deadline.set(monotonic() + 2.0)  # 共享 deadline 比 cap 长
+        try:
+            with pytest.raises(TimeoutError, match="max-time"):
+                H._http_api_curl_post(loopback.url("/slow-header"), {}, b"{}", label="finance")
+        finally:
+            request_deadline.reset(token)
+        # 其他 label 同形态（max-time 硬切、无字节）保持既有语义：其
+        # max-time 与剩余 deadline 同值，父边界检查先报 attempt deadline
+        # exhausted（或竞态下走空回复 DataFetchError）——都不进入 finance
+        # 专属的 curl_max_time 归类。
+        short_token = request_deadline.set(monotonic() + 0.15)
+        try:
+            with pytest.raises((TimeoutError, DataFetchError)) as excinfo:
+                H._http_api_curl_post(loopback.url("/slow-header"), {}, b"{}", label="history")
+        finally:
+            request_deadline.reset(short_token)
+        assert "curl max-time reached" not in str(excinfo.value), \
+            "finance 专属归类不得外溢到其他 label"
+    diag = [r.getMessage() for r in caplog.records if "transport diagnostics" in r.getMessage()]
+    finance_28 = [line for line in diag
+                  if "failure=curl_max_time" in line and line.startswith("ifind http daily finance")]
+    assert finance_28 and all("curl_exit=28" in line for line in finance_28), \
+        f"finance exit 28 诊断按 curl_max_time 归类：{diag}"
+    assert any("max_time=0.300s" in line
+               and 0.3 < float(line.split("budget_at_start=", 1)[1].split("s", 1)[0]) <= 2.0
+               for line in finance_28), \
+        f"诊断保留收窄后的 max_time=0.300 与共享剩余预算（≈2s）：{finance_28}"
+    assert not [line for line in diag
+                if "failure=curl_max_time" in line and line.startswith("ifind http daily history")], \
+        f"history 不进入 finance 专属归类：{diag}"
+
+
+def test_finance_sub_millisecond_cap_not_dispatched(loopback, monkeypatch):
+    """极小正数配置（0.0004）格式化成 ``--max-time 0.000`` 会关闭 curl
+    超时——finance 在低于毫秒精度时直接不派发（零 Popen、零出站）并按
+    本地预算耗尽报 TimeoutError；配置默认与正常路径不受影响。"""
+    import subprocess
+
+    from src.config import get_config
+
+    monkeypatch.setattr(get_config(), "ifind_http_timeout_seconds", 0.0004)
+    dispatches: list[list[str]] = []
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        dispatches.append(list(argv))
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    token = request_deadline.set(monotonic() + 5.0)  # 共享预算充足：截断只来自 cap
+    try:
+        with pytest.raises(TimeoutError, match="precision"):
+            H._http_api_curl_post(
+                loopback.url("/ok/data"),
+                {"Content-Type": "application/json", "access_token": "secret-token"},
+                b'{"codes":"600519.SH"}',
+                label="finance",
+            )
+    finally:
+        request_deadline.reset(token)
+    assert dispatches == [], "低于毫秒精度的 finance 预算不得派发 curl 子进程"
+
+
 # ===== 第十七轮：curl 失败最小传输诊断（write-out 元数据与正文分离） =====
 
 def test_success_body_separated_from_writeout_meta(loopback):

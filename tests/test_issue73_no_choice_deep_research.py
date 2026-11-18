@@ -1493,6 +1493,84 @@ def test_public_details_timeout_choice_primary_keeps_real_choice_errors(offline_
     assert not any(str(e).startswith("choice_public") for e in errors), errors
 
 
+# ---------------------------------------------------------------- 深研跳过龙虎榜/板块涨跌榜（2026-11-18 600031 发布事件）
+
+def test_deep_scope_skips_dragon_tiger_and_board_rankings(offline_env, monkeypatch) -> None:
+    """真实 iFinD 主源深研身份：龙虎榜与板块涨跌榜零调用。
+
+    榜单只含涨跌排名，无法补个股行业（正式行业已由 iFinD 提供），也不进入
+    阶段 0 共享事实——零出站跳过，预算留给公共详情/主营等实际消费方。
+    公共业绩预告/快报/分红详情照常执行；跳过块保持既有载荷形状与诚实的
+    未查询语义（not_supported、零错误），不造错误、不发空 fallback 调用。"""
+    from src.core.research_run import ResearchRun
+
+    manager = DataFetcherManager()
+    calls = {"dragon_tiger": 0, "boards": 0, "public_details": 0}
+
+    def forbidden(name: str) -> Callable[..., Any]:
+        def _forbidden(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            calls[name] += 1
+            return manager._build_fundamental_block("failed", {}, [], [f"{name} must not be called"])
+        return _forbidden
+
+    monkeypatch.setattr(manager, "get_dragon_tiger_context", forbidden("dragon_tiger"))
+    monkeypatch.setattr(manager, "get_board_context", forbidden("boards"))
+
+    def public_bundle(code: str, *, financials: Any = None) -> Dict[str, Any]:
+        calls["public_details"] += 1
+        return {"growth": {}, "earnings": {"forecast": []}, "institution": {},
+                "source_chain": [], "errors": []}
+
+    monkeypatch.setattr(manager._fundamental_adapter, "get_fundamental_bundle", public_bundle)
+
+    with ResearchRun(120).bind():
+        result = manager.get_fundamental_context("688183", budget_seconds=60, include_sector_flows=False)
+    assert calls["dragon_tiger"] == 0, "深研零龙虎榜出站"
+    assert calls["boards"] == 0, "深研零板块涨跌榜出站"
+    assert calls["public_details"] >= 1, "公共业绩预告/快报/分红详情仍在"
+    for block in ("dragon_tiger", "boards"):
+        payload = result[block]
+        assert payload["status"] == "not_supported"
+        assert payload["errors"] == [], "未查询是设计语义，不造错误"
+        assert payload["coverage"] == {"status": "not_supported"}
+        assert payload["data"] == {}
+        assert payload["source_chain"] == [
+            {"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}]
+        assert "field_meta" in payload, "保持既有载荷形状"
+    assert result["coverage"]["dragon_tiger"] == "not_supported"
+    assert result["coverage"]["boards"] == "not_supported"
+    # 主行业不受影响：iFinD 正式行业照常落位（行业提示不依赖涨跌榜兜底）
+    assert (result["research"].get("industry_ifind") or {}).get("name")
+    assert offline_env["choice"] == []
+
+
+def test_non_deep_scope_still_fetches_dragon_tiger_and_boards(offline_env, monkeypatch) -> None:
+    """非深研消费者（同一 false-scope 入口、无深研 run）：龙虎榜与板块涨跌榜
+    照常执行——深研跳过不外溢到其他调用者；公共详情照常执行。"""
+    manager = DataFetcherManager()
+    calls = {"dragon_tiger": 0, "boards": 0, "public_details": 0}
+
+    def counting(name: str) -> Callable[..., Any]:
+        def _wrapped(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            calls[name] += 1
+            return manager._build_fundamental_block("not_supported", {}, [], [])
+        return _wrapped
+
+    monkeypatch.setattr(manager, "get_dragon_tiger_context", counting("dragon_tiger"))
+    monkeypatch.setattr(manager, "get_board_context", counting("boards"))
+
+    def public_bundle(code: str, *, financials: Any = None) -> Dict[str, Any]:
+        calls["public_details"] += 1
+        return {"growth": {}, "earnings": {}, "institution": {}, "source_chain": [], "errors": []}
+
+    monkeypatch.setattr(manager._fundamental_adapter, "get_fundamental_bundle", public_bundle)
+
+    result = manager.get_fundamental_context("688183", budget_seconds=60, include_sector_flows=False)
+    assert calls["dragon_tiger"] == 1, "非深研仍调用龙虎榜"
+    assert calls["boards"] == 1, "非深研仍调用板块涨跌榜"
+    assert calls["public_details"] >= 1, "非深研公共详情仍在"
+
+
 # ---------------------------------------------------------------- v5：主营分产品财期与正常空覆盖（真实 Q3 空/H1 成功回执）
 
 PRODUCTS_Q3_EMPTY_ENV = json.loads((FIXTURES / "ifind_products_600176_q3_empty.json").read_text())

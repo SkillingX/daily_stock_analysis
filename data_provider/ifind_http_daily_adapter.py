@@ -526,12 +526,16 @@ def _log_curl_transport_diagnostics(
     label: str, *, level: int, failure: str, curl_exit: Optional[int],
     resp_headers: Optional[Dict[str, str]], meta: Dict[str, Optional[str]],
     budget_at_start: Optional[float], elapsed: float,
+    max_time: Optional[float] = None,
 ) -> None:
     """传输诊断单行（白名单字段，复用现有 logger 入口）。
 
     不输出 URL 参数/header/正文/原始 stderr/凭据；request ID 仅从响应
     header 提取并做白名单字符过滤 + 限长；run/调用关联取当前 ResearchRun
     id（可取得时）。失败 warning / 成功 debug（避免日志量显著增长）。
+    ``budget_at_start`` 是出站时的真实剩余预算；``max_time`` 是实际下发给
+    curl 的 ``--max-time``（finance 单请求上限收窄后可小于剩余预算——两个
+    值并列保留，不互相冒充）。
     """
     import logging
 
@@ -554,13 +558,14 @@ def _log_curl_transport_diagnostics(
         level,
         "ifind http daily %s transport diagnostics: failure=%s curl_exit=%s "
         "http_status=%s remote_ip=%s dns=%s tcp=%s tls=%s ttfb=%s total=%s "
-        "request_id=%s run=%s budget_at_start=%s elapsed=%.3fs",
+        "request_id=%s run=%s budget_at_start=%s max_time=%s elapsed=%.3fs",
         label, failure, curl_exit if curl_exit is not None else "unavailable",
         *(meta.get(key) or "unavailable" for key in
           ("http_status", "remote_ip", "dns_seconds", "tcp_seconds", "tls_seconds",
            "ttfb_seconds", "total_seconds")),
         request_id or "unavailable", run_id or "unavailable",
         f"{budget_at_start:.3f}s" if budget_at_start is not None else "unbounded",
+        f"{max_time:.3f}s" if max_time is not None else "unset",
         elapsed,
     )
 
@@ -574,8 +579,10 @@ def _http_api_curl_post(
     检查；慢 header/慢 body/滴流实测超期 ~0.4s，取消也需等待读取超时）——
     本原语换用既有 curl 模式实现真实硬截止：
 
-    - ``--max-time``（min(配置超时， 剩余 deadline)，无 deadline 时兜底上限）
-      硬切传输；父进程 selectors 读循环每 20ms ``check_attempt_alive``——
+    - ``--max-time``：有外层 deadline 用其剩余，缺 deadline 才用兜底
+      上限；finance label 另与该次配置超时 ``ifind_http_timeout_seconds``
+      取小（低于毫秒格式化精度直接不派发并按本地超时报错）硬切传输；
+      父进程 selectors 读循环每 20ms ``check_attempt_alive``——
       用户取消（ResearchStopped）与 deadline 耗尽（TimeoutError）即时生效，
       ``finally`` kill 回收子进程；
     - 字节边界由父进程数 header/body 字节（声明超限立即拒绝，不等正文下完）；
@@ -603,7 +610,32 @@ def _http_api_curl_post(
 
     deadline = request_deadline.get()
     remaining = None if deadline is None else max(0.001, deadline - monotonic())
-    max_time = f"{(remaining if remaining is not None else _HTTP_CURL_MAX_TIME_FALLBACK):.3f}"
+    max_time_value = remaining if remaining is not None else _HTTP_CURL_MAX_TIME_FALLBACK
+    # finance 单请求硬上限：多期探测各期共用入口一次预留的 API 阶段截止，
+    # 剩余可大于该次配置的单次传输上限（cap=8 时 API 阶段=cap+余量-reserve
+    # =9.1s）——本次 ``--max-time`` 再与配置上限取小；其余 label 与无外层
+    # deadline 行为不变。budget_at_start 仍记真实剩余预算，实际收窄值单独
+    # 进诊断（max_time），两者不互相冒充。
+    if label == "finance":
+        from src.config import get_config
+
+        configured = float(getattr(get_config(), "ifind_http_timeout_seconds", 30.0) or 0.0)
+        if configured > 0:
+            max_time_value = min(max_time_value, configured)
+        if max_time_value < 0.001:
+            # 极小正数配置（如 0.0004）格式化成 ``--max-time 0.000``，curl
+            # 语义为不超时——低于毫秒精度时直接不派发，按本地预算耗尽报
+            # TimeoutError（不伪装成供应商超时/空回复，无出站无诊断帧）。
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "ifind http daily %s budget %.6fs below curl max-time precision, not dispatched",
+                label, max_time_value,
+            )
+            raise TimeoutError(
+                f"ifind http daily {label} budget below curl max-time precision"
+            )
+    max_time = f"{max_time_value:.3f}"
     start_monotonic = monotonic()
     budget_at_start = remaining
     header_fd, header_path = tempfile.mkstemp(prefix="ifind-http-hdr-")
@@ -650,10 +682,11 @@ def _http_api_curl_post(
                     # 本地中止（硬截止/取消）：元数据可能来不及输出，缺项
                     # 如实；只报告本地已知时间/原因，不为统计延长请求。
                     logging.getLogger(__name__).warning(
-                        "ifind http daily %s aborted locally: reason=%s elapsed=%.3fs budget_at_start=%s",
+                        "ifind http daily %s aborted locally: reason=%s elapsed=%.3fs budget_at_start=%s max_time=%s",
                         label, f"{type(exc).__name__}:{str(exc)[:80]}",
                         monotonic() - start_monotonic,
                         f"{budget_at_start:.3f}s" if budget_at_start is not None else "unbounded",
+                        f"{max_time_value:.3f}s" if max_time_value is not None else "unset",
                     )
                     raise
                 for key, _event in selector.select(0.02):
@@ -695,38 +728,50 @@ def _http_api_curl_post(
     try:
         status, resp_headers, body = _split_included_http(bytes(stdout))
     except DataFetchError as exc:
+        if label == "finance" and proc.returncode == 28:
+            # finance 新可达分支（单请求上限收窄后新增）：curl 在共享预算
+            # 仍剩时被 ``--max-time`` 硬切且尚未完成响应头（慢 header 场景
+            # 无任何可解析字节）——exit 28 的真实原因是本地超时，沿用
+            # returncode 28 分支的 curl_max_time/TimeoutError 归类与诊断
+            # （此形态无可得响应头，resp_headers 如实为 None），不得先经
+            # parser 误判成空回复类供应商失败；其他 label 既有语义保持。
+            _log_curl_transport_diagnostics(
+                label, level=logging.WARNING, failure="curl_max_time",
+                curl_exit=proc.returncode, resp_headers=None, meta=meta,
+                budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
+            raise TimeoutError(f"ifind http daily {label} curl max-time reached") from exc
         if not stdout and proc.returncode not in {0, None}:
             # curl 52 类空回复：正是诊断要定位的现场（退出码 + 可得节点
             # 元数据），失败语义不变。
             _log_curl_transport_diagnostics(
                 label, level=logging.WARNING, failure="empty_reply",
                 curl_exit=proc.returncode, resp_headers=None, meta=meta,
-                budget_at_start=budget_at_start, elapsed=elapsed)
+                budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
             raise DataFetchError(
                 f"ifind http daily {label} transport failed: curl exit {proc.returncode}"
             ) from exc
         _log_curl_transport_diagnostics(
             label, level=logging.WARNING, failure="unparsable_response",
             curl_exit=proc.returncode, resp_headers=None, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
         raise
     if proc.returncode == 28:
         _log_curl_transport_diagnostics(
             label, level=logging.WARNING, failure="curl_max_time",
             curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
         raise TimeoutError(f"ifind http daily {label} curl max-time reached")
     if proc.returncode == 63:
         _log_curl_transport_diagnostics(
             label, level=logging.WARNING, failure="byte_bound",
             curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
         raise DataFetchError(f"ifind http daily {label} byte bound exceeded")
     if proc.returncode not in {0, None}:
         _log_curl_transport_diagnostics(
             label, level=logging.WARNING, failure="transport_failed",
             curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
         raise DataFetchError(
             f"ifind http daily {label} transport failed: curl exit {proc.returncode}"
         )
@@ -737,13 +782,13 @@ def _http_api_curl_post(
         _log_curl_transport_diagnostics(
             label, level=logging.WARNING, failure="http_response",
             curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
     else:
         # 200 成功诊断仅 debug 级（对照样本，不显著增加常规日志量）。
         _log_curl_transport_diagnostics(
             label, level=logging.DEBUG, failure="none",
             curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
-            budget_at_start=budget_at_start, elapsed=elapsed)
+            budget_at_start=budget_at_start, elapsed=elapsed, max_time=max_time_value)
     return status, body
 
 
@@ -1388,14 +1433,13 @@ def _parse_finance_table(
     return readings
 
 
-def ifind_http_financial_snapshot(code: str, period: str, *, deadline: float) -> Dict[str, Any]:
-    """标准 API 财务快照（快照级单期出站）：具体报告期入口。
+def _ifind_http_financial_snapshot_once(code: str, period: str, *, deadline: float) -> Dict[str, Any]:
+    """单期快照的实际出站体：``deadline`` 已是绝对 API 截止，不再预留。
 
-    契约见 ``_parse_finance_table``；``deadline`` 落实 ``request_deadline``
-    （curl 硬截止与用户取消语义与日线同一传输）；失败统一抛
-    ``SourceReadError``/``DataFetchError`` 由调用方走 MCP 快照兜底。
-    """
-    from data_provider.cross_source_validator import SourceReadError
+    公开单期入口与多期探测共用（第五十轮）：多期入口只在入口预留一次
+    （MCP 兜底份额），各单期出站直接复用该绝对截止——若每期再套
+    ``_finance_api_deadline`` 会重复预留（线上 600031 事件：90 秒阶段
+    预算的财务半窗 45 秒被两层预留 45→27→约 19 秒）。"""
     from data_provider.cross_source_validator import SourceReadError
     from src.config import get_config
     from src.patches.eastmoney_patch import request_deadline
@@ -1409,14 +1453,7 @@ def ifind_http_financial_snapshot(code: str, period: str, *, deadline: float) ->
         raise SourceReadError("ifind", "invalid_configuration")
 
     canonical_period = _canonical_period(period)
-    # 预算预留按**实际可用**计算（第三十八轮修正：此前按配置 cap 使短预算
-    # 下 reserve 被外层 deadline 截断、HTTP 慢耗尽后 MCP 剩余 0）：
-    # available = deadline - now；budget = min(cap + 解析余量, available)；
-    # reserve = min(8, budget * 30%)；API 阶段 = now + max(budget - reserve, 1)。
-    # 总 deadline 与取消语义保持（api_deadline ≤ deadline），MCP 兜底复用
-    # 原 deadline 时保证正剩余。
-    api_deadline = _finance_api_deadline(float(deadline))
-    deadline_token = request_deadline.set(api_deadline)
+    deadline_token = request_deadline.set(float(deadline))
     try:
         access_token = _resolve_access_token(refresh)
         payload, used = _post_finance_query_authorized(
@@ -1430,6 +1467,24 @@ def ifind_http_financial_snapshot(code: str, period: str, *, deadline: float) ->
         )
     finally:
         request_deadline.reset(deadline_token)
+
+
+def ifind_http_financial_snapshot(code: str, period: str, *, deadline: float) -> Dict[str, Any]:
+    """标准 API 财务快照（快照级单期出站）：具体报告期入口。
+
+    契约见 ``_parse_finance_table``；``deadline`` 落实 ``request_deadline``
+    （curl 硬截止与用户取消语义与日线同一传输）；失败统一抛
+    ``SourceReadError``/``DataFetchError`` 由调用方走 MCP 快照兜底。
+    单期公开入口自行预留一次（多期探测路径不经本入口，避免重复预留）。
+    """
+    # 预算预留按**实际可用**计算（第三十八轮修正：此前按配置 cap 使短预算
+    # 下 reserve 被外层 deadline 截断、HTTP 慢耗尽后 MCP 剩余 0）：
+    # available = deadline - now；budget = min(cap + 解析余量, available)；
+    # reserve = min(8, budget * 30%)；API 阶段 = now + max(budget - reserve, 1)。
+    # 总 deadline 与取消语义保持（api_deadline ≤ deadline），MCP 兜底复用
+    # 原 deadline 时保证正剩余。
+    return _ifind_http_financial_snapshot_once(
+        code, period, deadline=_finance_api_deadline(float(deadline)))
 
 
 def _quarter_end_candidates(today: _date) -> List[str]:
@@ -1460,7 +1515,12 @@ def ifind_http_financial_snapshot_latest(code: str, *, deadline: float) -> Dict[
       不同财期混称同一期；
     - 自然缺一项（银行毛利率）不再导致弃用 API 或丢弃已合并核心财务；
     - 每期披露时点校验不变（未披露/回退/乱序期该期整体拒绝跳过）；
-    - 预算线（第三十八轮）与取消穿透不变；全字段合并齐即提前完成。
+    - 预算线（第三十八轮）与取消穿透不变；全字段合并齐即提前完成；
+    - 预算只在入口预留一次（第五十轮，MCP 兜底份额）：各单期出站复用
+      该绝对 API 截止，不再逐期重套 ``_finance_api_deadline`` 重复预留
+      （后续财期不重开预算）；单次传输在 curl 边界另受该次配置单请求
+      上限收窄（``min(剩余, IFIND_HTTP_TIMEOUT_SECONDS)``，默认 30 秒），
+      共享父截止、5 秒处理余量与保留已取得读数语义不变。
 
     全部候选耗尽仍无任何字段 → ``SourceReadError`` 走 MCP 原路径。
     """
@@ -1487,7 +1547,8 @@ def ifind_http_financial_snapshot_latest(code: str, *, deadline: float) -> Dict[
                 )
                 break
             try:
-                readings = ifind_http_financial_snapshot(code, candidate, deadline=api_deadline)
+                # 复用入口一次预留的绝对 API 截止（第五十轮：不逐期重开预算）。
+                readings = _ifind_http_financial_snapshot_once(code, candidate, deadline=api_deadline)
             except SourceReadError as exc:
                 # 该期整体不合格（未披露/回退/乱序/无值）跳过；资格/凭据类失败传播。
                 if exc.reason_code == "invalid_response":

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 import pytest
 
@@ -640,6 +641,103 @@ def test_probe_budget_reserve_leaves_mcp_positive_time(finance_env, monkeypatch)
     assert mcp_deadlines and mcp_deadlines[0] > fake_monotonic()
     # 且探测消耗没有吃满总预算（预留份额生效）
     assert deadline - mcp_deadlines[0] < 20.0
+
+
+def _freeze_analysis_date(monkeypatch, frozen=date(2026, 11, 18)) -> None:
+    """冻结 adapter 的分析日（候选期序与披露校验锚定 2026-11-18），测试
+    不随真实日历漂移（2027 年起候选期前移会先被披露校验拒收）。"""
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return frozen
+
+    monkeypatch.setattr(A, "_date", _FrozenDate)
+
+
+def test_latest_probe_single_reserve_shared_across_periods(finance_env, monkeypatch):
+    """第五十轮反例（可控时钟，2026-11-18 600031 发布事件）：多期探测只在
+    入口预留一次预算（MCP 兜底份额），各单期出站复用同一绝对 API 截止——
+    后续财期不重开 ``_finance_api_deadline``。生产事件为 90 秒阶段预算、
+    财务半窗 45 秒被两层预留 45→27→约 19 秒；本测试 60 秒是直接传给财务
+    适配器的预算（一次预留后 27 秒），修复后第二期不再少一个 reserve。"""
+    from src.config import get_config
+    from src.patches.eastmoney_patch import request_deadline
+
+    get_config().enable_ifind_mcp = True
+    _freeze_analysis_date(monkeypatch)
+    real_monotonic = A.monotonic
+    clock = {"now": real_monotonic() + 1000.0}
+
+    def fake_monotonic():
+        return clock["now"]
+
+    monkeypatch.setattr(A, "monotonic", fake_monotonic)
+    probes: list[tuple[str, float]] = []  # (canonical 请求期, 出站时剩余 API 份额)
+
+    def fake_curl(url, headers, body, *, label):
+        period = json.loads(body)["indipara"][0]["indiparams"][0]
+        probes.append((period, request_deadline.get() - clock["now"]))
+        clock["now"] += 5.0  # 每期探测消耗 5 秒
+        # 第一期自然缺毛利率（合并后仍缺 → 继续探测下一期），其余期补齐。
+        if len(probes) == 1:
+            values = {"gross_margin": None}
+        else:
+            values = {f: 321.09 for f, _i, _u, _fo, _c in A._FINANCE_FIELD_SPECS}
+        return 200, _payload(values=values)
+
+    monkeypatch.setattr(A, "_http_api_curl_post", fake_curl)
+
+    t0 = clock["now"]
+    deadline = t0 + 60.0
+    readings = A.ifind_http_financial_snapshot_latest(CODE, deadline=deadline)
+    assert [p[0] for p in probes] == ["20260930", "20260630"], \
+        f"冻结分析日下候选期序确定，缺毛利率触发恰好两期探测：{probes}"
+    assert len(readings) == len(A._FINANCE_FIELD_SPECS)
+    # 两期来源真实区分：其余字段定格第一期（2026-09-30），毛利率由第二期
+    # 补齐并按自身财期标注（2026-06-30）——字段级合并不把两期混称同期。
+    assert readings["revenue"].period == "2026-09-30"
+    assert readings["revenue"].value == pytest.approx(123.45)
+    assert readings["gross_margin"].period == "2026-06-30"
+    assert readings["gross_margin"].value == pytest.approx(321.09)
+    cap = float(get_config().ifind_http_timeout_seconds)  # 30.0
+    available = deadline - t0
+    budget = min(cap + A._HTTP_PARSE_STAGE_SECONDS, available)  # 35
+    expected_share = max(budget - min(8.0, budget * 0.3), 1.0)  # 27：入口一次预留
+    assert probes[0][1] == pytest.approx(expected_share), \
+        f"首期出站份额=入口一次预留值（实测 {probes[0][1]:.3f}s）"
+    assert probes[1][1] == pytest.approx(expected_share - 5.0), \
+        f"后续期复用同一绝对截止，不重开预算（实测 {probes[1][1]:.3f}s；重复预留行为会再少一个 reserve）"
+
+
+def test_single_period_entry_reserves_once(finance_env, monkeypatch):
+    """单期公开入口仍自行预留一次（抽出站体后不回归）：出站份额与多期入口
+    同一预留公式（一次，不重复）。"""
+    from src.config import get_config
+    from src.patches.eastmoney_patch import request_deadline
+
+    _freeze_analysis_date(monkeypatch)
+    real_monotonic = A.monotonic
+    clock = {"now": real_monotonic() + 1000.0}
+
+    def fake_monotonic():
+        return clock["now"]
+
+    monkeypatch.setattr(A, "monotonic", fake_monotonic)
+    shares: list[float] = []
+
+    def fake_curl(url, headers, body, *, label):
+        shares.append(request_deadline.get() - clock["now"])
+        return 200, _payload()
+
+    monkeypatch.setattr(A, "_http_api_curl_post", fake_curl)
+
+    t0 = clock["now"]
+    A.ifind_http_financial_snapshot(CODE, PERIOD, deadline=t0 + 60.0)
+    assert len(shares) == 1
+    cap = float(get_config().ifind_http_timeout_seconds)  # 30.0
+    budget = min(cap + A._HTTP_PARSE_STAGE_SECONDS, 60.0)  # 35
+    assert shares[0] == pytest.approx(max(budget - min(8.0, budget * 0.3), 1.0)), \
+        f"单期入口自行预留一次（实测 {shares[0]:.3f}s）"
 
 
 def test_short_deadline_reserve_keeps_mcp_positive_time(finance_env, monkeypatch):
