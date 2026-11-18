@@ -447,6 +447,124 @@ def _reject_http_api_bounds(raw: bytes, label: str) -> None:
         raise DataFetchError(f"ifind http daily {label} byte bound exceeded")
 
 
+# curl write-out 传输诊断元数据：经 ``%{stderr}``（curl ≥7.75）重定向到
+# 独立 stderr 通道，不占响应正文配额；正文边界检查只看 stdout（响应字节
+# 语义不变）。字段白名单见 ``_parse_curl_meta``；原始 stderr 错误文本只排
+# 空不记录（curl 退出码承载失败语义）。硬截止/取消杀进程时帧可能来不及输
+# 出——缺项如实不可得，不为等统计数据延长请求。
+_CURL_META_SENTINEL = "__IFIND_CURL_META__"
+_CURL_WRITEOUT_FORMAT = (
+    f"%{{stderr}}\n\n{_CURL_META_SENTINEL}%{{http_code}}|%{{remote_ip}}|%{{time_namelookup}}|"
+    f"%{{time_connect}}|%{{time_appconnect}}|%{{time_starttransfer}}|%{{time_total}}|%{{exitcode}}"
+)
+# stderr 诊断通道有界上限：write-out 帧（~100B）+ curl 错误行绰绰有余；
+# 超限丢弃后续（诊断降级，不影响传输语义）。
+_CURL_META_STDERR_MAX = 8192
+_CURL_META_FIELD_LIMIT = 64
+_META_NUMERIC_RE = re.compile(r"\d+(?:\.\d+)?")
+_META_STATUS_RE = re.compile(r"\d{3}")
+_META_EXIT_RE = re.compile(r"-?\d+")
+_REQUEST_ID_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _split_curl_meta(raw: Optional[bytes]) -> Optional[bytes]:
+    """stderr 通道 write-out 帧提取（哨兵 rfind，前置错误文本不干扰）。
+
+    帧缺失（硬截止/取消被杀、旧 curl 输出字面占位、stderr 超限截断）返回
+    None——缺项如实不可得；哨兵撞车取最后一次出现（真帧在流末尾）。
+    """
+    if not raw:
+        return None
+    idx = raw.rfind(_CURL_META_SENTINEL.encode("utf-8"))
+    if idx < 0:
+        return None
+    return raw[idx + len(_CURL_META_SENTINEL):]
+
+
+def _curl_meta_ip_plausible(value: str) -> bool:
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _parse_curl_meta(raw: Optional[bytes]) -> Dict[str, Optional[str]]:
+    """write-out 元数据白名单解析：字段限长 + 格式校验。
+
+    字段数不符（部分输出/被杀后残段）整段不可得；逐字段格式校验失败（旧
+    curl 字面 ``%{exitcode}``、非法数值、非法 IP、超长回显）该字段不可得，
+    不抛异常——诊断采集失败不得覆盖原异常或令失败变成功。
+    """
+    if not raw:
+        return {}
+    text = raw.decode("ascii", errors="replace").strip()
+    keys = ("http_status", "remote_ip", "dns_seconds", "tcp_seconds", "tls_seconds",
+            "ttfb_seconds", "total_seconds", "curl_exit")
+    parts = text.split("|")
+    if len(parts) != len(keys):
+        return {}
+    out: Dict[str, Optional[str]] = {}
+    for key, value in zip(keys, parts):
+        value = value.strip()[:_CURL_META_FIELD_LIMIT]
+        if not value:
+            out[key] = None
+        elif key == "http_status":
+            out[key] = value if _META_STATUS_RE.fullmatch(value) else None
+        elif key == "remote_ip":
+            out[key] = value if _curl_meta_ip_plausible(value) else None
+        elif key == "curl_exit":
+            out[key] = value if _META_EXIT_RE.fullmatch(value) else None
+        else:
+            out[key] = value if _META_NUMERIC_RE.fullmatch(value) else None
+    return out
+
+
+def _log_curl_transport_diagnostics(
+    label: str, *, level: int, failure: str, curl_exit: Optional[int],
+    resp_headers: Optional[Dict[str, str]], meta: Dict[str, Optional[str]],
+    budget_at_start: Optional[float], elapsed: float,
+) -> None:
+    """传输诊断单行（白名单字段，复用现有 logger 入口）。
+
+    不输出 URL 参数/header/正文/原始 stderr/凭据；request ID 仅从响应
+    header 提取并做白名单字符过滤 + 限长；run/调用关联取当前 ResearchRun
+    id（可取得时）。失败 warning / 成功 debug（避免日志量显著增长）。
+    """
+    import logging
+
+    request_id: Optional[str] = None
+    if resp_headers:
+        for name, value in resp_headers.items():
+            if str(name).lower() == "x-request-id":
+                filtered = _REQUEST_ID_RE.sub("", str(value))[:128]
+                request_id = filtered or None
+                break
+    run_id: Optional[str] = None
+    try:
+        from src.core.research_run import current_research
+
+        run = current_research.get()
+        run_id = run.run_id[:12] if run is not None else None
+    except Exception:  # noqa: BLE001  诊断失败不覆盖原异常
+        run_id = None
+    logging.getLogger(__name__).log(
+        level,
+        "ifind http daily %s transport diagnostics: failure=%s curl_exit=%s "
+        "http_status=%s remote_ip=%s dns=%s tcp=%s tls=%s ttfb=%s total=%s "
+        "request_id=%s run=%s budget_at_start=%s elapsed=%.3fs",
+        label, failure, curl_exit if curl_exit is not None else "unavailable",
+        *(meta.get(key) or "unavailable" for key in
+          ("http_status", "remote_ip", "dns_seconds", "tcp_seconds", "tls_seconds",
+           "ttfb_seconds", "total_seconds")),
+        request_id or "unavailable", run_id or "unavailable",
+        f"{budget_at_start:.3f}s" if budget_at_start is not None else "unbounded",
+        elapsed,
+    )
+
+
 def _http_api_curl_post(
     url: str, headers: Dict[str, str], body: Optional[bytes], *, label: str
 ) -> Tuple[int, bytes]:
@@ -468,6 +586,7 @@ def _http_api_curl_post(
     返回 ``(status, body)``；Windows（管道无法 selector 有界排空）明确失败
     走既有兜底。
     """
+    import logging
     import os
     import selectors
     import shutil
@@ -485,6 +604,8 @@ def _http_api_curl_post(
     deadline = request_deadline.get()
     remaining = None if deadline is None else max(0.001, deadline - monotonic())
     max_time = f"{(remaining if remaining is not None else _HTTP_CURL_MAX_TIME_FALLBACK):.3f}"
+    start_monotonic = monotonic()
+    budget_at_start = remaining
     header_fd, header_path = tempfile.mkstemp(prefix="ifind-http-hdr-")
     proc: Optional[subprocess.Popen] = None
     try:
@@ -501,6 +622,10 @@ def _http_api_curl_post(
             "--request", "POST",
             "--header", f"@{header_path}",
             "--data-binary", "@-",
+            # write-out 元数据经 %{stderr} 重定向到独立通道（不占正文配额）；
+            # 解析与脱敏见 _split_curl_meta/_parse_curl_meta。旧 curl 对
+            # %{stderr}/未知变量输出字面占位——解析层按白名单标不可得。
+            "--write-out", _CURL_WRITEOUT_FORMAT,
             "--url", url,
         ]
         proc = subprocess.Popen(
@@ -514,18 +639,35 @@ def _http_api_curl_post(
         except BrokenPipeError:
             proc.stdin.close()
         stdout = bytearray()
+        stderr_buf = bytearray()
         with selectors.DefaultSelector() as selector:
             selector.register(proc.stdout, selectors.EVENT_READ)
             selector.register(proc.stderr, selectors.EVENT_READ)
             while selector.get_map():
-                check_attempt_alive()
+                try:
+                    check_attempt_alive()
+                except BaseException as exc:
+                    # 本地中止（硬截止/取消）：元数据可能来不及输出，缺项
+                    # 如实；只报告本地已知时间/原因，不为统计延长请求。
+                    logging.getLogger(__name__).warning(
+                        "ifind http daily %s aborted locally: reason=%s elapsed=%.3fs budget_at_start=%s",
+                        label, f"{type(exc).__name__}:{str(exc)[:80]}",
+                        monotonic() - start_monotonic,
+                        f"{budget_at_start:.3f}s" if budget_at_start is not None else "unbounded",
+                    )
+                    raise
                 for key, _event in selector.select(0.02):
                     chunk = os.read(key.fileobj.fileno(), 8192)
                     if not chunk:
                         selector.unregister(key.fileobj)
                         continue
                     if key.fileobj is proc.stderr:
-                        continue  # 错误细节不采纳（curl 退出码承载失败语义）
+                        # 错误文本不采纳（退出码承载失败语义）；仅 write-out
+                        # 诊断帧有界累积（超限丢弃后续，诊断降级）。
+                        if len(stderr_buf) < _CURL_META_STDERR_MAX:
+                            stderr_buf.extend(
+                                chunk[:_CURL_META_STDERR_MAX - len(stderr_buf)])
+                        continue
                     stdout.extend(chunk)
                     _reject_http_api_bounds(bytes(stdout), label)
         check_attempt_alive()
@@ -543,22 +685,65 @@ def _http_api_curl_post(
             pass
     if proc is None:
         raise DataFetchError(f"ifind http daily {label} transport failed: no process")
+    # 独立 stderr 诊断通道：元数据只从 stderr 有界提取，stdout 是纯业务
+    # 正文（边界检查已在读循环完成）——诊断解析在任何情况下都不读取、不
+    # 改写 stdout（正文含哨兵文本亦原样保留）。curl ≥7.75（%{stderr} 支持）
+    # 是环境前置条件；更旧 curl 帧缺失时诊断如实不可得，不做 stdout 兼容。
+    meta_raw = _split_curl_meta(bytes(stderr_buf))
+    meta = _parse_curl_meta(meta_raw)
+    elapsed = monotonic() - start_monotonic
     try:
-        status, _headers, body = _split_included_http(bytes(stdout))
+        status, resp_headers, body = _split_included_http(bytes(stdout))
     except DataFetchError as exc:
         if not stdout and proc.returncode not in {0, None}:
+            # curl 52 类空回复：正是诊断要定位的现场（退出码 + 可得节点
+            # 元数据），失败语义不变。
+            _log_curl_transport_diagnostics(
+                label, level=logging.WARNING, failure="empty_reply",
+                curl_exit=proc.returncode, resp_headers=None, meta=meta,
+                budget_at_start=budget_at_start, elapsed=elapsed)
             raise DataFetchError(
                 f"ifind http daily {label} transport failed: curl exit {proc.returncode}"
             ) from exc
+        _log_curl_transport_diagnostics(
+            label, level=logging.WARNING, failure="unparsable_response",
+            curl_exit=proc.returncode, resp_headers=None, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
         raise
     if proc.returncode == 28:
+        _log_curl_transport_diagnostics(
+            label, level=logging.WARNING, failure="curl_max_time",
+            curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
         raise TimeoutError(f"ifind http daily {label} curl max-time reached")
     if proc.returncode == 63:
+        _log_curl_transport_diagnostics(
+            label, level=logging.WARNING, failure="byte_bound",
+            curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
         raise DataFetchError(f"ifind http daily {label} byte bound exceeded")
     if proc.returncode not in {0, None}:
+        _log_curl_transport_diagnostics(
+            label, level=logging.WARNING, failure="transport_failed",
+            curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
         raise DataFetchError(
             f"ifind http daily {label} transport failed: curl exit {proc.returncode}"
         )
+    if status != 200:
+        # 非 200 是「传输完成、HTTP 层异常」：默认日志下以 warning 保留现场
+        # （节点/时延/状态白名单证据）——不推断额度/限流原因（上层按状态
+        # 分类：401/403 触发续用重试、其余按 DataFetchError 语义）。
+        _log_curl_transport_diagnostics(
+            label, level=logging.WARNING, failure="http_response",
+            curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
+    else:
+        # 200 成功诊断仅 debug 级（对照样本，不显著增加常规日志量）。
+        _log_curl_transport_diagnostics(
+            label, level=logging.DEBUG, failure="none",
+            curl_exit=proc.returncode, resp_headers=resp_headers, meta=meta,
+            budget_at_start=budget_at_start, elapsed=elapsed)
     return status, body
 
 
@@ -1600,6 +1785,14 @@ def company_profile_with_fallback(
     api_failure: Optional[BaseException] = None
     api_deadline = _finance_api_deadline(float(deadline))
     if ifind_http_daily_enabled():
+        if api_deadline - monotonic() < 1.0:
+            # 本地预算耗尽（份额不足最小可执行请求）≠ 供应商接口超时：仍按
+            # 既有语义出站（curl 即刻硬截止），日志明确区分，不误述为远端故障。
+            logger.warning(
+                "company_profile API 本地预算耗尽（份额 %.3fs 不足最小可执行请求），"
+                "出站将即刻硬截止（本地预算耗尽，非供应商超时）",
+                api_deadline - monotonic(),
+            )
         deadline_token = request_deadline.set(api_deadline)
         try:
             api_readings = ifind_http_company_profile(code, deadline=api_deadline)
@@ -1633,21 +1826,28 @@ def company_profile_with_fallback(
     # 由 company.NAME 承载（base.py:5423-5428）。
     if (api_readings is None or missing_fields(api_readings, indicator_by_key)
             or "name" not in api_readings) and mcp_ready:
-        try:
-            mcp_profile = IfindFetcher(
-                mcp_endpoint, mcp_token, mcp_timeout,
-            ).company_profile(code, deadline=deadline)
-        except SourceReadError as exc:
-            mcp_errors.append(f"mcp:company:{exc.reason_code}")
+        if deadline - monotonic() <= 0:
+            # 预算耗尽后未派发 ≠ 供应商超时：如实区分（不发起无预算出站）。
             logger.warning(
-                "company_profile MCP 兜底失败（%s: %s）", code, exc.reason_code)
+                "company_profile MCP 补缺本地预算耗尽（未派发，非供应商超时）")
+            mcp_errors.append("mcp:company:timeout")
             mcp_profile = None
-        except ResearchStopped:
-            raise
-        except (DataFetchError, TimeoutError) as exc:
-            mcp_errors.append(f"mcp:company:{_finance_failure_code(exc)}")
-            logger.warning("company_profile MCP 兜底失败：%s", _safe(exc))
-            mcp_profile = None
+        else:
+            try:
+                mcp_profile = IfindFetcher(
+                    mcp_endpoint, mcp_token, mcp_timeout,
+                ).company_profile(code, deadline=deadline)
+            except SourceReadError as exc:
+                mcp_errors.append(f"mcp:company:{exc.reason_code}")
+                logger.warning(
+                    "company_profile MCP 兜底失败（%s: %s）", code, exc.reason_code)
+                mcp_profile = None
+            except ResearchStopped:
+                raise
+            except (DataFetchError, TimeoutError) as exc:
+                mcp_errors.append(f"mcp:company:{_finance_failure_code(exc)}")
+                logger.warning("company_profile MCP 兜底失败：%s", _safe(exc))
+                mcp_profile = None
         if not api_readings:
             # API 未产出任何有效字段（HTTP 关/失败/资格拒绝且 MCP 关）→
             # 按实际类别上抛（不返回空 facts CompanyProfile 伪装成功）。
@@ -2017,9 +2217,13 @@ def ifind_http_main_inflow_series(
     ``start_iso``/``end_iso``（YYYY-MM-DD）由消费方以**本地完成交易日历**
     锚定——enddate 恒为最近已完成交易日，响应不含盘中日（解析层再防御性
     丢弃更晚行）。失败统一抛 ``SourceReadError``/``DataFetchError`` 由调用
-    方回 MCP 原路径；预算按 ``_finance_api_deadline`` 为 MCP 兜底预留份额，
-    取消（``ResearchStopped``）照 curl 边界穿透。凭据/传输复用既有 authorized
-    模式（401/403 强刷重试一次）。
+    方回 MCP 原路径。资金专用尝试预留由唯一业务调用者（资金路由层
+    ``capital_flow_provider``）一次分配——本入口**不再划拨后备份额**，但
+    仍将本次尝试截止与「当前父截止」「HTTP 自建上限（配置 timeout + 解析
+    余量）」夹取（认证/强刷/业务请求同窗），更短外层截止照旧优先。取消
+    （``ResearchStopped``）照 curl 边界穿透。凭据/传输复用既有 authorized
+    模式（401/403 强刷重试一次）。本函数日志只承载「取得候选」语义：实际
+    渠道采纳由资金消费层确认后记录。
     """
     from data_provider.cross_source_validator import SourceReadError
     from src.config import get_config
@@ -2034,7 +2238,15 @@ def ifind_http_main_inflow_series(
         raise SourceReadError("ifind", "invalid_configuration")
     start_compact = start_iso.replace("-", "")
     end_compact = end_iso.replace("-", "")
-    api_deadline = _finance_api_deadline(float(deadline))
+    # 末位尝试截止：不预留，但保留请求级上限与更短父截止（min 三取一）。
+    _limits = [float(deadline)]
+    _outer = request_deadline.get()
+    if _outer is not None:
+        _limits.append(float(_outer))
+    _cap = float(getattr(config, "ifind_http_timeout_seconds", 30.0) or 0.0)
+    if _cap > 0:
+        _limits.append(monotonic() + _cap + _HTTP_PARSE_STAGE_SECONDS)
+    api_deadline = min(_limits)
     deadline_token = request_deadline.set(api_deadline)
     try:
         access_token = _resolve_access_token(refresh)
@@ -2056,7 +2268,7 @@ def ifind_http_main_inflow_series(
         )
         import logging
         logging.getLogger(__name__).info(
-            "ifind http flow %s %s~%s API 采纳（%d 行，null %d）",
+            "ifind http flow %s %s~%s 取得候选（%d 行，null %d）",
             identity, start_iso, end_iso, len(series),
             sum(1 for _d, v in series if v is None),
         )
