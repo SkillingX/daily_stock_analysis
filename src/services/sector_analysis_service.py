@@ -1571,7 +1571,7 @@ def _identify_sector(code: str, *, budget: ReportBudget) -> Dict[str, Any]:
         "board_code": "",         # 东财板块代码（BK****）
         "subject_status": "missing",
         "membership": {"verified": False, "member_count": None,
-                       "verified_source": None},
+                       "verified_source": None, "sw_membership": None},
         "observed_at": None,      # 本系统采集时点（与供应商 as_of 区分）
         "vendor_as_of": None,     # 供应商未回显 as_of，如实为未知
         "classification_system": None,   # 分类体系（锁定口径）；无行业数据时 None
@@ -3150,6 +3150,8 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         "snapshot_observed_at": snapshot_observed_at,
         "source": snapshot_source,
         "quotes_as_of": quotes_as_of,
+        "industry_reference": False,
+        "target_independent_quote": None,
         "gaps": [],
     }
     if not subject_confirmed:
@@ -3335,6 +3337,7 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
             "amount": float(m["amount"]) if m["amount"] is not None else None,
             "change_pct": m["change_pct"],
             "is_target": c == code,
+            "as_of_date": None,
         })
     out["items"] = items
     out["sample_size"] = len(items)
@@ -4684,10 +4687,191 @@ def _sw_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudget,
     return out
 
 
+_MEMBER_QUOTE_BATCH_SIZE = 150
+"""成分成员行情单批代码数上限（2026-11-18 实测成员行情按 ~150 分批）。"""
+
+_MEMBER_QUOTE_INDICATORS = "changeRatio,amount,tradeTime,latest,preClose"
+"""成分成员行情指标子集（与 2026-11-18 实测口径一致；同业只用成交额与涨跌幅）。"""
+
+
+def _fetch_constituents(code: str, index_code: str, session_date: str,
+                        session: "SessionContext", *, name: Optional[str],
+                        refresh_token: str, timeout_seconds: float,
+                        budget: ReportBudget,
+                        ) -> Dict[str, Any]:
+    """指数成分边界与成员行情链（issue #100；#98 决策 3/5；amend 后仅在
+    编排层决定**保留申万**时由预算允许内调用一次）。
+
+    顺序与失败隔离（各自独立降缺口，不影响核心行情/趋势资格与兜底门槛）：
+    1. 同日成分查询（p03473）→ 三态判定（带交易所身份精确匹配）；
+    2. 目标股未确认成分（excluded/unknown）时**先**查询目标独立行情（单次
+       小出站，优先于大批次；成员集为空同样独立尝试，绝不进入成员集合）；
+    3. 成员同日行情（real_time_quotation 分批，同一资格纪律：同日 + 时间/
+       新鲜度 + 交叉复核 + 每批按请求身份集筛选），批次失败隔离（该批缺失、
+       其余存活）。
+
+    成分查询失败 ≠ 非成员：membership 恒保守未知 + 可诊断缺口。
+    """
+    from src.services.sector_sw_market import (
+        SwSectorFetchError,
+        classify_membership,
+        fetch_index_members,
+        fetch_index_quotes,
+        qualify_quote_rows,
+    )
+
+    target_secucode = _secucode(code)
+    unknown_membership = {
+        "status": "unknown", "target_secucode": target_secucode,
+        "observation_date": session_date, "member_count": None,
+        "completeness_evidence": None,
+        "gaps": ["成分未查询（前置失败）"],
+    }
+    out: Dict[str, Any] = {
+        "membership": unknown_membership,
+        "members": {"member_codes": [], "member_names": {},
+                    "dates_seen": [], "rows_total": 0,
+                    "completeness_evidence": None, "gaps": []},
+        "member_quotes": {},
+        "member_quote_gaps": [],
+        "target_quote": None,
+        "target_quote_gaps": [],
+        "target_name": (name or None),
+    }
+    try:
+        members = fetch_index_members(
+            index_code, session_date, refresh_token=refresh_token,
+            timeout_seconds=timeout_seconds, deadline=budget.fetch_deadline,
+        )
+    except SwSectorFetchError as exc:
+        # 成分查询失败：membership 保守未知，目标独立行情仍独立尝试
+        # （与成员集为空同一语义；不提前返回，共享下方独立行情/成员批次流程）
+        members = {"member_codes": [], "member_names": {}, "dates_seen": [],
+                   "rows_total": 0, "completeness_evidence": None,
+                   "rejected_identity_rows": 0, "conflicting_code_members": 0,
+                   "gaps": [f"成分查询失败（{exc}）"]}
+        out["members"] = members
+        out["membership"] = classify_membership(
+            target_secucode, members, observation_date=session_date)
+    out["members"] = members
+    out["membership"] = classify_membership(
+        target_secucode, members, observation_date=session_date)
+    member_codes = members.get("member_codes") or []
+    not_included = out["membership"]["status"] != "included"
+    if not_included:
+        # 目标独立行情（未确认成分时的独立事实位；绝不进入成员集合/同业）：
+        # 单次小出站**优先于**大批次成员行情；成员集为空（成分查询失败/未
+        # 取得该日成分）同样保持 unknown 并独立尝试（预算允许内）
+        try:
+            rows = fetch_index_quotes(
+                target_secucode, refresh_token=refresh_token,
+                timeout_seconds=timeout_seconds,
+                deadline=budget.fetch_deadline,
+                indicators=_MEMBER_QUOTE_INDICATORS,
+                raw_amount=True,
+            )
+            received_at = _received_at_now()
+            qualified, _notes = qualify_quote_rows(
+                rows, session_date=session_date, received_at=received_at,
+                session_open=session.session_open,
+                session_close=session.session_close,
+            )
+            row = qualified.get(target_secucode)
+            if row is not None:
+                out["target_quote"] = row
+            else:
+                out["target_quote_gaps"].append(
+                    f"目标股 {target_secucode} 无 {session_date} 同日合格行情"
+                    "（资格不符或缺失），独立行情未取得")
+        except SwSectorFetchError as exc:
+            out["target_quote_gaps"].append(
+                f"目标股行情查询失败（{exc}），独立行情未取得")
+    if member_codes:
+        quotes: Dict[str, Dict[str, Any]] = {}
+        quote_gaps: List[str] = []
+        total_batches = (len(member_codes) + _MEMBER_QUOTE_BATCH_SIZE - 1) \
+            // _MEMBER_QUOTE_BATCH_SIZE
+        for offset in range(0, len(member_codes), _MEMBER_QUOTE_BATCH_SIZE):
+            batch = member_codes[offset:offset + _MEMBER_QUOTE_BATCH_SIZE]
+            batch_no = offset // _MEMBER_QUOTE_BATCH_SIZE + 1
+            try:
+                rows = fetch_index_quotes(
+                    ",".join(batch), refresh_token=refresh_token,
+                    timeout_seconds=timeout_seconds,
+                    deadline=budget.fetch_deadline,
+                    indicators=_MEMBER_QUOTE_INDICATORS,
+                    raw_amount=True,
+                )
+            except SwSectorFetchError as exc:
+                quote_gaps.append(
+                    f"成员行情第 {batch_no}/{total_batches} 批查询失败"
+                    f"（{exc}），该批 {len(batch)} 只成员行情缺失")
+                continue
+            received_at = _received_at_now()
+            qualified, notes = qualify_quote_rows(
+                rows, session_date=session_date, received_at=received_at,
+                session_open=session.session_open,
+                session_close=session.session_close,
+            )
+            quote_gaps.extend(notes)
+            # 批次身份资格：响应行只采用本批请求的完整身份集——供应商串批/
+            # 越界/跨批重复行一律不属于本批，不采用也不覆盖先批已采用行
+            # （计数披露，原始值不回显）
+            batch_identity = set(batch)
+            out_of_batch = 0
+            for code, row in qualified.items():
+                if code not in batch_identity:
+                    out_of_batch += 1
+                    continue
+                quotes[code] = row
+            if out_of_batch:
+                quote_gaps.append(
+                    f"成员行情第 {batch_no}/{total_batches} 批响应含 "
+                    f"{out_of_batch} 个非本批请求身份的行，不采用、不覆盖"
+                    "先批已采用行（原始值不回显）")
+        out["member_quotes"] = quotes
+        out["member_quote_gaps"] = quote_gaps
+    return out
+
+
+def _enrich_constituents(code: str, sw: Dict[str, Any], name: str, *,
+                         budget: ReportBudget, allow: bool = True) -> None:
+    """保留申万分支的成分/同业富化（**恰好一次**；切换东财路径不调用）。
+
+    - ``sw["constituents"]`` 已存在（含此前失败的显式占位）→ 不再出站；
+    - ``allow=False``（取数截止已过）或 session 缺失（降级/受控链）或主行业
+      未确认 → 不出站，constituents 保持未取得（阶段缺口如实）；
+    - 配置缺失（凭据未配置）→ 不出站（与核心链同一门控）。
+    """
+    if sw.get("constituents") is not None:
+        return
+    ident = sw.get("identity") or {}
+    session = sw.get("session")
+    if not allow or session is None or ident.get("status") != "confirmed":
+        return
+    from src.services.sector_sw_market import sw_http_config
+
+    cfg = sw_http_config()
+    if cfg is None:
+        return
+    token, timeout = cfg
+    snapshot_date = (sw.get("snapshot") or {}).get("session_date")
+    if not snapshot_date:
+        return
+    sw["constituents"] = _fetch_constituents(
+        code, ident.get("index_code") or "", snapshot_date, session,
+        name=name, refresh_token=token, timeout_seconds=timeout,
+        budget=budget)
+
+
 def _sw_market_chain(code: str, *, budget: ReportBudget,
                      current_time: Optional[datetime] = None,
+                     name: Optional[str] = None,
                      ) -> Dict[str, Any]:
-    """申万市场数据链（issue #99）：主行业归属 → 31 指数同日快照 → 趋势。
+    """申万市场数据链（issue #99；成分/同业扩展见 issue #100）。
+
+    流程：主行业归属 → 31 指数同日快照 → 行业+沪深 300 严格日历趋势 →
+    指数成分边界与成员行情（:func:`_fetch_constituents`）。
 
     输出（非载荷键，编排层消费）：
     - ``identity``：申万主行业归属解析结果（confirmed/unavailable + 缺口）
@@ -4697,6 +4881,11 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
     - ``trend``：:func:`_sw_trend_pillar` 输出
     - ``quote_target_ok``：目标行业在目标会话日有合格涨跌幅（兜底门槛输入）
     - ``trend_ok``：行业自身 20/20 合格且区间收益非空（兜底门槛输入）
+    - ``constituents``（issue #100）：成分边界三态、成员同日合格行情、目标
+      独立行情（未确认成分时）——由编排层在**决定保留申万**后经
+      :func:`_fetch_constituents` 富化（切换东财零被弃出站），不影响兜底
+      门槛输入
+    - ``session``：本链会话上下文（保留分支富化复用，非载荷键）
 
     主行业未确认（含凭据未配置/传输不可用）时快照与趋势不出站（无目标
     主体；兜底门槛由主行业直接触发）。供应商失败降缺口，不向上传播。
@@ -4728,6 +4917,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         "quote_target_ok": False,
         "trend_ok": False,
         "gaps": [],
+        "session": None,
     }
     cfg = sw_http_config()
     if cfg is None:
@@ -4836,6 +5026,11 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
                                     current_time=current_time)
     out["trend_ok"] = bool(out["trend"].get("eligible")
                            and out["trend"].get("period_return_pct") is not None)
+    # 成分/同业出站**不在此处**发起：兜底门槛只看主行业与两项核心行情，
+    # 编排层先判定保留申万还是切换东财——切换成功则零被弃的成分/成员行情
+    # 出站（issue #100 amend）；保留申万时由 compose_report 预算允许内
+    # 富化一次（session 随链返回供富化复用）
+    out["session"] = session
     return out
 
 
@@ -4942,19 +5137,372 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     return pillar
 
 
-_SW_STAGE_PEER_LABEL = "同业比较与指数成分验证：待后续版本接入（本阶段未执行）"
 _SW_STAGE_RESEARCH_LABEL = "行业催化与证据化综合：待后续版本接入（本阶段未执行）"
+
+_SW_MEMBERS_SOURCE = "iFinD 申万指数成分（p03473）+ 成员行情（real_time_quotation）"
+_SW_MEMBERS_AMOUNT_PROVENANCE = (
+    "成交额单位为元：iFinD real_time_quotation amount 字段（2026-11-18 成员"
+    "样本实测量级与东财个股成交额同为元口径；供应商文档未逐字段标注单位，"
+    "按实测复核口径标注）")
+
+
+def _sw_public_amount(amount: Optional[Decimal],
+                      reason: str) -> Tuple[Optional[Decimal], str]:
+    """成员/独立行情共享的本地 amount 契约（既有公开边界复核）：
+    Decimal 排序输入保留原始精度，但发布前按公开边界（PeerItem.amount 等
+    float 字段）复核有限性——不能以有限 float 表示的原始金额（超大整数
+    ``float()`` 溢出 ±inf）判 invalid（None + 缺口），JSON 与 Markdown
+    边界不出现 inf。ok/zero/missing 原样通过。"""
+    if amount is None:
+        return None, reason
+    try:
+        published = float(amount)
+    except (OverflowError, ValueError):
+        return None, "invalid"
+    if published != published or published in (float("inf"), float("-inf")):
+        return None, "invalid"
+    return amount, reason
+
+
+@require(lambda code: isinstance(code, str) and len(code) == 6 and code.isdigit(),
+         "code must be a 6-digit string")
+@require(lambda constituents: isinstance(constituents, dict),
+         "constituents must be a dict (chain output)")
+@ensure(
+    lambda result: (not result.get("industry_reference")
+                    or (result.get("target_change_pct_rank") is None
+                        and result.get("target_in_amount_top5") is None
+                        and not any(i.get("is_target")
+                                    for i in (result.get("items") or [])))),
+    "industry_reference=True (target not confirmed in constituents) must leave "
+    "in-constituents rank and top5 eligibility empty and must not list the "
+    "target inside the constituents sample items",
+)
+@ensure(
+    lambda result: (result.get("target_independent_quote") is None
+                    or not any(
+                        i.get("is_target")
+                        and i.get("code")
+                        == result["target_independent_quote"].get("code")
+                        for i in (result.get("items") or []))),
+    "no constituents sample item may be flagged as the target while the "
+    "target quote is only an independent fact (a bare-code lookalike from "
+    "another exchange in items stays a peer row, not target evidence)",
+)
+def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
+                     snapshot_observed_at: Optional[str],
+                     budget: ReportBudget) -> Dict[str, Any]:
+    """申万口径同业比较支柱（issue #100；父规格 #98 决策 3/5）。
+
+    成分边界三态（:func:`sector_sw_market.classify_membership` 输出）下的选取：
+    - ``included``（已纳入）：同一成分快照按成交额前五 + 目标股去重（既有
+      规则，Decimal 降序、并列代码升序）；全成分成交额前五资格需要**成分
+      全集证据与报价全集同时可证**，缺一为 None（不冒充全体排名）；样本内
+      涨跌幅名次在 picked 全覆盖时输出，缺失同行 withhold + 有效范围缺口；
+    - ``excluded``/``unknown``（明确未纳入/未知）：同业为**纯成分**成交额
+      前五并标注行业参考（``industry_reference=True``），成分内名次与前五
+      资格留空；目标股独立行情只进 ``target_independent_quote`` 独立事实位
+      （不进 items、不参与排名——目标未确认成分，其行情不得经由同业证据
+      进入成分比较）。
+
+    成员行情缺失（批次失败/资格拒绝）保留成员资格、金额 None（不缩分母、
+    不补造），有效范围与批次缺口如实披露；零额成员是已知零观测（保留 0、
+    不进活跃前五）；剥后缀后 6 位码冲突整组剔除（保守）。成员行情时点
+    （``quotes_as_of``）来自供应商时间戳（非接收钟）。
+    """
+    membership = constituents.get("membership") or {}
+    members = constituents.get("members") or {}
+    member_quotes: Dict[str, Dict[str, Any]] = constituents.get(
+        "member_quotes") or {}
+    quote_gaps = [str(g) for g in (constituents.get("member_quote_gaps") or [])]
+    target_quote = constituents.get("target_quote")
+    target_quote_gaps = [str(g) for g in
+                         (constituents.get("target_quote_gaps") or [])]
+    status = str(membership.get("status") or "unknown")
+    included = status == "included"
+    member_codes = [str(c) for c in (members.get("member_codes") or [])]
+    member_names: Dict[str, str] = members.get("member_names") or {}
+    evidence = membership.get("completeness_evidence")
+
+    out: Dict[str, Any] = {
+        "eligible": True,
+        "selection_rule": ("同一成分快照按成交额前五 + 目标股去重"
+                           "（成交活跃代表，非市值/基本面龙头）"),
+        "items": [],
+        "target_in_amount_top5": None,
+        "target_change_pct_rank": None,
+        "amount_unit": "元",
+        "amount_provenance": _SW_MEMBERS_AMOUNT_PROVENANCE,
+        # 超可发布上限的响应：成员集合整体不发布，观测行数不进有界字段
+        # （数值以缺口承载，不发布全集覆盖、不产生载荷校验 500）
+        "snapshot_rows": (0 if members.get("over_publish_limit")
+                          else int(members.get("rows_total") or 0)),
+        "rankable_rows": 0,
+        "sample_size": 0,
+        "snapshot_observed_at": snapshot_observed_at,
+        "source": _SW_MEMBERS_SOURCE,
+        "quotes_as_of": None,
+        "industry_reference": False,
+        "target_independent_quote": None,
+        "gaps": [],
+    }
+    gaps: List[str] = []
+    if members.get("over_publish_limit"):
+        gaps.extend(str(g) for g in (members.get("gaps") or []))
+    if not included:
+        out["industry_reference"] = True
+        boundary_label = ("明确未纳入" if status == "excluded" else "状态未知")
+        out["selection_rule"] = (
+            "同一成分快照按成交额前五（成交活跃代表，非市值/基本面龙头）；"
+            f"目标股指数成分{boundary_label}，未确认成分——同业为行业参考，"
+            "目标股独立展示、不参与成分内排名")
+        boundary_gap = (
+            f"目标股 {membership.get('target_secucode') or code} 指数成分"
+            f"{boundary_label}"
+            + ("（完整性证据可证）" if status == "excluded"
+               else ("（单次成分响应无完整性元数据，未命中目标股不能证明非成员）"
+                     if member_codes
+                     else "（同日成分未取得——查询失败或未取得该日成分，"
+                          "查询失败/未取得 ≠ 非成员）"))
+            + "；同业为行业参考，成分内名次与前五资格留空")
+        gaps.append(boundary_gap)
+        gaps.extend(str(g) for g in (membership.get("gaps") or []))
+
+    # 成员行构造（成员资格 = 6 位码有效 + 剥后缀无冲突；金额/涨跌幅独立判定）
+    by_stripped: Dict[str, List[str]] = {}
+    for secucode in member_codes:
+        by_stripped.setdefault(secucode.split(".", 1)[0], []).append(secucode)
+    conflicted = {s for s, lst in by_stripped.items() if len(lst) > 1}
+    if conflicted:
+        shown = "、".join(sorted(conflicted)[:5])
+        gaps.append(
+            f"成分成员剥交易所后缀后存在重复代码 {shown}"
+            f"{' 等 ' + str(len(conflicted)) + ' 个' if len(conflicted) > 5 else ''}"
+            "（身份冲突不静默取其一），相关成员整组剔除")
+
+    members_data: List[Dict[str, Any]] = []
+    amount_reasons = {"missing": 0, "zero": 0, "invalid": 0}
+    blank_names = 0
+    for stripped, secu_list in by_stripped.items():
+        if stripped in conflicted:
+            continue
+        secucode = secu_list[0]
+        name, adapted = _adapt_peer_name(member_names.get(secucode), stripped)
+        if adapted:
+            blank_names += 1
+        quote = member_quotes.get(secucode)
+        amount: Optional[Decimal] = None
+        change: Optional[float] = None
+        if quote is not None:
+            amount, reason = _sw_public_amount(
+                *_decimal_amount(quote.get("amount")))
+            if reason == "zero":
+                amount_reasons["zero"] += 1
+            elif reason != "ok":
+                amount_reasons[reason] += 1
+            change = _num(quote.get("change_pct"))
+        else:
+            amount_reasons["missing"] += 1
+        members_data.append({
+            "code": stripped, "secucode": secucode, "name": name,
+            "amount": amount, "change_pct": change,
+            # 目标身份只认**带交易所精确匹配**（membership.target_secucode）；
+            # unknown/excluded 态下同裸码异交易所的成员（如 600188.SZ）绝不
+            # 标为目标或携带 target 证据
+            "is_target": included and secucode == membership.get(
+                "target_secucode"),
+            "as_of_date": (str(quote.get("trade_date") or "") or None
+                           if quote is not None else None),
+        })
+    if blank_names:
+        gaps.append(
+            f"同业比较：{blank_names} 行成分响应名称空白/缺失，按代码显示（成员保留）")
+    for g in quote_gaps:
+        gaps.append(f"成员行情：{g}")
+
+    out["rankable_rows"] = sum(
+        1 for m in members_data
+        if m["amount"] is not None and m["amount"] > 0)
+    zero_total = amount_reasons["zero"]
+    invalid_total = amount_reasons["invalid"]
+    missing_total = amount_reasons["missing"]
+    if zero_total:
+        gaps.append(
+            f"同业比较：{zero_total} 名成员成交额为合法零额（已知零观测，保留 0、"
+            "不参与成交额活跃前五）")
+    if invalid_total or missing_total:
+        parts = []
+        if missing_total:
+            parts.append(f"报价未取得/缺失 {missing_total}")
+        if invalid_total:
+            parts.append(f"无效 {invalid_total}")
+        gaps.append(
+            f"同业比较：{invalid_total + missing_total} 名成员成交额不可排名"
+            f"（{'、'.join(parts)}，未知语义；成员资格保留，缺失金额不参与"
+            "成交额排名，不冒充全体分布）")
+
+    rankable = sorted(
+        (m for m in members_data if m["amount"] is not None and m["amount"] > 0),
+        key=lambda m: (-m["amount"], m["code"]))
+    ranked_codes = [m["code"] for m in rankable]
+    member_by_code = {m["code"]: m for m in members_data}
+    target_member = member_by_code.get(code)
+
+    # 报价全集：批次无缺口、无被剔除成员行（身份不合格/剥后缀矛盾——完整性
+    # 证明不得基于被静默缩小的分母）、全部成员行金额已知（正/零），且成分
+    # 观测集非空
+    identity_rejected = int(members.get("rejected_identity_rows") or 0)
+    conflicting_members = int(members.get("conflicting_code_members") or 0)
+    quotes_full = (not quote_gaps and bool(member_codes)
+                   and missing_total == 0 and invalid_total == 0
+                   and identity_rejected == 0 and conflicting_members == 0)
+    member_completeness = bool(evidence) and bool(member_codes)
+    full_universe = member_completeness and quotes_full
+
+    if included:
+        picked = list(ranked_codes[:5])
+        if target_member is not None and code not in picked:
+            picked.append(code)
+        if target_member is None:
+            # 已确认成分但成员集被全剔除/未含目标（如身份冲突整组剔除）：
+            # 目标不进样本，资格保持未知（不按缺口数据下结论）
+            gaps.append(
+                f"同业比较：目标股 {code} 未在有效成分成员行中（成分身份冲突"
+                "剔除或数据异常），目标未加入样本、资格保持未知")
+        elif target_member["amount"] == Decimal("0"):
+            # 已知零额目标：**成分全集证据与报价全集同时可证**才可判「不在
+            # 正额前五」（False）；任一缺失保持 None（与缺报价的未知一致）
+            if full_universe:
+                out["target_in_amount_top5"] = False
+                gaps.append(
+                    f"同业比较：目标股 {code} 成交额为已知零，不属于正额活跃前五")
+            else:
+                gaps.append(
+                    "同业比较：报价全集或成分完整性不可证（含被剔除成员行时"
+                    "分母不完整），目标股前五资格不判定（样本内事实保留）")
+        elif full_universe:
+            out["target_in_amount_top5"] = code in ranked_codes[:5]
+        else:
+            missing_parts = []
+            if not member_completeness:
+                missing_parts.append("成分全集证据缺失")
+            if not quotes_full:
+                missing_parts.append(
+                    "报价全集不可证（存在成员报价缺口或被剔除成员行）")
+            gaps.append(
+                "同业比较：全成分成交额前五资格需要成分全集证据与报价全集"
+                f"同时可证（{'、'.join(missing_parts)}），资格不判定"
+                "（样本内事实保留）")
+        # 样本内涨跌幅名次（picked 全覆盖才发；缺失同行 withhold）
+        if target_member is None:
+            pass
+        elif target_member["change_pct"] is None:
+            gaps.append(
+                f"同业比较：目标股 {code} 当日涨跌幅缺失，相对位置不输出"
+                "（不按其他指标顶替）")
+        elif len(picked) <= 1:
+            gaps.append(
+                "同业比较：样本内无可比同行（仅目标股自身），相对位置不输出")
+        else:
+            valid_changes = [
+                m["change_pct"] for m in (member_by_code[c] for c in picked)
+                if m["change_pct"] is not None]
+            missing_changes = len(picked) - len(valid_changes)
+            if missing_changes:
+                gaps.append(
+                    f"同业比较：样本内 {missing_changes} 家当日涨跌幅缺失，"
+                    f"有效比较范围 {len(valid_changes)}/{len(picked)} 家，"
+                    "不输出全样本名次（不伪完整排名）")
+            else:
+                out["target_change_pct_rank"] = (
+                    1 + sum(1 for ch in valid_changes
+                            if ch > target_member["change_pct"]))
+    else:
+        picked = list(ranked_codes[:5])
+        # 目标独立行情：只进独立事实位（不进 items、不参与排名）
+        if target_quote is not None:
+            t_secucode = str(target_quote.get("thscode") or "")
+            t_code = t_secucode.split(".", 1)[0] or code
+            t_name, t_adapted = _adapt_peer_name(
+                constituents.get("target_name"), t_code)
+            # 独立行情金额经同一 Decimal 判定 + 公开边界复核：负/非有限/
+            # 超大不可表示 = 无效观测（None + 缺口），不发布负额/inf 事实；
+            # 已知零额保留 0
+            t_amount, t_amount_reason = _sw_public_amount(
+                *_decimal_amount(target_quote.get("amount")))
+            if t_amount_reason not in ("ok", "zero"):
+                reason_text = {"missing": "缺失",
+                               "invalid": "负值/非数值"}.get(
+                    t_amount_reason, t_amount_reason)
+                gaps.append(
+                    f"目标股独立行情：成交额无效（{reason_text}），"
+                    "金额置为未知（不发布无效数值）")
+            tiq: Dict[str, Any] = {
+                "code": t_code, "name": t_name,
+                "amount": (float(t_amount)
+                           if t_amount is not None and t_amount_reason == "ok"
+                           else (0.0 if t_amount_reason == "zero" else None)),
+                "change_pct": _num(target_quote.get("change_pct")),
+                "is_target": True,
+                "as_of_date": str(target_quote.get("trade_date") or "") or None,
+            }
+            out["target_independent_quote"] = tiq
+            if t_adapted:
+                gaps.append("目标股独立行情：名称缺失，按代码显示")
+        else:
+            if target_quote_gaps:
+                # 细节缺口由 target_quote_gaps 承载（不嵌套重复）
+                gaps.append("目标股独立行情未取得（见下方具体缺口）")
+            else:
+                gaps.append("目标股独立行情未取得（未查询或资格不符）")
+        gaps.extend(target_quote_gaps)
+
+    items: List[Dict[str, Any]] = []
+    for c in picked:
+        m = member_by_code[c]
+        items.append({
+            "code": c, "name": m["name"],
+            "amount": float(m["amount"]) if m["amount"] is not None else None,
+            "change_pct": m["change_pct"], "is_target": m["is_target"],
+            # 实际同日归属日来自被接受的 wire 行（不伪造；缺行为 None）
+            "as_of_date": m["as_of_date"],
+        })
+    out["items"] = items
+    out["sample_size"] = len(items)
+    if out["rankable_rows"] == 0 and items:
+        gaps.append(
+            f"同业比较：无成交额可排名同行，样本仅保留目标股 {code}"
+            "（无同业可比代表，相对位置不输出）")
+    elif items and len(items) < 5:
+        gaps.append(
+            f"同业比较：成交额可排名样本仅 {out['rankable_rows']} 行"
+            f"（有效报价子集；原始成分 {out['snapshot_rows']} 行），"
+            "按实际范围列示，不伪完整排名")
+
+    # 成员行情供应商时间戳范围（非接收钟；wire 层已保证行内 stamp 可解析）
+    stamps = sorted(str(r.get("stamp")) for r in member_quotes.values()
+                    if r.get("stamp") is not None)
+    if stamps:
+        out["quotes_as_of"] = (
+            f"{stamps[0]}~{stamps[-1]}" if stamps[0] != stamps[-1]
+            else stamps[0])
+    out["gaps"] = _bound_gaps(gaps, 14)
+    return out
 
 
 def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: ReportBudget,
                         em_fallback_note: Optional[str] = None) -> Dict[str, Any]:
-    """申万口径阶段载荷组合（issue #99；payload_version=3）。
+    """申万口径阶段载荷组合（issue #99；同业/成分接线见 issue #100）。
 
-    市场数据块（主行业/当日快照/趋势）按申万事实产出；同业、催化、综合
-    为后续子票范围，本阶段置 None 并在 assessment.reasons 如实标注（阶段
-    范围，非取数失败）。完整性恒为部分（阶段范围未接入），缺口随载荷
-    透出。东财兜底未切换时保留口径一致的申万事实，触发与未恢复原因随
-    gaps 可回查（两套动态事实不拼接）。
+    市场数据块（主行业/当日快照/趋势）按申万事实产出；成分边界三态回填
+    identity.membership（``sw_index_members`` 口径 + ``sw_membership`` 明细）
+    并产出同业块（issue #100）；催化、综合为后续子票范围（#101），本阶段
+    置 None 并在 assessment.reasons 如实标注（阶段范围，非取数失败）。
+    目标股明确未纳入或成分状态未知时：同业标注行业参考、目标股独立展示、
+    成分内名次留空，报告如实标注部分原因（该差异本身不触发东财兜底）。
+    完整性恒为部分（研究阶段未接入），缺口随载荷透出。东财兜底未切换时
+    保留口径一致的申万事实，触发与未恢复原因随 gaps 可回查（两套动态事实
+    不拼接）。
     """
     ident_sw = sw.get("identity") or {}
     confirmed = ident_sw.get("status") == "confirmed"
@@ -4962,13 +5510,40 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     index_name = ident_sw.get("index_name") or ""
     session_date = (sw.get("snapshot") or {}).get("session_date")
     observed_at = datetime.now().isoformat(timespec="seconds")
+    constituents = sw.get("constituents") or {}
+    cons_membership = constituents.get("membership")
+
+    # 成分边界三态 → identity.membership（verified 仅 included；明细随载荷）
+    sw_membership_detail: Optional[Dict[str, Any]] = None
+    membership: Dict[str, Any] = {"verified": False, "member_count": None,
+                                  "verified_source": None,
+                                  "sw_membership": None}
+    if confirmed and cons_membership:
+        status_m = str(cons_membership.get("status") or "unknown")
+        sw_membership_detail = {
+            "status": status_m,
+            "index_code": index_code,
+            "index_name": index_name or None,
+            "observation_date": (cons_membership.get("observation_date")
+                                 or session_date or ""),
+            "member_count": cons_membership.get("member_count"),
+            "completeness_evidence": cons_membership.get("completeness_evidence"),
+            "target_secucode": (cons_membership.get("target_secucode")
+                                or _secucode(code)),
+            "gaps": _bound_gaps(
+                [str(g) for g in (cons_membership.get("gaps") or [])], 10),
+        }
+        membership["sw_membership"] = sw_membership_detail
+        if status_m == "included":
+            membership["verified"] = True
+            membership["member_count"] = cons_membership.get("member_count")
+            membership["verified_source"] = "sw_index_members"
 
     identity = {
         "industry_em": None, "industry_cninfo": None, "business_scope": None,
         "board_name": index_name or None, "board_code": index_code or None,
         "subject_status": "confirmed" if confirmed else "missing",
-        "membership": {"verified": False, "member_count": None,
-                       "verified_source": None},
+        "membership": membership,
         "observed_at": observed_at,
         "vendor_as_of": ident_sw.get("vendor_as_of"),
         "classification_system": ident_sw.get("classification_system"),
@@ -4980,6 +5555,26 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         "gaps": _bound_gaps(list(ident_sw.get("gaps") or []), 10),
     }
 
+    if confirmed:
+        peer_block = (
+            _sw_peers_pillar(code, constituents=constituents,
+                             snapshot_observed_at=observed_at, budget=budget)
+            if constituents else None)
+        if peer_block is None:
+            peer_block = {
+                "eligible": False,
+                "selection_rule": "同一成分快照按成交额前五 + 目标股去重",
+                "items": [], "target_in_amount_top5": None,
+                "target_change_pct_rank": None, "amount_unit": "元",
+                "amount_provenance": _SW_MEMBERS_AMOUNT_PROVENANCE,
+                "snapshot_rows": 0, "rankable_rows": 0, "sample_size": 0,
+                "snapshot_observed_at": observed_at, "source": None,
+                "quotes_as_of": None, "industry_reference": False,
+                "target_independent_quote": None,
+                "gaps": ["成分集合未取得，同业比较未执行"],
+            }
+    else:
+        peer_block = None
     if confirmed:
         intraday = _sw_snapshot_pillar(sw.get("snapshot") or {}, index_name,
                                        index_code, budget=budget)
@@ -5007,10 +5602,15 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
 
     if confirmed:
         status = "unscored"
-        reasons: List[str] = [
-            _bounded_reason(_SW_STAGE_PEER_LABEL),
-            _bounded_reason(_SW_STAGE_RESEARCH_LABEL),
-        ]
+        reasons: List[str] = [_bounded_reason(_SW_STAGE_RESEARCH_LABEL)]
+        cons_status = (cons_membership or {}).get("status")
+        if cons_status and cons_status != "included":
+            boundary_label = ("明确未纳入" if cons_status == "excluded"
+                              else "状态未知")
+            reasons.append(_bounded_reason(
+                f"目标股指数成分{boundary_label}：同业为行业参考，"
+                "目标股独立展示、成分内名次留空，报告如实标注部分"
+                "（该成分差异不触发东财兜底）"))
         snapshot = sw.get("snapshot") or {}
         if not snapshot.get("rows") and snapshot.get("reference_date"):
             reasons.append(_bounded_reason(
@@ -5034,6 +5634,8 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     gaps.extend(identity["gaps"])
     gaps.extend(intraday.get("gaps") or [])
     gaps.extend(trend.get("gaps") or [])
+    if peer_block is not None:
+        gaps.extend(peer_block.get("gaps") or [])
     for block in (policy, concepts):
         gaps.extend(block.get("gaps") or [])
     if base.get("is_default"):
@@ -5054,7 +5656,7 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         },
         "concepts": concepts,
         "sector_trend": trend,
-        "sector_peers": None,       # 阶段范围（#100 接入）
+        "sector_peers": peer_block,  # issue #100：成分边界 + 行业参考同业
         "sector_catalysts": None,   # 阶段范围（#101 接入）
         "sector_synthesis": None,   # 阶段范围（#101 接入）
         "assessment": {
@@ -5118,7 +5720,9 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         result.get("payload_version") == 3
         and result.get("research_basis") == "sw2021_l1"
         and result.get("research_outcome") == "kept_sw_stage"
-        and result.get("sector_peers") is None
+        and (result.get("sector_peers") is None
+             or (isinstance(result.get("sector_peers"), dict)
+                 and "eligible" in result["sector_peers"]))
         and result.get("sector_catalysts") is None
         and result.get("sector_synthesis") is None
         and result.get("assessment", {}).get("completeness") == "partial"
@@ -5128,15 +5732,17 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         and result.get("research_outcome") in ("switched_fallback",
                                                "partial_recovery")
     ),
-    "sw-first compose must emit either a v3 sw2021_l1 stage payload (no research "
-    "blocks, partial completeness) or a v2 eastmoney_board fallback payload "
-    "(switched or partial recovery, explicitly distinguished)",
+    "sw-first compose must emit either a v3 sw2021_l1 stage payload (peers block "
+    "per issue #100 allowed, research blocks still absent, partial completeness) "
+    "or a v2 eastmoney_board fallback payload (switched or partial recovery, "
+    "explicitly distinguished)",
 )
 def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, Any]:
     """申万优先编排（issue #99；父规格 #98 决策 6 有界整链兜底）。
 
     流程：申万市场数据链（主行业归属 → 31 指数同日快照 → 行业+沪深 300
-    严格日历趋势）→ 兜底门槛判定 → 申万阶段载荷或东财整链兜底。
+    严格日历趋势 → 指数成分边界与成员行情，issue #100）→ 兜底门槛判定 →
+    申万阶段载荷或东财整链兜底。
 
     兜底门槛：仅当申万主行业无法确认（含凭据未配置/HTTP 传输不可用），
     或目标交易日行业涨跌幅与合格行业趋势**均**不可用时，在同一剩余预算
@@ -5148,14 +5754,27 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     恢复随 gaps 可回查，两套动态事实不拼接。正常申万路径零东财行业/行情
     出站。
 
-    申万阶段载荷（payload_version=3 / research_basis=sw2021_l1）：同业、
-    催化、综合为后续子票范围，块为 None 并在 reasons 如实标注阶段范围；
+    申万阶段载荷（payload_version=3 / research_basis=sw2021_l1）：成分
+    边界三态与同业比较已接入（issue #100；目标股未确认成分时同业为行业
+    参考、目标股独立展示、成分内名次留空，差异本身不触发兜底）；催化、
+    综合为后续子票范围（#101），块为 None 并在 reasons 如实标注阶段范围；
     完整性恒为部分。东财兜底链自身的身份/行情/研究语义由其既有契约保证。
     """
-    sw = _sw_market_chain(code, budget=budget)
+    sw = _sw_market_chain(code, budget=budget, name=name)
     reason = _sw_fallback_reason(sw)
     if reason is None:
+        # 保留申万（门槛未触发）：成分/同业出站在此才发起（切换东财零被弃）
+        _enrich_constituents(code, sw, name, budget=budget)
         return _compose_sw_payload(code, name, sw, budget=budget)
+
+    def _kept_sw_payload(note: str) -> Dict[str, Any]:
+        # 保留申万口径：预算允许（取数截止未过）时富化一次成分/同业出站；
+        # 富化只发生一次且此后不再重试（不产生被弃出站）。
+        _enrich_constituents(code, sw, name, budget=budget,
+                             allow=not budget.fetch_expired())
+        return _compose_sw_payload(code, name, sw, budget=budget,
+                                   em_fallback_note=note)
+
     # 兜底：先跑东财核心事实缝（身份 + 两项核心行情），确认能恢复核心行情
     # 且需要完整报告时才运行研究阶段（同业/催化/综合只运行一次；双失败/
     # 未达门槛不运行将被丢弃的研究）。
@@ -5163,19 +5782,15 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     # 兜底 core 阶段内撞取数截止（BudgetExhausted）→ 同样保留既有申万事实
     # ——两者都不伪报总超时：真实总截止仍由提交边界按 timeout 终态（504）。
     if budget.fetch_expired():
-        return _compose_sw_payload(
-            code, name, sw, budget=budget,
-            em_fallback_note=(
-                f"东财兜底未启动：取数截止已过（取数预算耗尽、收尾余量仍有效），"
-                f"保留申万口径可用事实；兜底触发原因：{reason}"))
+        return _kept_sw_payload(
+            f"东财兜底未启动：取数截止已过（取数预算耗尽、收尾余量仍有效），"
+            f"保留申万口径可用事实；兜底触发原因：{reason}")
     try:
         core = _compose_eastmoney_core(code, budget=budget)
     except BudgetExhausted:
-        return _compose_sw_payload(
-            code, name, sw, budget=budget,
-            em_fallback_note=(
-                f"东财兜底在核心阶段到达取数截止，未运行研究（不产生被弃出站），"
-                f"保留申万口径可用事实；兜底触发原因：{reason}"))
+        return _kept_sw_payload(
+            f"东财兜底在核心阶段到达取数截止，未运行研究（不产生被弃出站），"
+            f"保留申万口径可用事实；兜底触发原因：{reason}")
     em_ident = core["ident"]
     em_confirmed = core["confirmed"]
     em_quote_recovered = ((core["prosper"].get("row") or {}).get("change_pct")
@@ -5188,6 +5803,7 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
         + (f"；东财缺口：{(em_ident.get('gaps') or ['无'])[0]}"
            if em_ident.get("gaps") else ""))
     if em_confirmed and (em_quote_recovered or em_trend_recovered):
+        # 成功切换：成分/同业出站从未发起（零被弃 SW 同业出站）
         em = _compose_eastmoney_report_from_core(core, code, name, budget=budget,
                                                  include_research=True)
         em["research_basis"] = "eastmoney_board"
@@ -5202,11 +5818,9 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     if sw_confirmed:
         # 双失败/未达门槛但申万主行业已确认：按 #98 保留申万口径可用事实
         # （不运行东财研究、不切口径），实际失败原因有界随载荷可回查。
-        return _compose_sw_payload(
-            code, name, sw, budget=budget,
-            em_fallback_note=(
-                f"东财兜底未切换、核心行情未恢复（{em_cause}），"
-                "保留申万口径可用事实；兜底触发原因：" + reason))
+        return _kept_sw_payload(
+            f"东财兜底未切换、核心行情未恢复（{em_cause}），"
+            "保留申万口径可用事实；兜底触发原因：" + reason)
     if em_ident.get("board_code") and em_ident.get("subject_status") in (
             "confirmed", "unverified"):
         # 部分恢复（≠成功切换）：申万主体未确认、东财主体已一致锁定

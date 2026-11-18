@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,6 +40,7 @@ _HTTP_ROOT = "https://quantapi.51ifind.com/api/v1"
 _BASIC_DATA_ENDPOINT = f"{_HTTP_ROOT}/basic_data_service"
 _REALTIME_ENDPOINT = f"{_HTTP_ROOT}/real_time_quotation"
 _HISTORY_ENDPOINT = f"{_HTTP_ROOT}/cmd_history_quotation"
+_DATA_POOL_ENDPOINT = f"{_HTTP_ROOT}/data_pool"
 
 # 涨跌幅与最新价/昨收交叉复核容差（与 2026-11-18 实测复核口径一致：
 # abs((latest/preClose − 1)×100 − changeRatio) < 0.005 个百分点）。
@@ -405,7 +407,12 @@ def resolve_sw_main_industry(secucode: str, *, observation_date: str,
 
 
 def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float,
-                       deadline: Optional[float]) -> List[Dict[str, Any]]:
+                       deadline: Optional[float],
+                       indicators: str = ("changeRatio,amount,tradeTime,"
+                                          "latest,preClose,turnoverRatio,"
+                                          "riseCount,fallCount"),
+                       raw_amount: bool = False,
+                       ) -> List[Dict[str, Any]]:
     """指数/证券实时快照 wire 解析：每行一个 thscode 的归一事实 dict。
 
     行字段：``thscode``/``trade_date``/``trade_time``/``stamp``（完整供应
@@ -416,11 +423,15 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     畸形 wire 形状（非 dict 行/缺键/不可解析时间戳）逐行保守跳过，不让
     供应商形状异常逃出边界（整体无有效行按源错误抛 :class:`SwSectorFetchError`，
     由调用方降缺口，不产生未处理 500）。
+    ``indicators`` 默认为 31 指数快照口径（issue #99）；成分成员行情
+    （issue #100）传成员口径子集（与 2026-11-18 实测一致），其余行为不变。
+    ``raw_amount=True``（成分成员行情路径）：``amount`` 原样保留首个有限
+    int/float（不经 float cast，供 Decimal 排序保原始精度）；默认路径
+    （31 指数快照与既有调用方）行为不变。
     """
     body = {
         "codes": codes,
-        "indicators": ("changeRatio,amount,tradeTime,latest,preClose,"
-                       "turnoverRatio,riseCount,fallCount"),
+        "indicators": indicators,
     }
     payload = _sector_http_post(
         _REALTIME_ENDPOINT, body, label="sector_sw_quotes",
@@ -453,7 +464,9 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
                 "change_pct": _first_finite(cells.get("changeRatio")),
                 "latest": _first_finite(cells.get("latest")),
                 "pre_close": _first_finite(cells.get("preClose")),
-                "amount": _first_finite(cells.get("amount")),
+                "amount": (_first_finite_raw(cells.get("amount"))
+                           if raw_amount
+                           else _first_finite(cells.get("amount"))),
                 "turnover": _first_finite(cells.get("turnoverRatio")),
                 "up_count": _first_finite(cells.get("riseCount")),
                 "down_count": _first_finite(cells.get("fallCount")),
@@ -569,6 +582,235 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
                 continue
         qualified[str(row.get("thscode") or "")] = row
     return qualified, notes
+
+
+# ---------------------------------------------------------------------------
+# 指数成分（data_pool 专题报表 p03473；issue #100，父规格 #98 决策 3）
+# ---------------------------------------------------------------------------
+
+
+_VALID_MEMBER_SECUCODE = re.compile(r"^\d{6}\.(?:SH|SZ|BJ)$")
+"""入站成分成员身份格式：6 位数字 + 沪/深/北交易所后缀（不猜交易所）。"""
+
+_MAX_PUBLISHABLE_MEMBER_ROWS = 10000
+"""成分成员集合的可发布行数上限（与载荷 schema 的 member_count/snapshot_rows
+上界一致）：供应商响应超过该上限属异常形状，成员集合整体不发布（明确有界
+源缺口，不发布全集覆盖、不产生载荷校验 500）。"""
+
+
+def _first_finite_raw(values: Optional[List[Any]]) -> Any:
+    """wire 数值位**原样**首个有限数（int/float 不做 cast，金融金额排序
+    经 Decimal 时保留原始精度）；缺值/None/非有限数原样缺失（不补造）。"""
+    if not values:
+        return None
+    v = values[0]
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, float) and (v != v or v in (float("inf"),
+                                                 float("-inf"))):
+        return None
+    return v
+
+
+def _is_valid_a_share_secucode(code_text: str) -> bool:
+    """入站成员代码必须形如 ``NNNNNN.SH|.SZ|.BJ``（6 位数字，精确后缀）。"""
+    return bool(_VALID_MEMBER_SECUCODE.fullmatch(code_text or ""))
+
+
+def fetch_index_members(index_code: str, observation_date: str, *,
+                        refresh_token: str, timeout_seconds: float,
+                        deadline: Optional[float]) -> Dict[str, Any]:
+    """申万指数成分 wire 解析（专题报表 p03473，``iv_date`` + ``iv_zsdm``）。
+
+    返回：``member_codes``（与观察日**同日**的成员代码，保留供应商带回的
+    **交易所后缀**——带交易所证券身份匹配的依据）、``member_names``、
+    ``dates_seen``（响应中出现的全部行日期）、``rows_total``（原始行数）、
+    ``completeness_evidence``（p03473 响应无总数/分页元数据，供应商单次
+    响应不能证明全集——恒 None，完整性判定交给 :func:`classify_membership`）、
+    ``rejected_identity_rows``（身份格式不合格被剔除的行数：非 6 位数字、缺
+    后缀或后缀非沪/深/北；结构化计数，完整性证明的分母依据）、
+    ``conflicting_code_members``（剥后缀后同 6 位码跨交易所矛盾被整组剔除的
+    成员数）、``gaps``。行级同日筛选：行日期 ≠ 观察日的行不进入成员集合
+    （异日成分不与目标日截面混用）；全部异日 = 未取得该日成分（非空成分，
+    如实缺口）。身份校验：入站成员代码必须是 ``6 位数字 + 有效交易所后缀``
+    （.SH/.SZ/.BJ），不合格行不采用且缺口**只含计数、不回显原始畸形标识**；
+    剥后缀后同 6 位码出现多个交易所后缀 = 身份矛盾，整组剔除（保守，不取
+    其一）。失败抛 :class:`SwSectorFetchError`，由调用方降缺口（成分查询
+    失败 ≠ 非成员）。
+    """
+    body = {
+        "reportname": "p03473",
+        "functionpara": {
+            "iv_date": observation_date.replace("-", ""),
+            "iv_zsdm": index_code,
+        },
+        "outputpara": "p03473_f001,p03473_f002,p03473_f003",
+    }
+    payload = _sector_http_post(
+        _DATA_POOL_ENDPOINT, body, label="sector_sw_members",
+        refresh_token=refresh_token, timeout_seconds=timeout_seconds,
+        deadline=deadline,
+    )
+    try:
+        raw_tables = payload.get("tables")
+        tables = raw_tables if isinstance(raw_tables, list) else []
+        codes: List[str] = []
+        names: Dict[str, str] = {}
+        dates_seen: List[str] = []
+        off_dates: List[str] = []
+        rejected_identity_rows = 0
+        stripped_seen: Dict[str, str] = {}
+        conflicting_stripped: set = set()
+        conflicting_members = 0
+        shape_gaps: List[str] = []
+        rows_total = 0
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            raw_cells = table.get("table")
+            cells = raw_cells if isinstance(raw_cells, dict) else {}
+            row_dates = cells.get("p03473_f001")
+            row_codes = cells.get("p03473_f002")
+            row_names = cells.get("p03473_f003")
+            if not isinstance(row_codes, list):
+                shape_gaps.append("成分响应缺成员代码列（p03473_f002），该表不采用")
+                continue
+            if not (isinstance(row_dates, list) and isinstance(row_names, list)
+                    and len(row_dates) == len(row_codes)
+                    and len(row_names) == len(row_codes)):
+                shape_gaps.append(
+                    "成分响应列形状异常（p03473 三列不对齐），该表不采用（不按位置猜值）")
+                continue
+            rows_total += len(row_codes)
+            for raw_date, raw_code, raw_name in zip(row_dates, row_codes,
+                                                    row_names):
+                date_text = str(raw_date or "").strip()
+                if date_text and date_text not in dates_seen:
+                    dates_seen.append(date_text)
+                if date_text != observation_date:
+                    if date_text and date_text not in off_dates:
+                        off_dates.append(date_text)
+                    continue
+                code_text = str(raw_code or "").strip()
+                if not _is_valid_a_share_secucode(code_text):
+                    rejected_identity_rows += 1
+                    continue
+                stripped = code_text.split(".", 1)[0]
+                prior = stripped_seen.get(stripped)
+                if prior is not None and prior != code_text:
+                    # 同 6 位码跨交易所矛盾：整组剔除（保守，不取其一）
+                    if stripped not in conflicting_stripped:
+                        conflicting_stripped.add(stripped)
+                        conflicting_members += 1  # 先到成员随后回滚
+                    conflicting_members += 1
+                    continue
+                stripped_seen.setdefault(stripped, code_text)
+                if code_text not in codes:
+                    codes.append(code_text)
+                    if isinstance(raw_name, str) and raw_name.strip():
+                        names[code_text] = raw_name.strip()
+        # 冲突组整组回滚（先到成员先回退，保证分母如实）
+        if conflicting_stripped:
+            codes = [c for c in codes
+                     if c.split(".", 1)[0] not in conflicting_stripped]
+            names = {c: n for c, n in names.items()
+                     if c.split(".", 1)[0] not in conflicting_stripped}
+        gaps: List[str] = list(shape_gaps)
+        if rejected_identity_rows:
+            gaps.append(
+                f"成分响应 {rejected_identity_rows} 行成员身份格式不合格"
+                "（非 6 位数字或交易所后缀无效，计数披露、不回显原始值），"
+                "不采用")
+        if conflicting_stripped:
+            shown = "、".join(sorted(conflicting_stripped)[:3])
+            more = (f" 等 {len(conflicting_stripped)} 个" if len(
+                conflicting_stripped) > 3 else "")
+            gaps.append(
+                f"成分响应 {len(conflicting_stripped)} 组剥后缀后同码跨交易所"
+                f"矛盾（{shown}{more}），身份矛盾整组剔除（保守，不取其一）")
+        if off_dates:
+            shown_dates = "、".join(sorted(off_dates)[:3])
+            more = f" 等 {len(off_dates)} 个日期" if len(off_dates) > 3 else ""
+            gaps.append(
+                f"成分响应存在非观察日 {observation_date} 的行"
+                f"（{shown_dates}{more}，异日成分不与目标日截面混用），已剔除并记录")
+        if rows_total and not codes and not rejected_identity_rows \
+                and not conflicting_stripped:
+            gaps.append(
+                f"成分响应共 {rows_total} 行但无 {observation_date} 同日合格行，"
+                "未取得该日成分（非空成分，如实缺口）")
+    except SwSectorFetchError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - wire 形状异常按源错误降级，不逃出边界
+        raise SwSectorFetchError(f"成分响应形状异常（{type(exc).__name__}）") from None
+    # 可发布上限：供应商响应超出载荷 schema 成员上界属异常形状——成员集合
+    # 整体不发布（明确有界源缺口；不发布全集覆盖、不产生载荷校验 500）
+    over_publish_limit = rows_total > _MAX_PUBLISHABLE_MEMBER_ROWS
+    if over_publish_limit:
+        codes = []
+        names = {}
+        gaps.append(
+            f"成分响应 {rows_total} 行超出可发布成员上限 "
+            f"{_MAX_PUBLISHABLE_MEMBER_ROWS}，成员集合不发布（完整性不可证、"
+            "不发布全集覆盖）")
+    if rows_total == 0 and not shape_gaps:
+        # 响应结构整体无成员表/无成员行：按源错误处理（与既有快照/日线 wire
+        # 同语义），调用方降缺口（成分未取得 ≠ 非成员）；表级形状问题
+        # （缺列/不对齐）已在 shape_gaps 如实记录，返回空成员由判定层保守未知
+        raise SwSectorFetchError(
+            "成分响应无成员行（" + ("、".join(gaps) if gaps else "tables 为空") + "）")
+    return {
+        "member_codes": codes,
+        "member_names": names,
+        "dates_seen": sorted(dates_seen),
+        "rows_total": rows_total,
+        "completeness_evidence": None,
+        "rejected_identity_rows": rejected_identity_rows,
+        "conflicting_code_members": conflicting_members,
+        "over_publish_limit": over_publish_limit,
+        "gaps": gaps,
+    }
+
+
+def classify_membership(target_secucode: str, members: Dict[str, Any], *,
+                        observation_date: str) -> Dict[str, Any]:
+    """指数成分边界三态判定（#98 决策 3：已纳入 / 明确未纳入 / 未知）。
+
+    - ``included``：目标带交易所身份在同日成分集合中（positive evidence，
+      无需完整性证明——找到即找到）；
+    - ``excluded``：目标未命中且完整性证据可证（完整集合或明确独立证据；
+      现场 p03473 无完整性元数据，此态仅受控/证据升级路径可达）；
+    - ``unknown``：目标未命中且完整性不可证（现场常态），或成分未取得
+      （查询失败/未取得 ≠ 非成员，不冒充排除）。
+
+    返回 ``{status, target_secucode, observation_date, member_count,
+    completeness_evidence, gaps}``；``member_count`` 是观测行数（非全集计数）。
+    """
+    member_codes = [str(c) for c in (members.get("member_codes") or [])]
+    evidence = members.get("completeness_evidence")
+    gaps = [str(g) for g in (members.get("gaps") or [])]
+    member_count = len(member_codes)
+    obtained = bool(member_codes)
+    if target_secucode in member_codes:
+        status = "included"
+    elif obtained and evidence:
+        # 排除需要真实成员集 + 完整性证据；空成员集与「完整集合」证据矛盾
+        # （申万一级指数均有成分），保守未知
+        status = "excluded"
+    else:
+        status = "unknown"
+        if not obtained:
+            gaps = gaps + [
+                f"目标股 {target_secucode} 未命中且成分集合不可用/完整性不可证，"
+                "成分状态未知（查询失败或无完整性证据 ≠ 非成员）"]
+    return {
+        "status": status,
+        "target_secucode": target_secucode,
+        "observation_date": observation_date,
+        "member_count": member_count if obtained else None,
+        "completeness_evidence": evidence if status != "unknown" else None,
+        "gaps": gaps,
+    }
 
 
 # ---------------------------------------------------------------------------

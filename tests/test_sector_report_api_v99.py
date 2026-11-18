@@ -95,7 +95,11 @@ def _basic_payload(name: str) -> Dict[str, Any]:
 
 
 class _SwTransportStub:
-    """申万模块缝替身：按端点/层级返回预置响应，记录全部请求。"""
+    """申万模块缝替身：按端点/层级返回预置响应，记录全部请求。
+
+    issue #100 扩展：data_pool（p03473 成分）与按请求 codes 的成员行情
+    路由——正常申万链路（成分+成员行情）与 #99 行为共用同一替身。
+    """
 
     def __init__(self) -> None:
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -103,6 +107,19 @@ class _SwTransportStub:
         self.quotes: Optional[List[Dict[str, Any]]] = None
         self.history_codes: List[str] = []
         self.history_dates: List[str] = []
+        self.session_date: str = ""
+        self.member_codes: List[str] = ["000552.SZ", "000723.SZ",
+                                        "600188.SH", "601225.SH",
+                                        "601898.SH", "002128.SZ"]
+
+    def _members_payload(self) -> Dict[str, Any]:
+        return {"errorcode": 0, "errmsg": "", "tables": [{
+            "table": {
+                "p03473_f001": [self.session_date] * len(self.member_codes),
+                "p03473_f002": list(self.member_codes),
+                "p03473_f003": [f"成员{c[:6]}" for c in self.member_codes],
+            },
+        }]}
 
     def __call__(self, url: str, headers: Dict[str, str],
                  body: Optional[bytes], *, label: str) -> Tuple[int, bytes]:
@@ -113,8 +130,15 @@ class _SwTransportStub:
             level = parsed["indipara"][0]["indiparams"][0]
             name = self.basic_by_level[level]
             return 200, json.dumps(_basic_payload(name)).encode()
+        if "data_pool" in url:
+            return 200, json.dumps(self._members_payload()).encode()
         if "real_time_quotation" in url:
-            return 200, json.dumps(_quotes_payload(self.quotes or [])).encode()
+            codes = parsed["codes"].split(",")
+            if codes == [c for c, _ in sw.SW_L1_DIRECTORY]:
+                return 200, json.dumps(_quotes_payload(self.quotes or [])).encode()
+            # 成员批次 / 目标独立行情：按请求 codes 生成同日行情行
+            rows = [_quote_row(c, self.session_date, 1.0) for c in codes]
+            return 200, json.dumps(_quotes_payload(rows)).encode()
         if "cmd_history_quotation" in url:
             self.history_codes = parsed["codes"].split(",")
             return 200, json.dumps(_history_payload(
@@ -269,6 +293,7 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         stub.basic_by_level = {"1": "煤炭", "2": "煤炭开采", "3": "动力煤"}
         sessions = _session_dates(20)
         session_date = sessions[0]
+        stub.session_date = session_date
         rows = []
         changes = [round(-14.0 + i, 2) for i in range(31)]
         target_change = -0.867
@@ -319,19 +344,31 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertIsNotNone(trend["benchmark"]["period_return_pct"])
         self.assertIsNotNone(trend["relative_return_pp"])
         self.assertEqual(trend["source"], "iFinD 标准HTTP指数日线")
-        # 阶段范围：同业/催化/综合为 None + reasons 标注
-        self.assertIsNone(analysis["sector_peers"])
+        # 成分边界（issue #100）：included + 同业块接入；研究块仍为阶段范围
+        membership = ident["membership"]
+        self.assertTrue(membership["verified"])
+        self.assertEqual(membership["verified_source"], "sw_index_members")
+        self.assertEqual(membership["sw_membership"]["status"], "included")
+        self.assertEqual(membership["sw_membership"]["index_code"], "801950.SL")
+        peers = analysis["sector_peers"]
+        self.assertIsNotNone(peers)
+        self.assertTrue(peers["eligible"])
+        self.assertFalse(peers["industry_reference"])
+        self.assertTrue(any(i["is_target"] for i in peers["items"]))
+        self.assertIsNotNone(peers["target_change_pct_rank"])
         self.assertIsNone(analysis["sector_catalysts"])
         self.assertIsNone(analysis["sector_synthesis"])
         reasons = " ".join(analysis["assessment"]["reasons"])
-        self.assertIn("同业", reasons)
         self.assertIn("催化", reasons)
+        self.assertNotIn("同业比较与指数成分验证", reasons)
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
-        # 归属请求按层级单独查询（3 次），行情/趋势各 1 次
+        # 归属请求按层级单独查询（3 次）；快照+成员批次行情；成分 1 次
         basic_calls = [p for u, p in stub.calls if "basic_data_service" in u]
         self.assertEqual(len(basic_calls), 3)
+        rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
+        self.assertEqual(len(rt_calls), 2)  # 31 指数快照 + 成员批次（included 无独立行情）
         self.assertEqual(len([1 for u, p in stub.calls
-                              if "real_time_quotation" in u]), 1)
+                              if "data_pool" in u]), 1)
         self.assertEqual(len([1 for u, p in stub.calls
                               if "cmd_history_quotation" in u]), 1)
 

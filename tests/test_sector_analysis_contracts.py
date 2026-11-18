@@ -577,3 +577,60 @@ class TestTencentAmountContracts:
         assert svc._is_uncertain_currency_code("900901") is True
         assert svc._is_uncertain_currency_code("600519") is False
         assert svc._is_uncertain_currency_code("920001") is False  # BJ 合法 CNY
+
+
+class TestSwPeersPillarContracts:
+    """成分边界不变式（issue #100）：行业参考态下目标股不进成分样本与名次。"""
+
+    def _constituents(self, status: str) -> Dict[str, Any]:
+        codes = ["000552.SZ", "600188.SH", "601225.SH", "601898.SH"]
+        return {
+            "membership": {"status": status, "target_secucode":
+                           ("600188.SH" if status == "included" else "920101.BJ"),
+                           "observation_date": "2026-11-18",
+                           "member_count": len(codes),
+                           "completeness_evidence": None, "gaps": []},
+            "members": {"member_codes": codes,
+                        "member_names": {c: f"成员{c[:6]}" for c in codes},
+                        "dates_seen": ["2026-11-18"], "rows_total": len(codes),
+                        "completeness_evidence": None, "gaps": []},
+            "member_quotes": {c: {"thscode": c, "trade_date": "2026-11-18",
+                                  "trade_time": "22:00:46", "change_pct": 1.0,
+                                  "amount": 5.0e8} for c in codes},
+            "member_quote_gaps": [],
+            "target_quote": (None if status == "included" else
+                             {"thscode": "920101.BJ",
+                              "trade_date": "2026-11-18",
+                              "trade_time": "22:00:46", "change_pct": 1.5,
+                              "amount": 4.0e7}),
+            "target_quote_gaps": [],
+            "target_name": "测试标的",
+        }
+
+    def test_included_target_inside_sample_satisfies_contracts(self):
+        out = svc._sw_peers_pillar(
+            "600188", constituents=self._constituents("included"),
+            snapshot_observed_at="2026-11-18T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0))
+        assert any(i["is_target"] for i in out["items"])
+        assert out["industry_reference"] is False
+        assert out["target_independent_quote"] is None
+
+    def test_reference_boundary_target_absent_from_items_and_ranks(self):
+        out = svc._sw_peers_pillar(
+            "920101", constituents=self._constituents("unknown"),
+            snapshot_observed_at="2026-11-18T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0))
+        assert out["industry_reference"] is True
+        assert out["target_change_pct_rank"] is None
+        assert out["target_in_amount_top5"] is None
+        assert not any(i["is_target"] for i in out["items"])
+        assert out["target_independent_quote"]["code"] == "920101"
+        assert not any(i["code"] == "920101" for i in out["items"])
+
+    def test_boundary_contracts_attached(self):
+        """行业参考态不变式以 icontract 契约强制（每次调用自动校验）。"""
+        postconditions = getattr(svc._sw_peers_pillar, "__postconditions__", [])
+        assert postconditions, "_sw_peers_pillar 应挂载 ensure 契约"
+        preconditions = getattr(svc._sw_peers_pillar, "__preconditions__", [])
+        assert preconditions, "_sw_peers_pillar 应挂载 require 契约"

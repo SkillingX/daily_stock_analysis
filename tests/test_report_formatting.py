@@ -188,6 +188,14 @@ def _sector_v2_data() -> dict[str, Any]:
             'source': '东财行业板块日线', 'observed_at': '2026-11-05T14:00:02',
             'gaps': [],
         },
+        # 真实 v2 载荷中 cat/peers/syn 同生（研究阶段整体运行）；issue #100 起
+        # 催化章节由 cat 块驱动渲染，fixture 同步补齐
+        'sector_catalysts': {
+            'eligible': False, 'query': '煤炭 行业', 'window_days': 14,
+            'items': [], 'background_items': [],
+            'provider': 'bocha', 'observed_at': '2026-11-05T14:00:03',
+            'gaps': ['受控 fixture：催化未取得（渲染顺序断言用）'],
+        },
         'sector_peers': {
             'eligible': True,
             'selection_rule': '同一成分快照按成交额前五 + 目标股去重（成交活跃代表，非市值/基本面龙头）',

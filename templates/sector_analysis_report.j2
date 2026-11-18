@@ -28,7 +28,20 @@
 {% set locked_text = '未锁定（不按近似名取行）' %}
 {% endif %}
 {% if is_sw %}
-{% set membership_text = '成分验证待后续版本接入（本阶段报告不含指数成分与同业比较，见阶段范围说明）' %}
+{% set sw_m = a.identity.membership.sw_membership %}
+{% if a.identity.membership.verified and sw_m and sw_m.status == 'included' %}
+{% set membership_text = '已纳入指数成分（' ~ sw_m.observation_date ~ ' 同日申万一级行业指数成分，观测 ' ~ sw_m.member_count ~ ' 只；带交易所身份匹配）' %}
+{% elif sw_m and sw_m.status == 'excluded' %}
+{% set membership_text = '明确未纳入指数成分（' ~ sw_m.observation_date ~ ' 同日成分完整集合证据；同业为行业参考，成分内名次留空，目标股独立展示）' %}
+{% elif sw_m and sw_m.status == 'unknown' %}
+{% if sw_m.member_count is not none %}
+{% set membership_text = '成分状态未知（' ~ sw_m.observation_date ~ ' 同日成分结果未见目标股且响应无完整性元数据，不能证明非成员；同业为行业参考，目标股独立展示，成分内名次留空）' %}
+{% else %}
+{% set membership_text = '成分状态未知（' ~ sw_m.observation_date ~ ' 同日成分未取得——查询失败或未取得该日成分，查询失败/未取得 ≠ 非成员；同业为行业参考，目标股独立展示，成分内名次留空）' %}
+{% endif %}
+{% else %}
+{% set membership_text = '成分验证未取得（见数据缺口）' %}
+{% endif %}
 {% elif a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
 {% set membership_text = '目标股在东财 F10 板块完整成员集合中（' ~ a.identity.membership.member_count ~ ' 只，成分验证通过；成员行情为逐股采集，批次时间范围见同业缺口）' %}
 {% elif a.identity.membership.verified %}
@@ -180,7 +193,7 @@
 {% endif %}
 {% endif %}
 
-{% if a.get('sector_catalysts') is not none or a.get('sector_peers') is not none or a.get('sector_synthesis') is not none %}
+{% if a.get('sector_catalysts') is not none %}
 ## 四、行业催化（近期政策/新闻，统一准入）
 
 {% set cat = a.get('sector_catalysts') %}
@@ -233,8 +246,7 @@
 {% for g in cat.gaps %}
 - ⚠️ {{ g }}
 {% endfor %}
-{% else %}
-- ⚠️ 行业催化未执行：主行业身份未确认（confirmed 前置不满足），不发起行业新闻搜索、不给催化结论。
+{% endif %}
 {% endif %}
 {% endif %}
 
@@ -244,6 +256,13 @@
 {% if peers.eligible %}
 {% set peer_rows = peers['items'] %}
 - 选取规则：{{ peers.selection_rule }}；不逐股补市值、不混用其他分类权重
+{% if peers.industry_reference %}
+- ⚠️ **行业参考**：目标股未确认在该指数成分内（成分边界见下），以上同业是行业指数成分的成交活跃代表，**不是与目标股同成分的可比样本**；目标股行情独立展示、不参与成分内比较与排名
+{% endif %}
+{% if peers.target_independent_quote %}
+{% set tiq = peers.target_independent_quote %}
+- 目标股独立行情：{{ tiq.code }}（{{ tiq.name }}）｜ 当日涨跌幅：{{ tiq.change_pct if tiq.change_pct is not none else 'N/A' }}% ｜ 当日成交额：{{ tiq.amount if tiq.amount is not none else 'N/A' }} 元{% if tiq.as_of_date %} ｜ 行情日期：{{ tiq.as_of_date }}{% endif %}（独立事实，不进入成分比较与同业证据）
+{% endif %}
 {% if peers.amount_provenance %}
 - 成交额单位：{{ peers.amount_unit or '元' }}（{{ peers.amount_provenance }}）
 {% endif %}
@@ -361,8 +380,6 @@
 {% endif %}
 {% endif %}
 
-{% endif %}
-
 ## 七、政策倾向（行业 DNA 库·静态规则背景）
 
 {% set p = a.background.policy %}
@@ -411,8 +428,9 @@
 {% if is_sw %}
 ## 阶段范围说明（本报告未包含的研究内容）
 
-- 本报告为申万口径**阶段报告**：已接通主行业归属、31 个申万一级行业指数当日快照与全量名次资格、目标行业与沪深 300 的严格日历二十交易日趋势。
-- 指数成分状态与同业比较、行业催化与证据化综合研判**待后续版本接入**（见资料状态说明的不足原因），本阶段未执行、不产出。
+- 本报告为申万口径**阶段报告**：已接通主行业归属、31 个申万一级行业指数当日快照与全量名次资格、目标行业与沪深 300 的严格日历二十交易日趋势、指数成分边界（已纳入/明确未纳入/未知）与成分内同业比较。
+- 行业催化与证据化综合研判**待后续版本接入**（见资料状态说明的不足原因），本阶段未执行、不产出。
+- 目标股未确认在指数成分内时（明确未纳入或成分状态未知，常见于北交所标的）：同业为**行业参考**口径，目标股独立展示，成分内名次留空；该成分差异本身不触发东财兜底。
 - 完整性恒为**部分**：即使上方市场数据全部取得，阶段范围未接入也如实标注，不冒充完整研究。
 
 {% endif %}

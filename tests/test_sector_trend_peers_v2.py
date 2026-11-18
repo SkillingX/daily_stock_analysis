@@ -793,7 +793,7 @@ class TestPeersPillar:
                             snapshot_observed_at="2026-11-05T14:00:01")
         assert out["items"] == [{
             "code": "600519", "name": "贵州茅台", "amount": None,
-            "change_pct": 1.65, "is_target": True,
+            "change_pct": 1.65, "is_target": True, "as_of_date": None,
         }]
         assert out["sample_size"] == 1
         assert out["rankable_rows"] == 0
@@ -838,7 +838,7 @@ class TestPeersPillar:
                             snapshot_observed_at="2026-11-05T14:00:01")
         assert out["items"][0] == {
             "code": "600519", "name": "贵州茅台", "amount": 9e8,
-            "change_pct": 1.65, "is_target": True,
+            "change_pct": 1.65, "is_target": True, "as_of_date": None,
         }
         assert out["source"] and "成分" in out["source"]
 

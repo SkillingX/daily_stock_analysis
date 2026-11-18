@@ -480,13 +480,20 @@ class TestSwStagePayload:
         assert validated.research_outcome == "switched_fallback"
 
     def test_stage_scope_labeled_in_reasons_and_no_research_blocks(self):
-        """阶段报告如实标注尚未完成的研究内容；同业/催化/综合块为 None。"""
+        """阶段报告如实标注尚未完成的研究内容；研究块为 None。
+
+        issue #100 起同业/成分已接入：受控链无 constituents 时同业为降级
+        块（eligible=False + 缺口），不再以 None 表达阶段范围；同业阶段
+        标注由实际成分边界状态取代。
+        """
         payload = self._build(_sw_core())
-        assert payload["sector_peers"] is None
+        peers = payload["sector_peers"]
+        assert peers is not None and peers["eligible"] is False
+        assert peers["items"] == [] and peers["gaps"]
         assert payload["sector_catalysts"] is None
         assert payload["sector_synthesis"] is None
         reasons = " ".join(payload["assessment"]["reasons"])
-        assert "同业" in reasons
+        assert "同业比较与指数成分验证" not in reasons
         assert "催化" in reasons or "综合" in reasons
 
     def test_identity_carries_sw_classification_metadata(self):

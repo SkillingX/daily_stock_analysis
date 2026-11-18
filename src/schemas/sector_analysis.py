@@ -117,6 +117,29 @@ class SWChain(_StrictBase):
     gaps: _GapList = Field(default_factory=list, max_length=10)
 
 
+class SwMembershipDetail(_StrictBase):
+    """申万指数成分边界明细（issue #100；三态：已纳入/明确未纳入/未知）。
+
+    ``status=included`` 只需 positive evidence（目标带交易所身份在同日成分
+    集合中）；``excluded`` 需要完整集合证据（现场 p03473 无完整性元数据，
+    此态仅受控/证据升级路径可达）；``unknown`` 为现场常态（无完整性证据的
+    列表未找到目标股不能证明非成员，查询失败同样不是非成员）。
+    ``member_count`` 是响应观测行数（非全集计数）；``completeness_evidence``
+    为 None 即完整性不可证。
+    """
+
+    status: Literal["included", "excluded", "unknown"]
+    index_code: Annotated[str, Field(min_length=1, max_length=16)]
+    index_name: Optional[Annotated[str, Field(max_length=64)]] = None
+    observation_date: Annotated[str, Field(min_length=8, max_length=10)]
+    member_count: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
+    completeness_evidence: Optional[Annotated[str, Field(max_length=200)]] = None
+    source: Annotated[str, Field(min_length=1, max_length=200)] = (
+        "iFinD 标准HTTP指数成分（data_pool p03473，iv_date + iv_zsdm）")
+    target_secucode: Annotated[str, Field(min_length=1, max_length=16)]
+    gaps: _GapList = Field(default_factory=list, max_length=10)
+
+
 class MembershipInfo(_StrictBase):
     """东财板块归属验证结果（成分集合含目标股才算 confirmed）。
 
@@ -127,6 +150,9 @@ class MembershipInfo(_StrictBase):
       RPT_F10_CORETHEME_BOARDTYPE 反向查询，BOARD_TYPE=行业校验+分页核完+
       去重；与 clist 成分表同语义，member_count 与同业成分快照可用，成员
       行情为逐股采集，批次时间范围在同业缺口如实标注）
+    - ``sw_index_members``（issue #100）：申万一级指数同日成分集合含目标股
+      （带交易所身份精确匹配；三态明细见 ``sw_membership``，verified 仅在
+      included 时 True——excluded/unknown 不冒充归属验证通过）
     F10 所属板块声明只用于**精确板块锁定**（BOARD_TYPE=行业、LEVEL=2 唯一
     命中），不作为归属确认证据——完整反向成员不可得时归属保持 unverified
     （root 收敛轮：confirmed 必须有成分集合验证，无更弱确认口径）。
@@ -134,7 +160,11 @@ class MembershipInfo(_StrictBase):
 
     verified: bool = False
     member_count: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
-    verified_source: Optional[Literal["cons_table", "f10_members"]] = None
+    verified_source: Optional[Literal["cons_table", "f10_members",
+                                      "sw_index_members"]] = None
+    sw_membership: Optional[SwMembershipDetail] = None
+    """申万指数成分边界三态明细（issue #100 追加兼容字段；东财口径为 None，
+    存量载荷读回不受影响）。"""
 
 
 class BoardIdentity(_StrictBase):
@@ -363,6 +393,9 @@ class PeerItem(_StrictBase):
     change_pct: Optional[float] = None
     """快照观测的当日涨跌幅；缺失为 None，不影响样本成员资格。"""
     is_target: bool = False
+    as_of_date: Optional[Annotated[str, Field(min_length=8, max_length=10)]] = None
+    """行情归属交易日（issue #100 追加兼容字段；东财 clist 快照路径 None，
+    申万独立行情事实携带——参考行情日期贯穿证据，不冒充当日截面）。"""
 
 
 class SectorPeersBlock(_StrictBase):
@@ -406,6 +439,14 @@ class SectorPeersBlock(_StrictBase):
     quotes_as_of: Optional[Annotated[str, Field(max_length=240)]] = None
     """成员行情供应商时点说明（逐股采集的来源/时间窗；F10 成员集合路径携带，
     clist 成分快照路径为 None——采集时间不冒充供应商时间）。"""
+    industry_reference: bool = False
+    """同业是否仅为行业参考（issue #100 追加兼容字段）：目标股明确未纳入或
+    成分状态未知时 True——同业为纯成分口径，成分内名次与前五资格留空，
+    目标股经 ``target_independent_quote`` 独立展示。"""
+    target_independent_quote: Optional[PeerItem] = None
+    """目标股独立行情事实（issue #100 追加兼容字段；仅未确认成分时携带）。
+    独立事实不进 ``items``、不参与任何排名——目标股行情不得经由同业证据
+    进入成分比较。"""
     gaps: _GapList = Field(default_factory=list, max_length=14)
 
 
