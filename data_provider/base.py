@@ -5693,6 +5693,28 @@ class DataFetcherManager:
                 chain = self._normalize_source_chain(auxiliary.get("source_chain", []), "public_details", status, cost_ms)
                 result[block] = self._build_fundamental_block(status, payload, chain, auxiliary_errors)
             for block, fetch in (("dragon_tiger", self.get_dragon_tiger_context), ("boards", self.get_board_context)):
+                if deep_scope:
+                    # 真实 iFinD 主源深研（现成 deep_scope）不消费龙虎榜与板块
+                    # 涨跌榜：榜单只含涨跌排名，无法补个股行业（正式行业已由
+                    # iFinD 提供），也不进入阶段 0 共享事实——零出站跳过，省下
+                    # 预算给公共详情/主营等实际消费方。块保持既有载荷形状，
+                    # not_supported 是设计语义（未查询，不是供应商失败），
+                    # 不造错误、不发空 fallback 调用；行业提示兜底与 belong_
+                    # boards 概念归属路径不受影响（industry_hint 优先 iFinD
+                    # 正式行业，概念走 iFinD 独立入口）。非深研调用者不变。
+                    result[block] = self._build_fundamental_block(
+                        "not_supported",
+                        {},
+                        [
+                            {
+                                "provider": "fundamental_pipeline",
+                                "result": "not_supported",
+                                "duration_ms": 0,
+                            }
+                        ],
+                        [],
+                    )
+                    continue
                 if run is not None:
                     run.check()
                 result[block] = fetch(code, budget_seconds=min(config.fundamental_fetch_timeout_seconds, max(0.0, deadline-time.monotonic())))
