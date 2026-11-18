@@ -317,12 +317,18 @@ def _run(sw_core: Dict[str, Any], em_core: Dict[str, Any]) -> tuple:
 
 class TestSwFallbackGate:
     def test_confirmed_with_quote_no_eastmoney_fallback(self):
-        """申万主行业确认 + 目标日行情有效：不触发东财（1/31 但目标有效同型）。"""
+        """申万主行业确认 + 目标日行情有效：不触发东财（1/31 但目标有效同型）。
+
+        issue #101 起保留申万路径运行研究（催化/综合记录器各一次；受控链
+        无成分集合，同业记录器桩不被调用——申万同业走 _sw_peers_pillar）。
+        """
         sw_core = _sw_core(quote_target_ok=True, trend_ok=False)
         em_core = _em_core_stub()
         payload, h = _run(sw_core, em_core)
         assert h.core.calls == []  # 东财核心缝未执行
-        assert h.research_calls == 0
+        assert h.peers.calls == 0
+        assert h.catalysts.calls == 1  # 选定申万口径后检索一次（issue #101）
+        assert h.synthesis.calls == 1
         assert payload["research_basis"] == "sw2021_l1"
         assert payload["research_outcome"] == "kept_sw_stage"
         assert payload["payload_version"] == 3
@@ -424,13 +430,19 @@ class TestEastmoneySwitchConditions:
         assert any("部分恢复" in g for g in payload["gaps"])
 
     def test_dual_failure_keeps_sw_facts_when_sw_confirmed(self):
-        """双失败且申万主行业已确认：保留申万事实（不切东财、不部分恢复）。"""
+        """双失败且申万主行业已确认：保留申万事实（不切东财、不部分恢复）。
+
+        issue #101：口径已选定（申万），研究运行一次并入报告（不产生被弃
+        研究）；东财研究零执行。
+        """
         sw_core = _sw_core(quote_target_ok=False, trend_ok=False,
                            snapshot_mode="reference")
         em_core = _em_core_stub(subject_status="confirmed", quote_change=None,
                                 trend_return=None)
         payload, h = _run(sw_core, em_core)
-        assert h.research_calls == 0
+        assert h.peers.calls == 0
+        assert h.catalysts.calls == 1
+        assert h.synthesis.calls == 1
         assert payload["research_basis"] == "sw2021_l1"
         assert payload["research_outcome"] == "kept_sw_stage"
         assert payload["identity"]["classification_system"] == "申万 2021 一级行业"
@@ -438,13 +450,19 @@ class TestEastmoneySwitchConditions:
         assert any("核心行情恢复" in g for g in payload["gaps"])  # 实际失败原因可回查
 
     def test_no_cohesive_subject_keeps_sw_payload_with_causes(self):
-        """申万不可确认 + 东财无一致主体（未锁定）：保留申万载荷 + 双失败原因。"""
+        """申万不可确认 + 东财无一致主体（未锁定）：保留申万载荷 + 双失败原因。
+
+        issue #101：主体不可确认时研究支柱仍产出「未执行」块（替身记录到
+        催化/综合各一次；东财同业桩零调用——无一致东财主体）。
+        """
         sw_core = _sw_core(status="unavailable", quote_target_ok=False,
                            trend_ok=False, snapshot_mode="none")
         em_core = _em_core_stub(subject_status="missing", board_locked=False,
                                 quote_change=None, trend_return=None)
         payload, h = _run(sw_core, em_core)
-        assert h.research_calls == 0
+        assert h.peers.calls == 0
+        assert h.catalysts.calls == 1
+        assert h.synthesis.calls == 1
         assert payload["research_basis"] == "sw2021_l1"
         assert payload["research_outcome"] == "kept_sw_stage"
         assert payload["identity"]["subject_status"] == "missing"
@@ -480,21 +498,25 @@ class TestSwStagePayload:
         assert validated.research_outcome == "switched_fallback"
 
     def test_stage_scope_labeled_in_reasons_and_no_research_blocks(self):
-        """阶段报告如实标注尚未完成的研究内容；研究块为 None。
+        """研究块随载荷透出（issue #101）：替身研究形状可见，缺口如实。
 
         issue #100 起同业/成分已接入：受控链无 constituents 时同业为降级
-        块（eligible=False + 缺口），不再以 None 表达阶段范围；同业阶段
-        标注由实际成分边界状态取代。
+        块（eligible=False + 缺口）；issue #101 起催化/综合在选定口径后
+        运行一次（替身形状），不再是 None，缺口随块与 assessment 透出。
         """
         payload = self._build(_sw_core())
         peers = payload["sector_peers"]
         assert peers is not None and peers["eligible"] is False
         assert peers["items"] == [] and peers["gaps"]
-        assert payload["sector_catalysts"] is None
-        assert payload["sector_synthesis"] is None
+        cat = payload["sector_catalysts"]
+        syn = payload["sector_synthesis"]
+        assert cat is not None and cat["eligible"] is True
+        assert cat["items"]  # 替身返回一条合格催化
+        assert syn is not None and syn["status"] == "ok"
+        # assessment reasons 汇报实际缺口（成分边界），不再有「待接入」阶段标签
         reasons = " ".join(payload["assessment"]["reasons"])
-        assert "同业比较与指数成分验证" not in reasons
-        assert "催化" in reasons or "综合" in reasons
+        assert "待后续版本接入" not in reasons
+        assert "成分状态未知" in reasons
 
     def test_identity_carries_sw_classification_metadata(self):
         payload = self._build(_sw_core())
@@ -578,7 +600,11 @@ class TestSwStagePayload:
         assert payload["identity"]["subject_status"] == "missing"
 
     def test_stage_completeness_is_partial_even_when_market_data_full(self):
-        """市场数据齐全也不标完整：同业/研究阶段范围未接入，如实部分。"""
+        """市场数据齐全但成分边界未确认（受控链无 constituents）：如实部分。
+
+        issue #101 起完整性按实际取得的合格证据判定：membership 未验证的
+        边界差异本身保持部分（成分状态未知，同业为行业参考）。
+        """
         payload = self._build(_sw_core())
         assert payload["assessment"]["completeness"] == "partial"
 
@@ -590,7 +616,12 @@ class TestSwStagePayload:
 
 class TestFallbackBudgetCutoff:
     def test_fetch_cutoff_elapsed_skips_fallback_start(self, monkeypatch):
-        """取数截止已过（收尾余量仍活）：不启动东财兜底，保留申万部分报告。"""
+        """取数截止已过（收尾余量仍活）：不启动东财兜底，保留申万部分报告。
+
+        issue #101：申万口径已选定，研究块按预算内的有界降级产出（替身
+        不执行预算纪律，记录器照常收到一次调用；真实支柱的预算纪律由
+        research_budget/模块测试覆盖）。
+        """
         import time as _time
 
         sw_core = _sw_core(quote_target_ok=False, trend_ok=False,
@@ -602,7 +633,9 @@ class TestFallbackBudgetCutoff:
         with _ResearchHarness(em_core.payload).with_sw(sw_core) as h:
             payload = compose_report("600188", "兖矿能源", budget=_budget())
         assert h.core.calls == []  # 兜底未启动
-        assert h.research_calls == 0
+        assert h.peers.calls == 0
+        assert h.catalysts.calls == 1
+        assert h.synthesis.calls == 1
         assert payload["research_outcome"] == "kept_sw_stage"
         assert any("兜底未启动" in g for g in payload["gaps"])
 

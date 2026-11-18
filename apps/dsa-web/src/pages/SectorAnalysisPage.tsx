@@ -279,7 +279,7 @@ export default function SectorAnalysisPage() {
           {!generating && !detail && (
             <div className="py-16 text-center text-muted-text">
               <LayoutGrid className="mx-auto mb-3 h-10 w-10 opacity-40" />
-              <p>输入股票，生成主行业定位（东财板块成分验证）/当日行情/近期板块趋势（20个已完成交易日，对比沪深300）/同业比较（成交活跃代表）/政策倾向（行业DNA库）/行业基率（启发式先验）的专项分析报告</p>
+              <p>输入股票，生成申万一级行业定位（指数成分单独核验）/当日行业行情/近期行业趋势（20个已完成交易日，对比沪深300）/同业比较（同一指数成分内成交活跃代表）/行业催化与证据化综合/政策倾向（行业DNA库）/行业基率（启发式先验）的专项分析报告</p>
             </div>
           )}
           {detail && !generating && (

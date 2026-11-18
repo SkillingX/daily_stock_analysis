@@ -96,8 +96,8 @@ ResearchOutcome = Literal["kept_sw_stage", "switched_fallback", "partial_recover
 None 仅兼容追加前的存量记录。"""
 
 PayloadVersion = Literal[2, 3]
-"""板块报告载荷版本。3 = 申万口径阶段报告（issue #99；阶段范围见
-``assessment.reasons`` 与报告正文的阶段范围说明）。"""
+"""板块报告载荷版本。3 = 申万口径报告（issue #99 起；#101 起研究块随载荷
+透出，完整性按实际取得的合格证据判定）。"""
 
 
 _GapList = List[Annotated[str, Field(min_length=1, max_length=200)]]

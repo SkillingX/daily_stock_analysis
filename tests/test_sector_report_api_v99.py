@@ -49,9 +49,18 @@ from src.services import sector_sw_market as sw
 from src.storage import DatabaseManager
 
 
-def _session_dates(count: int) -> List[Any]:
-    """最近 count 个已完成交易日（真实严格日历，最新在前）。"""
-    sessions = recent_completed_trading_sessions("cn", count)
+# 冻结时刻：已完成会话盘后（任意墙钟时间下会话/资格判定确定性）。
+# v99/v100 受控 wire 戳统一为该会话 22:00:46；供应商现行合同按**活跃会话**
+# 归属报价——盘中真实时段运行时，未冻结场景的请求会话漂移到当日，与夹具
+# 安排/断言依赖的已完成会话不一致。相关场景经 self._freeze 显式冻结到同一
+# 严格日历会话（安排、请求与断言一致源）。
+FROZEN_COMPLETED_NOW = datetime(2026, 11, 18, 22, 30, 0)
+
+
+def _frozen_session_dates(count: int) -> List[Any]:
+    """冻结时刻下最近 count 个已完成交易日（真实严格日历，最新在前）。"""
+    sessions = recent_completed_trading_sessions(
+        "cn", count, current_time=FROZEN_COMPLETED_NOW)
     assert sessions is not None, "真实 XSHG 日历应可用（离线数据）"
     return [d.isoformat() for d in sessions]
 
@@ -208,6 +217,8 @@ class SectorReportApiV99TestCase(unittest.TestCase):
         import src.services.sector_analysis_service as svc
 
         self._svc = svc
+        # 场景冻结状态（self._freeze 装入；_arranged_sessions 的时钟一致源）
+        self._frozen_now: Optional[datetime] = None
         self._orig_report_dir = svc._REPORT_DIR
         self.report_dir = self.data_dir / "reports" / "sector_analysis"
 
@@ -233,6 +244,27 @@ class SectorReportApiV99TestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         return sessions, frozen_ctx
+
+    def _freeze(self, now: datetime) -> None:
+        """场景内唯一冻结入口（与 v101 基座同模式）：冻结申万链时钟缝到
+        指定时刻。一个测试场景只装一次——叠加冻结会让后装 patcher 经已
+        替换的 `_session_context` 解析出前一冻结时刻的会话（显式盘中测试
+        用各自的 `_install_clock`，不与类级冻结叠加）。"""
+        self._frozen_now = now
+        for patcher in _freeze_clocks(self._svc, now=now, ref_sessions=[]):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _arranged_sessions(self, count: int) -> List[str]:
+        """夹具安排的时钟一致源：场景已冻结时按冻结时刻取严格日历，
+        否则按真实时刻（与既有行为逐位一致）。"""
+        if self._frozen_now is not None:
+            sessions = recent_completed_trading_sessions(
+                "cn", count, current_time=self._frozen_now)
+        else:
+            sessions = recent_completed_trading_sessions("cn", count)
+        assert sessions is not None, "真实 XSHG 日历应可用（离线数据）"
+        return [d.isoformat() for d in sessions]
 
     def tearDown(self) -> None:
         self._report_dir_patcher.stop()
@@ -289,10 +321,12 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
     """正常申万链路：生成→保存→读回→下载一致，零东财出站。"""
 
     def _prepare_stub(self) -> _SwTransportStub:
+        # 安排/请求/断言同一严格日历会话（冻结时刻的已完成交易日）：
+        # wire 戳 22:00:46 与冻结接收钟 22:30 满足已完结会话新鲜度纪律
+        sessions = _frozen_session_dates(20)
+        session_date = sessions[0]
         stub = _SwTransportStub()
         stub.basic_by_level = {"1": "煤炭", "2": "煤炭开采", "3": "动力煤"}
-        sessions = _session_dates(20)
-        session_date = sessions[0]
         stub.session_date = session_date
         rows = []
         changes = [round(-14.0 + i, 2) for i in range(31)]
@@ -306,6 +340,9 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         return stub
 
     def test_generate_save_readback_download_full_loop(self):
+        # 冻结到已完成会话盘后（供应商现行合同按活跃会话归属报价：盘中
+        # 真实时段运行时请求会话不再漂移到当日，安排/请求/断言同一会话）
+        self._freeze(FROZEN_COMPLETED_NOW)
         stub = self._prepare_stub()
         self._install_sw_stub(stub)
         self._install_eastmoney_sentinels()
@@ -327,11 +364,11 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
                          sw.SW_L1_DIRECTORY_VERSION)
         self.assertEqual(ident["board_code"], "801950.SL")
         self.assertEqual(ident["board_name"], "煤炭")
-        self.assertEqual(ident["vendor_as_of"], _session_dates(1)[0])
+        self.assertEqual(ident["vendor_as_of"], _frozen_session_dates(1)[0])
         # 31/31 同日合格 → 全量名次 + 真实日期
         intraday = analysis["background"]["intraday"]
         self.assertTrue(intraday["sector_found"])
-        self.assertEqual(intraday["snapshot_date"], _session_dates(1)[0])
+        self.assertEqual(intraday["snapshot_date"], _frozen_session_dates(1)[0])
         self.assertEqual(intraday["total_boards"], 31)
         self.assertIsNotNone(intraday["rank_of"])
         self.assertEqual(intraday["row"]["board_code"], "801950.SL")
@@ -344,7 +381,8 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertIsNotNone(trend["benchmark"]["period_return_pct"])
         self.assertIsNotNone(trend["relative_return_pp"])
         self.assertEqual(trend["source"], "iFinD 标准HTTP指数日线")
-        # 成分边界（issue #100）：included + 同业块接入；研究块仍为阶段范围
+        # 成分边界（issue #100）：included + 同业块接入；研究块随载荷透出
+        # （issue #101：搜索入口未配置 → 催化有界降级块，综合 no_qualified）
         membership = ident["membership"]
         self.assertTrue(membership["verified"])
         self.assertEqual(membership["verified_source"], "sw_index_members")
@@ -356,10 +394,16 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertFalse(peers["industry_reference"])
         self.assertTrue(any(i["is_target"] for i in peers["items"]))
         self.assertIsNotNone(peers["target_change_pct_rank"])
-        self.assertIsNone(analysis["sector_catalysts"])
-        self.assertIsNone(analysis["sector_synthesis"])
+        cat = analysis["sector_catalysts"]
+        self.assertIsNotNone(cat)
+        self.assertTrue(cat["eligible"])
+        self.assertEqual(cat["items"], [])
+        self.assertTrue(any("搜索入口未配置" in g for g in cat["gaps"]))
+        syn = analysis["sector_synthesis"]
+        self.assertIsNotNone(syn)
+        self.assertEqual(syn["status"], "no_qualified_facts")
         reasons = " ".join(analysis["assessment"]["reasons"])
-        self.assertIn("催化", reasons)
+        self.assertIn("行业催化未取得", reasons)
         self.assertNotIn("同业比较与指数成分验证", reasons)
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
         # 归属请求按层级单独查询（3 次）；快照+成员批次行情；成分 1 次
@@ -387,15 +431,17 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         md = download.text
         self.assertIn("申万 2021 一级行业", md)
         self.assertIn("煤炭（801950.SL）", md)
-        self.assertIn(_session_dates(1)[0], md)
-        self.assertIn("待后续版本接入", md)
+        self.assertIn(_frozen_session_dates(1)[0], md)
+        self.assertNotIn("待后续版本接入", md)
         # 正文行完整性（trim_blocks 粘连回归）：列表项各占一行
         self.assertIn("三级参考：动力煤\n- 成分验证：", md)
         self.assertIn("\n- 行情日期：**", md)
         self.assertNotIn("行情日期：**2026", md.replace(
-            f"行情日期：**{_session_dates(1)[0]}**", ""))
-        self.assertNotIn("## 四、行业催化", md)  # 阶段报告不渲染空研究章节
-        self.assertIn("阶段范围说明", md)
+            f"行情日期：**{_frozen_session_dates(1)[0]}**", ""))
+        # 催化章节渲染（issue #101）：搜索入口未配置的降级缺口如实呈现
+        self.assertIn("## 四、行业催化", md)
+        self.assertIn("搜索入口未配置", md)
+        self.assertIn("申万口径研究说明", md)
         self.assertEqual(download.headers.get("content-type"),
                          "text/markdown; charset=utf-8")
 
@@ -504,10 +550,13 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
                             for g in intraday["gaps"]))
 
     def test_partial_coverage_keeps_facts_without_full_rank_no_em(self):
-        """仅目标行业合格（1/31）：保留事实+覆盖缺口，不给全量名次，零东财出站。"""
+        """仅目标行业合格（1/31，目标口径）：保留事实+覆盖缺口，不给全量
+        名次，零东财出站。冻结到已完成会话盘后——盘中真实时段运行时请求
+        会话不漂移到活跃当日（否则本用例会静默漂成参考口径场景）。"""
+        self._freeze(FROZEN_COMPLETED_NOW)
         stub = _SwTransportStub()
         stub.basic_by_level = {"1": "煤炭", "2": "煤炭开采", "3": "动力煤"}
-        sessions = _session_dates(20)
+        sessions = _frozen_session_dates(20)
         session_date = sessions[0]
         stub.quotes = [_quote_row("801950.SL", session_date, -0.867)]
         stub.history_dates = sessions
@@ -520,6 +569,10 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         analysis = resp.json()["analysis"]
         intraday = analysis["background"]["intraday"]
         self.assertTrue(intraday["sector_found"])
+        # 冻结场景下的目标口径钉住（不漂移为参考口径）
+        self.assertEqual(intraday["snapshot_mode"], "target")
+        self.assertEqual(intraday["snapshot_date"],
+                         _frozen_session_dates(1)[0])
         self.assertIsNone(intraday["rank_of"])
         self.assertTrue(any("全量名次" in g or "合格行情" in g
                             for g in intraday["gaps"]))

@@ -449,10 +449,13 @@ class TestPayloadWiring:
         assert peers["eligible"] is True
         assert peers["industry_reference"] is False
         assert any(i["is_target"] for i in peers["items"])
-        # 阶段标注：同业已接入（无同业 stage label），研究阶段 label 保留
+        # 研究块随载荷透出（issue #101）：真实支柱在无搜索配置下降级为
+        # 有界缺口块，reasons 汇报实际研究缺口（无「待接入」阶段标签）
         reasons = payload["assessment"]["reasons"]
         assert not any("同业比较与指数成分验证" in r for r in reasons)
-        assert any("行业催化与证据化综合" in r for r in reasons)
+        assert not any("行业催化与证据化综合" in r for r in reasons)
+        assert any("行业催化未取得" in r for r in reasons)
+        assert any("证据化综合未产出" in r for r in reasons)
         SectorReportPayload.model_validate(payload)
 
     def test_bj_unknown_boundary_partial_reasons_and_reference_peers(self):

@@ -23,9 +23,11 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -818,6 +820,23 @@ def classify_membership(target_secucode: str, members: Dict[str, Any], *,
 # ---------------------------------------------------------------------------
 
 
+def _history_close_key(value: Any) -> Tuple[str, Any]:
+    """收盘等价键（与既有资格层收盘语义一致）：可解析为有限正 Decimal →
+    ``("valid", Decimal)``——数值等价（wire ``10`` 与 ``"10.00"`` 同键）；
+    否则 ``("invalid", None)``——None/NaN/布尔/非数值/非正一律不作数值
+    比较（布尔永不作数值，缺值语义同类）。"""
+    if value is None or (isinstance(value, float)
+                         and not math.isfinite(value)):
+        return ("invalid", None)
+    try:
+        d = Decimal(str(value).strip())
+    except (ArithmeticError, ValueError):
+        return ("invalid", None)
+    if not d.is_finite() or d <= 0:
+        return ("invalid", None)
+    return ("valid", d)
+
+
 def fetch_index_history(codes: str, start_date: str, end_date: str, *,
                         refresh_token: str, timeout_seconds: float,
                         deadline: Optional[float]) -> Dict[str, pd.DataFrame]:
@@ -825,7 +844,19 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
 
     请求固定 ``Interval=D / CPS=1（不复权，指数口径）/ Fill=Omit（无交易
     日期剔除——严格交易日历对齐由调用方完成）``。
-    """
+
+    同一 thscode 可能拆多表返回：同码观测**逐行合并**（缺失段互补，不取
+    末表覆盖前表）。合并前先做行级归一（与既有严格窗口资格语义一致）：
+    - **日期归一**：``pd.to_datetime``（mixed + coerce）解析后按自然日
+      ``date()`` 作键——同一交易日的不同 wire 形式（``"2026-11-03"`` 与
+      ``"2026-11-03 00:00:00"``）同键，不产生伪重复；
+    - **请求窗口过滤**：归一日期在 ``[start_date, end_date]`` 之外的行为
+      窗口外行，与资格层语义一致忽略——窗口外矛盾不淘汰窗口内有效行；
+    - **收盘等价**：按有限正 Decimal 数值比较（``10`` ≡ ``"10.00"``；
+      布尔/非数/非正同类缺值）。同日等值去重保留一行，同日不等价 → 该
+      代码整体保守拒绝（不取其一；不影响其他代码的有效行——调用方按缺行
+      降缺口）。
+    不可解析日期行原样透传（资格层忽略并计数，行级诊断不丢）。"""
     body = {
         "codes": codes,
         "indicators": "close",
@@ -841,7 +872,16 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
     try:
         raw_tables = payload.get("tables")
         tables = raw_tables if isinstance(raw_tables, list) else []
-        frames: Dict[str, pd.DataFrame] = {}
+        try:
+            window_start = date.fromisoformat(start_date)
+            window_end = date.fromisoformat(end_date)
+        except ValueError:
+            # 请求窗口非 ISO（调用方契约外）：退化为不按窗口过滤
+            # （资格层仍按期望交易日集对齐，不放大采用面）
+            window_start = window_end = None
+        rows_by_code: Dict[str, Dict[date, Tuple[Tuple[str, Any], Any]]] = {}
+        passthrough_by_code: Dict[str, List[Tuple[str, Any]]] = {}
+        conflicting: set = set()
         for table in tables:
             if not isinstance(table, dict):
                 continue
@@ -855,13 +895,45 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
             closes = raw_closes if isinstance(raw_closes, list) else []
             if not thscode or not dates or not closes:
                 continue
+            if thscode in conflicting:
+                continue
+            parsed = pd.to_datetime(dates, errors="coerce", format="mixed")
+            merged = rows_by_code.setdefault(thscode, {})
+            passthrough = passthrough_by_code.setdefault(thscode, [])
+            for d_ts, raw_date, c_raw in zip(parsed, dates, closes):
+                if pd.isna(d_ts):
+                    # 不可解析日期行：原样透传（资格层忽略并注明，诊断不丢）
+                    passthrough.append((raw_date, c_raw))
+                    continue
+                d = d_ts.date()
+                if window_start is not None and not (
+                        window_start <= d <= window_end):
+                    continue  # 窗口外行：资格层忽略，不参与冲突判定
+                key = _history_close_key(c_raw)
+                prior = merged.get(d)
+                if prior is not None and prior[0] != key:
+                    # 同码同日收盘矛盾（数值不等或有效性不同类）：供应商对
+                    # 同一身份给出冲突事实，该代码整体不采用（保守，不取
+                    # 其一；已合并观测一并放弃）
+                    conflicting.add(thscode)
+                    rows_by_code.pop(thscode, None)
+                    passthrough_by_code.pop(thscode, None)
+                    break
+                if prior is None:
+                    merged[d] = (key, c_raw)
+        frames: Dict[str, pd.DataFrame] = {}
+        for thscode, merged in rows_by_code.items():
+            rows = [(d.isoformat(), merged[d][1]) for d in sorted(merged)]
+            rows.extend(passthrough_by_code.get(thscode) or [])
             frames[thscode] = pd.DataFrame(
-                {"date": dates[:len(closes)], "close": closes[:len(dates)]},
+                {"date": [r[0] for r in rows],
+                 "close": [r[1] for r in rows]},
             )
     except SwSectorFetchError:
         raise
     except Exception as exc:  # noqa: BLE001 - wire 形状异常按源错误降级，不逃出边界
         raise SwSectorFetchError(f"日线响应形状异常（{type(exc).__name__}）") from None
     if not frames:
-        raise SwSectorFetchError("日线响应无有效行（tables 为空）")
+        raise SwSectorFetchError(
+            "日线响应无有效行（tables 为空或同码矛盾整码拒绝）")
     return frames

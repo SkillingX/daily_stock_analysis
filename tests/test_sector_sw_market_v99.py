@@ -381,6 +381,197 @@ class TestFetchIndexHistory:
                 refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
             )
 
+    # ---- #98 复审：同码多表不再 last-wins（合并对齐观测 / 矛盾整码拒绝）----
+
+    def test_same_code_disjoint_tables_concatenate_not_last_wins(self, recorder):
+        """同 thscode 拆两表（日期互斥）：合并全部观测，前表不被末表覆盖。"""
+        early = {"thscode": "801950.SL",
+                 "time": ["2026-11-03", "2026-11-04", "2026-11-05"],
+                 "table": {"close": [2500.0, 2501.0, 2502.0]}}
+        late = {"thscode": "801950.SL",
+                "time": ["2026-11-06", "2026-11-07"],
+                "table": {"close": [2503.0, 2504.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [early, late],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-07",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03", "2026-11-04", "2026-11-05",
+                                    "2026-11-06", "2026-11-07"]
+        assert list(df["close"]) == [2500.0, 2501.0, 2502.0, 2503.0, 2504.0]
+
+    def test_same_code_identical_overlap_deduped(self, recorder):
+        """同码两表重叠日期且值一致：按同日去重保留一行（不矛盾、不拒绝）。"""
+        t1 = {"thscode": "801950.SL",
+              "time": ["2026-11-03", "2026-11-04"],
+              "table": {"close": [2500.0, 2501.0]}}
+        t2 = {"thscode": "801950.SL",
+              "time": ["2026-11-04", "2026-11-05"],
+              "table": {"close": [2501.0, 2502.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [t1, t2],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-05",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03", "2026-11-04", "2026-11-05"]
+        assert list(df["close"]) == [2500.0, 2501.0, 2502.0]
+
+    def test_same_code_conflicting_duplicate_rejects_code_keeps_other(self, recorder):
+        """同码同日收盘矛盾：该代码整体不采用（不取其一），
+        其他指数/基准的有效行不受影响（不丢弃）。"""
+        bad_a = {"thscode": "801950.SL",
+                 "time": ["2026-11-03", "2026-11-04"],
+                 "table": {"close": [2500.0, 2501.0]}}
+        bad_b = {"thscode": "801950.SL",
+                 "time": ["2026-11-04"],
+                 "table": {"close": [9999.0]}}  # 同日矛盾值
+        bench = {"thscode": "000300.SH",
+                 "time": ["2026-11-03", "2026-11-04"],
+                 "table": {"close": [3200.0, 3201.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [bad_a, bad_b, bench],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL,000300.SH", "2026-11-03", "2026-11-04",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        assert "801950.SL" not in frames  # 矛盾整码保守拒绝
+        assert set(frames) == {"000300.SH"}  # 基准有效行保留
+        assert list(frames["000300.SH"]["close"]) == [3200.0, 3201.0]
+
+    def test_all_codes_conflicting_raises_fetch_error(self, recorder):
+        """全部代码同码矛盾：无有效行 → 源错误（调用方降缺口，不静默通过）。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [2500.0]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [2501.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        with pytest.raises(sw.SwSectorFetchError):
+            sw.fetch_index_history(
+                "801950.SL", "2026-11-03", "2026-11-03",
+                refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+            )
+
+    # ---- #98 复审二轮：同码合并的日期/数值归一与窗口边界 ----
+
+    def test_same_day_wire_format_variants_dedupe_to_one_observation(
+            self, recorder):
+        """"2026-11-03" 与 "2026-11-03 00:00:00" 是同一交易日：同日等值
+        合并去重为一行，不产生伪重复、不丢该日（既有严格窗口资格语义）。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [2500.0]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03 00:00:00"], "table": {"close": [2500.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-03",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03"]
+        assert list(df["close"]) == [2500.0]
+
+    def test_normalized_same_day_conflicting_closes_reject_code(self, recorder):
+        """同日不同 wire 形式的收盘矛盾：归一后命中整码冲突守卫（不再因
+        键不同而漏判），该代码不采用，其他代码保留。"""
+        bad_a = {"thscode": "801950.SL",
+                 "time": ["2026-11-03"], "table": {"close": [2500.0]}}
+        bad_b = {"thscode": "801950.SL",
+                 "time": ["2026-11-03 00:00:00"], "table": {"close": [9999.0]}}
+        bench = {"thscode": "000300.SH",
+                 "time": ["2026-11-03"], "table": {"close": [3200.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [bad_a, bad_b, bench],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL,000300.SH", "2026-11-03", "2026-11-03",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        assert "801950.SL" not in frames
+        assert set(frames) == {"000300.SH"}
+
+    def test_out_of_window_conflict_never_drops_in_window_rows(self, recorder):
+        """窗口外多给日期的矛盾按既有资格语义忽略（多给的旧日不能淘汰
+        窗口内有效行）：窗口内等值行全部保留、代码不拒绝。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03", "2026-11-04"],
+             "table": {"close": [2500.0, 2501.0]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03", "2026-11-04", "2026-10-30"],
+             "table": {"close": [2500.0, 2501.0, 9999.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-04",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03", "2026-11-04"]
+        assert list(df["close"]) == [2500.0, 2501.0]
+
+    def test_numeric_close_variants_of_same_day_dedupe(self, recorder):
+        """wire ``10`` 与 ``"10.00"`` 是同一有效收盘（既有有限正 Decimal
+        语义）：同日数值等价去重，不整码拒绝。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [10]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": ["10.00"]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-03",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03"]
+        assert list(df["close"]) == [10]
+
+    def test_boolean_close_is_never_numeric(self, recorder):
+        """布尔收盘永不作数值（True ≠ 1）：与同日有效值不同类 → 整码矛盾
+        保守拒绝（不取其一）；单码全拒绝 → 源错误（调用方降缺口）。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [True]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [1.0]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        with pytest.raises(sw.SwSectorFetchError):
+            sw.fetch_index_history(
+                "801950.SL", "2026-11-03", "2026-11-03",
+                refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+            )
+
+    def test_identical_missing_close_dedupes_preserving_row(self, recorder):
+        """同日同为缺值（None）：同一「缺值事实」去重保留一行透传（资格层
+        按无效收盘日记缺口，行级诊断不丢），不整码拒绝。"""
+        a = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [None]}}
+        b = {"thscode": "801950.SL",
+             "time": ["2026-11-03"], "table": {"close": [None]}}
+        recorder({"cmd_history_quotation": {
+            "errorcode": 0, "errmsg": "", "tables": [a, b],
+        }})
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-03",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+        )
+        df = frames["801950.SL"]
+        assert list(df["date"]) == ["2026-11-03"]
+        assert list(df["close"]) == [None]
+
 
 # ---------------------------------------------------------------------------
 # 时间/新鲜度纪律（接收钟 + 会话开收盘；盘后供应商推送合法）

@@ -3658,13 +3658,15 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     out["window_end"] = today.isoformat()
     out["source"] = "套餐搜索（通用行业查询）"
 
-    def _thread_search() -> Tuple[str, Any, List[str], int, int]:
+    def _thread_search() -> Tuple[str, Any, List[str], int, int, List[str]]:
         """provider fallback 搜索：返回 (provider 名, 响应或 None, 局部缺口,
-        失败供应商数, 供应商侧畸形行累计)。
+        失败供应商数, 供应商侧畸形行累计, 检索成功供应商名)。
 
         线程内首出站/每次出站前检查同一取数截止；deadline bind + finally
         reset（对齐 ResearchRun.bind 语义）。失败 SearchResponse ≠ 无新闻：
-        保留 sanitized 供应商名与错误类别。供应商 raw 行类型畸形计数
+        保留 sanitized 供应商名与错误类别。**检索成功独立于结果非空**记录
+        （success 响应即使零行也是成功检索——混合失败诊断不得把成功空结果
+        误报为全失败）。供应商 raw 行类型畸形计数
         （``SearchResponse.malformed_rows``，结构化字段）对**检查过的每个
         响应**累计——包括失败尝试与 fallback（那些行是真实被拒的供应商
         数据），不解析 error_message 文本，也不与本地准入拒绝双重计数
@@ -3674,6 +3676,7 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
         token = request_deadline.set(budget.fetch_deadline)
         worker_gaps: List[str] = []
         failed_providers = 0
+        ok_providers: List[str] = []
         malformed_total = 0
         last: Any = None
         try:
@@ -3697,10 +3700,11 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                     last = None
                     continue
                 malformed_total += int(getattr(resp, "malformed_rows", 0) or 0)
-                if getattr(resp, "success", False) and getattr(resp, "results", None):
+                resp_success = bool(getattr(resp, "success", False))
+                if resp_success and getattr(resp, "results", None):
                     return provider_name, resp, worker_gaps, failed_providers, (
-                        malformed_total)
-                if resp is not None and not getattr(resp, "success", False):
+                        malformed_total), ok_providers
+                if resp is not None and not resp_success:
                     # 显式失败响应 ≠「无新闻」：sanitized 错误类别保留
                     safe = sanitize_diagnostic_text(
                         str(getattr(resp, "error_message", "") or "未知原因"),
@@ -3710,16 +3714,19 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                         f"行业催化：搜索供应商 {provider_name} 返回失败（{safe}）"
                     )
                     failed_providers += 1
-                if last is None or getattr(resp, "success", False):
+                elif resp is not None:
+                    # 成功响应（含零行结果）：检索本身成功，独立于结果数记录
+                    ok_providers.append(provider_name)
+                if last is None or resp_success:
                     last = resp
-            return "", last, worker_gaps, failed_providers, malformed_total
+            return "", last, worker_gaps, failed_providers, malformed_total, (
+                ok_providers)
         finally:
             request_deadline.reset(token)
 
     try:
-        provider_name, resp, worker_gaps, failed_providers, malformed_total = (
-            bounded_call(_thread_search, budget=budget,)
-        )
+        provider_name, resp, worker_gaps, failed_providers, malformed_total, (
+            ok_providers) = bounded_call(_thread_search, budget=budget,)
     except BudgetExhausted:
         out["gaps"].append("行业催化：取数预算不足，行业新闻搜索未完成（已取得内容保留）")
         return out
@@ -3730,13 +3737,24 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     # 迟到 worker 只写自己的 worker_gaps；本 out 已被 caller 持有
     out["gaps"].extend(worker_gaps)
     if not provider_name or resp is None:
-        if failed_providers:
+        # 诊断三态按**实际检索成功**区分（#98 复审：success 空结果 ≠ 失败）：
+        # 全失败 / 混合（有成功空结果 + 有失败）/ 全成功无合格，不冒充无新闻
+        if ok_providers and failed_providers:
             out["gaps"].append(
-                "行业催化：搜索供应商均返回失败（见上方分类），不冒充「窗口内无新闻」"
+                f"行业催化：已检索 {len(ok_providers) + failed_providers} 个供应商，"
+                f"{len(ok_providers)} 个检索成功但未发现窗口内结果，"
+                f"{failed_providers} 个检索失败（见上方分类诊断），"
+                "不冒充「窗口内无新闻」"
+            )
+        elif failed_providers:
+            out["gaps"].append(
+                "行业催化：全部检索失败（搜索供应商均返回失败，见上方分类诊断），"
+                "不冒充「窗口内无新闻」"
             )
         elif not out["gaps"]:
             out["gaps"].append(
-                "行业催化：搜索未返回结果（窗口内无可用新闻或供应商覆盖限制）"
+                "行业催化：未发现合格催化（检索成功但窗口内无可用新闻或供应商"
+                "覆盖限制，不补造）"
             )
         out["gaps"] = _bound_gaps(out["gaps"], 14)
         return out
@@ -4090,23 +4108,30 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     out["background_items"] = background
     if not items:
         if failed_providers:
+            # 混合响应：有供应商已取得结果（否则上方已按全部失败返回）但经
+            # 统一准入无合格催化，且其他渠道失败——两者如实并陈（issue #101
+            # 验收 1），诊断不冒充「无新闻」也不把部分成功误报为全失败
             out["gaps"].append(
-                "行业催化：搜索供应商失败，已证实近期催化未取得（不冒充无新闻）"
+                "行业催化：部分检索成功但无合格结果（已取得结果供应商的候选经"
+                "统一准入均未证实为近期催化），且其他检索渠道失败（见上方分类"
+                "诊断）；不冒充「窗口内无新闻」"
             )
         elif undated_count[0] and not out["dropped_offwindow"]:
             out["gaps"].append(
-                f"行业催化：搜索返回 {undated_count[0]} 条相关结果均无可用发布日期，"
-                "无法确证近期催化（URL 日期不单独作证据；文章探查未能确证）；"
-                "无日期条目仅列示为背景线索，不作为已证实近期催化"
+                f"行业催化：未发现合格催化（搜索返回 {undated_count[0]} 条相关"
+                "结果均无可用发布日期，无法确证近期催化；URL 日期不单独作证据；"
+                "文章探查未能确证；无日期条目仅列示为背景线索，不作为已证实"
+                "近期催化）"
             )
         elif undated_count[0]:
             out["gaps"].append(
-                "行业催化：窗口外或无日期结果均不构成已证实近期催化（见上方计数）"
+                "行业催化：未发现合格催化（窗口外或无日期结果均不构成已证实"
+                "近期催化，见上方计数）"
             )
         else:
             out["gaps"].append(
-                "行业催化：去重与资格过滤后无已证实近期催化（真实无窗口内行业新闻"
-                "或供应商覆盖限制，不补造）"
+                "行业催化：未发现合格催化（去重与资格过滤后无已证实近期催化："
+                "真实无窗口内行业新闻或供应商覆盖限制，不补造）"
             )
     else:
         if upgraded:
@@ -4137,11 +4162,14 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
 
     只注册 immutable 事实：静态先验（政策 DNA/基率）不注册（仅报告背景，
     不能独立支撑结论）；身份注册但不含行情数值（身份事实不能佐证 fabricated
-    metrics）；bg-* 注册为 background（只能附加引用）。材料与 payload 载荷
-    同源（cat 条目字段一致）。root-decision 所有权：市场类证据
-    （intraday/trend/peers/target）的 raw magnitudes 不进模型投影（由
-    ``market_observation_relations`` 定性观察关系替代），非市场事实原样
-    投影；模型 claims 不含明确业务量值（有限明确量值契约，无 numeric token 锚定）。
+    metrics）；bg-* 注册为 background（只能附加引用）。带真实日期但不得
+    作为当日/成分截面证据的参考口径行情与未确认成分独立目标行情按
+    **不可引用**登记（detached：服务端摘要可取，模型不可引用、不投影）。
+    材料与 payload 载荷同源（cat 条目字段一致）。root-decision 所有权：
+    市场类证据（intraday/trend/peers/target）的 raw magnitudes 不进模型
+    投影（由 ``market_observation_relations`` 定性观察关系替代），非市场
+    事实原样投影；模型 claims 不含明确业务量值（有限明确量值契约，无
+    numeric token 锚定）。
     """
     from src.services import sector_research
 
@@ -4160,30 +4188,52 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
     row = prosper.get("row") or {}
     if prosper.get("sector_found"):
         snapshot_source = prosper.get("snapshot_source")
-        registry.register(sector_research.EvidenceEntry.build(
-            "intraday", "fact", "当日板块行情（当前快照，单期观测）",
-            {
-                "change_pct": row.get("change_pct"),
-                "rank_of": prosper.get("rank_of"),
-                "total_boards": prosper.get("total_boards"),
-                "momentum": prosper.get("momentum"),
-                "breadth": prosper.get("breadth"),
-                # 快照来源/时点贯穿登记表（root 纪律：as_of 不止 logger）；
-                # 衍生标记与 provenance 文本同源（_DERIVED_MARKER 单一 owner）
-                "snapshot_source": snapshot_source,
-                "snapshot_derived": bool(
-                    snapshot_source and _DERIVED_MARKER in snapshot_source),
-                "metric_meaning": {
-                    "change_pct": "板块指数当日涨跌幅（百分比，负值为下跌）",
-                    "rank_of/total_boards": "按当日涨跌幅在全部行业板块中的"
-                                            "排名（当前快照，无历史动量观测）",
-                    "momentum": "有界 0-100 横截面涨跌幅分位（有效板块中严格"
-                                "低于目标的占比折算），正值不表示收益为正或"
-                                "涨势延续",
-                    "breadth": "当日上涨家数占比（百分比，当前快照）",
-                },
+        intraday_material: Dict[str, Any] = {
+            "change_pct": row.get("change_pct"),
+            "rank_of": prosper.get("rank_of"),
+            "total_boards": prosper.get("total_boards"),
+            "momentum": prosper.get("momentum"),
+            "breadth": prosper.get("breadth"),
+            # 快照来源/时点贯穿登记表（root 纪律：as_of 不止 logger）；
+            # 衍生标记与 provenance 文本同源（_DERIVED_MARKER 单一 owner）
+            "snapshot_source": snapshot_source,
+            "snapshot_derived": bool(
+                snapshot_source and _DERIVED_MARKER in snapshot_source),
+            "metric_meaning": {
+                "change_pct": "板块指数当日涨跌幅（百分比，负值为下跌）",
+                "rank_of/total_boards": "按当日涨跌幅在全部行业板块中的"
+                                        "排名（当前快照，无历史动量观测）",
+                "momentum": "有界 0-100 横截面涨跌幅分位（有效板块中严格"
+                            "低于目标的占比折算），正值不表示收益为正或"
+                            "涨势延续",
+                "breadth": "当日上涨家数占比（百分比，当前快照）",
             },
-        ))
+        }
+        # 快照口径/实际行情日期贯穿登记表（issue #101 证据日期纪律）：
+        # 申万参考口径（snapshot_mode=reference）携带实际参考交易日，渲染
+        # 与模型投影按真实日期表述——参考日行情不进入当日证据；东财路径
+        # 无此键（None），渲染保持既有「当日」语义不变。
+        snapshot_mode = prosper.get("snapshot_mode")
+        snapshot_date = prosper.get("snapshot_date")
+        if snapshot_mode:
+            intraday_material["snapshot_mode"] = snapshot_mode
+            intraday_material["snapshot_date"] = snapshot_date
+        if snapshot_mode == "reference":
+            # #98 复审：参考口径是**前一交易日**行情——报告与服务端事实
+            # 摘要保留（带真实参考日），但**不可引用**（detached）：不进
+            # 模型 wire、引用校验按未知 ID 拒绝——引用它加当日同业/目标
+            # 行情不能暗示当日走强（跨会话比较在登记表层被切断，不只靠
+            # prompt）。东财路径无 reference 口径，不受影响。
+            registry.register_detached(sector_research.EvidenceEntry.build(
+                "intraday", "fact",
+                f"参考交易日（{snapshot_date}）板块行情（参考口径，单期观测）",
+                intraday_material,
+            ))
+        else:
+            registry.register(sector_research.EvidenceEntry.build(
+                "intraday", "fact", "当日板块行情（当前快照，单期观测）",
+                intraday_material,
+            ))
     if trend.get("eligible") and trend.get("period_return_pct") is not None:
         registry.register(sector_research.EvidenceEntry.build(
             "trend", "fact", "板块近期趋势（最近 20 个已完成交易日）",
@@ -4198,7 +4248,10 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
         ))
     peer_items = [
         {"name": p.get("name"), "is_target": p.get("is_target"),
-         "change_pct": p.get("change_pct")}
+         "change_pct": p.get("change_pct"),
+         # 行情归属交易日贯穿登记表（issue #101：真实日期随证据携带；
+         # 东财 clist 快照路径为 None，渲染保持既有「当日」语义）
+         "as_of_date": p.get("as_of_date")}
         for p in (peers.get("items") or [])
     ]
     if peer_items:
@@ -4218,13 +4271,39 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
                 "quotes_as_of": peers.get("quotes_as_of"),
             },
         ))
-    target_change = next(
-        (p.get("change_pct") for p in peer_items if p.get("is_target")), None,
+    target_item = next(
+        (p for p in peer_items if p.get("is_target")), None,
     )
-    if target_change is not None:
+    if target_item is not None and target_item.get("change_pct") is not None:
+        target_material: Dict[str, Any] = {
+            "stock_name": stock_name,
+            "snapshot_change_pct": target_item["change_pct"],
+        }
+        if target_item.get("as_of_date"):
+            target_material["as_of_date"] = target_item["as_of_date"]
         registry.register(sector_research.EvidenceEntry.build(
-            "target", "fact", "目标股快照当日涨跌幅",
-            {"stock_name": stock_name, "snapshot_change_pct": target_change},
+            "target", "fact", "目标股快照当日涨跌幅", target_material,
+        ))
+    elif peers.get("target_independent_quote"):
+        # 未确认成分的目标独立行情事实（issue #100/#101）：独立登记、独立
+        # 日期——不进入同业证据（items 无目标行），不与成分比较同截面。
+        # #98 复审：独立目标行情**不可引用**（detached）——独立目标事实
+        # 不得作为可引用市场证据与成分同业事实并陈（"目标股领涨指数成分
+        # 样本"类成分内断言在引用校验层被拒，不只靠投影措辞）；服务端
+        # 事实摘要保留独立呈现（带真实日期）。
+        tiq = peers["target_independent_quote"]
+        independent_material: Dict[str, Any] = {
+            "stock_name": stock_name,
+            "snapshot_change_pct": tiq.get("change_pct"),
+            "independent": True,
+            "note": "目标股未确认在该指数成分内：本条为独立行情事实，"
+                    "不进入同业成分比较与任何成分内排名",
+        }
+        if tiq.get("as_of_date"):
+            independent_material["as_of_date"] = tiq["as_of_date"]
+        registry.register_detached(sector_research.EvidenceEntry.build(
+            "target", "fact", "目标股独立行情（未确认成分；独立事实）",
+            independent_material,
         ))
     for c in (catalysts.get("items") or []):
         registry.register(sector_research.EvidenceEntry.build(
@@ -5058,6 +5137,8 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     以 31 个目录指数构造全表（目标会话日合格行填值，未取得行涨跌幅等
     置 NaN），复用 :func:`_prosperity_pillar` 既有命中/分位/全量名次纪律
     （全量名次只在 31/31 同日有效时输出；缺行保留合格值与覆盖说明）。
+    覆盖计数（当日与参考 cohort）只对核定目录内的请求身份成立：供应商
+    返回的非目录指数行计数披露、不进入 31 全表口径（不冒充全量覆盖）。
     目标指数目标日合格行缺失而立即上一已完成交易日有合格行时，采用该
     参考会话的同日 cohort（显式 ``snapshot_mode="reference"``，两日截面
     不拼接）并标注日期与当日缺口（报告为部分）；无任何合格行时只降当日
@@ -5067,9 +5148,18 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     from src.services.sector_sw_market import SW_L1_DIRECTORY
 
     session_date = sw_snapshot.get("session_date")
-    rows = sw_snapshot.get("rows") or {}
+    directory_codes = {c for c, _ in SW_L1_DIRECTORY}
+    # 计数与全表口径只对**请求身份**（31 个核定目录指数）成立：供应商返回
+    # 的非目录指数行不进入 31 全表与覆盖计数（30 目录行 + 未知码 ≠ 31/31
+    # 全量），当日与参考两个 cohort 均在计数前过滤；非目录行计数披露。
+    rows_all = sw_snapshot.get("rows") or {}
+    reference_all = sw_snapshot.get("reference_rows") or {}
+    unknown_codes = (set(rows_all) | set(reference_all)) - directory_codes
+    unknown_identity_count = len(unknown_codes)
+    rows = {k: v for k, v in rows_all.items() if k in directory_codes}
+    reference_rows = {k: v for k, v in reference_all.items()
+                      if k in directory_codes}
     reference_date = sw_snapshot.get("reference_date")
-    reference_rows = sw_snapshot.get("reference_rows") or {}
     target_in_rows = index_code in rows
     # 模式从实际选用的数据推导：参考口径必须含**目标指数行**（只看
     # reference_date/无关行存在性不激活——无主体参考不给）
@@ -5080,6 +5170,10 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     snapshot_mode = "reference" if use_reference else (
         "target" if rows else None)
     fetch_gaps = list(sw_snapshot.get("gaps") or [])
+    if unknown_identity_count:
+        fetch_gaps.append(
+            f"快照响应含 {unknown_identity_count} 个非申万一级核定目录指数行"
+            "（代码未命中 31 目录，不进入全表口径与覆盖计数，不采用）")
 
     if not qualified:
         return {
@@ -5136,8 +5230,6 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     pillar["gaps"] = _bound_gaps(fetch_gaps + list(pillar.get("gaps") or []), 10)
     return pillar
 
-
-_SW_STAGE_RESEARCH_LABEL = "行业催化与证据化综合：待后续版本接入（本阶段未执行）"
 
 _SW_MEMBERS_SOURCE = "iFinD 申万指数成分（p03473）+ 成员行情（real_time_quotation）"
 _SW_MEMBERS_AMOUNT_PROVENANCE = (
@@ -5492,17 +5584,21 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
 
 def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: ReportBudget,
                         em_fallback_note: Optional[str] = None) -> Dict[str, Any]:
-    """申万口径阶段载荷组合（issue #99；同业/成分接线见 issue #100）。
+    """申万口径载荷组合（issue #99；同业/成分接线见 issue #100；研究接线
+    见 issue #101）。
 
     市场数据块（主行业/当日快照/趋势）按申万事实产出；成分边界三态回填
     identity.membership（``sw_index_members`` 口径 + ``sw_membership`` 明细）
-    并产出同业块（issue #100）；催化、综合为后续子票范围（#101），本阶段
-    置 None 并在 assessment.reasons 如实标注（阶段范围，非取数失败）。
+    并产出同业块（issue #100）；选定申万口径后运行**一次**既有行业催化
+    检索（统一准入）与证据化综合（登记表校验），块随载荷透出（issue #101；
+    confirmed 前置由支柱内部判定，身份未确认时如实标注未执行）。
     目标股明确未纳入或成分状态未知时：同业标注行业参考、目标股独立展示、
     成分内名次留空，报告如实标注部分原因（该差异本身不触发东财兜底）。
-    完整性恒为部分（研究阶段未接入），缺口随载荷透出。东财兜底未切换时
-    保留口径一致的申万事实，触发与未恢复原因随 gaps 可回查（两套动态事实
-    不拼接）。
+    完整性按实际取得的合格证据判定（与东财口径同一纪律）：confirmed +
+    目标日行情（参考口径不算当日证据）+ 趋势 + 成分同业 + 合格催化 +
+    综合ok（无拒绝）才恢复 complete；其余如实 partial，缺口随载荷透出。
+    东财兜底未切换时保留口径一致的申万事实，触发与未恢复原因随 gaps 可
+    回查（两套动态事实不拼接）。
     """
     ident_sw = sw.get("identity") or {}
     confirmed = ident_sw.get("status") == "confirmed"
@@ -5594,36 +5690,98 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             10)
     trend["gaps"] = _bound_gaps(list(trend.get("gaps") or []), 10)
 
+    # 必需研究（issue #101）：选定申万口径后运行**一次**既有行业催化检索
+    # 与证据化综合（同业块之后、可选概念之前——必需研究不被可选长链吃掉
+    # 取数预算；confirmed 前置由支柱内部判定，身份未确认时块如实标注未执行）。
+    catalysts = _catalysts_pillar(index_name, budget=budget,
+                                  subject_confirmed=confirmed, stock_name=name)
+    registry_ident = {
+        "industry_em": None, "industry_cninfo": None, "business_scope": None,
+        "board_name": index_name or None, "board_code": index_code or None,
+        "membership": membership,
+    }
+    synthesis = _synthesis_pillar(name, code, registry_ident, intraday, trend,
+                                  peer_block, catalysts, budget=budget,
+                                  subject_confirmed=confirmed)
+
     sw_text = " ".join(x for x in (index_name, ident_sw.get("l2_name"),
                                    ident_sw.get("l3_name")) if x)
     policy = _policy_pillar(sw_text)
     base = _base_rate_pillar(f"{sw_text} {name}".strip())
     concepts = _concepts_pillar(code, budget=budget)
 
+    # ---- 资料状态与完整性（issue #101：完整状态仅由合格证据支撑的报告恢复，
+    #      判定依据**有效动态事实**，与东财口径同一纪律——缺口累积可见不短路）----
     if confirmed:
         status = "unscored"
-        reasons: List[str] = [_bounded_reason(_SW_STAGE_RESEARCH_LABEL)]
-        cons_status = (cons_membership or {}).get("status")
-        if cons_status and cons_status != "included":
-            boundary_label = ("明确未纳入" if cons_status == "excluded"
-                              else "状态未知")
-            reasons.append(_bounded_reason(
-                f"目标股指数成分{boundary_label}：同业为行业参考，"
-                "目标股独立展示、成分内名次留空，报告如实标注部分"
-                "（该成分差异不触发东财兜底）"))
-        snapshot = sw.get("snapshot") or {}
-        if not snapshot.get("rows") and snapshot.get("reference_date"):
-            reasons.append(_bounded_reason(
-                f"当日行业行情为参考口径：目标交易日 {session_date} 合格行情未取得，"
-                f"展示最近已完成交易日 {snapshot.get('reference_date')} 参考行情"))
-        if not sw.get("trend_ok"):
-            trend_gap = ((sw.get("trend") or {}).get("gaps") or ["未知原因"])[0]
-            reasons.append(_bounded_reason(f"行业近期趋势未取得：{trend_gap}"))
+        reasons: List[str] = []
     else:
         status = "insufficient_data"
         reasons = [_bounded_reason(
             f"申万主行业不可确认：{(ident_sw.get('gaps') or ['原因未记录'])[0]}")]
-    completeness = "partial"  # 阶段范围（同业/研究未接入）恒如实部分
+    completeness = "complete"
+    if status == "insufficient_data":
+        completeness = "partial"  # reasons 已含主行业缺失原因
+    if not intraday.get("sector_found"):
+        completeness = "partial"
+        reason = intraday["gaps"][0] if intraday.get("gaps") else "未知原因"
+        reasons.append(_bounded_reason(f"当日行业行情未取得：{reason}"))
+    elif intraday.get("momentum") is None:
+        completeness = "partial"
+        reason = next(
+            (g for g in intraday["gaps"] if "动量" in g),
+            intraday["gaps"][0] if intraday.get("gaps") else "未知原因",
+        )
+        reasons.append(_bounded_reason(
+            f"当日行情行存在但动态字段未取得：{reason}"))
+    if confirmed and intraday.get("snapshot_mode") == "reference":
+        # 参考口径不是当日完整证据（#98 US8：盘中参考行情报告标为部分）
+        completeness = "partial"
+        snapshot = sw.get("snapshot") or {}
+        reasons.append(_bounded_reason(
+            f"当日行业行情为参考口径：目标交易日 {session_date} 合格行情未取得，"
+            f"展示最近已完成交易日 {snapshot.get('reference_date')} 参考行情"
+            "（参考日行情不进入当日证据），完整性不为完整"))
+    if confirmed and not membership["verified"]:
+        completeness = "partial"
+        cons_status = (cons_membership or {}).get("status")
+        boundary_label = ("明确未纳入" if cons_status == "excluded"
+                          else "状态未知")
+        reasons.append(_bounded_reason(
+            f"目标股指数成分{boundary_label}：同业为行业参考，"
+            "目标股独立展示、成分内名次留空，报告如实标注部分"
+            "（该成分差异不触发东财兜底）"))
+    if confirmed and trend.get("period_return_pct") is None:
+        # 完整性按**实际缺失的行业趋势事实**判定（#98 复审）：合格趋势 =
+        # 区间收益非空；严格交易日历不可用（eligible=False）或窗口不足与
+        # 供应商失败同样使 confirmed 报告保持部分——不因 eligible=False
+        # 跳过检查而把缺趋势报告恢复 complete（与 compose 契约一致）。
+        # 日历缺口原文保留在 trend.gaps[0]（不按自然日补齐）。
+        completeness = "partial"
+        reason = trend["gaps"][0] if trend.get("gaps") else "未知原因"
+        reasons.append(_bounded_reason(f"行业近期趋势未取得：{reason}"))
+    if peer_block is not None and peer_block.get("eligible") \
+            and not peer_block.get("items"):
+        completeness = "partial"
+        reason = peer_block["gaps"][0] if peer_block.get("gaps") else "未知原因"
+        reasons.append(_bounded_reason(f"同业样本未取得：{reason}"))
+    if catalysts.get("eligible") and not catalysts.get("items"):
+        # 无已证实近期催化（含检索失败/无合格结果）如实 partial——缺口原因
+        # 见 catalysts.gaps（三态诊断），背景线索保留但不冒充催化
+        completeness = "partial"
+        reason = catalysts["gaps"][0] if catalysts.get("gaps") else "未知原因"
+        reasons.append(_bounded_reason(f"行业催化未取得：{reason}"))
+    if (synthesis.get("eligible") and synthesis.get("status") != "ok"):
+        completeness = "partial"
+        reason = synthesis["gaps"][0] if synthesis.get("gaps") else "未知原因"
+        reasons.append(_bounded_reason(f"证据化综合未产出：{reason}"))
+    if (synthesis.get("eligible") and synthesis.get("status") == "ok"
+            and synthesis.get("rejected_count")):
+        # 混合输出（部分结论合格 + 部分被拒）不呈现「全部合格研究」
+        completeness = "partial"
+        reasons.append(_bounded_reason(
+            f"模型综合存在已拒绝的结论输出（{synthesis['rejected_count']} 条），"
+            "完整性不为完整"))
 
     # 缺口优先级（issue #99 amend 四）：兜底路由原因与行情/趋势实际缺口
     # 排在最前，背景噪声（政策/概念/基率）垫底——复合失败下诊断信息在
@@ -5636,6 +5794,8 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     gaps.extend(trend.get("gaps") or [])
     if peer_block is not None:
         gaps.extend(peer_block.get("gaps") or [])
+    gaps.extend(catalysts.get("gaps") or [])
+    gaps.extend(synthesis.get("gaps") or [])
     for block in (policy, concepts):
         gaps.extend(block.get("gaps") or [])
     if base.get("is_default"):
@@ -5657,8 +5817,8 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         "concepts": concepts,
         "sector_trend": trend,
         "sector_peers": peer_block,  # issue #100：成分边界 + 行业参考同业
-        "sector_catalysts": None,   # 阶段范围（#101 接入）
-        "sector_synthesis": None,   # 阶段范围（#101 接入）
+        "sector_catalysts": catalysts,  # issue #101：选定口径后检索一次
+        "sector_synthesis": synthesis,  # issue #101：登记表校验的综合
         "assessment": {
             "status": status,
             "completeness": completeness,
@@ -5723,19 +5883,49 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         and (result.get("sector_peers") is None
              or (isinstance(result.get("sector_peers"), dict)
                  and "eligible" in result["sector_peers"]))
-        and result.get("sector_catalysts") is None
-        and result.get("sector_synthesis") is None
-        and result.get("assessment", {}).get("completeness") == "partial"
+        and isinstance(result.get("sector_catalysts"), dict)
+        and "eligible" in result["sector_catalysts"]
+        and isinstance(result.get("sector_synthesis"), dict)
+        and "eligible" in result["sector_synthesis"]
+        and "status" in result["sector_synthesis"]
+        and result.get("assessment", {}).get("completeness") in (
+            "partial", "complete")
     ) or (
         result.get("payload_version") == 2
         and result.get("research_basis") == "eastmoney_board"
         and result.get("research_outcome") in ("switched_fallback",
                                                "partial_recovery")
     ),
-    "sw-first compose must emit either a v3 sw2021_l1 stage payload (peers block "
-    "per issue #100 allowed, research blocks still absent, partial completeness) "
-    "or a v2 eastmoney_board fallback payload (switched or partial recovery, "
-    "explicitly distinguished)",
+    "sw-first compose must emit either a v3 sw2021_l1 payload (research blocks "
+    "present with eligibility fields per issue #101) or a v2 eastmoney_board "
+    "fallback payload (switched or partial recovery, explicitly distinguished)",
+)
+@ensure(
+    lambda result: (
+        result.get("payload_version") != 3
+        or result.get("assessment", {}).get("completeness") != "complete"
+        or (
+            result.get("identity", {}).get("subject_status") == "confirmed"
+            and (result.get("identity", {}).get("membership") or {}).get(
+                "verified") is True
+            and result.get("background", {}).get("intraday", {}).get(
+                "sector_found") is True
+            and result.get("background", {}).get("intraday", {}).get(
+                "momentum") is not None
+            and result.get("background", {}).get("intraday", {}).get(
+                "snapshot_mode") == "target"
+            and result.get("sector_trend", {}).get("period_return_pct")
+            is not None
+            and bool((result.get("sector_peers") or {}).get("items"))
+            and bool((result.get("sector_catalysts") or {}).get("items"))
+            and result.get("sector_synthesis", {}).get("status") == "ok"
+            and not result.get("sector_synthesis", {}).get("rejected_count")
+        )
+    ),
+    "sw completeness=complete must be backed by qualifying evidence: confirmed "
+    "verified membership, target-date intraday with momentum, qualified trend, "
+    "peers sample, qualified catalysts and ok synthesis without rejected claims "
+    "(reference-day intraday or unconfirmed membership keeps partial)",
 )
 def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, Any]:
     """申万优先编排（issue #99；父规格 #98 决策 6 有界整链兜底）。
@@ -5754,11 +5944,14 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     恢复随 gaps 可回查，两套动态事实不拼接。正常申万路径零东财行业/行情
     出站。
 
-    申万阶段载荷（payload_version=3 / research_basis=sw2021_l1）：成分
+    申万载荷（payload_version=3 / research_basis=sw2021_l1）：成分
     边界三态与同业比较已接入（issue #100；目标股未确认成分时同业为行业
-    参考、目标股独立展示、成分内名次留空，差异本身不触发兜底）；催化、
-    综合为后续子票范围（#101），块为 None 并在 reasons 如实标注阶段范围；
-    完整性恒为部分。东财兜底链自身的身份/行情/研究语义由其既有契约保证。
+    参考、目标股独立展示、成分内名次留空，差异本身不触发兜底）；选定申万
+    口径后运行**一次**既有行业催化检索与证据化综合并随载荷透出（issue
+    #101），完整性按实际取得的合格证据判定——confirmed + 目标日行情 +
+    趋势 + 成分同业 + 合格催化 + 综合ok 才恢复 complete，参考口径行情与
+    成分边界差异如实保持部分。东财兜底链自身的身份/行情/研究语义由其既有
+    契约保证。
     """
     sw = _sw_market_chain(code, budget=budget, name=name)
     reason = _sw_fallback_reason(sw)
@@ -5781,6 +5974,9 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
     # 取数截止已过（收尾余量仍活）→ 不再**启动**兜底，保留申万部分报告；
     # 兜底 core 阶段内撞取数截止（BudgetExhausted）→ 同样保留既有申万事实
     # ——两者都不伪报总超时：真实总截止仍由提交边界按 timeout 终态（504）。
+    # 兜底 core 阶段内东财供应商传输失败（已识别 requests 传输错误类别，
+    # issue #101 验收：兜底失败行为可诊断降级）→ 保留申万可用事实并把实际
+    # 失败类别随 gaps 回查；程序契约错误仍原样上抛（不吞）。
     if budget.fetch_expired():
         return _kept_sw_payload(
             f"东财兜底未启动：取数截止已过（取数预算耗尽、收尾余量仍有效），"
@@ -5791,6 +5987,16 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
         return _kept_sw_payload(
             f"东财兜底在核心阶段到达取数截止，未运行研究（不产生被弃出站），"
             f"保留申万口径可用事实；兜底触发原因：{reason}")
+    except requests.RequestException as exc:
+        from src.services.run_diagnostics import sanitize_diagnostic_text
+
+        safe = sanitize_diagnostic_text(
+            f"{type(exc).__name__}: {exc}", max_length=120,
+        ) or type(exc).__name__
+        return _kept_sw_payload(
+            f"东财兜底在核心阶段发生供应商传输失败（{safe}），"
+            "未切换口径，未运行研究（不产生被弃出站），保留申万口径"
+            f"可用事实；兜底触发原因：{reason}")
     em_ident = core["ident"]
     em_confirmed = core["confirmed"]
     em_quote_recovered = ((core["prosper"].get("row") or {}).get("change_pct")

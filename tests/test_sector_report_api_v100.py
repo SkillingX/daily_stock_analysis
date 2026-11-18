@@ -26,6 +26,7 @@ import os
 import socket
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
@@ -47,18 +48,15 @@ from src.core.trading_calendar import recent_completed_trading_sessions
 from src.schemas.sector_analysis import SectorReportPayload
 from src.services import sector_sw_market as sw
 from src.storage import DatabaseManager
+from tests.test_sector_report_api_v99 import (
+    FROZEN_COMPLETED_NOW,
+    _freeze_clocks,
+)
 
 BJ_TARGET = "920101"
 BJ_TARGET_SEC = "920101.BJ"
 SH_TARGET = "600188"
 SH_TARGET_SEC = "600188.SH"
-
-
-def _session_dates(count: int) -> List[Any]:
-    """最近 count 个已完成交易日（真实严格日历，最新在前）。"""
-    sessions = recent_completed_trading_sessions("cn", count)
-    assert sessions is not None, "真实 XSHG 日历应可用（离线数据）"
-    return [d.isoformat() for d in sessions]
 
 
 def _history_payload(codes: List[str], dates: List[str]) -> Dict[str, Any]:
@@ -239,6 +237,9 @@ class SectorReportApiV100TestCase(unittest.TestCase):
         import src.services.sector_analysis_service as svc
 
         self._svc = svc
+        # 场景冻结状态（基座继承的 self._freeze 装入；_arranged_sessions
+        # 的时钟一致源——未冻结场景保持真实时刻行为不变）
+        self._frozen_now: Optional[datetime] = None
         self.report_dir = self.data_dir / "reports" / "sector_analysis"
 
         def _fake_report_dir() -> Path:
@@ -260,9 +261,31 @@ class SectorReportApiV100TestCase(unittest.TestCase):
                 os.environ[name] = value
         self.temp_dir.cleanup()
 
+    def _freeze(self, now: datetime) -> None:
+        """场景内唯一冻结入口（与 v99/v101 基座同模式）：冻结申万链时钟缝
+        到指定时刻。一个测试场景只装一次——叠加冻结会让后装 patcher 经已
+        替换的 `_session_context` 解析出前一冻结时刻的会话。"""
+        self._frozen_now = now
+        for patcher in _freeze_clocks(self._svc, now=now, ref_sessions=[]):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _arranged_sessions(self, count: int) -> List[str]:
+        """夹具安排的时钟一致源：场景已冻结时按冻结时刻取严格日历，
+        否则按真实时刻（与既有行为逐位一致）。"""
+        if self._frozen_now is not None:
+            sessions = recent_completed_trading_sessions(
+                "cn", count, current_time=self._frozen_now)
+        else:
+            sessions = recent_completed_trading_sessions("cn", count)
+        assert sessions is not None, "真实 XSHG 日历应可用（离线数据）"
+        return [d.isoformat() for d in sessions]
+
     def _install_sw_stub(self, stub: _SwTransportStub) -> None:
-        stub.session_date = _session_dates(1)[0]
-        stub._history_dates = _session_dates(20)
+        # 会话/趋势日期从场景时钟一致源取值（已冻结场景 = 冻结时刻的严格
+        # 日历会话；未冻结场景 = 真实时刻，行为与既有逐位一致）
+        stub.session_date = self._arranged_sessions(1)[0]
+        stub._history_dates = self._arranged_sessions(20)
         self._sw_post_patcher = patch.object(sw, "_http_api_curl_post", stub)
         self._sw_token_patcher = patch.object(sw, "_resolve_access_token",
                                               stub.resolve_token)
@@ -297,6 +320,12 @@ class SectorReportApiV100TestCase(unittest.TestCase):
 class TestGiantRawAmountNeverInf(SectorReportApiV100TestCase):
     """API/Markdown 反例：超大原始整数金额经公开边界判无效——API null、
     Markdown 无 inf（JSON/Markdown 一致性，b59bcb6d 复现反例）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 冻结到已完成会话盘后：wire 戳 22:00:46 与请求会话同一严格日历
+        # 会话（盘中真实时段运行时请求会话不漂移到活跃当日）
+        self._freeze(FROZEN_COMPLETED_NOW)
 
     def test_bj_independent_quote_giant_amount_api_and_markdown_consistent(
             self):
@@ -383,6 +412,11 @@ class TestEmSwitchZeroConstituentOutbound(SectorReportApiV100TestCase):
 class TestBjUnknownBoundary(SectorReportApiV100TestCase):
     """北交所成分边界（unknown）：行业保留、同业行业参考、目标独立展示。"""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # 冻结到已完成会话盘后（安排/请求/断言同一严格日历会话）
+        self._freeze(FROZEN_COMPLETED_NOW)
+
     def _stub(self) -> _SwTransportStub:
         return _SwTransportStub(
             industry_by_level={"1": "煤炭", "2": "煤炭开采", "3": "动力煤"},
@@ -412,7 +446,7 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
         self.assertEqual(membership["sw_membership"]["target_secucode"],
                          BJ_TARGET_SEC)
         self.assertEqual(membership["sw_membership"]["observation_date"],
-                         _session_dates(1)[0])
+                         self._arranged_sessions(1)[0])
 
         # 行业行情与趋势保留
         intraday = analysis["background"]["intraday"]
@@ -434,7 +468,7 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
         tiq = peers["target_independent_quote"]
         self.assertIsNotNone(tiq)
         self.assertEqual(tiq["code"], BJ_TARGET)
-        self.assertEqual(tiq["as_of_date"], _session_dates(1)[0])
+        self.assertEqual(tiq["as_of_date"], self._arranged_sessions(1)[0])
         self.assertIsNotNone(tiq["change_pct"])
         self.assertIsNotNone(tiq["amount"])
 
@@ -468,7 +502,7 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
         self.assertIn("行业参考", md)
         self.assertIn("目标股独立行情", md)
         self.assertIn(BJ_TARGET, md)
-        self.assertIn(_session_dates(1)[0], md)
+        self.assertIn(self._arranged_sessions(1)[0], md)
 
     def test_target_quote_failure_keeps_report_with_disclosed_gap(self):
         stub = self._stub()
@@ -505,6 +539,11 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
 
 class TestShIncludedLoop(SectorReportApiV100TestCase):
     """沪深 included：目标并入样本、名次可判、membership verified。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 冻结到已完成会话盘后（安排/请求/断言同一严格日历会话）
+        self._freeze(FROZEN_COMPLETED_NOW)
 
     def test_full_loop_included_merges_target_and_verifies_membership(self):
         stub = _SwTransportStub(
@@ -544,6 +583,11 @@ class TestShIncludedLoop(SectorReportApiV100TestCase):
 
 class TestConstituentFailureLoop(SectorReportApiV100TestCase):
     """成分查询供应商失败：报告成功（部分）、membership 保守未知。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 冻结到已完成会话盘后（安排/请求/断言同一严格日历会话）
+        self._freeze(FROZEN_COMPLETED_NOW)
 
     def test_vendor_error_degrades_membership_not_report(self):
         stub = _SwTransportStub(
