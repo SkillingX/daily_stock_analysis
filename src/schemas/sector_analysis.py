@@ -79,8 +79,25 @@ Completeness = Literal["complete", "partial"]
   核心动态未取得（行存在 ≠ 数据取得）、或成分 unverified（归属未确认）
 """
 
-PayloadVersion = Literal[2]
-"""板块报告载荷版本。"""
+ResearchBasis = Literal["sw2021_l1", "eastmoney_board"]
+"""报告实际研究口径（issue #99 追加；两套口径的动态事实不拼接）：
+- ``sw2021_l1``：申万 2021 一级行业（iFinD 标准 HTTP 归属与指数行情）
+- ``eastmoney_board``：东财行业板块（有界兜底链路，旧规则口径）
+None 仅允许出现在追加字段之前存档的存量 v2 记录（读回兼容），新生成
+报告必须携带。"""
+
+ResearchOutcome = Literal["kept_sw_stage", "switched_fallback", "partial_recovery"]
+"""兜底结果显式区分（issue #99 amend 追加；部分失败恢复 ≠ 成功切换）：
+- ``kept_sw_stage``：申万链路达门槛之上，未触发兜底（v3 阶段载荷）
+- ``switched_fallback``：东财主行业按旧规则确认且至少一项核心行情恢复，
+  完整切换为东财口径报告（同业/研究只运行一次）
+- ``partial_recovery``：东财主体一致锁定但核心行情未恢复，保留东财口径
+  既有身份/可用资料（研究不运行、完整性部分），非成功切换
+None 仅兼容追加前的存量记录。"""
+
+PayloadVersion = Literal[2, 3]
+"""板块报告载荷版本。3 = 申万口径阶段报告（issue #99；阶段范围见
+``assessment.reasons`` 与报告正文的阶段范围说明）。"""
 
 
 _GapList = List[Annotated[str, Field(min_length=1, max_length=200)]]
@@ -230,6 +247,16 @@ class IntradayPillar(_StrictBase):
     rank_of: Optional[int] = Field(default=None, ge=1)
     total_boards: Optional[int] = Field(default=None, ge=1)
     row: IntradayRow = Field(default_factory=IntradayRow)
+    snapshot_date: Optional[Annotated[str, Field(min_length=10, max_length=10)]] = None
+    """快照行情的实际交易日（YYYY-MM-DD；issue #99 追加兼容字段）。
+
+    目标交易日行情未取得而展示最近已完成交易日参考行情时，为参考日
+    （目标日缺口随 gaps/reasons 透出）；默认 None 仅兼容存量记录。"""
+    snapshot_mode: Optional[Literal["target", "reference"]] = None
+    """快照实际采用口径的显式标注（issue #99 amend 追加；渲染按此字段而非
+    日期对比判断参考口径——目标日盘中合格行情不是参考口径）。``target``=
+    目标交易日口径；``reference``=立即上一已完成交易日参考口径。默认 None
+    仅兼容存量记录。"""
     snapshot_source: Optional[Annotated[str, Field(max_length=200)]] = None
     """当日行情快照来源/时点说明：东财行业板块全表路径为 None（口径见文档）；
     全表不可用时单标的快照来源如实标注（stock/get 原样映射或 trends2
@@ -656,6 +683,11 @@ class SectorReportPayload(_StrictBase):
     """
 
     payload_version: PayloadVersion
+    # ---- v3 追加（issue #99）：实际研究口径。None 仅兼容追加前的存量
+    # v2 记录读回；新生成报告必须携带（compose 契约保证）----
+    research_basis: Optional[ResearchBasis] = None
+    # ---- amend 追加（issue #99）：兜底结果显式区分（部分恢复 ≠ 成功切换）----
+    research_outcome: Optional[ResearchOutcome] = None
     stock_code: Annotated[str, Field(min_length=6, max_length=6, pattern=r"^\d{6}$")]
     stock_name: Annotated[str, Field(min_length=1, max_length=64)]
     generated_at: Annotated[str, Field(min_length=10, max_length=32)]

@@ -239,7 +239,10 @@ class TestComposeReport:
         assert payload["background"]["policy"]["lean"] == "supportive"
         assert payload["background"]["intraday"]["amount_activity"] == 50.0
         assert payload["concepts"]["items"][0]["name"] == "白酒概念"
-        assert payload["gaps"] == []
+        # issue #99：东财链经有界兜底切换时触发原因随 gaps 可见（唯一 gap）；
+        # EM 链自身零缺口语义由 _compose_eastmoney_report 直调用例验证
+        assert len(payload["gaps"]) == 1
+        assert "兜底" in payload["gaps"][0]
 
     def test_base_rate_default_adds_background_gap(self, monkeypatch):
         monkeypatch.setattr(

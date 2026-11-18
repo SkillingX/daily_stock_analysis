@@ -515,6 +515,11 @@ class TestUnconfirmedIdentityNoOutbound(SectorResearchApiV3TestCase):
     """unverified/ambiguous 身份：不搜索、不综合（零研究出站）。"""
 
     def test_unverified_membership_no_research_outbound(self):
+        """unverified 身份：不搜索、不综合（零研究出站；东财链语义直调）。
+
+        issue #99 后 EM unverified 在编排层不切换（保留申万事实、研究块为
+        None），链内零研究出站语义改为对东财兜底链直调断言。
+        """
         board_hist, bench_hist = self._real_window_hist()
         from src.search_service import SearchResult, get_search_service
 
@@ -546,11 +551,7 @@ class TestUnconfirmedIdentityNoOutbound(SectorResearchApiV3TestCase):
             cons=["000568"],  # 不含 600519
             board_table=boards, board_hist=board_hist, bench_hist=bench_hist,
         )
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        analysis = resp.json()["analysis"]
+        analysis = self._em_chain_payload()
         self.assertEqual(analysis["identity"]["subject_status"], "unverified")
         catalysts = analysis["sector_catalysts"]
         self.assertFalse(catalysts["eligible"])

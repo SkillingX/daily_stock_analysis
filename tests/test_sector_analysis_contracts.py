@@ -405,7 +405,7 @@ class TestTrendPeersEligibilityContracts:
                                      "total_returned": 0, "truncated": False,
                                      "gaps": []},
         )
-        return svc.compose_report("600519", "测试股票", budget=_budget())
+        return svc._compose_eastmoney_report("600519", "测试股票", budget=_budget())
 
     def test_confirmed_with_matching_eligibility_passes(self, monkeypatch):
         result = self._run(monkeypatch, subject="confirmed",

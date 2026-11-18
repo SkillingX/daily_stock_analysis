@@ -1,6 +1,12 @@
 {% set st = a.identity.subject_status %}
+{% set is_sw = (a.get('research_basis') == 'sw2021_l1') %}
+{% if is_sw %}
+{% set st_label = {'confirmed': '已确认（申万一级归属与核定目录唯一匹配）', 'unverified': '已锁定但成分未验证',
+                   'ambiguous': '无法唯一锁定', 'missing': '未取得'}[st] %}
+{% else %}
 {% set st_label = {'confirmed': '已确认（成分验证通过）', 'unverified': '已锁定但成分未验证',
                    'ambiguous': '无法唯一锁定', 'missing': '未取得'}[st] %}
+{% endif %}
 {% if a.assessment.status == 'unscored' %}
 {% set status_text = '**未评分**（首版板块专项不产出综合评分）' %}
 {% else %}
@@ -21,7 +27,9 @@
 {% else %}
 {% set locked_text = '未锁定（不按近似名取行）' %}
 {% endif %}
-{% if a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
+{% if is_sw %}
+{% set membership_text = '成分验证待后续版本接入（本阶段报告不含指数成分与同业比较，见阶段范围说明）' %}
+{% elif a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
 {% set membership_text = '目标股在东财 F10 板块完整成员集合中（' ~ a.identity.membership.member_count ~ ' 只，成分验证通过；成员行情为逐股采集，批次时间范围见同业缺口）' %}
 {% elif a.identity.membership.verified %}
 {% set membership_text = '目标股在该板块成分内' ~ (('（成分 ' ~ a.identity.membership.member_count ~ ' 只）') if a.identity.membership.member_count is not none else '') %}
@@ -37,9 +45,21 @@
 
 > 报告 id：{{ report_id }} ｜ 生成时间：{{ as_of }}
 > 主行业身份：**{{ st_label }}** ｜ 资料状态：{{ status_text }} ｜ 完整性：{{ completeness_text }}
+{% if a.get('research_basis') %}
+> 研究口径：{{ {'sw2021_l1': '申万 2021 一级行业（iFinD 标准 HTTP）', 'eastmoney_board': '东财行业板块（有界兜底链路）'}[a.research_basis] }}{% if a.get('research_outcome') == 'switched_fallback' %}（东财兜底成功切换）{% elif a.get('research_outcome') == 'partial_recovery' %}（**东财兜底部分恢复，未达切换门槛**；同业与研究未运行，非成功切换）{% endif %}
+{% endif %}
 > 采集时点：{{ a.identity.observed_at or '未记录' }} ｜ 供应商数据截止：{{ as_of_text }}
 > 本报告基于公开数据与启发式规则，仅供研究参考，不构成投资建议
 
+{% if is_sw %}
+## 一、主行业定位（申万 2021 一级行业）
+
+{% set sw_ref = ((' ｜ 二级参考：' ~ sw.l2) if sw and sw.l2 else '') ~ ((' ｜ 三级参考：' ~ sw.l3) if sw and sw.l3 else '') %}
+- 申万一级归属：{{ locked_text }}{{ sw_ref }}
+- 成分验证：{{ membership_text }}
+- 归属观察日：{{ a.identity.vendor_as_of or '未知' }}（按该日期向供应商查询正式归属；目录版本 {{ a.identity.classification_version or '未知' }}）
+- 目录来源：申万 2021 一级行业指数目录（iFinD 实测核定，31/31 逐一核对）
+{% else %}
 ## 一、主行业定位（同一东财行业板块）
 
 - 东财个股行业：**{{ a.identity.industry_em or '未返回' }}**
@@ -58,11 +78,15 @@
 - 巨潮证监会行业（参考）：{{ a.identity.industry_cninfo }}
 
 {% endif %}
+{% endif %}
 ## 二、当日板块行情（价格强弱与活跃度）
 
 {% set pr = a.background.intraday %}
 {% if pr.sector_found %}
 - 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ 当日涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
+{% if pr.get('snapshot_date') %}
+- 行情日期：**{{ pr.snapshot_date }}**{{ '（参考口径：目标交易日目标指数合格行情未取得，展示立即上一已完成交易日同日参考，见缺口）' if pr.get('snapshot_mode') == 'reference' else '' }}
+{% endif %}
 - 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ 当日成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
 - 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
 {% if pr.snapshot_source %}
@@ -127,7 +151,17 @@
 {% elif trend.benchmark and trend.benchmark.period_return_pct is not none and trend.period_return_pct is none %}
 - 相对表现：不计算（需板块与基准同窗口均 20/20 合格；当前板块侧不合格，见缺口）
 {% endif %}
+{% if is_sw %}
+{% if trend.source %}
+- 数据来源：板块 {{ trend.source }}{% if trend.benchmark %}、基准 {{ trend.benchmark.source or '未取得（见缺口）' }}（{{ trend.benchmark.symbol }}）{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% elif trend.observations %}
+- 数据来源：合格区间收益未取得——窗口内实际取得 {{ trend.qualified_sessions or 0 }}/{{ trend.window_completed_sessions }} 个交易日收盘观测（iFinD，见上表）；**数据获取与合格区间收益分开标注**，不以已取得观测冒充区间收益{% if trend.benchmark and trend.benchmark.source %}；基准（{{ trend.benchmark.name }}）来源 {{ trend.benchmark.source }}（{{ trend.benchmark.symbol }}）独立标注{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% else %}
+- 数据来源：**未取得板块本身合格日线观测**（见缺口）{% if trend.benchmark and trend.benchmark.source %}；基准（{{ trend.benchmark.name }}）来源 {{ trend.benchmark.source }}（{{ trend.benchmark.symbol }}）独立标注——基准有观测不代表板块侧已取得{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% endif %}
+{% else %}
 - 数据来源：板块 {{ trend.source or '东财行业板块日线' }}（板块代码直查）、基准 东财指数日线（sh000300）；期望交易日集来自严格交易日历（不补自然日）
+{% endif %}
 {% if trend.expected_dates %}
 - 期望交易日集（{{ trend.expected_dates | length }} 天）：{{ trend.expected_dates | join('、') }}
 {% endif %}
@@ -138,10 +172,15 @@
 - ⚠️ {{ g }}
 {% endfor %}
 {% else %}
+{% if is_sw %}
+- ⚠️ 板块趋势未产出：{{ trend.gaps[0] if trend.gaps else '未知原因' }}
+{% else %}
 - ⚠️ 板块趋势未执行：主行业身份未确认（confirmed 前置不满足），不发起板块/基准行情查询、不给趋势结论。
 {% endif %}
 {% endif %}
+{% endif %}
 
+{% if a.get('sector_catalysts') is not none or a.get('sector_peers') is not none or a.get('sector_synthesis') is not none %}
 ## 四、行业催化（近期政策/新闻，统一准入）
 
 {% set cat = a.get('sector_catalysts') %}
@@ -322,6 +361,8 @@
 {% endif %}
 {% endif %}
 
+{% endif %}
+
 ## 七、政策倾向（行业 DNA 库·静态规则背景）
 
 {% set p = a.background.policy %}
@@ -367,6 +408,14 @@
 - 未取得相关概念列表（见缺口）；概念缺失不影响主行业报告。
 {% endif %}
 
+{% if is_sw %}
+## 阶段范围说明（本报告未包含的研究内容）
+
+- 本报告为申万口径**阶段报告**：已接通主行业归属、31 个申万一级行业指数当日快照与全量名次资格、目标行业与沪深 300 的严格日历二十交易日趋势。
+- 指数成分状态与同业比较、行业催化与证据化综合研判**待后续版本接入**（见资料状态说明的不足原因），本阶段未执行、不产出。
+- 完整性恒为**部分**：即使上方市场数据全部取得，阶段范围未接入也如实标注，不冒充完整研究。
+
+{% endif %}
 {% if a.gaps %}
 ## 数据缺口（按纪律不编造）
 
