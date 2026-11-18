@@ -196,109 +196,159 @@ def _ifind_main_inflow_cumulative(
     # 关闭形态保持 MCP 原路径零变化（预算：API 阶段为 MCP 兜底预留份额，
     # 取消照 curl 边界穿透，与 MCP 同语义）。
     series = None
+    _adopted_channel: Optional[str] = None
+    # 通用 MCP 后备的窗口：HTTP 参与时与 API 同用路由建立的 ``_flow_deadline``
+    # （同窗合同——API 失败后后备不得按 ``deadline=None`` 重开自身 timeout 的
+    # 更长窗口）；HTTP 不参与时保持调用方原 ``deadline``/None 语义。
+    _mcp_fallback_deadline = deadline
     from data_provider.ifind_http_daily_adapter import http_financial_participation_active
     if http_financial_participation_active():
-        from data_provider.ifind_http_daily_adapter import ifind_http_main_inflow_series
+        from data_provider.ifind_http_daily_adapter import _finance_api_deadline, ifind_http_main_inflow_series
         from data_provider.base import DataFetchError as _FlowDFE
         from data_provider.cross_source_validator import SourceReadError as _FlowSRE
         from src.core.research_run import ResearchStopped as _FlowRS
+        from src.core.research_run import current_research as _flow_research
         from src.core.trading_calendar import get_market_now
         from src.config import get_config as _flow_get_config
         # deadline=None 时按既有取数超时兜底（与 MCP 分支无 deadline 语义对齐）。
         _flow_deadline = deadline if deadline is not None else monotonic() + _flow_get_config().fundamental_fetch_timeout_seconds
+        _mcp_fallback_deadline = _flow_deadline
+        _flow_run = _flow_research.get()
 
-        def _mcp_window():
-            """MCP 原路径整个窗口（同预算；取消照原语义传播）。"""
-            return fetcher.fetch_main_inflow_series(
-                code, max(days + 8, _IFIND_FLOW_FETCH_ROWS),
-                **({"deadline": deadline} if deadline is not None else {}),
-            )
+        def _stopped_or_exhausted() -> bool:
+            """停止或总预算耗尽：不再发任何后备出站（不重置 deadline）。"""
+            return _flow_deadline <= monotonic() or bool(
+                _flow_run and (_flow_run.stop_reason or _flow_run.finalized))
 
-        api_series = None
-        try:
-            api_series = ifind_http_main_inflow_series(
-                code, deadline=_flow_deadline, start_iso=expected[-1], end_iso=expected[0],
-            )
-        except _FlowRS:
-            raise  # 取消不是供应商失败：不回退、不消耗 MCP 出站
-        except (_FlowSRE, _FlowDFE, TimeoutError) as exc:
-            logger.warning(
-                "capital flow API 不合格/失败（%s: %s），回退 MCP", code,
-                getattr(exc, "reason_code", type(exc).__name__))
-        else:
-            # 第十二~十四轮审查（T 定稿防御 + 原鲜度优先 + 失败披露与有效
-            # 性判定）：参考日与窗口日历**同一时区语义**（``get_market_now``）。
-            # **有效性按 expected 交易日集合判定**（第十四轮）：API 序列在
-            # expected 内零有效值（全 null、或区间内非交易日/窗口外行非空而
-            # expected 全 null）视同不合格——回 MCP 原路径，不得跳过兜底；
-            # 单个 expected 日 null 仍为缺值行（不补零，窗口不完整披露）。
-            _expected_set = set(expected)
-            if not any(value is not None for day, value in api_series if day in _expected_set):
-                logger.warning(
-                    "capital flow API（%s）expected 交易日零有效值，视同不合格回 MCP", code)
-            else:
-                # 当日 T（expected[0] ≥ 参考日）：``recent_completed_trading_
-                # sessions`` 只证明交易所已收盘——收盘后供应商可能返回非空
-                # 但尚会修订的 T 日值（官方手册无定稿时效说明、既有双源对照
-                # 皆为历史日，收盘瞬间定稿不可证）——
-                #   T 非空：弃用 API 值，先以同预算调 MCP 整窗（原鲜度）；
-                #     MCP 失败/空序列按缺口披露（不采信未定稿值、不拼两源）。
-                #   T null/缺：同样先 MCP（MCP 可能有 T 值）；MCP **真实失败**
-                #     才保留 API 的 T-1 完整窗口——失败原因（``ifind:<code>``）
-                #     随 result.errors 结构化保留 + pending_day 披露，不伪装
-                #     正常；MCP 空序列不构成「MCP 成功」——同按未提供处理。
-                # 历史日（expected[0] < 参考日）：四证券×20 交易日双源对照
-                # 背书，API 非空照常采纳（不试 MCP）。
-                _ref_day = get_market_now("cn", current_time=current_time).date().isoformat()
-                _api_t_value = next((value for day, value in api_series if day == expected[0]), None)
-                if expected[0] >= _ref_day:
+        # 参考日与窗口日历同一时区语义（``get_market_now``），**先于任何出
+        # 站**比较 expected 最新日期与参考日决定出站次序（反转：T 日窗口
+        # MCP 优先，消除「先 API 后必弃用」的必丢候选请求；历史窗口仍 API
+        # 优先）。预算只在路由层分配一次：首尝试沿用既有有界比例思路（30%，
+        # 最多 8 秒）为末位候选留正剩余、不得耗尽全部窗口——**MCP 首试的
+        # 份额只按实际剩余 R 计算**（MCP 是独立渠道，其窗口不受 HTTP cap
+        # 影响；MCP 自身 timeout 在 query 边界仍生效）；末位 API 只消费传入
+        # 的本次尝试 deadline，不再内部预留不存在的第三次请求（适配入口
+        # 仍夹取父截止与 HTTP 请求上限），两渠道同一外层绝对截止。
+        _ref_day = get_market_now("cn", current_time=current_time).date().isoformat()
+        if expected[0] >= _ref_day:
+            # --- 当日 T：MCP 优先（至多一次）---
+            # ``recent_completed_trading_sessions`` 只证明交易所已收盘——
+            # 收盘后供应商可能返回尚会修订的 T 日值（官方手册无定稿时效说
+            # 明、既有双源对照皆为历史日，收盘瞬间定稿不可证），故原鲜度
+            # 优先取 MCP 整窗。
+            _remaining_flow = _flow_deadline - monotonic()
+            _first_reserve = min(8.0, _remaining_flow * 0.3) if _remaining_flow > 0 else 0.0
+            _mcp_first_deadline = _flow_deadline - _first_reserve
+            _mcp_failure: Optional[str] = None
+            _mcp_raw: Optional[list] = None
+            try:
+                _mcp_raw = fetcher.fetch_main_inflow_series(
+                    code, max(days + 8, _IFIND_FLOW_FETCH_ROWS),
+                    deadline=_mcp_first_deadline,
+                )
+            except _FlowRS:
+                raise  # 取消不是供应商失败：不回退、不消耗 API 出站
+            except _FlowSRE as exc:
+                _mcp_failure = str(exc)
+            if _mcp_raw:
+                # 非空序列（含全 null、日期不合格、缺交易日等不完整形态）
+                # 一律交既有归一/窗口聚合规则——零 API 补查，不把「非空返
+                # 回」当「窗口合格」，不放宽完整性/定稿校验、不换源拼接。
+                series = _mcp_raw
+                _adopted_channel = "mcp"
+            elif not _stopped_or_exhausted():
+                # MCP 真实失败或空结果（不构成成功）才走 API 既有补充路径。
+                api_series = None
+                try:
+                    api_series = ifind_http_main_inflow_series(
+                        code, deadline=_flow_deadline, start_iso=expected[-1], end_iso=expected[0],
+                    )
+                except _FlowRS:
+                    raise
+                except (_FlowSRE, _FlowDFE, TimeoutError) as exc:
+                    logger.warning(
+                        "capital flow API 补充不合格/失败（%s: %s）", code,
+                        getattr(exc, "reason_code", type(exc).__name__))
+                if api_series is not None:
+                    _api_t_value = next(
+                        (value for day, value in api_series if day == expected[0]), None)
                     if _api_t_value is not None:
-                        logger.info(
-                            "capital flow API %s 当日 T（%s）非空但定稿未证明，弃用 API 值",
+                        # API T 非空（定稿未证明）：整批拒绝，不删 T 行后
+                        # 拼装成合格历史结果。
+                        logger.warning(
+                            "capital flow API %s 当日 T（%s）非空但定稿未证明，整批拒绝",
                             code, expected[0])
-                        api_series = None  # 未定稿值不可采信
-                    # MCP 在本分支**至多调用一次**（第十五轮）：不依赖底层
-                    # single_fetch 假定包装层零额外调用——所有结果路径在此
-                    # 分流终结，绝不落入下方通用分支二次调用。
-                    _mcp_failure: Optional[str] = None
-                    _mcp_raw: Optional[list] = None
-                    try:
-                        _mcp_raw = _mcp_window()
-                    except SourceReadError as exc:
-                        _mcp_failure = str(exc)
+                        api_series = None
+                if api_series is not None:
+                    series = api_series
+                    _adopted_channel = "api"
                     if _mcp_failure is not None:
-                        # MCP 真实异常：T null 保留 API T-1（真实原因结构化
-                        # 随 errors，不伪装正常）；T 非空弃用值 → 缺口披露。
-                        if api_series is not None:
-                            logger.warning(
-                                "capital flow MCP 失败（%s），保留 API T-1 完整窗口", code)
-                            series = api_series
-                            result["errors"].append(_mcp_failure)
-                        else:
-                            result["status"] = "failed"
-                            result["errors"].append(_mcp_failure)
-                            return result
-                    elif not _mcp_raw:
-                        # 空序列不构成 MCP 成功（第十四轮）：T null 保留
-                        # API T-1（数据质量优先，不虚构失败原因——与既有
-                        # T-1 回退 ok+pending 语义一致）；T 非空弃用 → 按
-                        # 原契约窗口全缺 partial 披露。
-                        logger.warning("capital flow MCP（%s）返回空序列", code)
-                        series = api_series if api_series is not None else []
-                    else:
-                        series = _mcp_raw  # MCP 完整窗口（原鲜度优先）
+                        # T null：按既有数据质量语义保留 API T-1 完整窗口，
+                        # 真实 MCP 失败原因结构化随 errors（不伪装正常）。
+                        logger.warning(
+                            "capital flow MCP 失败（%s），保留 API T-1 完整窗口", code)
+                        result["errors"].append(_mcp_failure)
+                elif _mcp_failure is not None:
+                    # 双渠道失败：按失败披露（MCP 真实原因为主；预算耗尽/
+                    # 供应商失败在诊断日志分别承载，不互相误述）。
+                    result["status"] = "failed"
+                    result["errors"].append(_mcp_failure)
+                    return result
                 else:
-                    series = api_series  # 历史日：API 采纳（不试 MCP）
+                    # MCP 空序列 + API 补充失败/拒绝：窗口全缺 partial（空
+                    # 序列非供应商失败，不虚构错误码——与既有披露语义一致）。
+                    series = []
+            elif _mcp_failure is not None:
+                # MCP 失败且停止/预算耗尽：不再发后备 API，失败如实披露。
+                result["status"] = "failed"
+                result["errors"].append(_mcp_failure)
+                return result
+            else:
+                series = []  # MCP 空序列后停止/耗尽：窗口全缺 partial
+        else:
+            # --- 历史窗口：API 优先（四证券×20 交易日双源对照背书）---
+            api_series = None
+            try:
+                api_series = ifind_http_main_inflow_series(
+                    code, deadline=_finance_api_deadline(_flow_deadline),
+                    start_iso=expected[-1], end_iso=expected[0],
+                )
+            except _FlowRS:
+                raise  # 取消不是供应商失败：不回退、不消耗 MCP 出站
+            except (_FlowSRE, _FlowDFE, TimeoutError) as exc:
+                logger.warning(
+                    "capital flow API 不合格/失败（%s: %s），回退 MCP", code,
+                    getattr(exc, "reason_code", type(exc).__name__))
+            else:
+                # 有效性按 expected 交易日集合判定：API 序列在 expected 内
+                # 零有效值（全 null、或区间内非交易日/窗口外行非空而
+                # expected 全 null）视同不合格——回 MCP 原路径，不得跳过
+                # 兜底；单个 expected 日 null 仍为缺值行（不补零）。
+                _expected_set = set(expected)
+                if not any(value is not None for day, value in api_series if day in _expected_set):
+                    logger.warning(
+                        "capital flow API（%s）expected 交易日零有效值，视同不合格回 MCP", code)
+                else:
+                    series = api_series
+                    _adopted_channel = "api"
+            # API 失败/不合格 → 落入下方通用 MCP 分支（历史路径兜底，一次）。
     if series is None:
         try:
             series = fetcher.fetch_main_inflow_series(
                 code, max(days + 8, _IFIND_FLOW_FETCH_ROWS),
-                **({"deadline": deadline} if deadline is not None else {}),
+                **({"deadline": _mcp_fallback_deadline} if _mcp_fallback_deadline is not None else {}),
             )
         except SourceReadError as exc:
             result["status"] = "failed"
             result["errors"].append(str(exc))
             return result
+    if _adopted_channel is not None and series:
+        # 实际渠道采纳由消费层在此确认记录（底层日志只承载「取得候选」，
+        # 候选随后被拒绝时不得宣称已采用）。
+        logger.info(
+            "capital flow %s 窗口实际采用渠道 %s（%d 行，null %d）", code,
+            _adopted_channel, len(series),
+            sum(1 for _d, v in series if v is None))
     # 归一供应商日期并丢弃无法证明实际日期的行；空白/无法解析的金额不补零。
     normalized: list[tuple[str, float | None]] = []
     for raw_day, raw_value in series or ():

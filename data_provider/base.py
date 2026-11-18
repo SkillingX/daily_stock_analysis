@@ -826,7 +826,7 @@ def _prior_products_period_disqualified(prior: "ProductSegments", current_period
     return None
 
 
-def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True, include_company: bool = False, deep_identity: bool = False) -> Dict[str, Any]:
+def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: float, config: Any, include_holders: bool = True, include_company: bool = False, deep_identity: bool = False, products_deadline: float | None = None) -> Dict[str, Any]:
     """主营/股东已有合格 iFinD 结果时，跳过对应 Choice 查询并带回结果。
 
     ``include_company``（issue #73，深研 scope）：公司事实改由 iFinD 提供
@@ -838,6 +838,11 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     产品失败/已尝试状态的报告内共享（阻断 business 的 latest_annual 旁路）。
     非深研消费者（普通显式期入口/Choice 主源/股东/独立服务）保持既有重试
     资格与失败语义，不被本函数新增策略改变。
+    ``products_deadline``（深研身份）：主营初查的上限＝聚合层为公司资料
+    预留后的可选前序截止（``deadline - C``）；None 时保持原 deadline。全局
+    停止/返回检查（``_out_of_budget``）、公司查询、历史主营候选与股东仍用
+    原阶段 ``deadline``——预留只缩短可选前序，不得把整段函数换短截止而
+    提前跳过公司。
 
     失败不再静默：供应商、操作与原因记入 errors，随 research 一路保留
     （issue #51），且不影响已取得的财务或概念结果。取消/停止不是供应商
@@ -876,7 +881,13 @@ def _ifind_research_omissions(code: str, readings: Dict[str, Any], deadline: flo
     products_no_data: tuple[str, ...] = ()
     requested_period = normalize_report_period(period)[0] if period else None
     try:
-        products = fetcher.product_segments(code, period, deadline=deadline)
+        # 深研身份：初查上限＝可选前序截止（公司预留已划出）；超时仍是真实
+        # 供应商失败——失败状态随报告共享（不旁路默认年报），公司随后在原
+        # 阶段截止内照常出站。
+        products = fetcher.product_segments(
+            code, period,
+            deadline=deadline if products_deadline is None else products_deadline,
+        )
         if products.items and not products.errors:
             adopted, initial_reason = (None, None) if not deep_identity else _initial_products_selection(products, requested_period)
             if initial_reason is not None:
@@ -5303,11 +5314,29 @@ class DataFetcherManager:
         # 调用者走同一 false-scope 入口时保持既有完整聚合（Choice 补充/目标价/
         # 公司）与原副作用（无行业榜/股东）不变。
         deep_scope = prefer_ifind and ifind_deep_research_scope_active(include_sector_flows)
-        if deep_scope and "pb_ratio" not in valuation_records and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
+        # 深研身份：必要财务/当前估值/正式行业/资金窗口完成后，进入定向 PB
+        # 与主营等**可选**工作前为公司资料计算一次预留 C=min(8 秒, 30%×R,
+        # 配置单次基本面预算)——定向 PB 实际查询与其 single_fetch 等待、主营
+        # 初查共享 ``deadline - C``；公司资料与历史主营候选仍用原阶段
+        # deadline。预留仅限 **HTTP 实际参与形态**（``http_financial_
+        # participation_active``，与公司 API 出站同资格）：HTTP 关闭/缺凭据
+        # 时公司 HTTP 不出站、预留无受益方，PB/主营保持原阶段截止；非深研
+        # 消费者不套用（公司资料走 Choice 可选补查，基线行为不变）。
+        reserve_scope = deep_scope and http_financial_participation_active()
+        company_reserve = 0.0
+        optional_deadline = deadline
+        if reserve_scope:
+            remaining_for_optional = deadline - time.monotonic()
+            if remaining_for_optional > 0:
+                company_reserve = min(
+                    8.0, remaining_for_optional * 0.3,
+                    float(config.fundamental_fetch_timeout_seconds))
+                optional_deadline = deadline - company_reserve
+        if deep_scope and "pb_ratio" not in valuation_records and time.monotonic() < optional_deadline and not (run and (run.stop_reason or run.finalized)):
             # issue #73（返修）：聚合批次未取得合格 PB（含已知中证/% 误映射变体）
             # 时，用 root 已捕获验证过的单指标定向问句做每报告至多一次有界补全：
-            # 同绝对预算（不新增预算，deadline 内既有 single_fetch 共享——同报告
-            # 同键含已知失败，无重试框架），不覆盖健康合格值，不放宽任何解析
+            # 同绝对预算（不新增预算，可选前序截止内既有 single_fetch 共享——同
+            # 报告同键含已知失败，无重试框架），不覆盖健康合格值，不放宽任何解析
             # 资格；资金窗口预算已在此前预留落位，本可选补查不得侵占。补查仍
             # 不合格/失败保持缺失并保留真实拒绝原因。
             from data_provider.mx_data_adapter import financial_refresh as _pb_refresh
@@ -5316,12 +5345,12 @@ class DataFetcherManager:
             pb_key = _pb_supplier_need_key("ifind", config.financial_cache_contract, "directed_pb", code, _refresh[1] if _refresh else "")
 
             def _directed_pb() -> Dict[str, Any]:
-                return IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).directed_pb_snapshot(code, deadline=deadline)
+                return IfindFetcher(config.ifind_mcp_endpoint, config.ifind_mcp_token, config.ifind_mcp_timeout_seconds).directed_pb_snapshot(code, deadline=optional_deadline)
 
             pb_out: Dict[str, Any] = {}
             # 深研身份本身要求 active run——无 run 的 fallback 是不可达死代码（Ponytail）。
             try:
-                pb_out = run.single_fetch(pb_key, _directed_pb, timeout=max(0.0, deadline - time.monotonic())) or {}
+                pb_out = run.single_fetch(pb_key, _directed_pb, timeout=max(0.0, optional_deadline - time.monotonic())) or {}
             except SourceReadError as exc:
                 prior_pb_rejections = valuation_rejections.get("pb_ratio") or ()
                 valuation_rejections["pb_ratio"] = tuple(dict.fromkeys((*prior_pb_rejections, f"directed_pb:{exc.reason_code}")))
@@ -5423,8 +5452,15 @@ class DataFetcherManager:
         if prefer_ifind and time.monotonic() < deadline and not (run and (run.stop_reason or run.finalized)):
             # issue #64：深研 scope（include_sector_flows=False）同时禁 iFinD 股东隐式出站；
             # issue #73：深研身份内公司事实改由 iFinD 提供（include_company），非深研
-            # false-scope 调用者保持 Choice 公司补查（基线行为）。
-            ifind_research = _ifind_research_omissions(code, readings, deadline, config, include_holders=include_sector_flows, include_company=deep_scope, deep_identity=deep_scope)
+            # false-scope 调用者保持 Choice 公司补查（基线行为）。主营初查仅在 HTTP
+            # 实际参与形态用缩短后的可选前序截止（公司预留），其余出站与全局
+            # 停止检查仍用原阶段截止。
+            ifind_research = _ifind_research_omissions(
+                code, readings, deadline, config,
+                include_holders=include_sector_flows, include_company=deep_scope,
+                deep_identity=deep_scope,
+                products_deadline=optional_deadline if reserve_scope else None,
+            )
             research_omit = research_omit + tuple(ifind_research.pop("omit", ()))
         if not deep_scope and time.monotonic() < choice_deadline and not (run and (run.stop_reason or run.finalized)):
             adapter.append_optional_research(snapshot, code, deadline=choice_deadline, omit_indicators=(*omit, *research_omit))
