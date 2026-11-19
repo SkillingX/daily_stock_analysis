@@ -28,6 +28,7 @@ import re
 import time
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
+from fractions import Fraction
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
@@ -47,21 +48,17 @@ _DATA_POOL_ENDPOINT = f"{_HTTP_ROOT}/data_pool"
 
 # 涨跌幅与最新价/昨收交叉复核容差（与 2026-11-18 实测复核口径一致：
 # abs((latest/preClose − 1)×100 − changeRatio) < 0.005 个百分点）。
-# Decimal 语义（金融资格复算不进二进制浮点）：受控行情 latest=100.5 /
-# preClose=100 / changeRatio=0.495 的确切差值为 0.005pp——按 Decimal 计算
-# 落在容差边界，**拒绝**（二进制浮点会算出 0.00499… 并错误采纳）。
-_CHANGE_RATIO_TOLERANCE_PP = Decimal("0.005")
+# latest=100.5、preClose=100、changeRatio=0.495 的确切差值是 0.005pp，
+# 落在容差边界，拒绝。
+_CHANGE_RATIO_TOLERANCE_PP = Fraction("0.005")
 
 
-def _implied_change_pct(latest: Union[int, float, Decimal],
-                        pre_close: Union[int, float, Decimal]) -> Decimal:
-    """最新价/昨收推算涨跌幅（百分点；Decimal 保留入站十进制语义）。
-
-    涨跌幅交叉复核公式的单一 owner：行资格筛选与函数出口契约共用；
-    入参接受 wire 原始数值（int/float/Decimal），经 ``str`` 归一到 Decimal
-    不丢字面精度（``str`` 对三类入站都保留最短精确表示）。
-    """
-    return (Decimal(str(latest)) / Decimal(str(pre_close)) - 1) * 100
+def _parse_quote_number(text: str) -> Optional[Decimal]:
+    """保留实时行情的十进制字面，超出 Decimal 表示范围时仅该字段缺失。"""
+    try:
+        return Decimal(text)
+    except DecimalException:
+        return None
 
 
 def _change_ratio_within_tolerance(row: Dict[str, Any]) -> bool:
@@ -69,22 +66,27 @@ def _change_ratio_within_tolerance(row: Dict[str, Any]) -> bool:
     （latest/preClose>0）的行必须落在既有容差内；无涨跌幅（成分金额口径行，
     ``require_change=False`` 路径，含交叉复核不合格被空白化的行）或无复核
     基准时不对缺失发明断言。资格循环与出口契约共用本谓词，不重复实现。
-    Decimal 算术按行降级：超出 Decimal 上下文范围的畸形量级（如
-    ``latest=1e1000000`` 或微小正 ``preClose`` 触发 Overflow/InvalidOperation）
-    判不合格（非法行情不得通过复核），异常不逃出边界拖垮同批健康行。"""
+    先限制非零输入可由有限浮点值承载，再用精确比值比较容差。"""
     change = row.get("change_pct")
     if change is None:
         return True
     try:
-        # 公开涨跌幅必须可表示为有限浮点数；复核继续使用原始精确值。
-        if not math.isfinite(change):
+        projected_change = float(change)
+        if not math.isfinite(projected_change) or (change != 0 and projected_change == 0):
             return False
         latest = row.get("latest")
         pre_close = row.get("pre_close")
         if latest is None or pre_close is None or pre_close <= 0:
             return True
-        implied = _implied_change_pct(latest, pre_close)
-        diff = abs(implied - Decimal(str(change)))
+        projected_latest, projected_pre_close = float(latest), float(pre_close)
+        if (not math.isfinite(projected_latest) or not math.isfinite(projected_pre_close)
+                or (latest != 0 and projected_latest == 0) or projected_pre_close == 0):
+            return False
+        # 将 Decimal 字面转换为精确分数，避免上下文舍入改变阈值两侧的判断。
+        exact_latest = Fraction(Decimal(str(latest)))
+        exact_pre_close = Fraction(Decimal(str(pre_close)))
+        implied = (exact_latest / exact_pre_close - 1) * 100
+        diff = abs(implied - Fraction(Decimal(str(change))))
     except (DecimalException, OverflowError):
         return False
     return diff < _CHANGE_RATIO_TOLERANCE_PP
@@ -193,7 +195,7 @@ def _bounded_deadline(deadline: Optional[float], timeout_seconds: float) -> floa
 def _sector_http_post(endpoint_url: str, body: Dict[str, Any], *, label: str,
                       refresh_token: str, timeout_seconds: float,
                       deadline: Optional[float],
-                      parse_float: Optional[Callable[[str], Any]] = None,
+                      parse_float: Optional[Callable[[str], Optional[Decimal]]] = None,
                       ) -> Dict[str, Any]:
     """板块共用出站：认证 → 有界 curl POST → envelope/errorcode/tables 边界。
 
@@ -495,7 +497,7 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     ``indicators`` 默认为 31 指数快照口径（issue #99）；成分成员行情
     （issue #100）传成员口径子集（与 2026-11-18 实测一致），其余行为不变。
     ``raw_amount=True``（成分成员行情路径）：``amount`` 原样保留首个有限
-    int/float（不经 float cast，供 Decimal 排序保原始精度）；默认路径
+    整数或 Decimal（不经 float cast，供成交额排序保原始精度）；默认路径
     （31 指数快照与既有调用方）行为不变。
 
     金融精度（实时行情端点响应按 ``Decimal`` 解析浮点字面）：``change_pct``/
@@ -513,7 +515,7 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     payload = _sector_http_post(
         _REALTIME_ENDPOINT, body, label="sector_sw_quotes",
         refresh_token=refresh_token, timeout_seconds=timeout_seconds,
-        deadline=deadline, parse_float=Decimal,
+        deadline=deadline, parse_float=_parse_quote_number,
     )
     try:
         rows: List[Dict[str, Any]] = []
@@ -613,7 +615,7 @@ def _first_finite(values: object) -> Optional[float]:
 @ensure(
     lambda result: all(_change_ratio_within_tolerance(row)
                        for row in result[0].values()),
-    "qualified rows carrying change_pct must agree with the Decimal implied "
+    "qualified rows carrying change_pct must agree with the exact implied "
     "latest/preClose change within the 0.005pp tolerance (financial "
     "cross-field invariant at the quote qualification boundary)",
 )
@@ -637,8 +639,8 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
       盘中（接收 < ``session_close``）→ 时间戳须 ≥ 会话开盘。会话开收盘
       未提供时仅要求不晚于接收时刻（保守下界不省略上界验证）。
     - **字段资格**（身份/会话/时间戳之外，按口径拆分）：``change_pct``
-      与 ``latest/preClose`` 的 Decimal 推算值差异须在容差内（缺
-      latest/preClose 时不发明复核基准；推算按 Decimal 且入站保留字面
+      与 ``latest/preClose`` 的精确推算值差异须在容差内（缺
+      latest/preClose 时不发明复核基准；Decimal 入站保留字面
       精度，容差边界反例 100.5/100 + 0.495 恰差 0.005pp 拒绝、
       0.495000000000000001 在容差内采纳）。``require_change=True``
       （31 指数快照等既有口径，默认）：涨跌幅缺失**或交叉复核不合格**

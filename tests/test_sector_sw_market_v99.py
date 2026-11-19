@@ -450,17 +450,19 @@ class TestQuoteWireLiteralPrecision:
             sw, "_http_api_curl_post",
             lambda *a, **k: (200, raw))
 
-    def test_literal_beyond_float_precision_passes_tolerance(self, monkeypatch):
-        """字面 0.495000000000000001 对 100.5/100 推算 0.5pp：差
-        0.00499…pp 在容差内——**采纳**（float 舍入后与 0.495 不可区分）。"""
-        self._install_raw_wire(monkeypatch,
-                               _raw_quotes_wire("0.495000000000000001"))
+    @pytest.mark.parametrize("literal", [
+        "0.495000000000000001",
+        "0.4950000000000000000000000000001",
+    ])
+    def test_literal_beyond_float_precision_passes_tolerance(self, monkeypatch, literal):
+        """差值低于 0.005pp 时采纳，避免 float 或默认 Decimal 精度改变判定。"""
+        self._install_raw_wire(monkeypatch, _raw_quotes_wire(literal))
         rows = sw.fetch_index_quotes(
             "801950.SL", refresh_token="sector-test-refresh-token",
             timeout_seconds=10.0, deadline=None,
         )
         # 精确字面贯穿资格判定（不被 float 舍入）
-        assert rows[0]["change_pct"] == Decimal("0.495000000000000001")
+        assert rows[0]["change_pct"] == Decimal(literal)
         qualified, notes = sw.qualify_quote_rows(
             rows, session_date="2026-11-18",
             received_at=_dt(2026, 11, 19, 1, 35),
@@ -470,8 +472,7 @@ class TestQuoteWireLiteralPrecision:
         assert notes == []
         # 公开展示投影：JSON 安全 float（str/float 边界正常转换）
         assert float(qualified["801950.SL"]["change_pct"]) == pytest.approx(0.495)
-        assert str(qualified["801950.SL"]["change_pct"]) == (
-            "0.495000000000000001")
+        assert str(qualified["801950.SL"]["change_pct"]) == literal
 
     def test_exact_boundary_literal_rejected_strict_route(self, monkeypatch):
         """字面恰 0.495（latest=100.5/preClose=100 推算差恰 0.005pp）：
@@ -490,10 +491,7 @@ class TestQuoteWireLiteralPrecision:
         assert qualified == {}
 
     def test_overflow_magnitude_rejects_row_not_batch(self, monkeypatch):
-        """#102 复审三轮（溢出反例）：Decimal 解码下 ``latest=1e1000000``、
-        preClose=100、changeRatio=0.5 的行在容差算术触发 decimal.Overflow——
-        按行降级判不合格（严格口径拒绝/成分口径空白化涨跌幅），异常不逃出
-        边界，同批健康行照常合格。"""
+        """数值超出解码或报告范围时，保留同批健康行和合格的成分成交额。"""
         raw = (
             '{"errorcode":0,"errmsg":"Success!","tables":['
             '{"thscode":"801950.SL","time":["2026-11-18 22:00:46"],'
@@ -503,6 +501,8 @@ class TestQuoteWireLiteralPrecision:
             '"riseCount":[20.0],"fallCount":[10.0]}},'
             '{"thscode":"801890.SL","time":["2026-11-18 22:00:46"],'
             '"table":{"changeRatio":[1e400],"amount":[1000000000]}},'
+            '{"thscode":"801010.SL","time":["2026-11-18 22:00:46"],'
+            '"table":{"changeRatio":[1e9999999999999999999],"amount":[1000000000]}},'
             '{"thscode":"801120.SL","time":["2026-11-18 22:00:46"],'
             '"table":{"changeRatio":[0.5],"amount":[1000000000],'
             '"tradeTime":["22:00:46"],"latest":[100.5],'
@@ -511,7 +511,8 @@ class TestQuoteWireLiteralPrecision:
         ).encode()
         self._install_raw_wire(monkeypatch, raw)
         rows = sw.fetch_index_quotes(
-            "801950.SL,801890.SL,801120.SL", refresh_token="sector-test-refresh-token",
+            "801950.SL,801890.SL,801010.SL,801120.SL",
+            refresh_token="sector-test-refresh-token",
             timeout_seconds=10.0, deadline=None,
         )
         # 严格口径：溢出行拒绝，健康行合格
@@ -528,8 +529,9 @@ class TestQuoteWireLiteralPrecision:
             session_close=_dt(2026, 11, 18, 15, 0, 0),
             require_change=False,
         )
-        assert set(member) == {"801950.SL", "801890.SL", "801120.SL"}
-        for code in ("801950.SL", "801890.SL"):
+        invalid_change_codes = {"801950.SL", "801890.SL", "801010.SL"}
+        assert set(member) == invalid_change_codes | {"801120.SL"}
+        for code in invalid_change_codes:
             assert member[code]["change_pct"] is None
             assert member[code]["amount"] == pytest.approx(1.0e9)
 
