@@ -3647,12 +3647,12 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
         out["gaps"].append("行业催化：搜索入口未配置（套餐搜索不可用），本次未搜索")
         return out
 
-    search_days = int(svc.news_window_days)
+    search_days = sector_research.CATALYST_WINDOW_DAYS
     query = f"{base_term} 行业 政策 新闻"
     out["query"] = query
     out["window_days"] = search_days
     today = datetime.now().date()
-    earliest = today - timedelta(days=max(0, search_days - 1))
+    earliest = today - timedelta(days=search_days - 1)
     # 板块窗口不含未来日（共享全局过滤的 +1 未来容忍不照搬到 board 口径）
     out["window_start"] = earliest.isoformat()
     out["window_end"] = today.isoformat()

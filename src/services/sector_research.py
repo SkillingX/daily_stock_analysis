@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # 有界常量（与 schema 上限对齐；不做配置项）
 # ---------------------------------------------------------------------------
 
+CATALYST_WINDOW_DAYS = 7
 CATALYST_SEARCH_LIMIT = 10   # 过滤前请求条数
 CATALYST_DISPLAY_CAP = 5      # 已证实催化展示上限（模型输入同界）
 CATALYST_BACKGROUND_CAP = 3   # 无日期/降级背景线索上限
