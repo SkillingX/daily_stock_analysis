@@ -22,6 +22,7 @@ from typing import Any, Dict, Tuple
 import pytest
 from unittest.mock import patch
 
+from src.services import sector_sw_market as _sw_mod
 from src.services.sector_analysis_service import (
     ReportBudget,
     _build_evidence_registry,
@@ -42,6 +43,20 @@ from tests.test_sector_sw_compose_v99 import (
     _sw_core,
     _synthesis_stub_payload,
 )
+
+
+@pytest.fixture(autouse=True)
+def _offline_reference_levels(monkeypatch):
+    """单元编排测试离线缝（spec 复审拆缝）：二/三级参考链出站受控替身
+    （同 compose_v99 基座；真实传输与时序由 compose_v100 sequencing 与
+    API 闭环覆盖）。"""
+    monkeypatch.setattr(_sw_mod, "sw_http_config",
+                        lambda: ("sector-test-refresh-token", 10.0))
+    monkeypatch.setattr(
+        _sw_mod, "resolve_sw_reference_levels",
+        lambda secucode, *, observation_date, refresh_token,
+        timeout_seconds, deadline: {
+            "l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []})
 
 
 def _budget(seconds: float = 120.0) -> ReportBudget:
@@ -412,6 +427,35 @@ class TestEvidenceRegistryDateDiscipline:
         assert "independent" not in m
         s = program_fact_summary(reg)
         assert "目标股兖矿能源行情日（2026-11-18）涨跌幅" in s
+
+
+class TestMissingTargetQuoteNoMarketEvidence:
+    """#102 复审 Spec 4（单元级）：``sector_found=True`` 但目标行涨跌幅
+    缺失（其余指数有值的 30/31 覆盖态）不注册 intraday 市场证据——登记表
+    无该块（不可引用），服务端事实摘要无板块涨跌幅段（不冒充目标快照）。"""
+
+    def test_sector_found_without_target_change_registers_no_intraday(self):
+        prosper = {
+            "sector_found": True, "momentum": None, "activity": None,
+            "amount_activity": None, "breadth": None, "rank_of": None,
+            "total_boards": 31,
+            "row": {"board_name": "煤炭", "board_code": "801950.SL",
+                    "change_pct": None},
+            "snapshot_date": "2026-11-18", "snapshot_mode": "target",
+            "snapshot_source": "受控来源", "gaps": ["覆盖缺口（受控）"],
+        }
+        peers = {"eligible": True, "items": [],
+                 "target_independent_quote": None,
+                 "amount_provenance": "受控", "gaps": []}
+        reg = _build_evidence_registry(
+            "兖矿能源", "600188", {"board_name": "煤炭", "membership": {}},
+            prosper, {"eligible": False}, peers,
+            {"items": [], "background_items": []},
+        )
+        assert reg.get("intraday") is None
+        assert not reg.citable("intraday")
+        summary = program_fact_summary(reg)
+        assert "板块指数" not in summary
 
 
 # ---------------------------------------------------------------------------

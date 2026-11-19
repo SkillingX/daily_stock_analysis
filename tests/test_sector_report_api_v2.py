@@ -201,17 +201,21 @@ class SectorReportApiV2TestCase(unittest.TestCase):
         编排层（申万优先 + 兜底门槛/切换决策）由申万编排测试
         （test_sector_sw_compose_v99.py）覆盖；本基类各用例的 akshare mock
         针对 EM 链内部语义（身份锁定/成分验证/完整性/供应商降级），issue
-        #99 起直接对 ``_compose_eastmoney_report`` 断言，不再经申万优先
-        编排的切换规则转发（EM 未按旧规则确认时编排层保留申万事实，
-        两种语义分开验证）。
+        #99 起直接对 EM 整链断言，不再经申万优先编排的切换规则转发（EM
+        未按旧规则确认时编排层保留申万事实，两种语义分开验证）。#102 复审
+        后走生产拆缝（core 核心事实 + from_core 完整研究组装）——唯一入口，
+        后置契约由 from_core 唯一持有。
         """
         from src.services.sector_analysis_service import (
             ReportBudget,
-            _compose_eastmoney_report,
+            _compose_eastmoney_core,
+            _compose_eastmoney_report_from_core,
         )
 
-        return _compose_eastmoney_report(
-            code, name, budget=ReportBudget(300, finish_margin=5.0))
+        budget = ReportBudget(300, finish_margin=5.0)
+        core = _compose_eastmoney_core(code, budget=budget)
+        return _compose_eastmoney_report_from_core(
+            core, code, name, budget=budget)
 
     def _em_chain_markdown(self, payload: dict, name: str = "贵州茅台",
                            code: str = "600519") -> str:

@@ -51,10 +51,10 @@ from tests.test_sector_report_api_v100 import (
     COAL_MEMBERS,
     SH_TARGET,
     SH_TARGET_SEC,
+    SW31_CODES,
     SectorReportApiV100TestCase,
     _SwTransportStub,
 )
-from tests.test_sector_report_api_v99 import _freeze_clocks
 
 # 冻结时刻：已完成会话盘后（任意墙钟时间下会话/资格判定确定性）
 FROZEN_NOW = datetime(2026, 11, 18, 22, 30, 0)
@@ -161,12 +161,11 @@ class SectorReportApiV101TestCase(SectorReportApiV100TestCase):
         # 时钟不在此冻结：各场景经 self._freeze 显式冻结到自己的时刻
         # （叠加冻结会让后装 patcher 经已替换的 _session_context 解析出
         # 前一时刻的会话，见 _freeze_clocks 的真实上下文解析方式）。
-
-    def _freeze(self, now: datetime) -> None:
-        """冻结申万链时钟缝到指定时刻（唯一冻结入口，不叠加）。"""
-        for patcher in _freeze_clocks(self._svc, now=now, ref_sessions=[]):
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        # `_freeze` 继承 v100 基座实现：它同时记录 `self._frozen_now`
+        # （场景时钟一致源），`_install_sw_stub` 据此用同一冻结时刻安排
+        # stub 会话/趋势日期——本地覆盖版曾漏记该字段，TZ≠本地（CI
+        # UTC runner）时安排与请求会话漂移到不同交易日（东财哨兵兜底
+        # 被 500 命中），这里不留第二个冻结入口。
 
     def _install_search_providers(self, *providers: _FakeSearchProvider) -> None:
         from src.search_service import get_search_service
@@ -245,6 +244,10 @@ class TestFullQualifyingReportLoop(SectorReportApiV101TestCase):
         # ---- machine（载荷）→ 正文（Markdown）一致 ----
         md = body["markdown"]
         self.assertNotIn("待后续版本接入", md)
+        # 目标口径措辞保持既有格式（#102 复审 Spec 3：参考日措辞仅在
+        # snapshot_mode=reference 启用，target/东财口径逐字不变）
+        self.assertIn("## 二、当日板块行情", md)
+        self.assertIn("当日涨跌幅", md.split("## 三、")[0])
         self.assertIn("## 四、行业催化", md)
         self.assertIn(item["title"], md)
         self.assertIn(item["published_date"], md)
@@ -612,7 +615,17 @@ class TestReferenceDateEvidenceDiscipline(SectorReportApiV101TestCase):
         self.assertIn("参考口径", md)
         self.assertIn("目标股独立行情", md)
         self.assertIn(f"行情日期：{session_date}", md)
-        # 存档读回一致
+        # 参考口径渲染纪律（#102 复审 Spec 3）：第二节标题/指标/口径说明按
+        # snapshot_mode 统一为参考日措辞——上一日上涨不得出现在「当日」字段
+        section2 = md.split("## 三、")[0]
+        self.assertIn("## 二、参考交易日板块行情", section2)
+        self.assertIn("参考交易日涨跌幅：1.2%", section2)
+        self.assertIn("参考交易日成交额", section2)
+        self.assertIn("参考交易日行情维度", section2)
+        self.assertIn("以上是**参考交易日行情**", section2)
+        self.assertNotIn("当日涨跌幅", section2)
+        self.assertNotIn("当日成交额", section2)
+        # 存档读回与下载一致（实际保存与下载的 Markdown 均为参考日措辞）
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{out['rid']}")
         detail_analysis = detail.json()["data"]["analysis_json"]
         self.assertEqual(
@@ -620,6 +633,10 @@ class TestReferenceDateEvidenceDiscipline(SectorReportApiV101TestCase):
             ref_date)
         self.assertEqual(detail_analysis["sector_synthesis"]["summary"],
                          syn["summary"])
+        download = self.client.get(
+            f"/api/v1/sector-analysis/reports/{out['rid']}/markdown?download=1")
+        self.assertEqual(download.text, md)
+        self.assertIn("## 二、参考交易日板块行情", download.text)
 
     def test_adversarial_constituent_and_reference_claims_are_rejected(self):
         """对抗性模型输出回归（#98 复审）：引用未确认成分的独立目标事实
@@ -786,6 +803,98 @@ class TestAuthAndRouteIsolation(SectorReportApiV101TestCase):
         # provider 注册表身份不变（板块调用不改共享搜索配置）
         self.assertEqual(request_deadline.get(), None)
         self.assertEqual(get_search_service()._providers, providers_before)
+
+
+class TestMissingTargetCoverageNoMarketEvidence(SectorReportApiV101TestCase):
+    """目标指数无可用行情、其余 30 个指数有值（#102 复审 Spec 4，API/综合
+    边界）：30/31 只是覆盖事实——报告保留覆盖说明，但**不给无数据目标注册
+    可引用 intraday 市场证据或冒充目标快照**：服务端事实摘要不出现板块
+    当日涨跌幅段落，引用 intraday 的模型结论在登记表引用校验被拒。"""
+
+    def _scenario(self, syno_content: str) -> Dict[str, Any]:
+        stub = self._qualified_sw_stub()
+        self._install_sw_stub(stub)
+        self._install_eastmoney_sentinels()
+        orig_call = stub.__call__
+
+        def _missing_target_call(url, headers, body_bytes, *, label):
+            parsed = json.loads(body_bytes.decode())
+            if "real_time_quotation" in url \
+                    and parsed.get("codes") == ",".join(SW31_CODES):
+                payload = json.loads(orig_call(
+                    url, headers, body_bytes, label=label)[1].decode())
+                payload["tables"] = [
+                    row for row in payload.get("tables") or []
+                    if row.get("thscode") != "801950.SL"]
+                return 200, json.dumps(payload).encode()
+            return orig_call(url, headers, body_bytes, label=label)
+
+        self._sw_post_patcher = patch.object(sw_mod, "_http_api_curl_post",
+                                             _missing_target_call)
+        self._sw_token_patcher = patch.object(
+            sw_mod, "_resolve_access_token", stub.resolve_token)
+        self._sw_post_patcher.start()
+        self._sw_token_patcher.start()
+        provider = _FakeSearchProvider("SyntheticSearch", rows=[
+            _news_row("煤炭行业新政发布",
+                      "https://news.example.com/coal/9.html",
+                      published=datetime.now().date().isoformat()),
+        ])
+        self._install_search_providers(provider)
+        wire = _install_api_synthetic_wire(syno_content)
+        with wire:
+            resp = self.client.post(
+                "/api/v1/sector-analysis/generate"
+                f"?stock_code={SH_TARGET}&stock_name=兖矿能源"
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        return {"analysis": body["analysis"], "md": body["markdown"],
+                "rid": body["report_id"]}
+
+    def test_coverage_only_report_has_no_citable_target_intraday(self):
+        out = self._scenario(_SYNO_CONTENT)
+        analysis, md = out["analysis"], out["md"]
+        intraday = analysis["background"]["intraday"]
+        # 覆盖事实成立：其余 30 个指数有值（target 口径），目标行无值
+        self.assertTrue(intraday["sector_found"])
+        self.assertEqual(intraday["snapshot_mode"], "target")
+        self.assertIsNone(intraday["row"]["change_pct"])
+        # 覆盖说明在载荷缺口与实际存档 Markdown 中如实保留
+        gaps = " ".join(analysis["gaps"])
+        self.assertIn("31 个申万一级指数中 1 个未取得", gaps)
+        self.assertIn("31 个申万一级指数中 1 个未取得", md)
+        # 完整性如实部分（目标动态字段未取得），报告实际存档
+        self.assertEqual(analysis["assessment"]["completeness"], "partial")
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{out['rid']}")
+        self.assertEqual(detail.status_code, 200)
+        # 综合边界：无 citable intraday 证据 → 服务端事实摘要无板块当日
+        # 涨跌幅段落（不冒充目标快照）；其余已取得事实照常渲染
+        syn = analysis["sector_synthesis"]
+        self.assertEqual(syn["status"], "ok")
+        summary = syn["summary"] or ""
+        self.assertNotIn("板块指数当日涨跌幅", summary)
+        self.assertIn("板块区间收益", summary)
+
+    def test_intraday_claim_rejected_without_target_quote(self):
+        """引用 intraday 的模型结论被拒（unknown_evidence_ref）——目标无
+        合格行情时登记表不含可引用市场证据，引用校验层切断而非 prompt。"""
+        adversarial = json.dumps({"claims": [
+            {"kind": "interpretation",
+             "text": "板块当日上涨，动能延续",
+             "evidence_refs": ["intraday"]},
+        ]}, ensure_ascii=False)
+        out = self._scenario(adversarial)
+        syn = out["analysis"]["sector_synthesis"]
+        self.assertEqual(syn["status"], "malformed_output")
+        self.assertEqual(syn["claims"], [])
+        self.assertIn("unknown_evidence_ref:intraday",
+                      " ".join(syn["gaps"]))
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{out['rid']}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            detail.json()["data"]["analysis_json"]["sector_synthesis"]["status"],
+            "malformed_output")
 
 
 if __name__ == "__main__":  # pragma: no cover

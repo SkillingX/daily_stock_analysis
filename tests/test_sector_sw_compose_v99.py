@@ -20,10 +20,28 @@ from unittest.mock import patch
 import pytest
 
 from src.schemas.sector_analysis import SectorReportPayload
+from src.services import sector_sw_market as _sw_mod
 from src.services.sector_analysis_service import (
     ReportBudget,
     compose_report,
 )
+
+
+@pytest.fixture(autouse=True)
+def _offline_reference_levels(monkeypatch):
+    """单元编排测试离线缝（spec 复审拆缝）：二/三级参考链出站受控替身。
+
+    保留申万路径的载荷组装会在必需研究后补齐参考链——单元编排测试统一
+    走受控解析（不读本地凭据、不真实出站）；真实传输与发起时序见
+    compose_v100 ``TestOptionalReferenceLevelSequencing`` 与 v99 模块缝/
+    API 闭环。替身值与受控身份（煤炭开采/动力煤）一致，断言语义不变。"""
+    monkeypatch.setattr(_sw_mod, "sw_http_config",
+                        lambda: ("sector-test-refresh-token", 10.0))
+    monkeypatch.setattr(
+        _sw_mod, "resolve_sw_reference_levels",
+        lambda secucode, *, observation_date, refresh_token,
+        timeout_seconds, deadline: {
+            "l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []})
 
 
 def _budget(seconds: float = 120.0) -> ReportBudget:

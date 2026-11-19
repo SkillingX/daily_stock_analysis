@@ -74,9 +74,10 @@ def _quotes_payload(quotes: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"errorcode": 0, "errmsg": "Success!", "tables": quotes}
 
 
-def _quote_row(thscode: str, date: str, change: float,
+def _quote_row(thscode: str, date: str, change: Optional[float],
                amount: float = 1.0e9) -> Dict[str, Any]:
-    latest = round(100.0 * (1 + change / 100.0), 3)
+    latest = (round(100.0 * (1 + change / 100.0), 3)
+              if change is not None else None)
     return {
         "marketCategory": "1", "pricetype": 1, "thscode": thscode,
         "time": [f"{date} 22:00:46"],
@@ -112,7 +113,8 @@ class _SwTransportStub:
     def __init__(self, *, industry_by_level: Dict[str, str],
                  target_secucode: str, member_codes: List[str],
                  members_error: Optional[Dict[str, Any]] = None,
-                 member_changes: Optional[Dict[str, float]] = None,
+                 member_changes: Optional[Dict[str, Optional[float]]] = None,
+                 member_amounts: Optional[Dict[str, float]] = None,
                  target_independent: bool = True,
                  target_change: float = 1.5) -> None:
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -121,6 +123,7 @@ class _SwTransportStub:
         self.member_codes = list(member_codes)
         self.members_error = members_error
         self.member_changes = member_changes or {}
+        self.member_amounts = member_amounts or {}
         self.target_independent = target_independent
         self.target_change = target_change
         self.quotes_error = False
@@ -158,7 +161,8 @@ class _SwTransportStub:
                     _quote_row(self.target_secucode, self.session_date,
                                self.target_change, 4.0e7)])).encode()
             rows = [_quote_row(c, self.session_date,
-                               self.member_changes.get(c, 1.0))
+                               self.member_changes.get(c, 1.0),
+                               self.member_amounts.get(c, 1.0e9))
                     for c in codes]
             return 200, json.dumps(_quotes_payload(rows)).encode()
         if "cmd_history_quotation" in url:
@@ -619,6 +623,111 @@ class TestConstituentFailureLoop(SectorReportApiV100TestCase):
         # Markdown：成分未取得 ≠「响应未见目标股」（诊断如实区分）
         self.assertIn("同日成分未取得", resp.json()["markdown"])
         self.assertNotIn("未见目标股", resp.json()["markdown"])
+
+
+class TestAmountOnlyMemberKeepsSample(SectorReportApiV100TestCase):
+    """成分成员口径反例（#102 复审 Spec 2，wire → 报告全实链）：
+
+    六只成分中成交额第一的成员涨跌幅缺失——修复前该行在资格层被整行剔除
+    （第六名递补进前五、样本内名次照常输出）；修复后身份/会话/时间戳合格
+    的 amount-only 成员保留有效金额参与选样，涨跌幅名次 withhold + 覆盖
+    说明。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._freeze(FROZEN_COMPLETED_NOW)
+
+    def test_top_amount_member_missing_change_stays_in_sample(self):
+        stub = _SwTransportStub(
+            industry_by_level={"1": "煤炭", "2": "煤炭开采", "3": "动力煤"},
+            target_secucode=SH_TARGET_SEC, member_codes=COAL_MEMBERS,
+            member_amounts={"601898.SH": 5.0e9},
+            member_changes={"601898.SH": None})
+        self._install_sw_stub(stub)
+        self._install_eastmoney_sentinels()
+        resp = self.client.post(
+            "/api/v1/sector-analysis/generate"
+            f"?stock_code={SH_TARGET}&stock_name=兖矿能源"
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        analysis = resp.json()["analysis"]
+        self.assertEqual(analysis["identity"]["membership"]["verified"], True)
+        peers = analysis["sector_peers"]
+        codes = [i["code"] for i in peers["items"]]
+        # 成交额第一的 amount-only 成员保留在样本（不递补第六名）
+        self.assertIn("601898", codes)
+        self.assertNotIn("601225", codes)
+        top_member = next(i for i in peers["items"] if i["code"] == "601898")
+        self.assertEqual(top_member["amount"], 5.0e9)
+        self.assertIsNone(top_member["change_pct"])
+        # 任一选中成员缺涨跌幅 → 名次 withhold + 覆盖说明（不伪完整排名）
+        self.assertIsNone(peers["target_change_pct_rank"])
+        gaps = " ".join(peers["gaps"])
+        self.assertIn("有效比较范围", gaps)
+        # 成员行情批次真实出站（31 快照 + 1 批），存档与下载一致
+        rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
+        self.assertEqual(len(rt_calls), 2)
+        rid = resp.json()["report_id"]
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(
+            detail.json()["data"]["analysis_json"]["sector_peers"],
+            peers)
+        download = self.client.get(
+            f"/api/v1/sector-analysis/reports/{rid}/markdown?download=1")
+        self.assertIn("601898", download.text)
+
+
+class TestLongAncillaryTradeTimeArchives(SectorReportApiV100TestCase):
+    """快照来源文字归一（#102 复审 Standards 3，API 存档边界）：
+
+    辅助 tradeTime 单元格携带 250 字符任意文本时，快照来源自已解析合格的
+    完整供应商时间戳生成——snapshot_source 不超 Pydantic 上限（200），
+    报告实际存档可读回（修复前载荷校验失败 → 500 且不存档）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._freeze(FROZEN_COMPLETED_NOW)
+
+    def test_long_ancillary_trade_time_report_archives(self):
+        stub = _SwTransportStub(
+            industry_by_level={"1": "煤炭", "2": "煤炭开采", "3": "动力煤"},
+            target_secucode=SH_TARGET_SEC, member_codes=COAL_MEMBERS)
+        self._install_sw_stub(stub)
+        self._install_eastmoney_sentinels()
+        orig_call = stub.__call__
+
+        def _long_trade_time_call(url, headers, body_bytes, *, label):
+            parsed = json.loads(body_bytes.decode())
+            if "real_time_quotation" in url \
+                    and parsed.get("codes") == ",".join(SW31_CODES):
+                payload = json.loads(orig_call(
+                    url, headers, body_bytes, label=label)[1].decode())
+                for row in payload.get("tables") or []:
+                    row.setdefault("table", {})["tradeTime"] = ["x" * 250]
+                return 200, json.dumps(payload).encode()
+            return orig_call(url, headers, body_bytes, label=label)
+
+        self._sw_post_patcher = patch.object(sw, "_http_api_curl_post",
+                                             _long_trade_time_call)
+        self._sw_token_patcher = patch.object(
+            sw, "_resolve_access_token", stub.resolve_token)
+        self._sw_post_patcher.start()
+        self._sw_token_patcher.start()
+        resp = self.client.post(
+            "/api/v1/sector-analysis/generate"
+            f"?stock_code={SH_TARGET}&stock_name=兖矿能源"
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        intraday = resp.json()["analysis"]["background"]["intraday"]
+        source = intraday.get("snapshot_source") or ""
+        self.assertLessEqual(len(source), 200)
+        self.assertNotIn("xxxx", source)
+        self.assertIn("22:00:46", source)  # 已验证时间戳生成来源文字
+        rid = resp.json()["report_id"]
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertTrue(resp.json().get("report_id"))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -92,28 +92,29 @@
 
 {% endif %}
 {% endif %}
-## 二、当日板块行情（价格强弱与活跃度）
-
 {% set pr = a.background.intraday %}
+{% set day_label = '参考交易日' if pr.get('snapshot_mode') == 'reference' else '当日' %}
+## 二、{{ day_label }}板块行情（价格强弱与活跃度）
+
 {% if pr.sector_found %}
-- 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ 当日涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
+- 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ {{ day_label }}涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
 {% if pr.get('snapshot_date') %}
 - 行情日期：**{{ pr.snapshot_date }}**{{ '（参考口径：目标交易日目标指数合格行情未取得，展示立即上一已完成交易日同日参考，见缺口）' if pr.get('snapshot_mode') == 'reference' else '' }}
 {% endif %}
-- 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ 当日成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
+- 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ {{ day_label }}成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
 - 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
 {% if pr.snapshot_source %}
 - 快照来源/时点：{{ pr.snapshot_source }}
 {% endif %}
 
-| 当日行情维度 | 分值（0-100） | 口径 |
+| {{ day_label }}行情维度 | 分值（0-100） | 口径 |
 |---------|--------------|------|
 | 动量（涨跌幅有效样本分位） | {{ pr.momentum if pr.momentum is not none else 'N/A' }} | 严格低于目标的有效样本数÷(有效样本数−1)×100；并列不计入「低于」数 |
 | 换手活跃度（换手率/全表中位） | {{ pr.activity if pr.activity is not none else 'N/A' }} | 中位 = 50 分 |
 | 成交额活跃度（成交额/全表中位） | {{ pr.amount_activity if pr.amount_activity is not none else 'N/A' }} | 中位 = 50 分 |
 | 广度（上涨家数占比） | {{ pr.breadth if pr.breadth is not none else 'N/A' }} | 全涨 = 100 分 |
 
-> ⚠️ 口径说明：以上是**当日行情**（价格强弱与交易活跃度），不代表产业景气；
+> ⚠️ 口径说明：以上是**{{ day_label }}行情**（价格强弱与交易活跃度），不代表产业景气；
 > 「成交额活跃度」是成交额的相对水平，**不是资金净流入**；单日行情不构成趋势结论。
 {% else %}
 - ⚠️ 当日行情未产出：{{ pr.gaps[0] if pr.gaps else '未知原因' }}

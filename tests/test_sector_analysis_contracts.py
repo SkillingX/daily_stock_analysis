@@ -23,6 +23,7 @@ from icontract import ViolationError
 
 from src.services import sector_analysis_service as svc
 from src.services.sector_analysis_service import BudgetExhausted, ReportBudget
+from src.services.sector_sw_market import qualify_quote_rows
 
 
 def _budget(seconds: float = 30.0) -> ReportBudget:
@@ -405,7 +406,12 @@ class TestTrendPeersEligibilityContracts:
                                      "total_returned": 0, "truncated": False,
                                      "gaps": []},
         )
-        return svc._compose_eastmoney_report("600519", "测试股票", budget=_budget())
+        # 生产编排缝（拆分后唯一入口）：核心事实缝 + 完整研究组装
+        # （_compose_eastmoney_report 转发入口已随 #102 复审移除，
+        # 其四条后置契约由 _compose_eastmoney_report_from_core 唯一持有）
+        core = svc._compose_eastmoney_core("600519", budget=_budget())
+        return svc._compose_eastmoney_report_from_core(
+            core, "600519", "测试股票", budget=_budget())
 
     def test_confirmed_with_matching_eligibility_passes(self, monkeypatch):
         result = self._run(monkeypatch, subject="confirmed",
@@ -634,3 +640,67 @@ class TestSwPeersPillarContracts:
         assert postconditions, "_sw_peers_pillar 应挂载 ensure 契约"
         preconditions = getattr(svc._sw_peers_pillar, "__preconditions__", [])
         assert preconditions, "_sw_peers_pillar 应挂载 require 契约"
+
+
+# ========================================================================
+# qualify_quote_rows 契约（报价资格边界；#102 复审 Standards 1）
+# ========================================================================
+
+class TestQuoteQualificationContracts:
+    """快照行资格出口不变式（icontract @ensure）：带涨跌幅且带复核基准的
+    qualified 行必须与 latest/preClose 的 Decimal 推算涨跌幅落在既有
+    0.005pp 容差内；金额口径行（无涨跌幅）与无复核基准行不发明断言。"""
+
+    @staticmethod
+    def _row(code: str, change: float, latest: float,
+             pre_close: float) -> Dict[str, Any]:
+        from datetime import datetime as _dt
+
+        return {"thscode": code, "trade_date": "2026-11-18",
+                "trade_time": "22:00:46",
+                "stamp": _dt(2026, 11, 18, 22, 0, 46),
+                "change_pct": change, "latest": latest,
+                "pre_close": pre_close, "amount": 1.0e9}
+
+    def test_boundary_counterexample_is_rejected_not_adopted(self):
+        """受控反例（latest=100.5 / preClose=100 / changeRatio=0.495，确切
+        差值 0.005pp）：按 Decimal 落在容差边界 → 行被剔除（二进制浮点曾
+        算成 0.00499… 并错误采纳）。"""
+        rows = [self._row("801950.SL", 0.495, 100.5, 100.0)]
+        qualified, _notes = qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt_factory(2026, 11, 19, 1, 35))
+        assert qualified == {}
+
+    def test_interior_examples_pass_and_carry_qualified_change(self):
+        """容差内侧反例照常采纳，出口契约随行成立（每次调用自动校验）。"""
+        rows = [self._row("801950.SL", 0.496, 100.5, 100.0),
+                self._row("801120.SL", -0.867, 2520.109, 2542.15)]
+        qualified, _notes = qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt_factory(2026, 11, 19, 1, 35))
+        assert set(qualified) == {"801950.SL", "801120.SL"}
+
+    def test_member_amount_only_row_satisfies_contract_without_change(self):
+        """成分金额口径（require_change=False）：无涨跌幅行合格且不触发出
+        口契约（谓词对无涨跌幅行不发明断言）。"""
+        row = self._row("600188.SH", 0.0, 100.0, 100.0)
+        row["change_pct"] = None
+        qualified, _notes = qualify_quote_rows(
+            [row], session_date="2026-11-18",
+            received_at=_dt_factory(2026, 11, 19, 1, 35),
+            require_change=False)
+        assert set(qualified) == {"600188.SH"}
+        assert qualified["600188.SH"]["change_pct"] is None
+
+    def test_contract_attached_to_qualification_boundary(self):
+        """交叉复核不变式以 icontract 契约强制在资格边界（出口校验）。"""
+        postconditions = getattr(qualify_quote_rows, "__postconditions__",
+                                 [])
+        assert postconditions, "qualify_quote_rows 应挂载 ensure 契约"
+
+
+def _dt_factory(*args: int) -> Any:
+    from datetime import datetime as _dt
+
+    return _dt(*args)

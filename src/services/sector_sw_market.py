@@ -31,6 +31,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from icontract import ensure
 
 from data_provider.ifind_http_daily_adapter import (
     _http_api_curl_post,
@@ -46,7 +47,33 @@ _DATA_POOL_ENDPOINT = f"{_HTTP_ROOT}/data_pool"
 
 # 涨跌幅与最新价/昨收交叉复核容差（与 2026-11-18 实测复核口径一致：
 # abs((latest/preClose − 1)×100 − changeRatio) < 0.005 个百分点）。
-_CHANGE_RATIO_TOLERANCE_PP = 0.005
+# Decimal 语义（金融资格复算不进二进制浮点）：受控行情 latest=100.5 /
+# preClose=100 / changeRatio=0.495 的确切差值为 0.005pp——按 Decimal 计算
+# 落在容差边界，**拒绝**（二进制浮点会算出 0.00499… 并错误采纳）。
+_CHANGE_RATIO_TOLERANCE_PP = Decimal("0.005")
+
+
+def _implied_change_pct(latest: float, pre_close: float) -> Decimal:
+    """最新价/昨收推算涨跌幅（百分点；Decimal 保留入站十进制语义）。
+
+    涨跌幅交叉复核公式的单一 owner：行资格筛选与函数出口契约共用。
+    """
+    return (Decimal(str(latest)) / Decimal(str(pre_close)) - 1) * 100
+
+
+def _change_ratio_within_tolerance(row: Dict[str, Any]) -> bool:
+    """qualified 行出口契约谓词：带涨跌幅且带复核基准（latest/preClose>0）
+    的行必须落在既有容差内；无涨跌幅（成分金额口径行，``require_change=``
+    ``False`` 路径）或无复核基准时不发明断言（资格层已按各自口径判定）。"""
+    change = row.get("change_pct")
+    if change is None:
+        return True
+    latest = row.get("latest")
+    pre_close = row.get("pre_close")
+    if latest is None or pre_close is None or pre_close <= 0:
+        return True
+    implied = _implied_change_pct(latest, pre_close)
+    return abs(implied - Decimal(str(change))) < _CHANGE_RATIO_TOLERANCE_PP
 
 
 class SwSectorFetchError(RuntimeError):
@@ -323,15 +350,18 @@ def _fetch_sw_industry_name(secucode: str, level: int, observation_date: str, *,
 def resolve_sw_main_industry(secucode: str, *, observation_date: str,
                              refresh_token: str, timeout_seconds: float,
                              deadline: Optional[float]) -> Dict[str, Any]:
-    """个股申万主行业归属解析（决策 2：单一主行业口径）。
+    """个股申万主行业归属解析（决策 2：单一主行业口径；L1 核心单一出站）。
 
-    一级归属（核心）先行：与核定目录唯一名称匹配（不近似择首、不拼同名
-    东财板块）；核心未确认时**不发起**二/三级参考出站（可选参考不消耗
-    核心预算、不间接影响兜底门槛）。确认后才以同一剩余截止作有界可选
-    参考查询二、三级（层级单独查询——同批重复指标会覆盖结果）；参考失败
-    仅记可选缺口，不影响主行业状态。供应商不回显归属日期，
-    ``vendor_as_of`` 为本次请求的归属观察日（查询口径如实标注）。
-    失败/未命中 → ``status="unavailable"`` + 可诊断缺口（供兜底门槛判定）。
+    一级归属（核心）：与核定目录唯一名称匹配（不近似择首、不拼同名东财
+    板块）。**本函数不查询二/三级参考**——可选参考出站延迟到核心事实
+    （快照/趋势）、口径选择与必需研究完成之后，由
+    :func:`resolve_sw_reference_levels` 在真正剩余取数预算内有界执行
+    （spec 复审：一级很快、二级等待耗尽截止时不得让快照/趋势/兜底失去
+    机会；东财切换路径不发起参考出站）。``l2_name``/``l3_name`` 恒为
+    None，由调用方在参考补齐后回填。
+    供应商不回显归属日期，``vendor_as_of`` 为本次请求的归属观察日（查询
+    口径如实标注）。失败/未命中 → ``status="unavailable"`` + 可诊断缺口
+    （供兜底门槛判定）。
     """
     out: Dict[str, Any] = {
         "status": "unavailable",
@@ -368,10 +398,35 @@ def resolve_sw_main_industry(secucode: str, *, observation_date: str,
             "不拼入同名东财板块），主行业不可确认")
         out["gaps"] = gaps
         return out
+    out.update({
+        "status": "confirmed",
+        "classification_system": "申万 2021 一级行业",
+        "classification_level": "L1",
+        "classification_version": SW_L1_DIRECTORY_VERSION,
+        "index_code": index_code,
+        "index_name": l1_name,
+        "vendor_as_of": observation_date,
+        "l2_name": None,
+        "l3_name": None,
+        "gaps": gaps,
+    })
+    return out
 
-    # 可选参考：二、三级归属（仅在核心口径选定后有界查询；失败不降主行业）
-    l2_name = ""
-    l3_name = ""
+
+def resolve_sw_reference_levels(secucode: str, *, observation_date: str,
+                                refresh_token: str, timeout_seconds: float,
+                                deadline: Optional[float]) -> Dict[str, Any]:
+    """申万二/三级归属参考（可选链；L1 确认后的余量出站）。
+
+    层级单独查询（同批重复指标会覆盖结果）与既有失败隔离语义不变：单级
+    失败仅记该级可选缺口，不影响另一级与主行业状态。调用方负责预算门控
+    （取数截止后不发起；东财切换路径不发起）与结果回填
+    （``l2_name``/``l3_name`` 回填进主行业归属事实，缺口随身份缺口透出）。
+    返回 ``{"l2_name", "l3_name", "gaps"}``；未取得的层级为 None。
+    """
+    gaps: List[str] = []
+    l2_name: Optional[str] = None
+    l3_name: Optional[str] = None
     for level in (2, 3):
         label = "二级" if level == 2 else "三级"
         try:
@@ -388,19 +443,7 @@ def resolve_sw_main_industry(secucode: str, *, observation_date: str,
             l2_name = name
         else:
             l3_name = name
-    out.update({
-        "status": "confirmed",
-        "classification_system": "申万 2021 一级行业",
-        "classification_level": "L1",
-        "classification_version": SW_L1_DIRECTORY_VERSION,
-        "index_code": index_code,
-        "index_name": l1_name,
-        "vendor_as_of": observation_date,
-        "l2_name": l2_name or None,
-        "l3_name": l3_name or None,
-        "gaps": gaps,
-    })
-    return out
+    return {"l2_name": l2_name, "l3_name": l3_name, "gaps": gaps}
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +463,10 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     行字段：``thscode``/``trade_date``/``trade_time``/``stamp``（完整供应
     商时间戳 datetime，新鲜度资格依据）/``change_pct``/``latest``/
     ``pre_close``/``amount``/``turnover``/``up_count``/``down_count``。
+    ``trade_time`` 自**已解析合格的完整供应商时间戳**归一（``HH:MM:SS``）：
+    wire 的辅助 ``tradeTime`` 单元格是任意文本，不作为行事实或下游来源
+    文字（畸形/超长辅助值既不进快照行，也不进 ``snapshot_source`` 等边界
+    字段）。
     缺值（None）原样保留，不在 wire 层补造；跨行资格（同日、时间/新鲜度、
     交叉复核、同码重复冲突）由 :func:`qualify_quote_rows` 判定。
     畸形 wire 形状（非 dict 行/缺键/不可解析时间戳）逐行保守跳过，不让
@@ -454,15 +501,13 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
             times = raw_times if isinstance(raw_times, list) else []
             trade_stamp = str(times[0]) if times else ""
             trade_date = trade_stamp.split(" ")[0] if trade_stamp else ""
-            trade_time = ""
-            raw_trade_times = cells.get("tradeTime")
-            if isinstance(raw_trade_times, list) and raw_trade_times:
-                trade_time = str(raw_trade_times[0] or "")
+            # trade_time 归一自已解析的完整供应商时间戳（不取辅助 tradeTime）
+            stamp = _parse_vendor_stamp(trade_stamp)
             rows.append({
                 "thscode": thscode,
                 "trade_date": trade_date,
-                "trade_time": trade_time,
-                "stamp": _parse_vendor_stamp(trade_stamp),
+                "trade_time": stamp.strftime("%H:%M:%S") if stamp else "",
+                "stamp": stamp,
                 "change_pct": _first_finite(cells.get("changeRatio")),
                 "latest": _first_finite(cells.get("latest")),
                 "pre_close": _first_finite(cells.get("preClose")),
@@ -497,25 +542,54 @@ def _parse_vendor_stamp(raw: str) -> Optional[datetime]:
         return None
 
 
-def _first_finite(values: Optional[List[Any]]) -> Optional[float]:
-    """wire 数值位首个有限数；缺值/None/非有限数原样缺失（不补造）。"""
-    if not values:
+def _first_finite_raw(values: Optional[List[Any]]) -> Any:
+    """wire 数值位**原样**首个有限 int/float（共享数值位解析唯一入口：
+    不做 cast，成分金额经 Decimal 排序时保留原始精度）。畸形输入本地守卫，
+    不抛出、不让单行字段异常拖垮同批健康行：
+    - 非 list 容器（dict/str/标量等 malformed wire）→ 缺值（不取 ``[0]``
+      顶替、不按容器真值猜测）；
+    - 布尔永不作数值；非 int/float 元素 → 缺值；
+    - 浮点 NaN/±inf → 缺值；原始大整数**保留**（float 口径由
+      :func:`_first_finite` 另行守卫溢出，公开边界另行复核有限性）。
+    """
+    if not isinstance(values, list) or not values:
         return None
     v = values[0]
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    finite = float(v)
-    if finite != finite or finite in (float("inf"), float("-inf")):
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    return v
+
+
+def _first_finite(values: Optional[List[Any]]) -> Optional[float]:
+    """wire 数值位 float 口径（31 指数快照等既有路径）：委托共享解析器，
+    原始整数超出 float 可表示范围时按缺值处理（溢出异常本地消化，不逃出
+    边界拖垮同批健康行）。"""
+    v = _first_finite_raw(values)
+    if v is None:
+        return None
+    try:
+        finite = float(v)
+    except OverflowError:
         return None
     return finite
 
 
+@ensure(
+    lambda result: all(_change_ratio_within_tolerance(row)
+                       for row in result[0].values()),
+    "qualified rows carrying change_pct must agree with the Decimal implied "
+    "latest/preClose change within the 0.005pp tolerance (financial "
+    "cross-field invariant at the quote qualification boundary)",
+)
 def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
                        received_at: Optional[datetime] = None,
                        session_open: Optional[datetime] = None,
                        session_close: Optional[datetime] = None,
+                       require_change: bool = True,
                        ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
-    """快照行资格筛选：同日 + 时间/新鲜度纪律 + 交叉复核 + 重复保守拒绝。
+    """快照行资格筛选：身份/会话/时间戳纪律 + 字段资格 + 重复保守拒绝。
 
     资格规则（沿用既有报价采纳纪律，见板块文档「统一报价交易时点资格」）：
     - **同码重复保守拒绝**：同一 thscode 出现多行时，逐字段完全一致才保留
@@ -528,11 +602,19 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
       （盘后推送如 22:00:46 合法；已完结会话的上午盘中旧快照拒绝）；
       盘中（接收 < ``session_close``）→ 时间戳须 ≥ 会话开盘。会话开收盘
       未提供时仅要求不晚于接收时刻（保守下界不省略上界验证）。
-    - ``change_pct`` 有限，且与 ``latest/preClose`` 推算值差异在容差内
-      （缺 latest/preClose 时仅要求 change_pct 有限，不发明复核基准）；
-    - 返回 ``({thscode: 行}, 保守拒绝说明)``：不合格行剔除（调用方按 31
-      目录全集对齐缺口，剔除事实不丢失）；说明仅记录重复冲突等需显式
-      诊断的拒绝，调用方负责有界化。
+    - **字段资格**（身份/会话/时间戳之外，按口径拆分）：``change_pct``
+      与 ``latest/preClose`` 的 Decimal 推算值差异须在容差内（缺
+      latest/preClose 时不发明复核基准；推算按 Decimal，容差边界反例
+      100.5/100 + 0.495 拒绝）。``require_change=True``（31 指数快照等
+      既有口径，默认）：涨跌幅缺失行整体不合格——目标日行情资格与
+      ``quote_target_ok`` 依赖有效涨跌幅。``require_change=False``（成分
+      成员/目标独立行情口径）：涨跌幅缺失**不再剔除整行**——身份/会话/
+      时间戳合格的行保留有效金额用于选样（amount-only 成员仍按成交额
+      参与前五），涨跌幅名次由同业支柱对缺失同行 withhold 并给覆盖说明；
+      涨跌幅存在时交叉复核照常执行。
+    - 返回 ``({thscode: 行}, 保守拒绝说明)``：不合格行剔除（调用方按全集
+      对齐缺口，剔除事实不丢失）；说明仅记录重复冲突等需显式诊断的拒绝，
+      调用方负责有界化。
     """
     # 同码重复保守拒绝：逐字段完全一致才去重，矛盾即整码不采用
     by_code: Dict[str, List[Dict[str, Any]]] = {}
@@ -563,7 +645,7 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
         if row.get("trade_date") != session_date:
             continue
         change = row.get("change_pct")
-        if change is None:
+        if require_change and change is None:
             continue
         stamp = row.get("stamp")
         if received_at is not None:
@@ -578,9 +660,10 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
                 continue  # 盘中：当日开盘前的时间戳
         latest = row.get("latest")
         pre_close = row.get("pre_close")
-        if latest is not None and pre_close is not None and pre_close > 0:
-            implied = (latest / pre_close - 1.0) * 100.0
-            if abs(implied - change) >= _CHANGE_RATIO_TOLERANCE_PP:
+        if (change is not None and latest is not None
+                and pre_close is not None and pre_close > 0):
+            implied = _implied_change_pct(latest, pre_close)
+            if abs(implied - Decimal(str(change))) >= _CHANGE_RATIO_TOLERANCE_PP:
                 continue
         qualified[str(row.get("thscode") or "")] = row
     return qualified, notes
@@ -598,20 +681,6 @@ _MAX_PUBLISHABLE_MEMBER_ROWS = 10000
 """成分成员集合的可发布行数上限（与载荷 schema 的 member_count/snapshot_rows
 上界一致）：供应商响应超过该上限属异常形状，成员集合整体不发布（明确有界
 源缺口，不发布全集覆盖、不产生载荷校验 500）。"""
-
-
-def _first_finite_raw(values: Optional[List[Any]]) -> Any:
-    """wire 数值位**原样**首个有限数（int/float 不做 cast，金融金额排序
-    经 Decimal 时保留原始精度）；缺值/None/非有限数原样缺失（不补造）。"""
-    if not values:
-        return None
-    v = values[0]
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
-        return None
-    if isinstance(v, float) and (v != v or v in (float("inf"),
-                                                 float("-inf"))):
-        return None
-    return v
 
 
 def _is_valid_a_share_secucode(code_text: str) -> bool:
@@ -872,13 +941,15 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
     try:
         raw_tables = payload.get("tables")
         tables = raw_tables if isinstance(raw_tables, list) else []
+        # 请求窗口成对表示（两端同取同弃的显式不变式）：解析失败整体为
+        # None——退化为不按窗口过滤（资格层仍按期望交易日集对齐，不放大
+        # 采用面），使用点无需再对两端分别收窄
+        window: Optional[Tuple[date, date]] = None
         try:
-            window_start = date.fromisoformat(start_date)
-            window_end = date.fromisoformat(end_date)
+            window = (date.fromisoformat(start_date),
+                      date.fromisoformat(end_date))
         except ValueError:
-            # 请求窗口非 ISO（调用方契约外）：退化为不按窗口过滤
-            # （资格层仍按期望交易日集对齐，不放大采用面）
-            window_start = window_end = None
+            window = None
         rows_by_code: Dict[str, Dict[date, Tuple[Tuple[str, Any], Any]]] = {}
         passthrough_by_code: Dict[str, List[Tuple[str, Any]]] = {}
         conflicting: set = set()
@@ -906,8 +977,7 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
                     passthrough.append((raw_date, c_raw))
                     continue
                 d = d_ts.date()
-                if window_start is not None and not (
-                        window_start <= d <= window_end):
+                if window is not None and not (window[0] <= d <= window[1]):
                     continue  # 窗口外行：资格层忽略，不参与冲突判定
                 key = _history_close_key(c_raw)
                 prior = merged.get(d)

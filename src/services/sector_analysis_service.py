@@ -4186,7 +4186,12 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
         },
     ))
     row = prosper.get("row") or {}
-    if prosper.get("sector_found"):
+    # 只给**真实合格目标行情**注册市场证据（#98 复审/spec：目标指数无可用
+    # 行情、其余指数有值时 ``sector_found=True`` 仅是覆盖事实——30/31 覆盖
+    # 说明保留在缺口，不给无数据目标注册可引用 intraday 证据或冒充目标
+    # 快照；东财路径目标行涨跌幅缺失同样不注册）。参考口径分支要求目标
+    # 参考行存在（含涨跌幅），维持 detached 不可引用语义。
+    if prosper.get("sector_found") and row.get("change_pct") is not None:
         snapshot_source = prosper.get("snapshot_source")
         intraday_material: Dict[str, Any] = {
             "change_pct": row.get("change_pct"),
@@ -4785,9 +4790,10 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
     1. 同日成分查询（p03473）→ 三态判定（带交易所身份精确匹配）；
     2. 目标股未确认成分（excluded/unknown）时**先**查询目标独立行情（单次
        小出站，优先于大批次；成员集为空同样独立尝试，绝不进入成员集合）；
-    3. 成员同日行情（real_time_quotation 分批，同一资格纪律：同日 + 时间/
-       新鲜度 + 交叉复核 + 每批按请求身份集筛选），批次失败隔离（该批缺失、
-       其余存活）。
+    3. 成员同日行情（real_time_quotation 分批，身份/会话/时间戳资格同一
+       纪律：同日 + 时间/新鲜度 + 每批按请求身份集筛选；字段资格按口径
+       拆分——涨跌幅缺失不剔除整行，amount-only 成员/目标保留有效金额
+       参与选样），批次失败隔离（该批缺失、其余存活）。
 
     成分查询失败 ≠ 非成员：membership 恒保守未知 + 可诊断缺口。
     """
@@ -4850,10 +4856,13 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                 raw_amount=True,
             )
             received_at = _received_at_now()
+            # 独立目标事实：身份/会话/时间戳资格照常，涨跌幅缺失不剔除
+            # 整行（amount-only 目标行情保留有效金额；无值字段如实 N/A）
             qualified, _notes = qualify_quote_rows(
                 rows, session_date=session_date, received_at=received_at,
                 session_open=session.session_open,
                 session_close=session.session_close,
+                require_change=False,
             )
             row = qualified.get(target_secucode)
             if row is not None:
@@ -4887,10 +4896,14 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                     f"（{exc}），该批 {len(batch)} 只成员行情缺失")
                 continue
             received_at = _received_at_now()
+            # 成员行情口径：身份/会话/时间戳资格照常；涨跌幅缺失不剔除
+            # 整行——amount-only 成员保留有效金额参与选样（不递补第六名），
+            # 涨跌幅名次由同业支柱对缺失同行 withhold 并给覆盖说明
             qualified, notes = qualify_quote_rows(
                 rows, session_date=session_date, received_at=received_at,
                 session_open=session.session_open,
                 session_close=session.session_close,
+                require_change=False,
             )
             quote_gaps.extend(notes)
             # 批次身份资格：响应行只采用本批请求的完整身份集——供应商串批/
@@ -5582,6 +5595,55 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
     return out
 
 
+def _enrich_sw_reference_levels(code: str, sw: Dict[str, Any], *,
+                                budget: ReportBudget) -> None:
+    """申万二/三级归属参考补齐（issue #99 spec 复审拆缝）：可选出站后置。
+
+    顺序契约（compose 编排）：L1 归属 → 核心市场事实（快照/趋势）→ 口径
+    选择（保留申万/东财兜底）→ 必需研究（同业/催化/综合）→ **本函数**在
+    真正剩余取数预算内查询二/三级参考（:func:`resolve_sw_main_industry`
+    只出站 L1；一级很快、二级等待耗尽截止时不得让快照/趋势/兜底失去
+    机会）。门控：
+    - 主行业未确认：不出站（无主体可参考）；
+    - 凭据未配置：不出站（与核心链同一门控，身份缺口已可诊断）；
+    - 取数截止已过：不出站并记可选缺口（可选参考不与核心/研究/兜底抢
+      预算，不晚于截止发起出站）；
+    - 东财切换路径不经过本函数（仅保留申万的载荷组装调用）。
+    查询失败仅记可选参考缺口并保持 l2/l3 为 None（不影响主行业状态与
+    完整性判定）；as-of 与凭据/超时语义与 L1 同源（同一观察日、同一
+    ``sw_http_config``、同一单次超时与取数截止）。
+    """
+    ident = sw.get("identity") or {}
+    if ident.get("status") != "confirmed":
+        return
+    session_date = (sw.get("snapshot") or {}).get("session_date")
+    if not session_date:
+        return
+    from src.services.sector_sw_market import (
+        resolve_sw_reference_levels,
+        sw_http_config,
+    )
+
+    cfg = sw_http_config()
+    if cfg is None:
+        return
+    token, timeout = cfg
+    if budget.fetch_expired():
+        ident.setdefault("gaps", []).append(
+            "申万二/三级归属参考：取数截止已过，可选参考未查询"
+            "（可选出站不晚于截止发起，不影响主行业状态）")
+        return
+    refs = resolve_sw_reference_levels(
+        _secucode(code), observation_date=session_date,
+        refresh_token=token, timeout_seconds=timeout,
+        deadline=budget.fetch_deadline,
+    )
+    ident["l2_name"] = refs["l2_name"]
+    ident["l3_name"] = refs["l3_name"]
+    if refs["gaps"]:
+        ident.setdefault("gaps", []).extend(refs["gaps"])
+
+
 def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: ReportBudget,
                         em_fallback_note: Optional[str] = None) -> Dict[str, Any]:
     """申万口径载荷组合（issue #99；同业/成分接线见 issue #100；研究接线
@@ -5635,22 +5697,6 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             membership["member_count"] = cons_membership.get("member_count")
             membership["verified_source"] = "sw_index_members"
 
-    identity = {
-        "industry_em": None, "industry_cninfo": None, "business_scope": None,
-        "board_name": index_name or None, "board_code": index_code or None,
-        "subject_status": "confirmed" if confirmed else "missing",
-        "membership": membership,
-        "observed_at": observed_at,
-        "vendor_as_of": ident_sw.get("vendor_as_of"),
-        "classification_system": ident_sw.get("classification_system"),
-        "classification_level": ident_sw.get("classification_level"),
-        "classification_version": ident_sw.get("classification_version"),
-        "sw_chain": {"l1": index_name or None, "l2": ident_sw.get("l2_name"),
-                     "l3": ident_sw.get("l3_name"), "l3_code": None, "gaps": []},
-        "sector_name": index_name or None,
-        "gaps": _bound_gaps(list(ident_sw.get("gaps") or []), 10),
-    }
-
     if confirmed:
         peer_block = (
             _sw_peers_pillar(code, constituents=constituents,
@@ -5703,6 +5749,28 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     synthesis = _synthesis_pillar(name, code, registry_ident, intraday, trend,
                                   peer_block, catalysts, budget=budget,
                                   subject_confirmed=confirmed)
+
+    # 二/三级归属参考：必需研究之后的余量可选出站（spec 复审拆缝；东财
+    # 切换路径不经过本组装，取数截止后不出站——见 _enrich_sw_reference_levels）。
+    # 装配 identity 在参考补齐**之后**（单一 owner）：l2/l3 回填与可选参考
+    # 缺口随身份块一并进入载荷，不在装配后再改写已组装事实。
+    _enrich_sw_reference_levels(code, sw, budget=budget)
+
+    identity = {
+        "industry_em": None, "industry_cninfo": None, "business_scope": None,
+        "board_name": index_name or None, "board_code": index_code or None,
+        "subject_status": "confirmed" if confirmed else "missing",
+        "membership": membership,
+        "observed_at": observed_at,
+        "vendor_as_of": ident_sw.get("vendor_as_of"),
+        "classification_system": ident_sw.get("classification_system"),
+        "classification_level": ident_sw.get("classification_level"),
+        "classification_version": ident_sw.get("classification_version"),
+        "sw_chain": {"l1": index_name or None, "l2": ident_sw.get("l2_name"),
+                     "l3": ident_sw.get("l3_name"), "l3_code": None, "gaps": []},
+        "sector_name": index_name or None,
+        "gaps": _bound_gaps(list(ident_sw.get("gaps") or []), 10),
+    }
 
     sw_text = " ".join(x for x in (index_name, ident_sw.get("l2_name"),
                                    ident_sw.get("l3_name")) if x)
@@ -5873,7 +5941,7 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
                    and result.get("research_basis") == "eastmoney_board"))
     ),
     "sw route must return the full payload contract; eastmoney route payload "
-    "contract is guaranteed by _compose_eastmoney_report's own ensures",
+    "contract is guaranteed by _compose_eastmoney_report_from_core's own ensures",
 )
 @ensure(
     lambda result: (
@@ -5936,7 +6004,8 @@ def compose_report(code: str, name: str, *, budget: ReportBudget) -> Dict[str, A
 
     兜底门槛：仅当申万主行业无法确认（含凭据未配置/HTTP 传输不可用），
     或目标交易日行业涨跌幅与合格行业趋势**均**不可用时，在同一剩余预算
-    内尝试原东财整链（:func:`_compose_eastmoney_report`，原语义不变）。
+    内尝试原东财整链（:func:`_compose_eastmoney_core` 核心事实缝 +
+    :func:`_compose_eastmoney_report_from_core` 完整研究阶段，原语义不变）。
     东财主行业按旧规则确认且至少恢复一项核心行情（目标日行业涨跌幅或
     合格行业趋势）才切换为东财口径报告（payload_version=2 /
     research_basis=eastmoney_board，触发原因随 gaps 可见）；未切换时保留
@@ -6353,68 +6422,6 @@ def _compose_eastmoney_report_from_core(core: Dict[str, Any], code: str, name: s
         "prosperity_score": None,
         "gaps": gaps,
     }
-
-
-@require(lambda code: isinstance(code, str) and len(code) == 6 and code.isdigit(),
-         "code must be a 6-digit string")
-@require(lambda budget: isinstance(budget, ReportBudget) and not budget.expired(),
-         "budget must be a live ReportBudget")
-@ensure(
-    lambda result: (
-        isinstance(result, dict)
-        and {"payload_version", "stock_code", "stock_name", "generated_at",
-             "identity", "background", "concepts", "assessment", "gaps",
-             "sector_trend", "sector_peers",
-             "sector_catalysts", "sector_synthesis"}
-        .issubset(result.keys())
-    ),
-    "_compose_eastmoney_report must return the v2 payload contract",
-)
-@ensure(
-    lambda result: (
-        isinstance(result, dict)
-        and result.get("sector_trend", {}).get("eligible")
-        == (result.get("identity", {}).get("subject_status") == "confirmed")
-        and result.get("sector_peers", {}).get("eligible")
-        == (result.get("identity", {}).get("subject_status") == "confirmed")
-        and result.get("sector_catalysts", {}).get("eligible")
-        == (result.get("identity", {}).get("subject_status") == "confirmed")
-        and result.get("sector_synthesis", {}).get("eligible")
-        == (result.get("identity", {}).get("subject_status") == "confirmed")
-    ),
-    "eastmoney chain trend/peers/catalysts/synthesis eligibility must follow "
-    "confirmed subject identity (issues #82/#83)",
-)
-@ensure(
-    lambda result: (
-        result["assessment"]["status"] == "unscored"
-        and result["identity"]["subject_status"] in ("confirmed", "unverified")
-    ) or (
-        result["assessment"]["status"] == "insufficient_data"
-        and result["identity"]["subject_status"] in ("missing", "ambiguous")
-    ),
-    "assessment.status must agree with identity.subject_status",
-)
-@ensure(
-    lambda result: (
-        result.get("sector_score") is None and result.get("band") is None
-        and result.get("beta_meaning") is None and result.get("weights") is None
-        and result.get("prosperity_score") is None
-    ),
-    "legacy composite score/band fields must stay explicitly None (retired)",
-)
-def _compose_eastmoney_report(code: str, name: str, *,
-                              budget: ReportBudget) -> Dict[str, Any]:
-    """东财整链编排（v2 原语义，issue #99 起作为有界兜底链路的完整入口）。
-
-    = :func:`_compose_eastmoney_core`（核心事实）+ 完整研究阶段；行为与拆分
-    前等价（仅 ``_prosperity_pillar`` 本地计算提前到同业之前，无出站顺序
-    语义变化，见 core 文档）。编排层的切换决策走 core 缝（未达切换门槛不
-    运行将被丢弃的研究），本入口供直接调用者与既有契约/回归测试使用。
-    """
-    core = _compose_eastmoney_core(code, budget=budget)
-    return _compose_eastmoney_report_from_core(core, code, name, budget=budget,
-                                               include_research=True)
 
 
 # ---------------------------------------------------------------------------

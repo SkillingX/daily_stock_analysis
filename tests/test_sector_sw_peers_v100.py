@@ -207,9 +207,20 @@ class TestIncludedTarget:
         assert out["target_change_pct_rank"] == 5
 
     def test_rank_withheld_when_peer_change_missing(self):
-        quotes = _coal_quotes()
-        quotes["000552.SZ"] = _member_row("000552.SZ", None, 3.0e8)
+        """成交额第一的 amount-only 成员（涨跌幅缺失）保留在样本（不递补
+        第六名），名次 withhold + 有效范围缺口（#102 复审 Spec 2 的支柱级
+        语义；wire → 报告全实链回归见 test_sector_report_api_v100）。"""
+        quotes = _coal_quotes(amounts={
+            "000552.SZ": 3.0e8, "000723.SZ": 5.0e8, "600188.SH": 9.0e8,
+            "601225.SH": 7.0e8, "601898.SH": 5.0e9, "002128.SZ": 2.0e8})
+        quotes["601898.SH"] = _member_row("601898.SH", None, 5.0e9)
         out = _pillar(COAL_TARGET, self._included_constituents(quotes=quotes))
+        codes = [i["code"] for i in out["items"]]
+        assert "601898" in codes       # 保留在样本（有效金额参与选样）
+        assert "002128" not in codes   # 第六名不递补
+        top = next(i for i in out["items"] if i["code"] == "601898")
+        assert top["amount"] == 5.0e9
+        assert top["change_pct"] is None
         assert out["target_change_pct_rank"] is None
         assert any("有效比较范围" in g for g in out["gaps"])
 

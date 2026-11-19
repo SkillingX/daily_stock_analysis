@@ -18,6 +18,7 @@ exchange-calendars（冻结时刻取值）；资格判定/渲染/校验不 mock�
 from __future__ import annotations
 
 import json
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
@@ -34,6 +35,10 @@ from src.services.sector_analysis_service import (
     _sw_market_chain,
     _compose_sw_payload,
 )
+
+# 模块导入时捕获真实参考链解析（autouse 离线缝会替换模块属性；
+# sequencing 用例经此回接真实解析 + 传输替身走实际代码路径）
+_REAL_RESOLVE_REFERENCE_LEVELS = sw.resolve_sw_reference_levels
 
 SESSION_DATE = "2026-11-18"
 SESSION_OPEN = datetime(2026, 11, 18, 9, 30)
@@ -174,6 +179,23 @@ def _stub_post_default(url: str, headers: Dict[str, str],
     return _ACTIVE_STUB(url, headers, body, label=label)
 
 
+@pytest.fixture(autouse=True)
+def _offline_reference_levels(monkeypatch):
+    """单元编排测试离线缝（spec 复审拆缝）：二/三级参考链出站受控替身。
+
+    保留申万路径的载荷组装会在必需研究后补齐参考链——单元编排测试统一
+    走受控解析（不读本地凭据、不真实出站）；真实传输与发起时序由
+    TestOptionalReferenceLevelSequencing（真实解析 + 传输替身）与 API
+    闭环（v100/v101）覆盖。"""
+    monkeypatch.setattr(sw, "sw_http_config",
+                        lambda: ("sector-test-refresh-token", 10.0))
+    monkeypatch.setattr(
+        sw, "resolve_sw_reference_levels",
+        lambda secucode, *, observation_date, refresh_token,
+        timeout_seconds, deadline: {
+            "l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []})
+
+
 @pytest.fixture()
 def frozen_session(monkeypatch):
     """冻结会话上下文与接收钟（真实交易日历取已完成会话序列）。"""
@@ -196,7 +218,10 @@ def _run_chain(monkeypatch, frozen_session, stub: _SwStub, code: str) -> Dict[st
                             lambda: ("sector-test-refresh-token", 10.0))
         monkeypatch.setattr(sw, "_http_api_curl_post", _stub_post_default)
         monkeypatch.setattr(sw, "_resolve_access_token", _SwStub.resolve_token)
-        return _sw_market_chain(code, budget=_budget())
+        # current_time 与夹具同一时钟源：趋势窗口按 RECEIVED_AT 的严格日历
+        # 取值（生产缝不冻结；本地 TZ 与 CI UTC runner 下同值确定）
+        return _sw_market_chain(code, budget=_budget(),
+                                current_time=RECEIVED_AT)
     finally:
         _ACTIVE_STUB = None
 
@@ -213,7 +238,8 @@ def _enrich_chain(monkeypatch, frozen_session, stub: _SwStub,
                             lambda: ("sector-test-refresh-token", 10.0))
         monkeypatch.setattr(sw, "_http_api_curl_post", _stub_post_default)
         monkeypatch.setattr(sw, "_resolve_access_token", _SwStub.resolve_token)
-        chain = _sw_market_chain(code, budget=_budget())
+        chain = _sw_market_chain(code, budget=_budget(),
+                                 current_time=RECEIVED_AT)
         ident = chain["identity"]
         session = chain.get("session")
         assert session is not None, "核心链应携带 session 供保留分支富化"
@@ -354,7 +380,8 @@ class TestMarketChainConstituents:
             monkeypatch.setattr(sw, "sw_http_config",
                                 lambda: ("sector-test-refresh-token", 10.0))
             from src.services.sector_analysis_service import _fetch_constituents
-            out = _sw_market_chain("600188", budget=_budget())
+            out = _sw_market_chain("600188", budget=_budget(),
+                                   current_time=RECEIVED_AT)
             out["constituents"] = _fetch_constituents(
                 "600188", out["identity"]["index_code"],
                 out["snapshot"]["session_date"], out["session"],
@@ -668,8 +695,15 @@ class TestOrchestrationConstituentOrder:
 
     def test_em_switch_sends_zero_constituent_outbound(
             self, monkeypatch):
-        """东财切换成功：成分/成员/独立行情出站为零（零被弃 SW 同业出站）。"""
-        payload, recorder = self._run(monkeypatch, _em_core_stub())
+        """东财切换成功：成分/成员/独立行情出站为零（零被弃 SW 同业出站），
+        二/三级参考链出站同样零发起（可选参考链不进入东财切换路径）。"""
+
+        def _reference_sentinel(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+            raise AssertionError("东财切换路径不应发起二/三级归属参考出站")
+
+        with patch("src.services.sector_sw_market.resolve_sw_reference_levels",
+                   _reference_sentinel):
+            payload, recorder = self._run(monkeypatch, _em_core_stub())
         assert payload["research_outcome"] == "switched_fallback"
         assert recorder.calls == []
 
@@ -696,3 +730,112 @@ class TestOrchestrationConstituentOrder:
         assert recorder.calls == []
         assert payload["sector_peers"] is not None
         assert payload["sector_peers"]["eligible"] is False
+
+
+class TestOptionalReferenceLevelSequencing:
+    """spec 复审（issue #99）拆缝回归：二/三级参考链是必需研究之后的余量
+    可选出站——慢/失败的可选参考不得饿死核心事实与研究，取数截止后不
+    发起（走真实 resolve_sw_reference_levels + 传输替身）。"""
+
+    def test_slow_optional_reference_never_starves_core_or_research(
+            self, monkeypatch, frozen_session):
+        events: List[Tuple[str, float]] = []
+        research_times: List[Tuple[str, float]] = []
+        base = time.monotonic()
+        # 回接真实参考链解析 + 受控传输：核心端点走既有 _SwStub（活跃替身），
+        # L2/L3 参考出站慢且失败（真实解析代码路径，仅传输叶子受控）
+        monkeypatch.setattr(sw, "resolve_sw_reference_levels",
+                            _REAL_RESOLVE_REFERENCE_LEVELS)
+        stub = _SwStub(industry_by_level={1: "煤炭", 2: "煤炭开采",
+                                          3: "动力煤"})
+
+        def _transport(url: str, headers: Dict[str, str],
+                       body: Optional[bytes], *, label: str) -> Tuple[int, bytes]:
+            parsed = json.loads(body.decode()) if body else {}
+            if "basic_data_service" in url:
+                level = int(parsed["indipara"][0]["indiparams"][0])
+                if level == 1:
+                    return 200, json.dumps(_industry_payload_by_level(
+                        parsed["codes"], "煤炭")).encode()
+                events.append((f"basic_l{level}", time.monotonic() - base))
+                time.sleep(0.15)  # 慢可选参考
+                return 200, json.dumps(
+                    {"errorcode": -3, "errmsg": "slow upstream",
+                     "tables": []}).encode()
+            return stub(url, headers, body, label=label)
+
+        monkeypatch.setattr(sw, "_http_api_curl_post", _transport)
+        monkeypatch.setattr(sw, "_resolve_access_token", _SwStub.resolve_token)
+        real_cat = svc._catalysts_pillar
+        real_syn = svc._synthesis_pillar
+
+        def _cat(name, *, budget, subject_confirmed, stock_name=None):
+            research_times.append(("catalysts", time.monotonic() - base))
+            return real_cat(name, budget=budget,
+                            subject_confirmed=subject_confirmed,
+                            stock_name=stock_name)
+
+        def _syn(name, code, ident, prosper, trend, peers, catalysts, *,
+                 budget, subject_confirmed=False):
+            research_times.append(("synthesis", time.monotonic() - base))
+            return real_syn(name, code, ident, prosper, trend, peers,
+                            catalysts, budget=budget,
+                            subject_confirmed=subject_confirmed)
+
+        monkeypatch.setattr(svc, "_catalysts_pillar", _cat)
+        monkeypatch.setattr(svc, "_synthesis_pillar", _syn)
+        from src.services.sector_analysis_service import _fetch_constituents
+
+        chain = _sw_market_chain("600188", budget=_budget(),
+                                 current_time=RECEIVED_AT)
+        chain["constituents"] = _fetch_constituents(
+            "600188", chain["identity"]["index_code"],
+            chain["snapshot"]["session_date"], chain["session"],
+            name="测试标的", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, budget=_budget())
+        payload = _compose_sw_payload("600188", "兖矿能源", chain,
+                                      budget=_budget())
+        # 核心事实与研究不受慢可选参考影响（不饿死）
+        assert payload["background"]["intraday"]["sector_found"] is True
+        assert payload["sector_trend"]["period_return_pct"] is not None
+        assert payload["sector_peers"] is not None and payload["sector_peers"]["items"]
+        assert payload["sector_catalysts"] is not None
+        assert payload["sector_synthesis"] is not None
+        # 可选参考失败如实缺口，l2/l3 未取得
+        assert payload["identity"]["sw_chain"]["l2"] is None
+        assert any("可选参考" in g and "失败" in g
+                   for g in payload["identity"]["gaps"])
+        # 时序：二/三级参考出站在必需研究（催化/综合）之后（余量出站）
+        assert events and [lv for lv, _t in events] == ["basic_l2", "basic_l3"]
+        last_research = max(t for _name, t in research_times)
+        assert all(t > last_research for _lv, t in events)
+
+    def test_reference_levels_not_started_after_fetch_deadline(
+            self, monkeypatch, frozen_session):
+        chain = _run_chain(monkeypatch, frozen_session,
+                           _SwStub(industry_by_level={
+                               1: "煤炭", 2: "煤炭开采", 3: "动力煤"}),
+                           "600188")
+        assert chain["identity"]["status"] == "confirmed"
+        budget = _budget(120.0)
+        monkeypatch.setattr(budget, "fetch_expired", lambda: True)
+        outbound_urls: List[str] = []
+        monkeypatch.setattr(sw, "resolve_sw_reference_levels",
+                            _REAL_RESOLVE_REFERENCE_LEVELS)
+
+        def _recording_transport(url, headers, body, *, label):
+            outbound_urls.append(url)
+            return 200, json.dumps({"errorcode": -1, "errmsg": "unused",
+                                    "tables": []}).encode()
+
+        monkeypatch.setattr(sw, "_http_api_curl_post", _recording_transport)
+        monkeypatch.setattr(svc, "_concepts_pillar", lambda code, *, budget: {
+            "items": [], "source": "ifind", "total_returned": 0,
+            "truncated": False, "gaps": ["受控：概念阶段不执行"]})
+        payload = _compose_sw_payload("600188", "兖矿能源", chain,
+                                      budget=budget)
+        # 截止后不发起参考出站（零 basic 出站）+ 可选缺口如实
+        assert not [u for u in outbound_urls if "basic_data_service" in u]
+        assert payload["identity"]["sw_chain"]["l2"] is None
+        assert any("取数截止已过" in g and "参考" in g
+                   for g in payload["identity"]["gaps"])

@@ -155,45 +155,68 @@ class TestResolveSwMainIndustry:
         assert out["classification_level"] == "L1"
         assert out["classification_version"] == sw.SW_L1_DIRECTORY_VERSION
         assert out["vendor_as_of"] == "2026-11-18"
-        # 层级单独查询（同批重复指标会覆盖结果）：每个请求只带一个层级
+        # L1 核心单一出站（spec 复审拆缝）：二/三级参考出站延迟到
+        # resolve_sw_reference_levels（核心事实/口径选择/必需研究之后）
         basic_calls = [p for u, p in rec.calls if "basic_data_service" in u]
-        assert len(basic_calls) == 3
-        for payload in basic_calls:
-            indipara = payload["indipara"]
-            assert len(indipara) == 1
-            assert indipara[0]["indicator"] == "ths_the_sw_industry_stock"
-        levels = [p["indipara"][0]["indiparams"][0] for p in basic_calls]
-        assert sorted(levels) == ["1", "2", "3"]
+        assert len(basic_calls) == 1
+        indipara = basic_calls[0]["indipara"]
+        assert len(indipara) == 1
+        assert indipara[0]["indicator"] == "ths_the_sw_industry_stock"
+        assert indipara[0]["indiparams"][0] == "1"
+        assert out["l2_name"] is None and out["l3_name"] is None
 
-    def test_l2_l3_recorded_as_reference(self, recorder):
-        responses = {
-            "basic_data_service": _basic_data_payload("煤炭"),
-        }
-        rec = recorder(responses)
-        # 按调用序返回 L1=煤炭、L2=煤炭开采、L3=动力煤：post 内按响应键匹配
-        # 同一端点，因此用按序出队的响应列表覆盖
-        queue = [_basic_data_payload("煤炭"), _basic_data_payload("煤炭开采"),
-                 _basic_data_payload("动力煤")]
-        rec.responses.clear()
+    def test_reference_levels_resolved_per_level_in_leftover_call(self, recorder):
+        """参考链独立入口：层级单独查询（L2/L3 各一次），结果随 dict 返回。"""
+        rec = recorder({})
+        queue = {2: _basic_data_payload("煤炭开采"),
+                 3: _basic_data_payload("动力煤")}
 
         def post_by_order(url, headers, body, *, label):
             parsed = json.loads(body.decode())
             rec.calls.append((url, parsed))
-            level = parsed["indipara"][0]["indiparams"][0]
-            return 200, json.dumps(queue[int(level) - 1]).encode()
+            level = int(parsed["indipara"][0]["indiparams"][0])
+            return 200, json.dumps(queue[level]).encode()
 
-        monkey_rec = post_by_order
+        rec.calls.clear()
         from unittest.mock import patch as _patch
 
-        with _patch.object(sw, "_http_api_curl_post", monkey_rec), \
+        with _patch.object(sw, "_http_api_curl_post", post_by_order), \
                 _patch.object(sw, "_resolve_access_token", rec.resolve_token):
-            out = sw.resolve_sw_main_industry(
+            refs = sw.resolve_sw_reference_levels(
                 "600188.SH", observation_date="2026-11-18",
-                refresh_token="sector-test-refresh-token", timeout_seconds=10.0, deadline=None,
+                refresh_token="sector-test-refresh-token",
+                timeout_seconds=10.0, deadline=None,
             )
-        assert out["status"] == "confirmed"
-        assert out["l2_name"] == "煤炭开采"
-        assert out["l3_name"] == "动力煤"
+        assert refs == {"l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []}
+        levels = [p["indipara"][0]["indiparams"][0] for _u, p in rec.calls]
+        assert levels == ["2", "3"]  # 层级单独查询（同批重复指标会覆盖结果）
+
+    def test_reference_level_failure_isolates_levels_with_gap(self, recorder):
+        """单级参考失败：该级 None + 可选缺口，另一级不受影响（不抛出）。"""
+        rec = recorder({})
+
+        def post_by_order(url, headers, body, *, label):
+            parsed = json.loads(body.decode())
+            rec.calls.append((url, parsed))
+            level = int(parsed["indipara"][0]["indiparams"][0])
+            if level == 2:
+                return 200, json.dumps(
+                    {"errorcode": -1, "errmsg": "busy", "tables": []}).encode()
+            return 200, json.dumps(_basic_data_payload("动力煤")).encode()
+
+        from unittest.mock import patch as _patch
+
+        with _patch.object(sw, "_http_api_curl_post", post_by_order), \
+                _patch.object(sw, "_resolve_access_token", rec.resolve_token):
+            refs = sw.resolve_sw_reference_levels(
+                "600188.SH", observation_date="2026-11-18",
+                refresh_token="sector-test-refresh-token",
+                timeout_seconds=10.0, deadline=None,
+            )
+        assert refs["l2_name"] is None
+        assert refs["l3_name"] == "动力煤"
+        assert len(refs["gaps"]) == 1
+        assert "二级" in refs["gaps"][0] and "可选参考" in refs["gaps"][0]
 
     def test_l1_name_not_in_directory_is_unavailable_no_approximation(self, recorder):
         """三级行业名（如「动力煤」）不在一级目录：不近似择首、不拼同名板块。"""
@@ -323,6 +346,151 @@ class TestFetchIndexQuotes:
         )
         qualified, _notes = sw.qualify_quote_rows(rows, session_date="2026-11-18")
         assert qualified == {}
+
+    # ---- #102 复审：Decimal 交叉复核边界 + 畸形数值位不拖垮同批健康行 ----
+
+    def test_tolerance_boundary_counterexample_rejected_by_decimal(self, recorder):
+        """复核边界反例（#102 复审 Standards 1）：latest=100.5 / preClose=100 /
+        changeRatio=0.495 的确切差值 0.005pp 按Decimal 计算**拒绝**（二进制
+        浮点曾算成 0.00499… 并错误采纳）；容差内侧同样反例仍拒绝、一致行采纳。"""
+        boundary = _quote_row("801950.SL", "2026-11-18", "22:00:46",
+                              0.495, 100.5, 100.0)
+        beyond = _quote_row("801120.SL", "2026-11-18", "22:00:46",
+                            0.494, 100.5, 100.0)  # 差 0.006pp：边界外
+        consistent = _quote_row("801890.SL", "2026-11-18", "22:00:46",
+                                0.496, 100.5, 100.0)  # 差 0.004pp：容差内
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!",
+            "tables": [boundary, beyond, consistent],
+        }})
+        rows = sw.fetch_index_quotes(
+            "801950.SL,801120.SL,801890.SL",
+            refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        qualified, notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18", received_at=_dt(2026, 11, 19, 1, 35))
+        assert set(qualified) == {"801890.SL"}
+        assert notes == []
+
+    def test_mixed_batch_malformed_cells_keep_healthy_rows(self, recorder):
+        """混合批次（#102 复审 Standards 2）：第二行涨跌幅为非 list 畸形容器、
+        第三行 amount 为超 float 范围的原始整数——畸形都只作用于本行字段
+        （按缺值处理），健康首行完整存活，整批不再 KeyError/OverflowError。"""
+        healthy = _quote_row("801950.SL", "2026-11-18", "22:00:46",
+                             -0.867, 2520.109, 2542.15)
+        bad_change = _quote_row("801120.SL", "2026-11-18", "22:00:46",
+                                1.0, 3543.0, 3579.0)
+        bad_change["table"]["changeRatio"] = {"unexpected": 1}  # 非 list
+        overflow_amount = _quote_row("801890.SL", "2026-11-18", "22:00:46",
+                                     0.486, 1940.623, 1931.23)
+        overflow_amount["table"]["amount"] = [10 ** 400]  # float 口径溢出
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!",
+            "tables": [healthy, bad_change, overflow_amount],
+        }})
+        rows = sw.fetch_index_quotes(
+            "801950.SL,801120.SL,801890.SL",
+            refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        by_code = {r["thscode"]: r for r in rows}
+        assert by_code["801950.SL"]["change_pct"] == pytest.approx(-0.867)
+        assert by_code["801120.SL"]["change_pct"] is None  # 畸形按缺值
+        assert by_code["801890.SL"]["change_pct"] == pytest.approx(0.486)
+        assert by_code["801890.SL"]["amount"] is None  # float 口径溢出按缺值
+        # 健康行照常合格；畸形行不冒充有效涨跌幅（31 指数口径剔除）
+        qualified, _notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18", received_at=_dt(2026, 11, 19, 1, 35))
+        assert set(qualified) == {"801950.SL", "801890.SL"}
+
+    def test_ancillary_trade_time_never_becomes_source_text(self, recorder):
+        """超长辅助 tradeTime（250 字符，#102 复审 Standards 3）：不进入行
+        事实——trade_time 归一自已解析合格的完整供应商时间戳。"""
+        row = _quote_row("801950.SL", "2026-11-18", "22:00:46",
+                         -0.867, 2520.109, 2542.15)
+        row["table"]["tradeTime"] = ["x" * 250]
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!", "tables": [row],
+        }})
+        rows = sw.fetch_index_quotes(
+            "801950.SL", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        assert rows[0]["trade_time"] == "22:00:46"
+        assert rows[0]["stamp"] == _dt(2026, 11, 18, 22, 0, 46)
+
+
+class TestMemberQuoteFieldSplitQualification:
+    """成分成员/目标独立行情口径（require_change=False）：身份/会话/时间戳
+    资格照常，涨跌幅缺失不剔除整行——amount-only 行保留有效金额。"""
+
+    def _rows(self, *, change) -> List[Dict[str, Any]]:
+        row = _quote_row("600188.SH", "2026-11-18", "22:00:46",
+                         change if change is not None else -0.867,
+                         9.4 if change is not None else 100.0, 100.0)
+        if change is None:
+            row["table"]["changeRatio"] = [None]
+        return [row]
+
+    def test_amount_only_member_stays_qualified_with_amount(self, recorder):
+        """同会话 amount-only 成员（涨跌幅缺失）：行保留（金额参与选样）。"""
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!", "tables": self._rows(change=None),
+        }})
+        rows = sw.fetch_index_quotes(
+            "600188.SH", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        qualified, notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+            require_change=False,
+        )
+        assert set(qualified) == {"600188.SH"}
+        assert qualified["600188.SH"]["amount"] == pytest.approx(1.0e9)
+        assert qualified["600188.SH"]["change_pct"] is None
+        assert notes == []
+
+    def test_member_cross_check_still_applies_when_change_present(self, recorder):
+        """amount-only 口径下涨跌幅存在时交叉复核照常：不一致行仍剔除。"""
+        bad = self._rows(change=5.0)  # 报告 5.0 但 latest/preClose 推算不符
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!", "tables": bad,
+        }})
+        rows = sw.fetch_index_quotes(
+            "600188.SH", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        qualified, _notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+            require_change=False,
+        )
+        assert qualified == {}
+
+    def test_malformed_change_member_kept_amount_only(self, recorder):
+        """畸形涨跌幅单元（非 list 容器）：按缺值处理，amount-only 行保留
+        （不抛出、不丢行）。"""
+        bad = self._rows(change=None)
+        bad[0]["table"]["changeRatio"] = {"unexpected": 1}
+        recorder({"real_time_quotation": {
+            "errorcode": 0, "errmsg": "Success!", "tables": bad,
+        }})
+        rows = sw.fetch_index_quotes(
+            "600188.SH", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        qualified, _notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+            require_change=False,
+        )
+        assert set(qualified) == {"600188.SH"}
+        assert qualified["600188.SH"]["change_pct"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -592,7 +760,7 @@ class TestQuoteFreshnessDiscipline:
             "thscode": "801120.SL", "trade_date": "2026-11-18",
             "trade_time": "10:30:00",
             "stamp": _dt(2026, 11, 18, 10, 30, 0),  # 已完结会话的盘中旧快照
-            "change_pct": 1.0, "latest": 3543.0, "pre_close": 3579.0,
+            "change_pct": -1.006, "latest": 3543.0, "pre_close": 3579.0,
         }, {
             "thscode": "801890.SL", "trade_date": "2026-11-18",
             "trade_time": "15:10:00",
@@ -668,17 +836,6 @@ class TestQuoteFreshnessDiscipline:
 
 
 class TestDuplicateQuoteRows:
-    def test_identical_duplicates_keep_one(self):
-        row = {"thscode": "801950.SL", "trade_date": "2026-11-18",
-               "trade_time": "22:00:46", "stamp": _dt(2026, 11, 18, 22, 0, 46),
-               "change_pct": -0.867, "latest": 2520.109, "pre_close": 2542.15}
-        dup = dict(row)
-        qualified, notes = sw.qualify_quote_rows(
-            [row, dup], session_date="2026-11-18",
-            received_at=_dt(2026, 11, 19, 1, 35))
-        assert set(qualified) == {"801950.SL"}
-        assert notes == []
-
     def test_contradictory_date_duplicates_reject_code_with_note(self):
         """同码矛盾重复行（不同日期）：整码不采用，不取首行/末行，缺口注明。"""
         a = {"thscode": "801950.SL", "trade_date": "2026-11-18",
@@ -695,7 +852,7 @@ class TestDuplicateQuoteRows:
     def test_contradictory_value_duplicates_reject_code(self):
         a = {"thscode": "801120.SL", "trade_date": "2026-11-18",
              "trade_time": "22:00:46", "stamp": _dt(2026, 11, 18, 22, 0, 46),
-             "change_pct": 1.0, "latest": 3543.0, "pre_close": 3579.0}
+             "change_pct": -1.006, "latest": 3543.0, "pre_close": 3579.0}
         b = dict(a, change_pct=8.11)  # 同日不同涨跌幅
         qualified, notes = sw.qualify_quote_rows(
             [a, b], session_date="2026-11-18",
@@ -737,8 +894,10 @@ class TestAttributionOrderAndRedaction:
         assert any("curl unavailable" in g for g in out["gaps"])
         assert len(rec.calls) == 0
 
-    def test_l2_l3_optional_failures_keep_confirmed(self, recorder):
-        """核心确认后 L2/L3 失败：保留 confirmed + 可选参考缺口（不降状态）。"""
+    def test_l1_confirm_initiates_no_reference_outbound(self, recorder):
+        """核心确认后无参考出站：可选二/三级延迟到 resolve_sw_reference_levels
+        （由编排层在必需研究后的余量预算内调用），主行业解析内也无虚构的
+        可选参考缺口。"""
         rec = recorder({})
         rec.responses.clear()
 
@@ -763,7 +922,8 @@ class TestAttributionOrderAndRedaction:
         assert out["status"] == "confirmed"
         assert out["index_code"] == "801950.SL"
         assert out["l2_name"] is None and out["l3_name"] is None
-        assert any("可选参考" in g for g in out["gaps"])
+        assert len(rec.calls) == 1  # 仅 L1 出站
+        assert out["gaps"] == []
 
     def test_error_message_redacts_tokens(self, monkeypatch):
         """异常消息中的凭据值一律脱敏（refresh 与本次 access token）。"""
@@ -1003,12 +1163,19 @@ class TestDuplicateStampEquality:
         assert notes_a == [] and notes_b == []
 
     def test_rows_differing_only_in_stamp_reject_both_orders(self):
-        """仅完整时间戳不同的重复行：矛盾（首行序无关），整码保守拒绝。"""
+        """仅完整时间戳不同的重复行：矛盾（首行序无关），整码保守拒绝。
+
+        单行自身合格（涨跌幅与 latest/preClose 的 Decimal 推算一致），
+        冲突只来自时间戳矛盾——拒绝理由不被字段不合格混淆。"""
         base = {"thscode": "801120.SL", "trade_date": "2026-11-18",
                 "trade_time": "22:00:46",
-                "change_pct": 8.11, "latest": 3543.0, "pre_close": 3579.0}
+                "change_pct": -1.006, "latest": 3543.0, "pre_close": 3579.0}
         early = dict(base, stamp=_dt(2026, 11, 18, 15, 1, 0))
         late = dict(base, stamp=_dt(2026, 11, 18, 22, 0, 46))
+        single, _notes = sw.qualify_quote_rows(
+            [dict(late)], session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35))
+        assert set(single) == {"801120.SL"}  # 单独看每行都合格
         for pair in ([early, late], [late, early]):
             qualified, notes = sw.qualify_quote_rows(
                 pair, session_date="2026-11-18",
