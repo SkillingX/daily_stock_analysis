@@ -554,6 +554,8 @@ class TestReferenceDateEvidenceDiscipline(SectorReportApiV101TestCase):
                                               stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
         self._install_eastmoney_sentinels()
         provider = _FakeSearchProvider("SyntheticSearch", rows=[
             _news_row("煤炭行业新政发布",
@@ -835,6 +837,8 @@ class TestMissingTargetCoverageNoMarketEvidence(SectorReportApiV101TestCase):
             sw_mod, "_resolve_access_token", stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
         provider = _FakeSearchProvider("SyntheticSearch", rows=[
             _news_row("煤炭行业新政发布",
                       "https://news.example.com/coal/9.html",
@@ -850,20 +854,34 @@ class TestMissingTargetCoverageNoMarketEvidence(SectorReportApiV101TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         return {"analysis": body["analysis"], "md": body["markdown"],
-                "rid": body["report_id"]}
+                "rid": body["report_id"],
+                "session_date": stub.session_date}
 
     def test_coverage_only_report_has_no_citable_target_intraday(self):
         out = self._scenario(_SYNO_CONTENT)
         analysis, md = out["analysis"], out["md"]
         intraday = analysis["background"]["intraday"]
-        # 覆盖事实成立：其余 30 个指数有值（target 口径），目标行无值
-        self.assertTrue(intraday["sector_found"])
-        self.assertEqual(intraday["snapshot_mode"], "target")
-        self.assertIsNone(intraday["row"]["change_pct"])
-        # 覆盖说明在载荷缺口与实际存档 Markdown 中如实保留
+        # 无目标合格行（当日与参考均无）：不发布行情块——sector_found=false
+        # 且快照元数据（日期/口径/来源）全空；不以 N/A 数值表冒充实际行情
+        self.assertFalse(intraday["sector_found"])
+        self.assertIsNone(intraday["snapshot_mode"])
+        self.assertIsNone(intraday["snapshot_date"])
+        self.assertIsNone(intraday["snapshot_source"])
+        self.assertIsNone(intraday["row"].get("change_pct"))
+        self.assertIsNone(intraday["momentum"])
+        section2 = md.split("## 三、")[0]
+        self.assertIn("当日行情未产出", section2)
+        self.assertNotIn("当日行情维度", section2)   # 不渲染 N/A 数值表
+        self.assertNotIn("当日涨跌幅：N/A", section2)
+        # 精确 30/31 覆盖事实与明确的目标不足缺口在载荷缺口与实际存档
+        # Markdown 中保留（缺口首位呈现）
+        self.assertIn("其余 30/31 个指数取得当日合格行情",
+                      " ".join(intraday["gaps"]))
+        self.assertIn(f"目标指数 801950.SL 无 {out['session_date']} 同日合格行情",
+                      intraday["gaps"][0])
+        self.assertIn("其余 30/31 个指数取得当日合格行情", md)
         gaps = " ".join(analysis["gaps"])
-        self.assertIn("31 个申万一级指数中 1 个未取得", gaps)
-        self.assertIn("31 个申万一级指数中 1 个未取得", md)
+        self.assertIn("其余 30/31 个指数取得当日合格行情", gaps)
         # 完整性如实部分（目标动态字段未取得），报告实际存档
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{out['rid']}")

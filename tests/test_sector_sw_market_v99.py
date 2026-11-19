@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -293,9 +294,11 @@ class TestFetchIndexQuotes:
         coal = by_code["801950.SL"]
         assert coal["trade_date"] == "2026-11-18"
         assert coal["trade_time"] == "22:00:46"
-        assert coal["change_pct"] == pytest.approx(-0.867)
-        assert coal["latest"] == pytest.approx(2520.109)
-        assert coal["pre_close"] == pytest.approx(2542.15)
+        # 交叉复核输入保留精确字面（Decimal）；公开投影经 float 边界
+        assert isinstance(coal["change_pct"], Decimal)
+        assert float(coal["change_pct"]) == pytest.approx(-0.867)
+        assert float(coal["latest"]) == pytest.approx(2520.109)
+        assert float(coal["pre_close"]) == pytest.approx(2542.15)
         assert coal["amount"] == pytest.approx(1.0e9)
         assert coal["up_count"] == 20.0 and coal["down_count"] == 10.0
 
@@ -395,9 +398,9 @@ class TestFetchIndexQuotes:
             timeout_seconds=10.0, deadline=None,
         )
         by_code = {r["thscode"]: r for r in rows}
-        assert by_code["801950.SL"]["change_pct"] == pytest.approx(-0.867)
+        assert float(by_code["801950.SL"]["change_pct"]) == pytest.approx(-0.867)
         assert by_code["801120.SL"]["change_pct"] is None  # 畸形按缺值
-        assert by_code["801890.SL"]["change_pct"] == pytest.approx(0.486)
+        assert float(by_code["801890.SL"]["change_pct"]) == pytest.approx(0.486)
         assert by_code["801890.SL"]["amount"] is None  # float 口径溢出按缺值
         # 健康行照常合格；畸形行不冒充有效涨跌幅（31 指数口径剔除）
         qualified, _notes = sw.qualify_quote_rows(
@@ -419,6 +422,134 @@ class TestFetchIndexQuotes:
         )
         assert rows[0]["trade_time"] == "22:00:46"
         assert rows[0]["stamp"] == _dt(2026, 11, 18, 22, 0, 46)
+
+
+
+
+def _raw_quotes_wire(change_literal: str) -> bytes:
+    """真实 wire 原始字节（transport leaf）：changeRatio 保留**字面**精度。"""
+    return (
+        '{"errorcode":0,"errmsg":"Success!","tables":[{"thscode":"801950.SL",'
+        '"time":["2026-11-18 22:00:46"],"table":{"changeRatio":[%s],'
+        '"amount":[1000000000],"tradeTime":["22:00:46"],'
+        '"latest":[100.5],"preClose":[100],"turnoverRatio":[2.0],'
+        '"riseCount":[20.0],"fallCount":[10.0]}}]}' % change_literal
+    ).encode()
+
+
+class TestQuoteWireLiteralPrecision:
+    """真实 wire 字面精度（#102 复审 #1）：json.loads 的 float 会把
+    ``0.495000000000000001`` 舍入成 ``0.495``——实时行情响应按 Decimal 解析、
+    交叉复核输入原样贯穿资格判定，两个字面可区分；公开展示投影仍是
+    JSON 安全 float。测试在**传输叶子**喂原始响应字节（真实解码/解析全链）。"""
+
+    def _install_raw_wire(self, monkeypatch, raw: bytes) -> None:
+        monkeypatch.setattr(sw, "_resolve_access_token",
+                            lambda rt, *, force_refresh=False: "stub-token")
+        monkeypatch.setattr(
+            sw, "_http_api_curl_post",
+            lambda *a, **k: (200, raw))
+
+    def test_literal_beyond_float_precision_passes_tolerance(self, monkeypatch):
+        """字面 0.495000000000000001 对 100.5/100 推算 0.5pp：差
+        0.00499…pp 在容差内——**采纳**（float 舍入后与 0.495 不可区分）。"""
+        self._install_raw_wire(monkeypatch,
+                               _raw_quotes_wire("0.495000000000000001"))
+        rows = sw.fetch_index_quotes(
+            "801950.SL", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        # 精确字面贯穿资格判定（不被 float 舍入）
+        assert rows[0]["change_pct"] == Decimal("0.495000000000000001")
+        qualified, notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+        )
+        assert set(qualified) == {"801950.SL"}
+        assert notes == []
+        # 公开展示投影：JSON 安全 float（str/float 边界正常转换）
+        assert float(qualified["801950.SL"]["change_pct"]) == pytest.approx(0.495)
+        assert str(qualified["801950.SL"]["change_pct"]) == (
+            "0.495000000000000001")
+
+    def test_exact_boundary_literal_rejected_strict_route(self, monkeypatch):
+        """字面恰 0.495（latest=100.5/preClose=100 推算差恰 0.005pp）：
+        严格指数口径（require_change 默认 True）整行拒绝。"""
+        self._install_raw_wire(monkeypatch, _raw_quotes_wire("0.495"))
+        rows = sw.fetch_index_quotes(
+            "801950.SL", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        assert rows[0]["change_pct"] == Decimal("0.495")
+        qualified, _notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+        )
+        assert qualified == {}
+
+    def test_overflow_magnitude_rejects_row_not_batch(self, monkeypatch):
+        """#102 复审三轮（溢出反例）：Decimal 解码下 ``latest=1e1000000``、
+        preClose=100、changeRatio=0.5 的行在容差算术触发 decimal.Overflow——
+        按行降级判不合格（严格口径拒绝/成分口径空白化涨跌幅），异常不逃出
+        边界，同批健康行照常合格。"""
+        raw = (
+            '{"errorcode":0,"errmsg":"Success!","tables":['
+            '{"thscode":"801950.SL","time":["2026-11-18 22:00:46"],'
+            '"table":{"changeRatio":[0.5],"amount":[1000000000],'
+            '"tradeTime":["22:00:46"],"latest":[1e1000000],'
+            '"preClose":[100],"turnoverRatio":[2.0],'
+            '"riseCount":[20.0],"fallCount":[10.0]}},'
+            '{"thscode":"801890.SL","time":["2026-11-18 22:00:46"],'
+            '"table":{"changeRatio":[1e400],"amount":[1000000000]}},'
+            '{"thscode":"801120.SL","time":["2026-11-18 22:00:46"],'
+            '"table":{"changeRatio":[0.5],"amount":[1000000000],'
+            '"tradeTime":["22:00:46"],"latest":[100.5],'
+            '"preClose":[100],"turnoverRatio":[2.0],'
+            '"riseCount":[20.0],"fallCount":[10.0]}}]}'
+        ).encode()
+        self._install_raw_wire(monkeypatch, raw)
+        rows = sw.fetch_index_quotes(
+            "801950.SL,801890.SL,801120.SL", refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        # 严格口径：溢出行拒绝，健康行合格
+        strict, _notes = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+        )
+        assert set(strict) == {"801120.SL"}
+        # 成分口径：溢出行保留（涨跌幅空白化、金额保留）
+        member, _notes2 = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+            require_change=False,
+        )
+        assert set(member) == {"801950.SL", "801890.SL", "801120.SL"}
+        for code in ("801950.SL", "801890.SL"):
+            assert member[code]["change_pct"] is None
+            assert member[code]["amount"] == pytest.approx(1.0e9)
+
+    def test_history_decoding_stays_plain_float(self, monkeypatch):
+        """日线/其他端点解码不受影响（不传 parse_float，历史行为逐位一致）。"""
+        import pandas as pd
+
+        raw = ('{"errorcode":0,"errmsg":"","tables":[{"thscode":"801950.SL",'
+               '"time":["2026-11-03"],"table":{"close":[2500.5]}}]}').encode()
+        monkeypatch.setattr(sw, "_resolve_access_token",
+                            lambda rt, *, force_refresh=False: "stub-token")
+        monkeypatch.setattr(sw, "_http_api_curl_post",
+                            lambda *a, **k: (200, raw))
+        frames = sw.fetch_index_history(
+            "801950.SL", "2026-11-03", "2026-11-03",
+            refresh_token="sector-test-refresh-token",
+            timeout_seconds=10.0, deadline=None,
+        )
+        close = frames["801950.SL"].iloc[0]["close"]
+        assert isinstance(close, float)  # 既有 float 解码语义不变
 
 
 class TestMemberQuoteFieldSplitQualification:
@@ -454,7 +585,9 @@ class TestMemberQuoteFieldSplitQualification:
         assert notes == []
 
     def test_member_cross_check_still_applies_when_change_present(self, recorder):
-        """amount-only 口径下涨跌幅存在时交叉复核照常：不一致行仍剔除。"""
+        """amount-only 口径下涨跌幅存在时交叉复核照常：不一致（报告 5.0 但
+        latest/preClose 推算不符）→ 成分口径只作废涨跌幅（行保留、金额
+        保留）；严格指数口径（require_change=True）整行拒绝。"""
         bad = self._rows(change=5.0)  # 报告 5.0 但 latest/preClose 推算不符
         recorder({"real_time_quotation": {
             "errorcode": 0, "errmsg": "Success!", "tables": bad,
@@ -469,7 +602,17 @@ class TestMemberQuoteFieldSplitQualification:
             session_close=_dt(2026, 11, 18, 15, 0, 0),
             require_change=False,
         )
-        assert qualified == {}
+        assert set(qualified) == {"600188.SH"}  # 行保留（副本空白化）
+        assert qualified["600188.SH"]["change_pct"] is None
+        assert qualified["600188.SH"]["amount"] == pytest.approx(1.0e9)
+        # 原始行未被污染（调用方复用同一 rows 二筛时不携带空白化结果）
+        assert rows[0]["change_pct"] is not None
+        strict, _notes2 = sw.qualify_quote_rows(
+            rows, session_date="2026-11-18",
+            received_at=_dt(2026, 11, 19, 1, 35),
+            session_close=_dt(2026, 11, 18, 15, 0, 0),
+        )
+        assert strict == {}  # 严格指数口径：复核不合格整行拒绝
 
     def test_malformed_change_member_kept_amount_only(self, recorder):
         """畸形涨跌幅单元（非 list 容器）：按缺值处理，amount-only 行保留

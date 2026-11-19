@@ -4295,7 +4295,8 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
         # #98 复审：独立目标行情**不可引用**（detached）——独立目标事实
         # 不得作为可引用市场证据与成分同业事实并陈（"目标股领涨指数成分
         # 样本"类成分内断言在引用校验层被拒，不只靠投影措辞）；服务端
-        # 事实摘要保留独立呈现（带真实日期）。
+        # 事实摘要保留独立呈现（带真实日期）。空值观测（行情行存在但
+        # 成交额与涨跌幅均缺失/无效）不发布块、不登记任何目标事实。
         tiq = peers["target_independent_quote"]
         independent_material: Dict[str, Any] = {
             "stock_name": stock_name,
@@ -5154,8 +5155,10 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     返回的非目录指数行计数披露、不进入 31 全表口径（不冒充全量覆盖）。
     目标指数目标日合格行缺失而立即上一已完成交易日有合格行时，采用该
     参考会话的同日 cohort（显式 ``snapshot_mode="reference"``，两日截面
-    不拼接）并标注日期与当日缺口（报告为部分）；无任何合格行时只降当日
-    行情块。``snapshot_mode`` 为实际采用口径的显式字段（渲染不按日期
+    不拼接）并标注日期与当日缺口（报告为部分）；目标指数当日与参考
+    合格行**均**缺失时不发布行情块（``sector_found=false``、快照元数据
+    全空，不以 N/A 数值表冒充实际行情——其余指数的覆盖事实保留在缺口）。
+    ``snapshot_mode`` 为实际采用口径的显式字段（渲染不按日期
     对比猜测：目标日盘中合格行情 ≠ 参考口径）。
     """
     from src.services.sector_sw_market import SW_L1_DIRECTORY
@@ -5196,6 +5199,25 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
             "snapshot_mode": None, "snapshot_source": None,
             "gaps": _bound_gaps(fetch_gaps + [
                 "申万一级行业当日快照未取得（见上方缺口），当日行情未产出"], 10),
+        }
+
+    if not target_in_rows and not use_reference:
+        # 无目标合格行（当日与参考 cohort 均未取得目标指数行情）：不发布
+        # 行情块——``sector_found=false`` 且目标快照元数据（日期/口径/来源）
+        # 全空，不以 N/A 数值表冒充实际行情；精确的当日覆盖事实（其余
+        # N/31 个指数取得）保留在缺口首位（API 载荷、存档与下载 Markdown
+        # 同源呈现），链上参考口径不适用等原因随后可回查
+        coverage = (
+            f"（其余 {len(rows)}/31 个指数取得当日合格行情——覆盖事实保留，"
+            "不冒充目标行情）" if rows else "（快照无任何同日合格行）")
+        return {
+            "sector_found": False, "momentum": None, "activity": None,
+            "amount_activity": None, "breadth": None, "rank_of": None,
+            "total_boards": None, "row": {}, "snapshot_date": None,
+            "snapshot_mode": None, "snapshot_source": None,
+            "gaps": _bound_gaps([
+                f"申万一级行业当日行情未产出：目标指数 {index_code} 无 "
+                f"{session_date} 同日合格行情{coverage}"] + fetch_gaps, 10),
         }
 
     table_rows = []
@@ -5535,25 +5557,39 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
             # 已知零额保留 0
             t_amount, t_amount_reason = _sw_public_amount(
                 *_decimal_amount(target_quote.get("amount")))
-            if t_amount_reason not in ("ok", "zero"):
+            t_change = _num(target_quote.get("change_pct"))
+            t_as_of = str(target_quote.get("trade_date") or "") or None
+            if t_amount_reason not in ("ok", "zero") and t_change is not None:
                 reason_text = {"missing": "缺失",
                                "invalid": "负值/非数值"}.get(
                     t_amount_reason, t_amount_reason)
                 gaps.append(
                     f"目标股独立行情：成交额无效（{reason_text}），"
                     "金额置为未知（不发布无效数值）")
-            tiq: Dict[str, Any] = {
-                "code": t_code, "name": t_name,
-                "amount": (float(t_amount)
-                           if t_amount is not None and t_amount_reason == "ok"
-                           else (0.0 if t_amount_reason == "zero" else None)),
-                "change_pct": _num(target_quote.get("change_pct")),
-                "is_target": True,
-                "as_of_date": str(target_quote.get("trade_date") or "") or None,
-            }
-            out["target_independent_quote"] = tiq
-            if t_adapted:
-                gaps.append("目标股独立行情：名称缺失，按代码显示")
+            if t_amount_reason in ("ok", "zero") or t_change is not None:
+                # 发布门（spec：有有效成交额（含已知零）或合格涨跌幅才发布
+                # 数值块）；成交额无效但涨跌幅合格时金额 None + 缺口照发
+                tiq: Dict[str, Any] = {
+                    "code": t_code, "name": t_name,
+                    "amount": (float(t_amount)
+                               if t_amount is not None
+                               and t_amount_reason == "ok"
+                               else (0.0 if t_amount_reason == "zero"
+                                     else None)),
+                    "change_pct": t_change,
+                    "is_target": True,
+                    "as_of_date": t_as_of,
+                }
+                out["target_independent_quote"] = tiq
+                if t_adapted:
+                    gaps.append("目标股独立行情：名称缺失，按代码显示")
+            else:
+                # 空值观测（行情行存在且时点/身份合格，但成交额与涨跌幅均
+                # 缺失/无效）：不发布全空数值块、不登记任何目标事实——
+                # 明确缺口承载（无数值可发布，不冒充独立行情事实）
+                gaps.append(
+                    "目标股独立行情未取得（当日行情观测存在但成交额与"
+                    "涨跌幅均缺失/无效，无数值可发布）")
         else:
             if target_quote_gaps:
                 # 细节缺口由 target_quote_gaps 承载（不嵌套重复）

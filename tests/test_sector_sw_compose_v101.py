@@ -434,6 +434,30 @@ class TestMissingTargetQuoteNoMarketEvidence:
     缺失（其余指数有值的 30/31 覆盖态）不注册 intraday 市场证据——登记表
     无该块（不可引用），服务端事实摘要无板块涨跌幅段（不冒充目标快照）。"""
 
+    def test_all_null_independent_observation_registers_no_target_fact(self):
+        """#102 复审三轮（登记表级）：空值观测（行情行存在且时点合格、
+        成交额与涨跌幅均缺失/无效）不发布块、**不登记任何目标事实**——
+        无 detached target 条目、不可引用、摘要无目标段。"""
+        peers = {
+            "eligible": True, "selection_rule": "受控",
+            "items": [{"code": "601088", "name": "成员甲", "amount": 1.2e9,
+                       "change_pct": 0.5, "is_target": False,
+                       "as_of_date": "2026-11-19"}],
+            "target_in_amount_top5": None, "target_change_pct_rank": None,
+            "amount_provenance": "受控", "quotes_as_of": "2026-11-19 10:29:00",
+            "industry_reference": True,
+            "target_independent_quote": None,
+            "gaps": ["目标股独立行情未取得（当日行情观测存在但成交额与"
+                     "涨跌幅均缺失/无效，无数值可发布）"],
+        }
+        reg = _build_evidence_registry(
+            "目标股", "920101", {"board_name": "煤炭", "membership": {}},
+            {"sector_found": False}, {"eligible": False}, peers,
+            {"items": [], "background_items": []},
+        )
+        assert reg.get("target") is None  # 无任何登记目标事实
+        assert not reg.citable("target")  # 引用校验按未知 ID 拒绝
+
     def test_sector_found_without_target_change_registers_no_intraday(self):
         prosper = {
             "sector_found": True, "momentum": None, "activity": None,

@@ -295,6 +295,10 @@ class SectorReportApiV100TestCase(unittest.TestCase):
                                               stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        # 模块缝替换必须随场景 teardown 还原（叠加 patch 的套件级重装
+        # 各自 addCleanup；本基座 patcher 最后停止，恢复真实模块函数）
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
 
     def _install_eastmoney_sentinels(self) -> None:
         """东财链全部入口缝替换为即时失败：成分边界路径必须零东财出站。"""
@@ -356,6 +360,8 @@ class TestGiantRawAmountNeverInf(SectorReportApiV100TestCase):
             sw, "_resolve_access_token", stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
         resp = self.client.post(
             "/api/v1/sector-analysis/generate"
             f"?stock_code={BJ_TARGET}&stock_name=测试北交所标的"
@@ -530,6 +536,8 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
             sw, "_resolve_access_token", stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
         resp = self.client.post(
             "/api/v1/sector-analysis/generate"
             f"?stock_code={BJ_TARGET}&stock_name=测试北交所标的"
@@ -677,6 +685,137 @@ class TestAmountOnlyMemberKeepsSample(SectorReportApiV100TestCase):
             f"/api/v1/sector-analysis/reports/{rid}/markdown?download=1")
         self.assertIn("601898", download.text)
 
+    def test_inconsistent_change_member_blanks_change_keeps_amount(self):
+        """交叉复核不合格的成员涨跌幅（changeRatio=0.495、latest=100.5/
+        preClose=100 恰差 0.005pp）同日行：成分口径只作废涨跌幅本身——
+        有效成交额 5e9 保留参与选样（不剔除、不递补第六名），目标涨跌幅
+        名次 withhold + 有效范围缺口（#102 复审 Spec）。"""
+        stub = _SwTransportStub(
+            industry_by_level={"1": "煤炭", "2": "煤炭开采", "3": "动力煤"},
+            target_secucode=SH_TARGET_SEC, member_codes=COAL_MEMBERS,
+            member_amounts={"601898.SH": 5.0e9},
+            member_changes={"601898.SH": 0.495})
+        self._install_sw_stub(stub)
+        self._install_eastmoney_sentinels()
+        orig_call = stub.__call__
+
+        def _inconsistent_call(url, headers, body_bytes, *, label):
+            parsed = json.loads(body_bytes.decode())
+            if ("real_time_quotation" in url
+                    and "601898.SH" in parsed.get("codes", "").split(",")):
+                payload = json.loads(orig_call(
+                    url, headers, body_bytes, label=label)[1].decode())
+                for row in payload.get("tables") or []:
+                    if row.get("thscode") == "601898.SH":
+                        # 涨跌幅 0.495 对 latest 100.5/preClose 100 恰差 0.005pp
+                        row["table"]["latest"] = [100.5]
+                        row["table"]["preClose"] = [100.0]
+                return 200, json.dumps(payload).encode()
+            return orig_call(url, headers, body_bytes, label=label)
+
+        self._sw_post_patcher = patch.object(sw, "_http_api_curl_post",
+                                             _inconsistent_call)
+        self._sw_token_patcher = patch.object(
+            sw, "_resolve_access_token", stub.resolve_token)
+        self._sw_post_patcher.start()
+        self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
+        resp = self.client.post(
+            "/api/v1/sector-analysis/generate"
+            f"?stock_code={SH_TARGET}&stock_name=兖矿能源"
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        peers = resp.json()["analysis"]["sector_peers"]
+        top = next(i for i in peers["items"] if i["code"] == "601898")
+        self.assertEqual(top["amount"], 5.0e9)      # 有效金额保留参与选样
+        self.assertIsNone(top["change_pct"])        # 只作废涨跌幅本身
+        self.assertNotIn("601225", [i["code"] for i in peers["items"]])
+        self.assertIsNone(peers["target_change_pct_rank"])  # 名次 withhold
+        gaps = " ".join(peers["gaps"])
+        self.assertIn("有效比较范围", gaps)
+        # 存档一致
+        rid = resp.json()["report_id"]
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
+        self.assertEqual(
+            detail.json()["data"]["analysis_json"]["sector_peers"], peers)
+
+
+class TestBjIndependentObservation(SectorReportApiV100TestCase):
+    """目标独立行情发布门与空值观测（#102 复审 Spec）：行情行存在且时点/
+    身份合格——有有效成交额（含已知零）或合格涨跌幅才发布数值块；数值
+    全缺时不发布全空块，降为空值观测事实 + 同款明确缺口。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._freeze(FROZEN_COMPLETED_NOW)
+
+    def _generate_with_target_row(self, row: Optional[Dict[str, Any]]):
+        stub = _SwTransportStub(
+            industry_by_level={"1": "煤炭", "2": "煤炭开采", "3": "动力煤"},
+            target_secucode=BJ_TARGET_SEC, member_codes=COAL_MEMBERS)
+        self._install_sw_stub(stub)
+        self._install_eastmoney_sentinels()
+        orig_call = stub.__call__
+
+        def _call(url, headers, body_bytes, *, label):
+            parsed = json.loads(body_bytes.decode())
+            if ("real_time_quotation" in url
+                    and parsed.get("codes") == BJ_TARGET_SEC):
+                if row is None:
+                    return 200, json.dumps(_quotes_payload([])).encode()
+                return 200, json.dumps(_quotes_payload([row])).encode()
+            return orig_call(url, headers, body_bytes, label=label)
+
+        self._sw_post_patcher = patch.object(sw, "_http_api_curl_post", _call)
+        self._sw_token_patcher = patch.object(
+            sw, "_resolve_access_token", stub.resolve_token)
+        self._sw_post_patcher.start()
+        self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
+        return self.client.post(
+            "/api/v1/sector-analysis/generate"
+            f"?stock_code={BJ_TARGET}&stock_name=测试北交所标的"
+        )
+
+    def test_all_null_row_no_published_quote_no_observation(self):
+        """有效 BJ 时点 + 空值表：不发布全空数值块，也不发布任何空值观测
+        字段——「独立行情未取得」明确缺口承载；登记表不注册任何目标事实
+        （compose_v101 登记表级断言覆盖）。"""
+        row = _quote_row(BJ_TARGET_SEC, self._arranged_sessions(1)[0], None,
+                         amount=0.0)
+        # 全空数值：成交额与涨跌幅均缺失（时点/身份合格）
+        row["table"]["changeRatio"] = [None]
+        row["table"]["amount"] = [None]
+        resp = self._generate_with_target_row(row)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        analysis = resp.json()["analysis"]
+        peers = analysis["sector_peers"]
+        self.assertIsNone(peers["target_independent_quote"])
+        self.assertNotIn("target_independent_observation", peers)
+        gaps = " ".join(peers["gaps"])
+        self.assertIn("独立行情未取得", gaps)
+        self.assertIn("均缺失/无效", gaps)
+        # 存档一致（严格载荷校验随 200 通过）
+        rid = resp.json()["report_id"]
+        detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
+        self.assertEqual(
+            detail.json()["data"]["analysis_json"]["sector_peers"], peers)
+
+    def test_zero_amount_with_valid_change_publishes_quote(self):
+        """已知零额 + 合格涨跌幅：发布数值块（零额合法保留 0，含 0 语义）。"""
+        row = _quote_row(BJ_TARGET_SEC, self._arranged_sessions(1)[0], 1.5,
+                         amount=0.0)
+        resp = self._generate_with_target_row(row)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        peers = resp.json()["analysis"]["sector_peers"]
+        tiq = peers["target_independent_quote"]
+        self.assertIsNotNone(tiq)
+        self.assertEqual(tiq["amount"], 0.0)
+        self.assertEqual(tiq["change_pct"], 1.5)
+        self.assertNotIn("target_independent_observation", peers)
+
 
 class TestLongAncillaryTradeTimeArchives(SectorReportApiV100TestCase):
     """快照来源文字归一（#102 复审 Standards 3，API 存档边界）：
@@ -714,6 +853,8 @@ class TestLongAncillaryTradeTimeArchives(SectorReportApiV100TestCase):
             sw, "_resolve_access_token", stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
         resp = self.client.post(
             "/api/v1/sector-analysis/generate"
             f"?stock_code={SH_TARGET}&stock_name=兖矿能源"

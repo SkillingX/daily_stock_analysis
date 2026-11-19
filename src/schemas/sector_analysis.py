@@ -446,7 +446,8 @@ class SectorPeersBlock(_StrictBase):
     target_independent_quote: Optional[PeerItem] = None
     """目标股独立行情事实（issue #100 追加兼容字段；仅未确认成分时携带）。
     独立事实不进 ``items``、不参与任何排名——目标股行情不得经由同业证据
-    进入成分比较。"""
+    进入成分比较。仅在行情行有**有效成交额（含已知零）或合格涨跌幅**时
+    发布数值块；数值全缺时不发布块（明确缺口承载，无登记事实）。"""
     gaps: _GapList = Field(default_factory=list, max_length=14)
 
 

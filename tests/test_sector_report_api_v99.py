@@ -286,6 +286,10 @@ class SectorReportApiV99TestCase(unittest.TestCase):
                                               stub.resolve_token)
         self._sw_post_patcher.start()
         self._sw_token_patcher.start()
+        # 模块缝替换随场景 teardown 还原（套件级重装各自 addCleanup，
+        # 本基座 patcher 最后停止恢复真实模块函数）
+        self.addCleanup(self._sw_post_patcher.stop)
+        self.addCleanup(self._sw_token_patcher.stop)
 
     # ---- 东财零出站哨兵 ----
 
@@ -515,12 +519,18 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         analysis = resp.json()["analysis"]
         intraday = analysis["background"]["intraday"]
-        # 模式从实际选用数据推导：目标日其他指数合格行保留 → target 口径
-        # （参考口径不激活——盘后目标不前向参考上一交易日）
-        self.assertEqual(intraday["snapshot_mode"], "target")
+        # 无目标合格行（当日缺失、盘后不前向参考）：不发布行情块——
+        # sector_found=false、快照元数据（日期/口径/来源）全空，不以
+        # N/A 数值表冒充实际行情；其余指数覆盖事实与盘后不参考原因保留
+        # 在缺口（#102 复审三轮修正契约）
+        self.assertFalse(intraday["sector_found"])
+        self.assertIsNone(intraday["snapshot_mode"])
+        self.assertIsNone(intraday["snapshot_date"])
+        self.assertIsNone(intraday["snapshot_source"])
         self.assertTrue(any("已完成会话" in g for g in intraday["gaps"]))
-        # 目标日其他指数合格行保留（target 口径、无全量名次），不前向参考
-        self.assertGreater(intraday["total_boards"] or 0, 0)
+        gaps_text = " ".join(intraday["gaps"])
+        self.assertIn("目标指数 801950.SL", gaps_text)
+        self.assertIn("其余 30/31 个指数取得当日合格行情", gaps_text)
         self.assertEqual(analysis["research_basis"], "sw2021_l1")
 
     def test_reference_without_target_row_not_applied(self):
@@ -808,10 +818,10 @@ class TestAmendTimingAndReference(SectorReportApiV99TestCase):
                     parsed["codes"].split(","), sessions[:20])).encode()
             raise AssertionError(f"未预置的申万端点: {url}")
 
-        self._sw_post_patcher.stop()
         self._sw_post_patcher = patch.object(sw, "_http_api_curl_post",
                                              malformed_quotes)
         self._sw_post_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
         resp = self.client.post(
             "/api/v1/sector-analysis/generate?stock_code=600188&stock_name=兖矿能源"
         )
@@ -929,9 +939,9 @@ class TestAttributionIdentityQualification(SectorReportApiV99TestCase):
                     parsed["codes"].split(","), sessions[:20])).encode()
             raise AssertionError(f"未预置的申万端点: {url}")
 
-        self._sw_post_patcher.stop()
         self._sw_post_patcher = patch.object(sw, "_http_api_curl_post", post)
         self._sw_post_patcher.start()
+        self.addCleanup(self._sw_post_patcher.stop)
         return self.client.post(
             "/api/v1/sector-analysis/generate?stock_code=600188&stock_name=兖矿能源"
         )

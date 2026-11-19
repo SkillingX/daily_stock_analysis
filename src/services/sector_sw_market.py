@@ -27,8 +27,8 @@ import math
 import re
 import time
 from datetime import date, datetime
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, DecimalException
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 from icontract import ensure
@@ -53,27 +53,41 @@ _DATA_POOL_ENDPOINT = f"{_HTTP_ROOT}/data_pool"
 _CHANGE_RATIO_TOLERANCE_PP = Decimal("0.005")
 
 
-def _implied_change_pct(latest: float, pre_close: float) -> Decimal:
+def _implied_change_pct(latest: Union[int, float, Decimal],
+                        pre_close: Union[int, float, Decimal]) -> Decimal:
     """最新价/昨收推算涨跌幅（百分点；Decimal 保留入站十进制语义）。
 
-    涨跌幅交叉复核公式的单一 owner：行资格筛选与函数出口契约共用。
+    涨跌幅交叉复核公式的单一 owner：行资格筛选与函数出口契约共用；
+    入参接受 wire 原始数值（int/float/Decimal），经 ``str`` 归一到 Decimal
+    不丢字面精度（``str`` 对三类入站都保留最短精确表示）。
     """
     return (Decimal(str(latest)) / Decimal(str(pre_close)) - 1) * 100
 
 
 def _change_ratio_within_tolerance(row: Dict[str, Any]) -> bool:
-    """qualified 行出口契约谓词：带涨跌幅且带复核基准（latest/preClose>0）
-    的行必须落在既有容差内；无涨跌幅（成分金额口径行，``require_change=``
-    ``False`` 路径）或无复核基准时不发明断言（资格层已按各自口径判定）。"""
+    """qualified 行出口契约谓词（容差判定唯一入口）：带涨跌幅且带复核基准
+    （latest/preClose>0）的行必须落在既有容差内；无涨跌幅（成分金额口径行，
+    ``require_change=False`` 路径，含交叉复核不合格被空白化的行）或无复核
+    基准时不对缺失发明断言。资格循环与出口契约共用本谓词，不重复实现。
+    Decimal 算术按行降级：超出 Decimal 上下文范围的畸形量级（如
+    ``latest=1e1000000`` 或微小正 ``preClose`` 触发 Overflow/InvalidOperation）
+    判不合格（非法行情不得通过复核），异常不逃出边界拖垮同批健康行。"""
     change = row.get("change_pct")
     if change is None:
         return True
-    latest = row.get("latest")
-    pre_close = row.get("pre_close")
-    if latest is None or pre_close is None or pre_close <= 0:
-        return True
-    implied = _implied_change_pct(latest, pre_close)
-    return abs(implied - Decimal(str(change))) < _CHANGE_RATIO_TOLERANCE_PP
+    try:
+        # 公开涨跌幅必须可表示为有限浮点数；复核继续使用原始精确值。
+        if not math.isfinite(change):
+            return False
+        latest = row.get("latest")
+        pre_close = row.get("pre_close")
+        if latest is None or pre_close is None or pre_close <= 0:
+            return True
+        implied = _implied_change_pct(latest, pre_close)
+        diff = abs(implied - Decimal(str(change)))
+    except (DecimalException, OverflowError):
+        return False
+    return diff < _CHANGE_RATIO_TOLERANCE_PP
 
 
 class SwSectorFetchError(RuntimeError):
@@ -178,7 +192,9 @@ def _bounded_deadline(deadline: Optional[float], timeout_seconds: float) -> floa
 
 def _sector_http_post(endpoint_url: str, body: Dict[str, Any], *, label: str,
                       refresh_token: str, timeout_seconds: float,
-                      deadline: Optional[float]) -> Dict[str, Any]:
+                      deadline: Optional[float],
+                      parse_float: Optional[Callable[[str], Any]] = None,
+                      ) -> Dict[str, Any]:
     """板块共用出站：认证 → 有界 curl POST → envelope/errorcode/tables 边界。
 
     认证缓存沿用共享键/刷新/锁语义；本次出站截止为
@@ -187,6 +203,9 @@ def _sector_http_post(endpoint_url: str, body: Dict[str, Any], *, label: str,
     与本次实际使用的 access token 一律不出现，跨截断边界的长回显同样被
     脱敏——复用既有适配器 ``_redact_token`` 安全语义）；errorcode 非标量时
     按类型分类不入消息内容（防恶意长回显）。
+    ``parse_float``（可选）仅作用于**响应** JSON 的浮点字面解析（如实时行情
+    传 ``Decimal`` 保留入站字面精度供金融交叉复核）；不传时响应解码与既有
+    行为逐位一致（归属/成分/日线等其他端点不受影响）。
     """
     from src.patches.eastmoney_patch import request_deadline
 
@@ -241,7 +260,8 @@ def _sector_http_post(endpoint_url: str, body: Dict[str, Any], *, label: str,
         if status != 200:
             raise SwSectorFetchError(_safe(f"HTTP {status}", access_used))
         try:
-            payload = json.loads(raw)
+            payload = (json.loads(raw, parse_float=parse_float)
+                       if parse_float is not None else json.loads(raw))
         except (ValueError, UnicodeDecodeError):
             raise SwSectorFetchError(_safe("响应不是有效 JSON", access_used)) from None
         if not isinstance(payload, dict):
@@ -477,6 +497,14 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     ``raw_amount=True``（成分成员行情路径）：``amount`` 原样保留首个有限
     int/float（不经 float cast，供 Decimal 排序保原始精度）；默认路径
     （31 指数快照与既有调用方）行为不变。
+
+    金融精度（实时行情端点响应按 ``Decimal`` 解析浮点字面）：``change_pct``/
+    ``latest``/``pre_close`` 在行内**原样保留精确数值**（int/float/Decimal，
+    不经 float cast）贯穿 :func:`qualify_quote_rows` 交叉复核——字面
+    ``0.495000000000000001`` 与 ``0.495`` 在资格判定下可区分（前者对
+    100.5/100 推算 0.5pp 差 0.00499… 在容差内，后者恰 0.005pp 拒绝）；
+    公开展示投影（float 字段）由消费方 ``_num``/``float`` 边界转换（JSON
+    安全）。其余数值位（换手/涨跌家数与非 raw 金额）维持 float 口径。
     """
     body = {
         "codes": codes,
@@ -485,7 +513,7 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
     payload = _sector_http_post(
         _REALTIME_ENDPOINT, body, label="sector_sw_quotes",
         refresh_token=refresh_token, timeout_seconds=timeout_seconds,
-        deadline=deadline,
+        deadline=deadline, parse_float=Decimal,
     )
     try:
         rows: List[Dict[str, Any]] = []
@@ -508,9 +536,10 @@ def fetch_index_quotes(codes: str, *, refresh_token: str, timeout_seconds: float
                 "trade_date": trade_date,
                 "trade_time": stamp.strftime("%H:%M:%S") if stamp else "",
                 "stamp": stamp,
-                "change_pct": _first_finite(cells.get("changeRatio")),
-                "latest": _first_finite(cells.get("latest")),
-                "pre_close": _first_finite(cells.get("preClose")),
+                # 交叉复核输入保留精确字面（Decimal 语义见 docstring）
+                "change_pct": _first_finite_raw(cells.get("changeRatio")),
+                "latest": _first_finite_raw(cells.get("latest")),
+                "pre_close": _first_finite_raw(cells.get("preClose")),
                 "amount": (_first_finite_raw(cells.get("amount"))
                            if raw_amount
                            else _first_finite(cells.get("amount"))),
@@ -542,38 +571,43 @@ def _parse_vendor_stamp(raw: str) -> Optional[datetime]:
         return None
 
 
-def _first_finite_raw(values: Optional[List[Any]]) -> Any:
-    """wire 数值位**原样**首个有限 int/float（共享数值位解析唯一入口：
-    不做 cast，成分金额经 Decimal 排序时保留原始精度）。畸形输入本地守卫，
-    不抛出、不让单行字段异常拖垮同批健康行：
+def _first_finite_raw(values: object) -> Optional[Union[int, float, Decimal]]:
+    """wire 数值位**原样**首个有限数值（共享数值位解析唯一入口：不做
+    cast，Decimal 字面/大整数保留原始精度供金融复核与排序）。输入如实
+    类型化为 ``object``（wire 单元格是未知 JSON 值），输出收窄为
+    ``int | float | Decimal | None``。畸形输入本地守卫，不抛出、不让单行
+    字段异常拖垮同批健康行：
     - 非 list 容器（dict/str/标量等 malformed wire）→ 缺值（不取 ``[0]``
       顶替、不按容器真值猜测）；
-    - 布尔永不作数值；非 int/float 元素 → 缺值；
-    - 浮点 NaN/±inf → 缺值；原始大整数**保留**（float 口径由
-      :func:`_first_finite` 另行守卫溢出，公开边界另行复核有限性）。
+    - 布尔永不作数值；非 int/float/Decimal 元素 → 缺值；
+    - 浮点 NaN/±inf 与非有限 Decimal → 缺值；原始大整数/大 Decimal
+      **保留**（float 口径由 :func:`_first_finite` 另行守卫溢出与有限性）。
     """
     if not isinstance(values, list) or not values:
         return None
     v = values[0]
-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+    if isinstance(v, bool) or not isinstance(v, (int, float, Decimal)):
         return None
     if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, Decimal) and not v.is_finite():
         return None
     return v
 
 
-def _first_finite(values: Optional[List[Any]]) -> Optional[float]:
-    """wire 数值位 float 口径（31 指数快照等既有路径）：委托共享解析器，
-    原始整数超出 float 可表示范围时按缺值处理（溢出异常本地消化，不逃出
+def _first_finite(values: object) -> Optional[float]:
+    """wire 数值位 float 口径（公开展示投影/31 指数快照非精确字段）：委托
+    共享解析器后转 float；原始值超出 float 可表示范围或转换结果非有限
+    （NaN/±inf，含大 Decimal 转 inf）按缺值处理（异常本地消化，不逃出
     边界拖垮同批健康行）。"""
     v = _first_finite_raw(values)
     if v is None:
         return None
     try:
         finite = float(v)
-    except OverflowError:
+    except (OverflowError, ValueError, TypeError):
         return None
-    return finite
+    return finite if math.isfinite(finite) else None
 
 
 @ensure(
@@ -604,14 +638,16 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
       未提供时仅要求不晚于接收时刻（保守下界不省略上界验证）。
     - **字段资格**（身份/会话/时间戳之外，按口径拆分）：``change_pct``
       与 ``latest/preClose`` 的 Decimal 推算值差异须在容差内（缺
-      latest/preClose 时不发明复核基准；推算按 Decimal，容差边界反例
-      100.5/100 + 0.495 拒绝）。``require_change=True``（31 指数快照等
-      既有口径，默认）：涨跌幅缺失行整体不合格——目标日行情资格与
-      ``quote_target_ok`` 依赖有效涨跌幅。``require_change=False``（成分
-      成员/目标独立行情口径）：涨跌幅缺失**不再剔除整行**——身份/会话/
-      时间戳合格的行保留有效金额用于选样（amount-only 成员仍按成交额
-      参与前五），涨跌幅名次由同业支柱对缺失同行 withhold 并给覆盖说明；
-      涨跌幅存在时交叉复核照常执行。
+      latest/preClose 时不发明复核基准；推算按 Decimal 且入站保留字面
+      精度，容差边界反例 100.5/100 + 0.495 恰差 0.005pp 拒绝、
+      0.495000000000000001 在容差内采纳）。``require_change=True``
+      （31 指数快照等既有口径，默认）：涨跌幅缺失**或交叉复核不合格**
+      的行整体不合格——目标日行情资格与 ``quote_target_ok`` 依赖有效
+      涨跌幅。``require_change=False``（成分成员/目标独立行情口径）：
+      涨跌幅缺失或复核不合格**不剔除整行**——身份/会话/时间戳合格的行
+      保留有效金额用于选样（amount-only 成员仍按成交额参与前五）；
+      复核不合格的涨跌幅在**副本上置 None**（不污染调用方原始行），涨
+      跌幅名次由同业支柱对缺失同行 withhold 并给覆盖说明。
     - 返回 ``({thscode: 行}, 保守拒绝说明)``：不合格行剔除（调用方按全集
       对齐缺口，剔除事实不丢失）；说明仅记录重复冲突等需显式诊断的拒绝，
       调用方负责有界化。
@@ -658,13 +694,15 @@ def qualify_quote_rows(rows: List[Dict[str, Any]], *, session_date: str,
                     continue  # 已完结会话的盘前/盘中旧快照（未过收盘）
             elif session_open is not None and stamp < session_open:
                 continue  # 盘中：当日开盘前的时间戳
-        latest = row.get("latest")
-        pre_close = row.get("pre_close")
-        if (change is not None and latest is not None
-                and pre_close is not None and pre_close > 0):
-            implied = _implied_change_pct(latest, pre_close)
-            if abs(implied - Decimal(str(change))) >= _CHANGE_RATIO_TOLERANCE_PP:
+        if change is not None and not _change_ratio_within_tolerance(row):
+            # 涨跌幅与 latest/preClose 交叉复核不合格（唯一容差谓词）：
+            # 严格口径（31 指数快照）整行拒绝；成分口径只作废涨跌幅本身
+            # ——副本上置 None（不污染调用方复用的原始行，如参考日二筛），
+            # 有效金额保留参与选样，涨跌幅名次由同业支柱 withhold
+            if require_change:
                 continue
+            row = dict(row)
+            row["change_pct"] = None
         qualified[str(row.get("thscode") or "")] = row
     return qualified, notes
 
