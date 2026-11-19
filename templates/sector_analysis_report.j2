@@ -1,13 +1,19 @@
 {% set st = a.identity.subject_status %}
+{% set is_sw = (a.get('research_basis') == 'sw2021_l1') %}
+{% if is_sw %}
+{% set st_label = {'confirmed': '已确认（申万一级归属与核定目录唯一匹配）', 'unverified': '已锁定但成分未验证',
+                   'ambiguous': '无法唯一锁定', 'missing': '未取得'}[st] %}
+{% else %}
 {% set st_label = {'confirmed': '已确认（成分验证通过）', 'unverified': '已锁定但成分未验证',
                    'ambiguous': '无法唯一锁定', 'missing': '未取得'}[st] %}
+{% endif %}
 {% if a.assessment.status == 'unscored' %}
 {% set status_text = '**未评分**（首版板块专项不产出综合评分）' %}
 {% else %}
 {% set status_text = '**资料不足**' %}
 {% endif %}
 {% if a.assessment.completeness == 'complete' %}
-{% set completeness_text = '完整（当日行情等动态事实已取得）' %}
+{% set completeness_text = '完整（当日行情与既有研究证据等动态事实已取得）' %}
 {% else %}
 {% set completeness_text = '**部分**（动态事实未全部取得，见缺口与不足原因）' %}
 {% endif %}
@@ -21,7 +27,22 @@
 {% else %}
 {% set locked_text = '未锁定（不按近似名取行）' %}
 {% endif %}
-{% if a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
+{% if is_sw %}
+{% set sw_m = a.identity.membership.sw_membership %}
+{% if a.identity.membership.verified and sw_m and sw_m.status == 'included' %}
+{% set membership_text = '已纳入指数成分（' ~ sw_m.observation_date ~ ' 同日申万一级行业指数成分，观测 ' ~ sw_m.member_count ~ ' 只；带交易所身份匹配）' %}
+{% elif sw_m and sw_m.status == 'excluded' %}
+{% set membership_text = '明确未纳入指数成分（' ~ sw_m.observation_date ~ ' 同日成分完整集合证据；同业为行业参考，成分内名次留空，目标股独立展示）' %}
+{% elif sw_m and sw_m.status == 'unknown' %}
+{% if sw_m.member_count is not none %}
+{% set membership_text = '成分状态未知（' ~ sw_m.observation_date ~ ' 同日成分结果未见目标股且响应无完整性元数据，不能证明非成员；同业为行业参考，目标股独立展示，成分内名次留空）' %}
+{% else %}
+{% set membership_text = '成分状态未知（' ~ sw_m.observation_date ~ ' 同日成分未取得——查询失败或未取得该日成分，查询失败/未取得 ≠ 非成员；同业为行业参考，目标股独立展示，成分内名次留空）' %}
+{% endif %}
+{% else %}
+{% set membership_text = '成分验证未取得（见数据缺口）' %}
+{% endif %}
+{% elif a.identity.membership.verified and a.identity.membership.verified_source == 'f10_members' %}
 {% set membership_text = '目标股在东财 F10 板块完整成员集合中（' ~ a.identity.membership.member_count ~ ' 只，成分验证通过；成员行情为逐股采集，批次时间范围见同业缺口）' %}
 {% elif a.identity.membership.verified %}
 {% set membership_text = '目标股在该板块成分内' ~ (('（成分 ' ~ a.identity.membership.member_count ~ ' 只）') if a.identity.membership.member_count is not none else '') %}
@@ -37,9 +58,21 @@
 
 > 报告 id：{{ report_id }} ｜ 生成时间：{{ as_of }}
 > 主行业身份：**{{ st_label }}** ｜ 资料状态：{{ status_text }} ｜ 完整性：{{ completeness_text }}
+{% if a.get('research_basis') %}
+> 研究口径：{{ {'sw2021_l1': '申万 2021 一级行业（iFinD 标准 HTTP）', 'eastmoney_board': '东财行业板块（有界兜底链路）'}[a.research_basis] }}{% if a.get('research_outcome') == 'switched_fallback' %}（东财兜底成功切换）{% elif a.get('research_outcome') == 'partial_recovery' %}（**东财兜底部分恢复，未达切换门槛**；同业与研究未运行，非成功切换）{% endif %}
+{% endif %}
 > 采集时点：{{ a.identity.observed_at or '未记录' }} ｜ 供应商数据截止：{{ as_of_text }}
 > 本报告基于公开数据与启发式规则，仅供研究参考，不构成投资建议
 
+{% if is_sw %}
+## 一、主行业定位（申万 2021 一级行业）
+
+{% set sw_ref = ((' ｜ 二级参考：' ~ sw.l2) if sw and sw.l2 else '') ~ ((' ｜ 三级参考：' ~ sw.l3) if sw and sw.l3 else '') %}
+- 申万一级归属：{{ locked_text }}{{ sw_ref }}
+- 成分验证：{{ membership_text }}
+- 归属观察日：{{ a.identity.vendor_as_of or '未知' }}（按该日期向供应商查询正式归属；目录版本 {{ a.identity.classification_version or '未知' }}）
+- 目录来源：申万 2021 一级行业指数目录（iFinD 实测核定，31/31 逐一核对）
+{% else %}
 ## 一、主行业定位（同一东财行业板块）
 
 - 东财个股行业：**{{ a.identity.industry_em or '未返回' }}**
@@ -58,25 +91,30 @@
 - 巨潮证监会行业（参考）：{{ a.identity.industry_cninfo }}
 
 {% endif %}
-## 二、当日板块行情（价格强弱与活跃度）
-
+{% endif %}
 {% set pr = a.background.intraday %}
+{% set day_label = '参考交易日' if pr.get('snapshot_mode') == 'reference' else '当日' %}
+## 二、{{ day_label }}板块行情（价格强弱与活跃度）
+
 {% if pr.sector_found %}
-- 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ 当日涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
-- 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ 当日成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
+- 板块：**{{ pr.row.board_name }}{% if pr.row.board_code %}（{{ pr.row.board_code }}）{% endif %}** ｜ {{ day_label }}涨跌幅：{{ pr.row.change_pct if pr.row.change_pct is not none else 'N/A' }}% ｜ 全表排名：{{ pr.rank_of if pr.rank_of is not none else 'N/A' }} / {{ pr.total_boards if pr.total_boards is not none else 'N/A' }}（按涨跌幅）
+{% if pr.get('snapshot_date') %}
+- 行情日期：**{{ pr.snapshot_date }}**{{ '（参考口径：目标交易日目标指数合格行情未取得，展示立即上一已完成交易日同日参考，见缺口）' if pr.get('snapshot_mode') == 'reference' else '' }}
+{% endif %}
+- 换手率：{{ pr.row.turnover_rate if pr.row.turnover_rate is not none else 'N/A' }}% ｜ {{ day_label }}成交额：{{ pr.row.amount if pr.row.amount is not none else 'N/A' }} ｜ 上涨/下跌家数：{{ pr.row.up_count if pr.row.up_count is not none else 'N/A' }} / {{ pr.row.down_count if pr.row.down_count is not none else 'N/A' }}
 - 领涨股：{{ pr.row.leader or 'N/A' }}（{{ pr.row.leader_change_pct if pr.row.leader_change_pct is not none else 'N/A' }}%）
 {% if pr.snapshot_source %}
 - 快照来源/时点：{{ pr.snapshot_source }}
 {% endif %}
 
-| 当日行情维度 | 分值（0-100） | 口径 |
+| {{ day_label }}行情维度 | 分值（0-100） | 口径 |
 |---------|--------------|------|
 | 动量（涨跌幅有效样本分位） | {{ pr.momentum if pr.momentum is not none else 'N/A' }} | 严格低于目标的有效样本数÷(有效样本数−1)×100；并列不计入「低于」数 |
 | 换手活跃度（换手率/全表中位） | {{ pr.activity if pr.activity is not none else 'N/A' }} | 中位 = 50 分 |
 | 成交额活跃度（成交额/全表中位） | {{ pr.amount_activity if pr.amount_activity is not none else 'N/A' }} | 中位 = 50 分 |
 | 广度（上涨家数占比） | {{ pr.breadth if pr.breadth is not none else 'N/A' }} | 全涨 = 100 分 |
 
-> ⚠️ 口径说明：以上是**当日行情**（价格强弱与交易活跃度），不代表产业景气；
+> ⚠️ 口径说明：以上是**{{ day_label }}行情**（价格强弱与交易活跃度），不代表产业景气；
 > 「成交额活跃度」是成交额的相对水平，**不是资金净流入**；单日行情不构成趋势结论。
 {% else %}
 - ⚠️ 当日行情未产出：{{ pr.gaps[0] if pr.gaps else '未知原因' }}
@@ -127,7 +165,17 @@
 {% elif trend.benchmark and trend.benchmark.period_return_pct is not none and trend.period_return_pct is none %}
 - 相对表现：不计算（需板块与基准同窗口均 20/20 合格；当前板块侧不合格，见缺口）
 {% endif %}
+{% if is_sw %}
+{% if trend.source %}
+- 数据来源：板块 {{ trend.source }}{% if trend.benchmark %}、基准 {{ trend.benchmark.source or '未取得（见缺口）' }}（{{ trend.benchmark.symbol }}）{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% elif trend.observations %}
+- 数据来源：合格区间收益未取得——窗口内实际取得 {{ trend.qualified_sessions or 0 }}/{{ trend.window_completed_sessions }} 个交易日收盘观测（iFinD，见上表）；**数据获取与合格区间收益分开标注**，不以已取得观测冒充区间收益{% if trend.benchmark and trend.benchmark.source %}；基准（{{ trend.benchmark.name }}）来源 {{ trend.benchmark.source }}（{{ trend.benchmark.symbol }}）独立标注{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% else %}
+- 数据来源：**未取得板块本身合格日线观测**（见缺口）{% if trend.benchmark and trend.benchmark.source %}；基准（{{ trend.benchmark.name }}）来源 {{ trend.benchmark.source }}（{{ trend.benchmark.symbol }}）独立标注——基准有观测不代表板块侧已取得{% endif %}；期望交易日集来自严格交易日历（不补自然日）
+{% endif %}
+{% else %}
 - 数据来源：板块 {{ trend.source or '东财行业板块日线' }}（板块代码直查）、基准 东财指数日线（sh000300）；期望交易日集来自严格交易日历（不补自然日）
+{% endif %}
 {% if trend.expected_dates %}
 - 期望交易日集（{{ trend.expected_dates | length }} 天）：{{ trend.expected_dates | join('、') }}
 {% endif %}
@@ -138,10 +186,15 @@
 - ⚠️ {{ g }}
 {% endfor %}
 {% else %}
+{% if is_sw %}
+- ⚠️ 板块趋势未产出：{{ trend.gaps[0] if trend.gaps else '未知原因' }}
+{% else %}
 - ⚠️ 板块趋势未执行：主行业身份未确认（confirmed 前置不满足），不发起板块/基准行情查询、不给趋势结论。
 {% endif %}
 {% endif %}
+{% endif %}
 
+{% if a.get('sector_catalysts') is not none %}
 ## 四、行业催化（近期政策/新闻，统一准入）
 
 {% set cat = a.get('sector_catalysts') %}
@@ -194,8 +247,7 @@
 {% for g in cat.gaps %}
 - ⚠️ {{ g }}
 {% endfor %}
-{% else %}
-- ⚠️ 行业催化未执行：主行业身份未确认（confirmed 前置不满足），不发起行业新闻搜索、不给催化结论。
+{% endif %}
 {% endif %}
 {% endif %}
 
@@ -205,6 +257,13 @@
 {% if peers.eligible %}
 {% set peer_rows = peers['items'] %}
 - 选取规则：{{ peers.selection_rule }}；不逐股补市值、不混用其他分类权重
+{% if peers.industry_reference %}
+- ⚠️ **行业参考**：目标股未确认在该指数成分内（成分边界见下），以上同业是行业指数成分的成交活跃代表，**不是与目标股同成分的可比样本**；目标股行情独立展示、不参与成分内比较与排名
+{% endif %}
+{% if peers.target_independent_quote %}
+{% set tiq = peers.target_independent_quote %}
+- 目标股独立行情：{{ tiq.code }}（{{ tiq.name }}）｜ 当日涨跌幅：{{ tiq.change_pct if tiq.change_pct is not none else 'N/A' }}% ｜ 当日成交额：{{ tiq.amount if tiq.amount is not none else 'N/A' }} 元{% if tiq.as_of_date %} ｜ 行情日期：{{ tiq.as_of_date }}{% endif %}（独立事实，不进入成分比较与同业证据）
+{% endif %}
 {% if peers.amount_provenance %}
 - 成交额单位：{{ peers.amount_unit or '元' }}（{{ peers.amount_provenance }}）
 {% endif %}
@@ -367,6 +426,17 @@
 - 未取得相关概念列表（见缺口）；概念缺失不影响主行业报告。
 {% endif %}
 
+{% if is_sw %}
+## 申万口径研究说明
+
+- 本报告以申万 2021 一级行业为主口径：主行业归属、31 个申万一级行业指数当日快照与全量名次资格、目标行业与沪深 300 的严格日历二十交易日趋势、指数成分边界（已纳入/明确未纳入/未知）与成分内同业比较如上。
+- 行业催化与证据化综合在**选定申万口径后运行一次**（统一准入、登记表校验与完整性规则与报告口径一致；催化检索的三种结果——未发现合格催化、全部检索失败、部分检索成功但无合格结果且其他渠道失败——在催化节与缺口中如实区分）。
+- 目标股未确认在指数成分内时（明确未纳入或成分状态未知，常见于北交所标的）：同业为**行业参考**口径，目标股独立展示，成分内名次留空；该成分差异本身不触发东财兜底。
+{% if a.background.intraday.get('snapshot_mode') == 'reference' %}
+- 本报告当日行情为**参考口径**：目标交易日合格行情未取得，展示参考交易日行情；参考交易日行情**不进入当日证据**，与当日截面不拼接，报告完整性如实为部分。
+
+{% endif %}
+{% endif %}
 {% if a.gaps %}
 ## 数据缺口（按纪律不编造）
 

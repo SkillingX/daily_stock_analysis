@@ -606,9 +606,12 @@ class TestTrendPeersBudgetPriority:
         return order
 
     def test_required_blocks_precede_optional_long_chains(self, monkeypatch: pytest.MonkeyPatch):
-        """趋势/同业（必需）先于申万参考链与概念（可选长链）执行。"""
+        """趋势/同业（必需）先于申万参考链与概念（可选长链）执行（东财链语义）。"""
         order = self._compose_with_order_capture(monkeypatch)
-        payload = svc_module.compose_report("600519", "贵州茅台", budget=ReportBudget(30.0))
+        budget = ReportBudget(30.0)
+        core = svc_module._compose_eastmoney_core("600519", budget=budget)
+        payload = svc_module._compose_eastmoney_report_from_core(
+            core, "600519", "贵州茅台", budget=budget)
         self_idx_trend = order.index("trend")
         self_idx_peers = order.index("peers")
         assert self_idx_trend < order.index("sw")
@@ -669,7 +672,9 @@ class TestTrendPeersBudgetPriority:
         monkeypatch.setattr(ak, "stock_board_industry_hist_em", _exhausted)
         monkeypatch.setattr(ak, "stock_zh_index_daily_em", _exhausted)
         budget = ReportBudget(30.0, finish_margin=5.0)
-        payload = svc_module.compose_report("600519", "贵州茅台", budget=budget)
+        core = svc_module._compose_eastmoney_core("600519", budget=budget)
+        payload = svc_module._compose_eastmoney_report_from_core(
+            core, "600519", "贵州茅台", budget=budget)
         trend = payload["sector_trend"]
         assert trend["eligible"] is True
         assert trend["period_return_pct"] is None

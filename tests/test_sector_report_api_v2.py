@@ -194,6 +194,35 @@ class SectorReportApiV2TestCase(unittest.TestCase):
         with self.db._engine.connect() as conn:
             return int(conn.exec_driver_sql("PRAGMA busy_timeout").scalar_one())
 
+    def _em_chain_payload(self, code: str = "600519",
+                          name: str = "贵州茅台") -> dict:
+        """东财兜底链直调（issue #99 后 EM 链语义的测试缝）。
+
+        编排层（申万优先 + 兜底门槛/切换决策）由申万编排测试
+        （test_sector_sw_compose_v99.py）覆盖；本基类各用例的 akshare mock
+        针对 EM 链内部语义（身份锁定/成分验证/完整性/供应商降级），issue
+        #99 起直接对 EM 整链断言，不再经申万优先编排的切换规则转发（EM
+        未按旧规则确认时编排层保留申万事实，两种语义分开验证）。#102 复审
+        后走生产拆缝（core 核心事实 + from_core 完整研究组装）——唯一入口，
+        后置契约由 from_core 唯一持有。
+        """
+        from src.services.sector_analysis_service import (
+            ReportBudget,
+            _compose_eastmoney_core,
+            _compose_eastmoney_report_from_core,
+        )
+
+        budget = ReportBudget(300, finish_margin=5.0)
+        core = _compose_eastmoney_core(code, budget=budget)
+        return _compose_eastmoney_report_from_core(
+            core, code, name, budget=budget)
+
+    def _em_chain_markdown(self, payload: dict, name: str = "贵州茅台",
+                           code: str = "600519") -> str:
+        """东财链载荷 → 渲染 Markdown（正文断言用，不经存档路径）。"""
+        return self._svc._render(name, code, payload["generated_at"],
+                                 "sa_chaincheck", payload)
+
     # ---- issue #83 合成研究终端：搜索 provider 响应 + 模型 SSE wire ----
     # 只隔离终端供应商响应；真实 SearchService/准入/文章日期证据提取/证据
     # 登记表/引用与数字锚定校验/渲染/存档全部真实执行。
@@ -524,36 +553,27 @@ class TestGenerateClosedLoop(SectorReportApiV2TestCase):
         self.assertEqual(resp.status_code, 400)
 
     def test_near_name_board_not_locked_insufficient(self):
-        """名称近似：不取首行，身份 ambiguous → 资料不足贯穿载荷/正文。"""
+        """名称近似：不取首行，身份 ambiguous → 资料不足贯穿载荷/正文（东财链语义）。"""
         self._mock_vendors(industry="白酒Ⅱ", boards=[("白酒", "BK0001"), ("啤酒", "BK0002")],
                            cons=["600519"])
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        analysis = resp.json()["analysis"]
+        analysis = self._em_chain_payload()
         self.assertEqual(analysis["identity"]["subject_status"], "ambiguous")
         self.assertEqual(analysis["assessment"]["status"], "insufficient_data")
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
         self.assertTrue(analysis["assessment"]["reasons"])
-        self.assertIn("近似", resp.json()["markdown"])
-        # 部分报告仍存档（如实标注资料不足），历史可回看
-        lst = self.client.get("/api/v1/sector-analysis/reports").json()
-        self.assertEqual(lst["total"], 1)
+        self.assertIn("近似", self._em_chain_markdown(analysis))
+        # 东财身份未按旧规则确认时，编排层不切换、保留申万事实（切换决策
+        # 由申万编排测试覆盖）；部分报告存档路径由其余闭环用例覆盖。
 
     def test_unverified_membership_partial_report(self):
-        """成分不含目标：unverified + 缺口贯穿，不静默确证。"""
+        """成分不含目标：unverified + 缺口贯穿，不静默确证（东财链语义）。"""
         self._mock_vendors(industry="白酒Ⅱ", boards=[("白酒Ⅱ", "BK1277")],
                            cons=["000568", "000596"])
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        analysis = resp.json()["analysis"]
+        analysis = self._em_chain_payload()
         self.assertEqual(analysis["identity"]["subject_status"], "unverified")
         self.assertEqual(analysis["assessment"]["status"], "unscored")
         self.assertTrue(any("归属未确认" in g for g in analysis["gaps"]))
-        self.assertIn("归属未确认", resp.json()["markdown"])
+        self.assertIn("归属未确认", self._em_chain_markdown(analysis))
 
     def test_missing_everything_default_base_rate_no_neutral(self):
         """固定反例：全缺失 + 默认基率 0.5 → 资料不足，无 60 分中性。
@@ -576,25 +596,21 @@ class TestGenerateClosedLoop(SectorReportApiV2TestCase):
             self.assertNotIn(legacy_band_word, md)
 
     def test_vendor_timeout_keeps_partial_report_not_budget_error(self):
-        """供应商自身 TimeoutError：局部缺口保留有效内容，不谎报预算耗尽 504。
+        """供应商自身 TimeoutError：局部缺口保留有效内容，不谎报预算耗尽（东财链语义）。
 
         第一轮审查反例：Py3.11 futures.TimeoutError 即内建 TimeoutError，
         初版把 fn 内部的供应商超时终结为预算耗尽，丢弃全部有效事实。
+        issue #99 后经东财链直调断言（编排层把 EM 不可确认降级为保留申万
+        事实，供应商超时≠预算耗尽的语义在链内验证）。
         """
         self._mock_vendors(industry=None, boards=None, cons=None,
                            info_side_effect=TimeoutError("vendor socket timeout (fake)"))
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)  # 不 504
-        analysis = resp.json()["analysis"]
+        analysis = self._em_chain_payload()  # 不抛 BudgetExhausted，返回部分载荷
         self.assertEqual(analysis["assessment"]["status"], "insufficient_data")
         self.assertTrue(
             any("TimeoutError" in g or "timeout" in g.lower() for g in analysis["gaps"]),
             analysis["gaps"],
         )
-        lst = self.client.get("/api/v1/sector-analysis/reports").json()
-        self.assertEqual(lst["total"], 1)  # 部分报告存档可回看
 
     def test_concepts_over_display_cap_partial_report_saved(self):
         """51 条合法概念：截取展示上限并标注总量，部分报告正常存档（不 500）。
@@ -770,30 +786,22 @@ class TestIntradayIdentityBinding(SectorReportApiV2TestCase):
         self.assertEqual(intraday["gaps"], [])
 
     def test_same_code_wrong_name_not_silently_selected(self):
-        """代码命中但名称与锁定名不一致：不静默取首行（不回退其他板块）。"""
+        """代码命中但名称与锁定名不一致：不静默取首行（东财链语义）。"""
         table = _board_table([("错误行业", "BK1277")])
         self._mock_vendors(industry="白酒Ⅱ", boards=None, cons=["600519"],
                            board_table=table)
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        a = resp.json()["analysis"]
+        a = self._em_chain_payload()
         # 身份阶段：板块表无「白酒Ⅱ」精确命中 → 无法锁定
         self.assertEqual(a["identity"]["subject_status"], "ambiguous")
         self.assertEqual(a["assessment"]["status"], "insufficient_data")
         self.assertFalse(a["background"]["intraday"]["sector_found"])
 
     def test_duplicate_same_key_rows_not_locked(self):
-        """同名称+同代码重复两行：同键多行不可锁定，不取首行。"""
+        """同名称+同代码重复两行：同键多行不可锁定，不取首行（东财链语义）。"""
         table = _board_table([("白酒Ⅱ", "BK1277"), ("白酒Ⅱ", "BK1277")])
         self._mock_vendors(industry="白酒Ⅱ", boards=None, cons=["600519"],
                            board_table=table)
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        a = resp.json()["analysis"]
+        a = self._em_chain_payload()
         self.assertEqual(a["identity"]["subject_status"], "ambiguous")
         intraday = a["background"]["intraday"]
         self.assertFalse(intraday["sector_found"])
@@ -1227,15 +1235,11 @@ class TestCompletenessJudgment(SectorReportApiV2TestCase):
     """
 
     def test_row_present_but_all_dynamic_missing_is_partial(self):
-        """确认身份 + 行存在但涨跌幅/换手/成交额/广度全缺 → partial，不伪 complete。"""
+        """确认身份 + 行存在但涨跌幅/换手/成交额/广度全缺 → partial（东财链语义）。"""
         table = pd.DataFrame({"板块名称": ["白酒Ⅱ"], "板块代码": ["BK1277"]})
         self._mock_vendors(industry="白酒Ⅱ", boards=None, cons=["600519"],
                            board_table=table)
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        a = resp.json()["analysis"]
+        a = self._em_chain_payload()
         self.assertEqual(a["identity"]["subject_status"], "confirmed")
         intraday = a["background"]["intraday"]
         self.assertTrue(intraday["sector_found"])
@@ -1251,11 +1255,7 @@ class TestCompletenessJudgment(SectorReportApiV2TestCase):
         self._mock_vendors(industry="白酒Ⅱ",
                            boards=[("白酒Ⅱ", "BK1277"), ("电池", "BK1033")],
                            cons=["000568", "000596"])
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        assessment = resp.json()["analysis"]["assessment"]
+        assessment = self._em_chain_payload()["assessment"]
         self.assertEqual(assessment["completeness"], "partial")
         self.assertTrue(
             any("归属未确认" in r for r in assessment["reasons"]),
@@ -1331,8 +1331,14 @@ class TestFetchBudgetCoverage(SectorReportApiV2TestCase):
         self.assertEqual(lst["total"], 1)
 
     def test_timeout_no_archive_and_late_io_not_adopted(self):
-        """预算 1s（收尾余量 0.5s → 取数预算 0.5s）：供应商延迟 0.8s 超钳制
-        → 放弃等待 → 504 不存档；晚到 IO 不采纳。"""
+        """预算 1s（收尾余量 0.5s → 取数预算 0.5s）：供应商延迟 0.8s 超钳制。
+
+        issue #99 amend 三轮：兜底核心阶段撞取数截止（BudgetExhausted）时
+        **保留申万口径部分报告并存档**（总截止仍活，不伪报总超时——504 终态
+        由真实总截止的渲染/写盘/提交边界把关，覆盖见
+        test_render_overruns_budget_no_archive）；晚到供应商结果不采纳的
+        性质不变（延迟 0.8s 的东财行业信息从不进入任何存档载荷）。
+        """
         os.environ["SECTOR_ANALYSIS_REPORT_TIMEOUT_SECONDS"] = "1"
         Config.reset_instance()
         self._mock_vendors(industry="白酒Ⅱ", boards=[("白酒Ⅱ", "BK1277")],
@@ -1340,11 +1346,21 @@ class TestFetchBudgetCoverage(SectorReportApiV2TestCase):
         resp = self.client.post(
             "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
         )
-        self.assertEqual(resp.status_code, 504, resp.text)
-        self.assertIn("超时", resp.json()["message"])
+        self.assertEqual(resp.status_code, 200, resp.text)  # 总截止未过 → 非 504
+        analysis = resp.json()["analysis"]
+        # 申万口径部分保留（本用例凭据未配置 → 主体 missing 的部分报告）
+        self.assertEqual(analysis["research_basis"], "sw2021_l1")
+        self.assertEqual(analysis["identity"]["subject_status"], "missing")
+        self.assertTrue(any("核心阶段到达取数截止" in g for g in analysis["gaps"]))
+        # 晚到 IO 不采纳：延迟供应商的行业事实（白酒Ⅱ/BK1277）不在任何载荷
+        self.assertNotIn("BK1277", resp.text)
+        # 部分报告存档可回看（1 条记录），渲染正文一致
         lst = self.client.get("/api/v1/sector-analysis/reports").json()
-        self.assertEqual(lst["total"], 0)  # 无伪成功记录
-        self.assertFalse(self.report_dir.exists() and any(self.report_dir.iterdir()))
+        self.assertEqual(lst["total"], 1)
+        rid = lst["data"][0]["id"]
+        download = self.client.get(f"/api/v1/sector-analysis/reports/{rid}/markdown")
+        self.assertEqual(download.status_code, 200)
+        self.assertNotIn("BK1277", download.text)
 
 
 class TestPersistenceDeadline(SectorReportApiV2TestCase):
@@ -1699,15 +1715,16 @@ class TestSupplierNonFiniteNumericQualification(SectorReportApiV2TestCase):
     不伪造动量分位/正文 nan%；其余有效事实与存档语义保持正常。"""
 
     def test_nan_change_pct_partial_not_pseudo_complete(self):
+        """非有限涨跌幅缺失（东财链语义）：无动量/排名，缺口如实、无 nan 正文。
+
+        存档/下载一致性由 API 闭环用例覆盖；此处直调东财链断言载荷与
+        渲染正文（渲染同一函数，存档写同一字符串）。
+        """
         table = _board_table([("白酒Ⅱ", "BK1277"), ("电池", "BK1033"), ("银行", "BK0475")])
         table.loc[0, "涨跌幅"] = float("nan")
         self._mock_vendors(industry="白酒Ⅱ", boards=None, cons=["600519"],
                            board_table=table)
-        response = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台")
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        analysis = body["analysis"]
+        analysis = self._em_chain_payload()
         intraday = analysis["background"]["intraday"]
         # 行命中（其他事实保留）但涨跌幅缺失：无动量/排名，缺口如实
         self.assertTrue(intraday["sector_found"])
@@ -1723,20 +1740,7 @@ class TestSupplierNonFiniteNumericQualification(SectorReportApiV2TestCase):
         self.assertEqual(assessment["completeness"], "partial")
         self.assertTrue(assessment["reasons"])
         self.assertTrue(any("动量" in r for r in assessment["reasons"]))
-        # API 响应与存档一致：change_pct null、无 nan 正文
-        self.assertIn("change_pct", response.text)
-        self.assertIsNone(intraday["row"]["change_pct"])
-        # 真实临时 SQLite + 文件：存档语义正常（不是 500/不存档）
-        rows, total = self.db.list_sector_analysis_reports()
-        self.assertEqual(total, 1)
-        self.assertEqual(len(list(self.report_dir.glob("*.md"))), 1)
-        rid = rows[0]["id"]
-        detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
-        self.assertEqual(detail.status_code, 200)
-        download = self.client.get(f"/api/v1/sector-analysis/reports/{rid}/markdown")
-        self.assertEqual(download.status_code, 200)
-        self.assertNotIn("nan%", download.text)
-        self.assertNotIn("nan%", body["markdown"])
+        self.assertNotIn("nan%", self._em_chain_markdown(analysis))
 
     def test_inf_change_pct_also_missing(self):
         """无穷大同理：非有限一律缺失，不参与分位、不写正文。"""
@@ -1909,7 +1913,7 @@ class TestTrendPeersClosedLoop(SectorReportApiV2TestCase):
     # ---- 资格边界 ----
 
     def test_unverified_membership_no_trend_outbound(self):
-        """成分验证未通过：不发趋势/基准出站，趋势/同业块 eligible=False。"""
+        """成分验证未通过：不发趋势/基准出站，趋势/同业块 eligible=False（东财链语义）。"""
         expected = self._real_window()
         boards = _board_table([("白酒Ⅱ", "BK1277")])
         # 成分不含目标股 → unverified
@@ -1919,11 +1923,7 @@ class TestTrendPeersClosedLoop(SectorReportApiV2TestCase):
             board_hist=_daily_hist_df(expected),
             bench_hist=_daily_hist_df(expected, date_col="date", close_col="close"),
         )
-        resp = self.client.post(
-            "/api/v1/sector-analysis/generate?stock_code=600519&stock_name=贵州茅台"
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        analysis = resp.json()["analysis"]
+        analysis = self._em_chain_payload()
         self.assertEqual(analysis["identity"]["subject_status"], "unverified")
         self.assertFalse(analysis["sector_trend"]["eligible"])
         self.assertFalse(analysis["sector_peers"]["eligible"])

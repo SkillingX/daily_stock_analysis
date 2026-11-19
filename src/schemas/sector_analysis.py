@@ -79,8 +79,25 @@ Completeness = Literal["complete", "partial"]
   核心动态未取得（行存在 ≠ 数据取得）、或成分 unverified（归属未确认）
 """
 
-PayloadVersion = Literal[2]
-"""板块报告载荷版本。"""
+ResearchBasis = Literal["sw2021_l1", "eastmoney_board"]
+"""报告实际研究口径（issue #99 追加；两套口径的动态事实不拼接）：
+- ``sw2021_l1``：申万 2021 一级行业（iFinD 标准 HTTP 归属与指数行情）
+- ``eastmoney_board``：东财行业板块（有界兜底链路，旧规则口径）
+None 仅允许出现在追加字段之前存档的存量 v2 记录（读回兼容），新生成
+报告必须携带。"""
+
+ResearchOutcome = Literal["kept_sw_stage", "switched_fallback", "partial_recovery"]
+"""兜底结果显式区分（issue #99 amend 追加；部分失败恢复 ≠ 成功切换）：
+- ``kept_sw_stage``：申万链路达门槛之上，未触发兜底（v3 阶段载荷）
+- ``switched_fallback``：东财主行业按旧规则确认且至少一项核心行情恢复，
+  完整切换为东财口径报告（同业/研究只运行一次）
+- ``partial_recovery``：东财主体一致锁定但核心行情未恢复，保留东财口径
+  既有身份/可用资料（研究不运行、完整性部分），非成功切换
+None 仅兼容追加前的存量记录。"""
+
+PayloadVersion = Literal[2, 3]
+"""板块报告载荷版本。3 = 申万口径报告（issue #99 起；#101 起研究块随载荷
+透出，完整性按实际取得的合格证据判定）。"""
 
 
 _GapList = List[Annotated[str, Field(min_length=1, max_length=200)]]
@@ -100,6 +117,29 @@ class SWChain(_StrictBase):
     gaps: _GapList = Field(default_factory=list, max_length=10)
 
 
+class SwMembershipDetail(_StrictBase):
+    """申万指数成分边界明细（issue #100；三态：已纳入/明确未纳入/未知）。
+
+    ``status=included`` 只需 positive evidence（目标带交易所身份在同日成分
+    集合中）；``excluded`` 需要完整集合证据（现场 p03473 无完整性元数据，
+    此态仅受控/证据升级路径可达）；``unknown`` 为现场常态（无完整性证据的
+    列表未找到目标股不能证明非成员，查询失败同样不是非成员）。
+    ``member_count`` 是响应观测行数（非全集计数）；``completeness_evidence``
+    为 None 即完整性不可证。
+    """
+
+    status: Literal["included", "excluded", "unknown"]
+    index_code: Annotated[str, Field(min_length=1, max_length=16)]
+    index_name: Optional[Annotated[str, Field(max_length=64)]] = None
+    observation_date: Annotated[str, Field(min_length=8, max_length=10)]
+    member_count: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
+    completeness_evidence: Optional[Annotated[str, Field(max_length=200)]] = None
+    source: Annotated[str, Field(min_length=1, max_length=200)] = (
+        "iFinD 标准HTTP指数成分（data_pool p03473，iv_date + iv_zsdm）")
+    target_secucode: Annotated[str, Field(min_length=1, max_length=16)]
+    gaps: _GapList = Field(default_factory=list, max_length=10)
+
+
 class MembershipInfo(_StrictBase):
     """东财板块归属验证结果（成分集合含目标股才算 confirmed）。
 
@@ -110,6 +150,9 @@ class MembershipInfo(_StrictBase):
       RPT_F10_CORETHEME_BOARDTYPE 反向查询，BOARD_TYPE=行业校验+分页核完+
       去重；与 clist 成分表同语义，member_count 与同业成分快照可用，成员
       行情为逐股采集，批次时间范围在同业缺口如实标注）
+    - ``sw_index_members``（issue #100）：申万一级指数同日成分集合含目标股
+      （带交易所身份精确匹配；三态明细见 ``sw_membership``，verified 仅在
+      included 时 True——excluded/unknown 不冒充归属验证通过）
     F10 所属板块声明只用于**精确板块锁定**（BOARD_TYPE=行业、LEVEL=2 唯一
     命中），不作为归属确认证据——完整反向成员不可得时归属保持 unverified
     （root 收敛轮：confirmed 必须有成分集合验证，无更弱确认口径）。
@@ -117,7 +160,11 @@ class MembershipInfo(_StrictBase):
 
     verified: bool = False
     member_count: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
-    verified_source: Optional[Literal["cons_table", "f10_members"]] = None
+    verified_source: Optional[Literal["cons_table", "f10_members",
+                                      "sw_index_members"]] = None
+    sw_membership: Optional[SwMembershipDetail] = None
+    """申万指数成分边界三态明细（issue #100 追加兼容字段；东财口径为 None，
+    存量载荷读回不受影响）。"""
 
 
 class BoardIdentity(_StrictBase):
@@ -230,6 +277,16 @@ class IntradayPillar(_StrictBase):
     rank_of: Optional[int] = Field(default=None, ge=1)
     total_boards: Optional[int] = Field(default=None, ge=1)
     row: IntradayRow = Field(default_factory=IntradayRow)
+    snapshot_date: Optional[Annotated[str, Field(min_length=10, max_length=10)]] = None
+    """快照行情的实际交易日（YYYY-MM-DD；issue #99 追加兼容字段）。
+
+    目标交易日行情未取得而展示最近已完成交易日参考行情时，为参考日
+    （目标日缺口随 gaps/reasons 透出）；默认 None 仅兼容存量记录。"""
+    snapshot_mode: Optional[Literal["target", "reference"]] = None
+    """快照实际采用口径的显式标注（issue #99 amend 追加；渲染按此字段而非
+    日期对比判断参考口径——目标日盘中合格行情不是参考口径）。``target``=
+    目标交易日口径；``reference``=立即上一已完成交易日参考口径。默认 None
+    仅兼容存量记录。"""
     snapshot_source: Optional[Annotated[str, Field(max_length=200)]] = None
     """当日行情快照来源/时点说明：东财行业板块全表路径为 None（口径见文档）；
     全表不可用时单标的快照来源如实标注（stock/get 原样映射或 trends2
@@ -336,6 +393,9 @@ class PeerItem(_StrictBase):
     change_pct: Optional[float] = None
     """快照观测的当日涨跌幅；缺失为 None，不影响样本成员资格。"""
     is_target: bool = False
+    as_of_date: Optional[Annotated[str, Field(min_length=8, max_length=10)]] = None
+    """行情归属交易日（issue #100 追加兼容字段；东财 clist 快照路径 None，
+    申万独立行情事实携带——参考行情日期贯穿证据，不冒充当日截面）。"""
 
 
 class SectorPeersBlock(_StrictBase):
@@ -379,6 +439,15 @@ class SectorPeersBlock(_StrictBase):
     quotes_as_of: Optional[Annotated[str, Field(max_length=240)]] = None
     """成员行情供应商时点说明（逐股采集的来源/时间窗；F10 成员集合路径携带，
     clist 成分快照路径为 None——采集时间不冒充供应商时间）。"""
+    industry_reference: bool = False
+    """同业是否仅为行业参考（issue #100 追加兼容字段）：目标股明确未纳入或
+    成分状态未知时 True——同业为纯成分口径，成分内名次与前五资格留空，
+    目标股经 ``target_independent_quote`` 独立展示。"""
+    target_independent_quote: Optional[PeerItem] = None
+    """目标股独立行情事实（issue #100 追加兼容字段；仅未确认成分时携带）。
+    独立事实不进 ``items``、不参与任何排名——目标股行情不得经由同业证据
+    进入成分比较。仅在行情行有**有效成交额（含已知零）或合格涨跌幅**时
+    发布数值块；数值全缺时不发布块（明确缺口承载，无登记事实）。"""
     gaps: _GapList = Field(default_factory=list, max_length=14)
 
 
@@ -656,6 +725,11 @@ class SectorReportPayload(_StrictBase):
     """
 
     payload_version: PayloadVersion
+    # ---- v3 追加（issue #99）：实际研究口径。None 仅兼容追加前的存量
+    # v2 记录读回；新生成报告必须携带（compose 契约保证）----
+    research_basis: Optional[ResearchBasis] = None
+    # ---- amend 追加（issue #99）：兜底结果显式区分（部分恢复 ≠ 成功切换）----
+    research_outcome: Optional[ResearchOutcome] = None
     stock_code: Annotated[str, Field(min_length=6, max_length=6, pattern=r"^\d{6}$")]
     stock_name: Annotated[str, Field(min_length=1, max_length=64)]
     generated_at: Annotated[str, Field(min_length=10, max_length=32)]

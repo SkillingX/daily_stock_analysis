@@ -537,15 +537,26 @@ class TestComposeReport:
         assert payload["assessment"]["status"] == "insufficient_data"
 
     def test_unverified_membership_still_renders_with_gap(self):
-        """板块锁定但成分未验证：部分报告继续（unscored + 明确缺口），不假成功。"""
-        from src.services.sector_analysis_service import compose_report
+        """板块锁定但成分未验证：部分报告继续（unscored + 明确缺口），不假成功。
+
+        issue #99 后本类用例针对东财兜底链断言；申万优先编排的切换决策
+        （EM unverified 不切换、保留申万事实）见 test_sector_sw_compose_v99.py。
+        #102 复审后走生产拆缝（core + from_core），转发入口已移除。
+        """
+        from src.services.sector_analysis_service import (
+            _compose_eastmoney_core,
+            _compose_eastmoney_report_from_core,
+        )
 
         self._identity.update({
             "subject_status": "unverified",
             "membership": {"verified": False, "member_count": 20},
             "gaps": ["东财板块「白酒Ⅱ」（BK1277）成分 20 只不含目标股 600519，归属未确认"],
         })
-        payload = compose_report("600519", "贵州茅台", budget=_budget())
+        budget = _budget()
+        core = _compose_eastmoney_core("600519", budget=budget)
+        payload = _compose_eastmoney_report_from_core(
+            core, "600519", "贵州茅台", budget=budget)
         assert payload["assessment"]["status"] == "unscored"
         assert any("归属未确认" in g for g in payload["gaps"])
 

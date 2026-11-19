@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # 有界常量（与 schema 上限对齐；不做配置项）
 # ---------------------------------------------------------------------------
 
+CATALYST_WINDOW_DAYS = 7
 CATALYST_SEARCH_LIMIT = 10   # 过滤前请求条数
 CATALYST_DISPLAY_CAP = 5      # 已证实催化展示上限（模型输入同界）
 CATALYST_BACKGROUND_CAP = 3   # 无日期/降级背景线索上限
@@ -577,7 +578,13 @@ class EvidenceEntry:
 
 class EvidenceRegistry:
     """实际合格证据登记表：缺失事实不注册（模型不可引用）；
-    引用资格按实际注册 ID 校验，陈述文本不含明确业务量值（有限合同）。"""
+    引用资格按实际注册 ID 校验，陈述文本不含明确业务量值（有限合同）。
+
+    ``register_detached`` 登记**不可引用**事实（issue #98 复审证据日期纪律）：
+    服务端程序化摘要仍可经 ``get`` 按真实日期渲染，但不进入 ``ids`` /
+    ``facts`` / ``backgrounds``——模型不可引用（引用校验按实际可引用 ID
+    拒绝）、不进入模型投影（观察关系按可引用集过滤）。适用于带真实日期但
+    不得作为当日截面证据的参考口径行情、未确认成分的独立目标行情。"""
 
     def __init__(self) -> None:
         self._entries: Dict[str, EvidenceEntry] = {}
@@ -588,6 +595,16 @@ class EvidenceRegistry:
             raise ValueError(f"evidence_id 重复注册: {entry.evidence_id}")
         self._entries[entry.evidence_id] = entry
         self._order.append(entry.evidence_id)
+
+    def register_detached(self, entry: EvidenceEntry) -> None:
+        """登记不可引用事实：get 可取（服务端摘要），不出现在可引用集。"""
+        if entry.evidence_id in self._entries:
+            raise ValueError(f"evidence_id 重复注册: {entry.evidence_id}")
+        self._entries[entry.evidence_id] = entry
+
+    def citable(self, evidence_id: str) -> bool:
+        """该 ID 当前是否可被模型引用（register 过；detached 不算）。"""
+        return evidence_id in set(self._order)
 
     def get(self, evidence_id: str) -> Optional[EvidenceEntry]:
         return self._entries.get(evidence_id)
@@ -842,20 +859,35 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
     每个关系单一 owner（现有装配缝）：只呈现已采纳值的符号关系、已存的
     板块对基准相对关系、样本选取含义与单期范围——不投影 raw percentile/
     rank/价格/收益 magnitudes 供模型重新解读；原始值逐字保留在公开载荷/
-    存档与报告服务端表格。缺失块省略（不填充）。
+    存档与报告服务端表格。缺失块省略（不填充）。**只投影可引用证据**
+    （``registry.citable``）：不可引用登记（detached，如参考口径行情、
+    未确认成分的独立目标行情）不进入模型 wire，也不可作为引用依据。
     """
     observations: List[Dict[str, str]] = []
-    intraday = registry.get("intraday")
+    intraday = (registry.get("intraday")
+                if registry.citable("intraday") else None)
     if intraday:
         m = json.loads(intraday.material)
         parts = []
         sign = _sign_word(m.get("change_pct"))
-        if sign:
-            parts.append(f"板块指数当日{sign}")
+        # 快照口径/实际行情日期贯穿投影（issue #101 证据日期纪律）：申万
+        # 参考口径按真实参考交易日表述，参考日行情不表述为当日、不与当日
+        # 事实拼接同一截面；东财路径无 snapshot_mode 键，保持既有语义。
+        reference_mode = (m.get("snapshot_mode") == "reference"
+                          and m.get("snapshot_date"))
+        if reference_mode:
+            day_label = f"参考交易日（{m['snapshot_date']}）"
+            scope_note = ("参考口径：目标交易日合格行情未取得；参考日行情不进入"
+                          "当日证据，不与当日事实拼接同一截面")
         else:
-            parts.append("板块指数当日涨跌方向未取得")
-        parts.append("当日行情为单期快照，分位/占比类指标仅表示横截面相对"
-                     "位置，不提供方向或历史动量证据")
+            day_label = "当日"
+            scope_note = ("当日行情为单期快照，分位/占比类指标仅表示横截面相对"
+                          "位置，不提供方向或历史动量证据")
+        if sign:
+            parts.append(f"板块指数{day_label}{sign}")
+        else:
+            parts.append(f"板块指数{day_label}涨跌方向未取得")
+        parts.append(scope_note)
         # 口径元数据随观察关系进模型 wire（root 反例：材料带来源/asof 但投影
         # 丢失）；纯口径描述，不投影 raw magnitudes（数值仍只在公开载荷）
         if m.get("snapshot_source"):
@@ -864,7 +896,7 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
             "evidence_id": "intraday",
             "observation": "；".join(parts) + "。",
         })
-    trend = registry.get("trend")
+    trend = (registry.get("trend") if registry.citable("trend") else None)
     if trend:
         m = json.loads(trend.material)
         parts = []
@@ -886,7 +918,7 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
             "evidence_id": "trend",
             "observation": "；".join(parts) + "。",
         })
-    peers = registry.get("peers")
+    peers = (registry.get("peers") if registry.citable("peers") else None)
     if peers:
         m = json.loads(peers.material)
         rule = m.get("selection_rule")
@@ -894,6 +926,18 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
         if rule:
             parts.append(f"同业样本选取口径：{rule}")
         items = m.get("items") or []
+        # 行情归属交易日（issue #101 证据日期纪律）：成员行携带统一真实
+        # 日期时按该日期表述（多日期显式区间，不并作一日）；日期缺失
+        # （东财快照路径）保持「当日」。
+        item_dates = sorted({str(i.get("as_of_date")) for i in items
+                             if i.get("as_of_date")})
+        if not item_dates:
+            day_label = "当日"
+        elif len(item_dates) == 1:
+            day_label = f"行情日（{item_dates[0]}）"
+        else:
+            day_label = (f"行情日（{item_dates[0]}~{item_dates[-1]}，"
+                         "跨日不并作一日）")
         # P1 证据缺口纪律：任何成员缺有效涨跌观测（None ≠ 0，零是有效
         # 「持平」观测）时不得得出全样本方向结论——公开载荷如实保留该成员
         # 与比较范围缺口，模型投影同样只披露不完整观测，不推断整体方向。
@@ -901,14 +945,14 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
                     if i.get("change_pct") is not None]
         missing = len(items) - len(observed)
         if missing:
-            parts.append(f"样本内 {missing} 家当日涨跌观测缺失，"
+            parts.append(f"样本内 {missing} 家{day_label}涨跌观测缺失，"
                          "无法得出全样本方向结论")
         elif observed:
             unique = set(observed)
             if len(unique) == 1:
-                parts.append(f"样本内当日涨跌方向一致（{observed[0]}）")
+                parts.append(f"样本内{day_label}涨跌方向一致（{observed[0]}）")
             else:
-                parts.append("样本内当日涨跌方向存在差异")
+                parts.append(f"样本内{day_label}涨跌方向存在差异")
         # 口径元数据随观察关系进模型 wire（root final 反例：只写「见公开载荷」
         # 不等于把实际来源/时点传给模型——模型没有该载荷）。保留实际供应商
         # 来源、成交额口径、衍生标记、供应商时点与时间窗、子集范围文本；
@@ -928,15 +972,24 @@ def market_observation_relations(registry: EvidenceRegistry) -> List[Dict[str, s
             "evidence_id": "peers",
             "observation": "；".join(parts) + "。",
         })
-    target = registry.get("target")
+    target = (registry.get("target") if registry.citable("target") else None)
     if target:
         m = json.loads(target.material)
         sign = _sign_word(m.get("snapshot_change_pct"))
         name = m.get("stock_name") or "目标股"
         if sign:
+            # 行情归属日（issue #101 证据日期纪律）：携带真实日期按日期表述
+            # （含目标独立行情——未确认成分，独立事实不进入同业成分比较）；
+            # 无日期（东财路径）保持「当日」。
+            as_of = m.get("as_of_date")
+            day_text = f"行情日（{as_of}）" if as_of else "当日"
+            if m.get("independent"):
+                note = "（独立事实，未确认成分，不进入同业成分比较）"
+            else:
+                note = "（单期快照）"
             observations.append({
                 "evidence_id": "target",
-                "observation": f"目标股{name}当日{sign}（单期快照）。",
+                "observation": f"目标股{name}{day_text}{sign}{note}。",
             })
     return observations
 
@@ -952,14 +1005,22 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
         m = json.loads(intraday.material)
         chg = m.get("change_pct")
         seg = []
+        # 快照口径/实际行情日期贯穿事实摘要（issue #101 证据日期纪律）：
+        # 参考口径按真实参考交易日表述，不冒充当日；东财路径无此键保持原语义。
+        reference_mode = (m.get("snapshot_mode") == "reference"
+                          and m.get("snapshot_date"))
+        day_label = (f"参考交易日（{m['snapshot_date']}）"
+                     if reference_mode else "当日")
         if chg is not None:
-            seg.append(f"板块指数当日涨跌幅 {chg}%（{_sign_word(chg)}）")
+            seg.append(f"板块指数{day_label}涨跌幅 {chg}%（{_sign_word(chg)}）")
         rank_of, total = m.get("rank_of"), m.get("total_boards")
         if rank_of is not None and total is not None:
             seg.append(f"全表涨跌幅排名 {rank_of}/{total}")
         breadth = m.get("breadth")
         if breadth is not None:
-            seg.append(f"当日上涨家数占比 {breadth}%")
+            # 广度归属日与涨跌幅同段同日（参考口径按真实参考交易日表述，
+            # 不冒充当日——字段日期屏幕，与模型投影无关的确定性输出同样适用）
+            seg.append(f"{day_label}上涨家数占比 {breadth}%")
         momentum = m.get("momentum")
         if momentum is not None:
             seg.append(f"涨跌幅分位 {momentum}/100（横截面相对位置，"
@@ -998,7 +1059,18 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
         if rule:
             seg.append(f"同业样本（{rule}）")
         if items:
-            seg.append(f"样本 {len(items)} 家（快照当日口径）")
+            # 行情归属日（issue #101 证据日期纪律）：成员携带统一真实日期
+            # 时按该日期表述（多日期显式区间）；缺失保持既有「快照当日口径」。
+            item_dates = sorted({str(i.get("as_of_date")) for i in items
+                                 if i.get("as_of_date")})
+            if not item_dates:
+                scope = "快照当日口径"
+            elif len(item_dates) == 1:
+                scope = f"同日行情 {item_dates[0]}"
+            else:
+                scope = (f"行情 {item_dates[0]}~{item_dates[-1]}"
+                         "（跨日不并作一日）")
+            seg.append(f"样本 {len(items)} 家（{scope}）")
         # 成交额来源口径与供应商时点贯穿事实摘要（衍生值不冒充原样字段）
         if m.get("quotes_as_of"):
             seg.append(f"行情时点：{m['quotes_as_of']}")
@@ -1010,7 +1082,15 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
         chg = m.get("snapshot_change_pct")
         name = m.get("stock_name") or "目标股"
         if chg is not None:
-            parts.append(f"目标股{name}当日涨跌幅 {chg}%（{_sign_word(chg)}）")
+            as_of = m.get("as_of_date")
+            day_text = f"行情日（{as_of}）" if as_of else "当日"
+            if m.get("independent"):
+                parts.append(f"目标股{name}{day_text}涨跌幅 {chg}%"
+                             f"（{_sign_word(chg)}；独立事实，未确认成分，"
+                             "不进入同业成分比较）")
+            else:
+                parts.append(f"目标股{name}{day_text}涨跌幅 {chg}%"
+                             f"（{_sign_word(chg)}）")
     if not parts:
         return "服务端事实摘要：本次无已采纳的市场事实块（缺口见下方披露）。"
     return "。".join(parts) + "。"
@@ -1022,10 +1102,15 @@ def program_fact_limitations(registry: EvidenceRegistry) -> Optional[str]:
     缺失块省略（缺口由编排层如实披露）；全部块缺失时 None。"""
     parts: List[str] = []
     if registry.get("intraday"):
-        parts.append("当日行情为单期快照，不外推历史趋势；涨跌幅分位仅为"
-                     "横截面相对位置，不提供方向或历史动量证据")
-        parts.append("行情与换手表现不构成资金流入流出或投资者偏好证据")
         m = json.loads(registry.get("intraday").material)  # type: ignore[union-attr]
+        if m.get("snapshot_mode") == "reference" and m.get("snapshot_date"):
+            parts.append(f"板块行情为参考交易日（{m['snapshot_date']}）单期"
+                         "快照（参考口径：目标交易日合格行情未取得），不外推"
+                         "历史趋势，参考日行情不进入当日证据")
+        else:
+            parts.append("当日行情为单期快照，不外推历史趋势；涨跌幅分位仅为"
+                         "横截面相对位置，不提供方向或历史动量证据")
+        parts.append("行情与换手表现不构成资金流入流出或投资者偏好证据")
         if m.get("snapshot_derived"):
             parts.append("当日板块快照为供应商分钟累计衍生口径"
                          "（trends2 求和，非原样快照字段；时点见载荷）")

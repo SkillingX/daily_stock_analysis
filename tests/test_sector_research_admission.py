@@ -49,14 +49,14 @@ class _FakeProvider:
         self._rows = rows
         self._success = success
         self._error_message = error_message
-        self.calls: List[str] = []
+        self.calls: List[tuple[str, int]] = []
 
     @property
     def is_available(self) -> bool:
         return True
 
     def search(self, query: str, max_results: int = 5, days: int = 7):
-        self.calls.append(query)
+        self.calls.append((query, days))
         results = [SearchResult(**row) for row in self._rows]
         return type("R", (), {
             "query": query, "results": results, "provider": self.name,
@@ -558,13 +558,12 @@ class TestOneAdmissionPath:
 
     def test_declared_day_earlier_than_window_downgraded_both_paths(
             self, monkeypatch):
-        # root 边界反例（边界终态）：标题声明完整日 11-01 早于窗口起始
-        # （today-2），发布/文章元数据日期都是今天（窗口内）→ 两条日期
-        # 路径都降级背景；声明日不降精度为月（旧实现月=窗口月 → 放行）
-        today = _today().isoformat()
+        # 发布日期在窗口内，标题声明的事件日期早于窗口且属于回顾。
+        today = _today()
+        event_day = today - timedelta(days=7)
+        title = f"白酒行业{event_day.year}年{event_day.month}月{event_day.day}日政策回顾"
         out = _run_admission(monkeypatch, [
-            _result("白酒行业2026年11月1日政策回顾",
-                    "https://example.com/news/old-day", published=today),
+            _result(title, "https://example.com/news/old-day", published=today.isoformat()),
         ])
         assert out["items"] == []
         assert len(out["background_items"]) == 1
@@ -572,7 +571,7 @@ class TestOneAdmissionPath:
         # article-metadata 路径：同标题 + 今日元数据确证 → 升级重入资格降级
         url = "https://example.com/news/old-day-meta.html"
         out = _run_admission(monkeypatch, [
-            _result("白酒行业2026年11月1日政策回顾", url, snippet="回顾政策"),
+            _result(title, url, snippet="回顾政策"),
         ], probe_results={url: _META_HTML.format(
             ts=_today().isoformat() + "T09:00:00")})
         assert out["items"] == []
@@ -1129,21 +1128,31 @@ class TestEligibilityAndSharedFilters:
         assert out["eligible"] is False
         assert provider.calls == []  # 未出站
 
-    def test_shared_news_window_used(self, monkeypatch):
+    def test_sector_uses_seven_calendar_days_independent_of_shared_window(self, monkeypatch):
         from src.search_service import get_search_service
 
-        provider = _FakeProvider([])
-        _install_provider(monkeypatch, provider)
-        svc._catalysts_pillar(
-            "白酒Ⅱ", budget=_budget(), subject_confirmed=True, stock_name="贵州茅台",
-        )
+        today = _today()
+        earliest = (today - timedelta(days=6)).isoformat()
+        before_window = (today - timedelta(days=7)).isoformat()
         search_svc = get_search_service()
+        monkeypatch.setattr(search_svc, "news_window_days", 3)
+        provider = _FakeProvider([
+            _result("白酒行业发布消费新政策", "https://example.com/in", published=earliest),
+            _result("白酒行业出台流通管理办法", "https://example.com/out", published=before_window),
+        ])
+        _install_provider(monkeypatch, provider)
+
         out = svc._catalysts_pillar(
             "白酒Ⅱ", budget=_budget(), subject_confirmed=True, stock_name="贵州茅台",
         )
-        # 窗口来自共享配置（news_window_days），不另设假设多窗口
-        assert out["window_days"] == int(search_svc.news_window_days)
-        assert out["window_end"] == _today().isoformat()
+
+        assert provider.calls == [(out["query"], 7)]
+        assert search_svc.news_window_days == 3
+        assert out["window_days"] == 7
+        assert out["window_start"] == earliest
+        assert out["window_end"] == today.isoformat()
+        assert [item["published_date"] for item in out["items"]] == [earliest]
+        assert out["dropped_offwindow"] == 1
 
     def test_search_budget_exhausted_returns_gap_not_raise(self, monkeypatch):
         provider = _FakeProvider([_result("白酒新政策", "https://a.com/1",

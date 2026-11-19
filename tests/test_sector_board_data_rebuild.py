@@ -659,7 +659,11 @@ def test_prosperity_snapshot_recovery_threading_provenance(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 def test_identity_f10_claim_lock_confirmed(monkeypatch) -> None:
-    """akshare 全链不可用：F10 声明锁定 + 反向完整成员 → confirmed(f10_members)。"""
+    """akshare 全链不可用：F10 声明锁定 + 反向完整成员 → confirmed(f10_members)。
+
+    issue #99 amend 四：身份阶段只锁定 verified 身份与成分快照，**不做成员
+    行情逐股补采**（延迟到东财兜底研究阶段——切换未发生时零被弃行情出站）。
+    """
     from src.services import sector_analysis_service as svc
 
     def _ak_down(*a, **k):  # noqa: ANN002 - 透传替身
@@ -673,16 +677,17 @@ def test_identity_f10_claim_lock_confirmed(monkeypatch) -> None:
     members_rows = [_f10_row(*_REAL_BAIJIU_ROWS[0]),  # 酒鬼酒
                     _f10_row(*_REAL_BAIJIU_ROWS[3])]  # 贵州茅台（目标股）
     budget = ReportBudget(60)
+
+    def _no_member_quotes(*a, **k):  # noqa: ANN002 - 身份阶段禁止行情补采
+        raise AssertionError("身份阶段不应运行成员行情补采（issue #99 amend 四）")
+
+    monkeypatch.setattr(svc, "_collect_member_quotes", _no_member_quotes)
     _install_wire(monkeypatch, _route_by_secid({
         "f10claims:600519.SH": _f10_ok(
             [_f10_row(*_REAL_BAIJIU_ROWS[3]),
              _f10_row("600519.SH", "600519", "贵州茅台", "BK0001", "白酒概念",
                       board_type="概念", board_level="1")]),
         "f10members:BK1277": {"1": _f10_ok(members_rows, count=2, pages=1)},
-        # 成员行情：目标股 stock/get 成功（真实 quote fixture），另一成员拒绝
-        "stockget:1.600519": _load("stock-quote.json"),
-        "stockget:0.000799": requests.ConnectionError("拒绝窗口"),
-        "trends2:0.000799": requests.ConnectionError("拒绝窗口"),
     }))
     ident = svc._identify_sector("600519", budget=budget)
     assert ident["board_code"] == "BK1277"
@@ -694,12 +699,134 @@ def test_identity_f10_claim_lock_confirmed(monkeypatch) -> None:
     assert ident["industry_em"] == "白酒Ⅱ"
     cons = ident["_cons_snapshot"]
     assert isinstance(cons, pd.DataFrame)
-    # 目标股行情已采（f48 原样映射），失败成员保留成员资格、金额 None + 缺口
-    target_row = cons[cons["代码"] == "600519"].iloc[0]
-    assert target_row["成交额"] == 6199528289.0
-    missing = cons[cons["代码"] == "000799"].iloc[0]
-    assert missing["成交额"] is None or pd.isna(missing["成交额"])
-    assert any("trends2" in g or "快照失败" in g for g in ident["gaps"])
+    # 成员快照只含身份列（代码/名称）；行情列由研究阶段延迟补采填充
+    assert list(cons["代码"]) == ["000799", "600519"]
+    assert "成交额" not in cons.columns
+    assert not any("trends2" in g or "快照失败" in g for g in ident["gaps"])
+
+
+def test_f10_member_quotes_deferred_to_research_once(monkeypatch) -> None:
+    """F10 路径（经真实 F10 缝）：切换成功时成员行情补采**恰好一次**，
+    既有 f10_members provenance/批次缺口语义保留（#98 零被弃出站的正向面）。"""
+    from src.services import sector_analysis_service as svc
+
+    def _ak_down(*a, **k):  # noqa: ANN002
+        raise RuntimeError("clist/stock-get 拒绝窗口")
+
+    monkeypatch.setattr(svc, "_bounded_ak", _ak_down)
+    monkeypatch.setattr(svc, "_session_context", _frozen_session_ctx)
+    monkeypatch.setattr(
+        svc, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)
+    members_rows = [_f10_row(*_REAL_BAIJIU_ROWS[2]),  # 山西汾酒 600809
+                    _f10_row(*_REAL_BAIJIU_ROWS[3])]  # 贵州茅台 600519（目标股）
+    calls = {"n": 0}
+    orig = svc._collect_member_quotes
+
+    def _counting(df, *, budget, **kwargs):
+        calls["n"] += 1
+        return orig(df, budget=budget, **kwargs)
+
+    monkeypatch.setattr(svc, "_collect_member_quotes", _counting)
+    # 板块单标的快照（当日行情，切换核心行情来源）：冻结会话内合法的 f86
+    board_quote = {
+        "rc": 0, "rt": 4, "svr": 1, "lt": 1, "full": 1, "dlmkts": "",
+        "dsc": "0",
+        "data": {"f43": 1453.0, "f48": 3100000000.0, "f57": "BK1277",
+                 "f58": "白酒Ⅱ", "f60": 1452.0,
+                 "f86": int(datetime(2026, 11, 6, 22, 0,
+                                     tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+                 "f168": 0.34, "f170": 1.65},
+    }
+    # 两名成员都有合格行情（成交额/涨跌幅已知）→ 富化快照驱动可复核的排名
+    member_quote_600809 = {
+        "rc": 0, "rt": 4, "svr": 1, "lt": 1, "full": 1, "dlmkts": "",
+        "dsc": "0",
+        "data": {"f43": 2100.0, "f48": 2200000000.0, "f57": "600809",
+                 "f58": "山西汾酒", "f60": 2090.0,
+                 "f86": int(datetime(2026, 11, 6, 22, 0,
+                                     tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
+                 "f168": 0.5, "f170": 0.9},
+    }
+    _install_wire(monkeypatch, _route_by_secid({
+        "f10claims:600519.SH": _f10_ok(
+            [_f10_row(*_REAL_BAIJIU_ROWS[3]),
+             _f10_row("600519.SH", "600519", "贵州茅台", "BK0001", "白酒概念",
+                      board_type="概念", board_level="1")]),
+        "f10members:BK1277": {"1": _f10_ok(members_rows, count=2, pages=1)},
+        "stockget:90.BK1277": board_quote,
+        # 成员行情（研究阶段）：两成员均成功（真实 stock/get 形状）
+        "stockget:1.600519": _load("stock-quote.json"),
+        "stockget:1.600809": member_quote_600809,
+    }))
+    budget = ReportBudget(120)
+    payload = svc.compose_report("600519", "贵州茅台", budget=budget)
+    assert calls["n"] == 1  # 切换成功：补采恰好一次（延迟后）
+    assert payload["research_basis"] == "eastmoney_board"
+    assert payload["research_outcome"] == "switched_fallback"
+    assert payload["identity"]["membership"]["verified_source"] == "f10_members"
+    peers = payload["sector_peers"]
+    assert peers is not None and peers["items"]
+    assert peers["source"] == "东财 F10 板块完整成员（身份验证同一集合）"
+    # 富化快照进入同业：成交额/涨跌幅为真实供应商值（身份快照不含行情列——
+    # 回归反例：传原成员快照会丢失全部金额/涨跌幅与排名）
+    items = peers["items"]
+    assert peers["sample_size"] == 2
+    assert peers["rankable_rows"] == 2
+    assert peers["target_in_amount_top5"] is True
+    assert [it["code"] for it in items] == ["600519", "600809"]  # 成交额降序
+    assert items[0]["amount"] == 6199528289.0
+    assert items[0]["change_pct"] == 0.07
+    assert items[0]["is_target"] is True
+    assert items[1]["amount"] == 2200000000.0
+    assert items[1]["change_pct"] == 0.9
+    # 样本内涨跌幅名次（目标 0.07 < 同行 0.9 → 第 2）
+    assert peers["target_change_pct_rank"] == 2
+
+
+def test_f10_member_quotes_not_run_when_not_switched(monkeypatch) -> None:
+    """F10 路径（经真实 F10 缝）：未达切换门槛（部分恢复）时**零**成员行情
+    出站（#98：不运行将被丢弃的研究/行情；wire 未映射成员行情端点——任何
+    尝试都会触发未匹配断言失败）。"""
+    from src.services import sector_analysis_service as svc
+
+    def _ak_down(*a, **k):  # noqa: ANN002
+        raise RuntimeError("clist/stock-get 拒绝窗口")
+
+    monkeypatch.setattr(svc, "_bounded_ak", _ak_down)
+    monkeypatch.setattr(svc, "_session_context", _frozen_session_ctx)
+    monkeypatch.setattr(
+        svc, "_fetch_tencent_member_quotes",
+        lambda df, *, budget, session_ctx: None)
+    members_rows = [_f10_row(*_REAL_BAIJIU_ROWS[0]),
+                    _f10_row(*_REAL_BAIJIU_ROWS[3])]
+    calls = {"n": 0}
+    orig = svc._collect_member_quotes
+
+    def _counting(df, *, budget, **kwargs):
+        calls["n"] += 1
+        return orig(df, budget=budget, **kwargs)
+
+    monkeypatch.setattr(svc, "_collect_member_quotes", _counting)
+    # 东财核心阶段自身可以探测板块单标的快照（核心事实，非研究）——映射为
+    # 失败（零核心行情恢复）；成员行情端点保持未映射 → 任何补采尝试即失败，
+    # 证明部分恢复路径零被弃成员行情出站
+    _install_wire(monkeypatch, _route_by_secid({
+        "f10claims:600519.SH": _f10_ok(
+            [_f10_row(*_REAL_BAIJIU_ROWS[3]),
+             _f10_row("600519.SH", "600519", "贵州茅台", "BK0001", "白酒概念",
+                      board_type="概念", board_level="1")]),
+        "f10members:BK1277": {"1": _f10_ok(members_rows, count=2, pages=1)},
+        "stockget:90.BK1277": requests.ConnectionError("拒绝窗口"),
+        "trends2:90.BK1277": requests.ConnectionError("拒绝窗口"),
+    }))
+    budget = ReportBudget(120)
+    payload = svc.compose_report("600519", "贵州茅台", budget=budget)
+    assert calls["n"] == 0  # 零被弃成员行情出站
+    assert payload["research_outcome"] == "partial_recovery"
+    assert payload["identity"]["membership"]["verified_source"] == "f10_members"
+    assert payload["sector_peers"] is None
+    assert any("部分恢复" in g for g in payload["gaps"])
 
 
 def test_membership_schema_accepts_verified_source_literals() -> None:
