@@ -417,8 +417,10 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertEqual(len(rt_calls), 2)  # 31 指数快照 + 成员批次（included 无独立行情）
         self.assertEqual(len([1 for u, p in stub.calls
                               if "data_pool" in u]), 1)
+        # issue #103：原一级 20 点趋势出站 + 必需研究后的多窗口（5/20/60 日）
+        # 出站各一次；多窗口为新增可选出站，不替代原 20 点请求
         self.assertEqual(len([1 for u, p in stub.calls
-                              if "cmd_history_quotation" in u]), 1)
+                              if "cmd_history_quotation" in u]), 2)
 
         # 存档：详情读回与下载与生成一致（同一载荷/同一 Markdown）
         rows, total = self.db.list_sector_analysis_reports()

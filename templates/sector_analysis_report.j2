@@ -54,6 +54,8 @@
 {% set sw = a.identity.sw_chain %}
 {% set trend = a.get('sector_trend') %}
 {% set peers = a.get('sector_peers') %}
+{% set l2id = a.get('sector_l2_identity') %}
+{% set trend_windows = a.get('sector_trend_windows') %}
 # {{ stock_name }}（{{ stock_code }}）板块分析报告
 
 > 报告 id：{{ report_id }} ｜ 生成时间：{{ as_of }}
@@ -63,6 +65,77 @@
 {% endif %}
 > 采集时点：{{ a.identity.observed_at or '未记录' }} ｜ 供应商数据截止：{{ as_of_text }}
 > 本报告基于公开数据与启发式规则，仅供研究参考，不构成投资建议
+
+{% if is_sw and (l2id or trend_windows or a.get('sector_trend_windows_gaps')) %}
+{% set pr_fs = a.background.intraday %}
+{% set fs_ref = (pr_fs.get('snapshot_mode') == 'reference') %}
+{% set fs_day = '参考日' if fs_ref else '当日' %}
+## 报告速览（首屏）
+
+- 一级 {{ fs_day }}行情：**{{ pr_fs.row.board_name or a.identity.board_name or 'N/A' }}**{% if pr_fs.row.change_pct is number %} ｜ {{ fs_day }}涨跌幅 {{ pr_fs.row.change_pct | round(4) }}%{% elif pr_fs.row.change_pct is not none %} ｜ {{ fs_day }}涨跌幅 {{ pr_fs.row.change_pct }}{% endif %}{% if pr_fs.rank_of is not none and pr_fs.total_boards is not none %} ｜ {{ fs_day }}排名 {{ pr_fs.rank_of }} / {{ pr_fs.total_boards }}（31 个申万一级行业，按{{ fs_day }}涨跌幅）{% endif %}{% if pr_fs.get('snapshot_date') %} ｜ {{ '参考口径 ' + pr_fs.snapshot_date if fs_ref else '行情日期 ' + pr_fs.snapshot_date }}{% if fs_ref %}（目标交易日合格行情未取得，展示最近已完成交易日）{% endif %}{% endif %}{{ '' }}
+{% if l2id %}
+{% if l2id.status == 'confirmed' %}
+- 行业层级：一级 **{{ l2id.l1_parent_name }}** ｜ 二级 **{{ l2id.l2_name }}（{{ l2id.l2_index_code }}）** ｜ 归属观察日 {{ l2id.observation_date or '未知' }}（iFinD 正式二级归属 + 官方发布目录与 iFinD 身份核验唯一映射）
+- 二级目录：{{ l2id.directory_version }}（官方发布目录全集 + iFinD 核验子集；缺失、歧义或仅官方分类未核验时按缺口处理，不按名称近似匹配）
+{% else %}
+- 行业层级：一级 **{{ a.identity.board_name or '未锁定' }}** ｜ 二级对照未采纳{% for g in l2id.gaps %}：{{ g }}{% endfor %}
+{% endif %}
+{% endif %}
+{% if trend_windows %}
+{% set fs_source = trend_windows[0]['series'][0].source if trend_windows[0]['series'] else 'iFinD 标准 HTTP 指数日线' %}
+{% for w in trend_windows %}
+{% set w_series = w['series'] %}
+{% if w_series %}
+**最近 {{ w.window_days }} 个交易日**（{{ w.start_date }} → {{ w.end_date }}，{{ w.point_count }} 个收盘点；盘中未完成交易日不进入）：
+
+| 序列 | 指数 | 窗口收益 | 合格观测 |
+|------|------|----------|----------|
+{% for s in w_series %}
+| {{ {'l2_industry': '二级', 'l1_industry': '一级（主行业）', 'benchmark': '沪深 300'}[s.role] }} | {{ s.name }}（{{ s.index_code }}） | {{ (s.period_return_pct ~ '%') if s.period_return_pct is not none else '留空（缺口见下）' }} | {{ s.qualified_sessions }}/{{ s.expected_sessions }} |
+{% endfor %}
+{% if w.gaps %}
+{% for g in w.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% endif %}
+{% for s in w_series %}
+{% for g in s.gaps %}
+- ⚠️ {{ s.name }}：{{ g }}
+{% endfor %}
+{% endfor %}
+
+{% endif %}
+{% endfor %}
+- 数据来源：{{ fs_source }}（cmd_history_quotation，CPS=1 不复权、Fill=Omit）；收益口径：窗口内首尾收盘复合（间隔数 = 收盘点数 − 1），三条序列从同窗首个收盘日各自合格后对比；图表切换 5/20/60 日使用本存档数据，不重新取数。
+{% if a.get('sector_trend_windows_gaps') %}
+{% for g in a.get('sector_trend_windows_gaps') %}
+- ⚠️ 多窗口趋势缺口：{{ g }}（整链级缺口只在此说明一次，各窗口内缺口见上方对应窗口）
+{% endfor %}
+{% endif %}
+{% elif a.get('sector_trend_windows_gaps') %}
+- ⚠️ 5/20/60 日多窗口趋势未取得{% for g in a.get('sector_trend_windows_gaps') %}：{{ g }}{% endfor %}
+{% endif %}
+{% set cat = a.get('sector_catalysts') %}
+{% set cat_fs = cat.get('first_screen') if cat else none %}
+{% set cat_items = (cat or {}).get('items') or [] %}
+{% if cat_fs and cat_fs.state == 'found' and cat_items %}
+{% set c0 = cat_items[0] %}
+- 近七天催化（首条，共 {{ cat_items | length }} 条已证实）：[{{ c0.title | md_link_text }}]({{ c0.url }})（{{ c0.published_date }} 发布，{{ c0.source_domain }}；全文见「行业催化」节）
+{% elif cat_fs and cat_fs.state == 'none_found' %}
+- 近七天催化：未发现合格催化（检索成功、经统一准入无近期催化；诊断见「行业催化」节）
+{% elif cat_fs and cat_fs.state == 'search_failed' %}
+- 近七天催化：全部检索失败（不冒充「窗口内无新闻」；供应商诊断见「行业催化」节）
+{% elif cat_fs and cat_fs.state == 'partial_failed' %}
+- 近七天催化：部分检索渠道失败且无合格催化（检索成功渠道的候选经准入均未证实；分类诊断见「行业催化」节）
+{% elif cat_fs and cat_fs.state == 'search_unavailable' %}
+- 近七天催化：搜索入口未配置，本次未搜索
+{% elif cat_fs and cat_fs.state == 'budget_exhausted' %}
+- 近七天催化：取数预算不足，搜索未完成（已取得内容保留）
+{% elif cat_items %}
+{% set c0 = cat_items[0] %}
+- 近七天催化（首条，共 {{ cat_items | length }} 条已证实）：[{{ c0.title | md_link_text }}]({{ c0.url }})（{{ c0.published_date }} 发布，{{ c0.source_domain }}；全文见「行业催化」节）
+{% endif %}
+{% endif %}
 
 {% if is_sw %}
 ## 一、主行业定位（申万 2021 一级行业）

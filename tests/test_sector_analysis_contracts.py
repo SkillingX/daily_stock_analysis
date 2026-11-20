@@ -704,3 +704,116 @@ def _dt_factory(*args: int) -> Any:
     from datetime import datetime as _dt
 
     return _dt(*args)
+
+
+# ========================================================================
+# 多窗口序列行契约（issue #103 复审；icontract 出口校验）
+# ========================================================================
+
+
+class TestTrendWindowSeriesContracts:
+    """多窗口序列行跨字段不变式（挂在实际构建路径 ``_sw_trend_windows_pillar``
+    出口）：合格日数与观察明细一致（``qualified_sessions == len(observations)``）、
+    已发布收益对应完整对齐窗口（收益非 None ⇒ 明细覆盖全部期望交易日）。
+    schema 反例（expected=6/qualified=2/observations=[]/return=1）必须被拒。
+    """
+
+    @staticmethod
+    def _full_frames(sessions):
+        import pandas as pd
+
+        def _frame(code):
+            return pd.DataFrame({
+                "date": [d.isoformat() for d in sessions],
+                "close": [100.0 + i for i in range(len(sessions))],
+            })
+
+        return {code: _frame(code) for code in
+                ("801194.SL", "801790.SL", "000300.SH")}
+
+    def _run_pillar(self, monkeypatch, sessions, frames):
+        from src.services import sector_sw_market as sw_mod
+
+        monkeypatch.setattr(svc, "recent_completed_trading_sessions",
+                            lambda market, n, current_time=None: sessions[:n])
+        monkeypatch.setattr(sw_mod, "fetch_index_history",
+                            lambda *a, **k: frames)
+        return svc._sw_trend_windows_pillar(
+            "801194.SL", "保险Ⅱ", "801790.SL", "非银金融",
+            budget=ReportBudget(60.0, finish_margin=5.0),
+            refresh_token="t", timeout_seconds=5.0)
+
+    def test_valid_output_satisfies_contracts(self, monkeypatch):
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        out = self._run_pillar(monkeypatch, sessions,
+                               self._full_frames(sessions))
+        assert svc._trend_window_series_invariants(out)
+        w5 = out["windows"][0]
+        for s in w5["series"]:
+            assert s["qualified_sessions"] == len(s["observations"]) == 6
+            assert s["period_return_pct"] is not None
+
+    def test_observations_missing_violates_contract(self, monkeypatch):
+        """缝反例 A：合格日数与观察明细脱节（明细被清空）→ ViolationError。"""
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        orig = svc._observation_rows
+        monkeypatch.setattr(svc, "_observation_rows", lambda obs: [])
+        with pytest.raises(ViolationError):
+            self._run_pillar(monkeypatch, sessions,
+                             self._full_frames(sessions))
+        monkeypatch.setattr(svc, "_observation_rows", orig)
+
+    def test_published_return_requires_full_window_rows(self, monkeypatch):
+        """缝反例 B：收益已发布但观察明细不完整（截断为一行）→
+        ViolationError（收益只许伴随完整对齐窗口发布）。"""
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        orig = svc._observation_rows
+        monkeypatch.setattr(
+            svc, "_observation_rows",
+            lambda obs: orig(dict(list(obs.items())[:1])))
+        with pytest.raises(ViolationError):
+            self._run_pillar(monkeypatch, sessions,
+                             self._full_frames(sessions))
+        monkeypatch.setattr(svc, "_observation_rows", orig)
+
+    def test_predicate_rejects_schema_counterexample_shape(self):
+        """谓词反例（schema 可接受而契约拒绝的形状）：expected=6、
+        qualified=2、observations=[]、period_return_pct=1 必须判 False。"""
+        bad = {"windows": [{"series": [{
+            "expected_sessions": 6, "qualified_sessions": 2,
+            "observations": [], "period_return_pct": 1.0}]}]}
+        assert svc._trend_window_series_invariants(bad) is False
+        # 部分合格且收益留空的合法形状不误伤
+        partial = {"windows": [{"series": [{
+            "expected_sessions": 6, "qualified_sessions": 2,
+            "observations": [{"date": "2026-11-18", "close": 100.0},
+                             {"date": "2026-11-19", "close": 101.0}],
+            "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(partial) is True
+
+    def test_contracts_attached_to_construction_path(self):
+        """出口不变式以 icontract 契约强制在实际构建路径（每次调用校验）。"""
+        postconditions = getattr(
+            svc._sw_trend_windows_pillar, "__postconditions__", [])
+        assert postconditions, "_sw_trend_windows_pillar 应挂载 ensure 契约"

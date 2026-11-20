@@ -316,4 +316,194 @@ describe('SectorAnalysisPage', () => {
       expect(button.className).toContain('sm:opacity-0'); // 桌面保留 hover 浮现
     }
   });
+
+  // ---- issue #103 报告速览首屏：生成/回看共用存档载荷，旧存档不渲染 ----
+
+  it('生成成功后首屏渲染二级映射与窗口趋势（同一存档载荷）', async () => {
+    postMock.mockResolvedValue({
+      data: { report_id: 'sa_202611190900', stock_code: '601318', stock_name: '中国平安',
+              markdown: '# 报告正文', analysis: {
+                payload_version: 3,
+                identity: { subject_status: 'confirmed', board_name: '非银金融', board_code: '801790.SL' },
+                sector_l2_identity: { status: 'confirmed', l2_name: '保险Ⅱ',
+                                      l2_index_code: '801194.SL', l1_parent_name: '非银金融',
+                                      observation_date: '2026-11-19', gaps: [] },
+              } },
+    });
+    render(<SectorAnalysisPage />);
+    await selectStock();
+    fireEvent.click(screen.getByRole('button', { name: /生成报告/ }));
+    await waitFor(() => {
+      expect(screen.getByText(/报告速览/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/保险Ⅱ（801194\.SL）/)).toBeInTheDocument();
+  });
+
+  it('历史回读详情携带 analysis_json 时渲染同一首屏', async () => {
+    getMock.mockImplementation((url: string) => {
+      if (url === HISTORY_URL) {
+        return Promise.resolve({ data: { success: true, data: [newItem], total: 1 } });
+      }
+      return Promise.resolve({ data: { data: { markdown: '# 存档报告', stock_name: '贵州茅台',
+        analysis_json: { payload_version: 3,
+          sector_l2_identity: { status: 'missing', gaps: ['二级归属未取得'] } } } } });
+    });
+    render(<SectorAnalysisPage />);
+    await waitFor(() => expect(screen.getAllByText('贵州茅台').length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByText('贵州茅台')[0]);
+    await waitFor(() => {
+      expect(screen.getByText(/报告速览/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/二级对照未采纳/)).toBeInTheDocument();
+  });
+
+  it('旧存档详情（无新增键）不渲染首屏，正文照常', async () => {
+    getMock.mockImplementation((url: string) => {
+      if (url === HISTORY_URL) {
+        return Promise.resolve({ data: { success: true, data: [newItem], total: 1 } });
+      }
+      return Promise.resolve({ data: { data: { markdown: '# 旧存档报告', stock_name: '贵州茅台',
+        analysis_json: { payload_version: 2 } } } });
+    });
+    render(<SectorAnalysisPage />);
+    await waitFor(() => expect(screen.getAllByText('贵州茅台').length).toBeGreaterThan(0));
+    fireEvent.click(screen.getAllByText('贵州茅台')[0]);
+    await waitFor(() => {
+      expect(screen.getByTestId('report-markdown')).toHaveTextContent('# 旧存档报告');
+    });
+    expect(screen.queryByText(/报告速览/)).not.toBeInTheDocument();
+  });
+});
+
+// issue #103 复审二轮：首屏窗口状态按报告 ID 重置、有结构化首屏时正文
+// 跳过 Markdown 自带的重复速览节。
+describe('SectorAnalysisPage 复审二轮', () => {
+  function trendWindows() {
+    const mk = (days: number, points: number) => ({
+      window_days: days,
+      point_count: points,
+      start_date: '2026-11-01',
+      end_date: '2026-11-19',
+      series: [{
+        role: 'l2_industry', name: '保险Ⅱ', index_code: '801194.SL',
+        expected_sessions: points, qualified_sessions: points,
+        observations: [
+          { date: '2026-11-01', close: 1000 },
+          { date: '2026-11-19', close: 1010 },
+        ],
+        period_return_pct: 1.0, gaps: [],
+      }],
+      gaps: [],
+    });
+    return [mk(5, 6), mk(20, 21), mk(60, 61)];
+  }
+
+  const MARKDOWN_WITH_FIRST_SCREEN =
+    '# 中国平安（601318）板块分析报告\n\n## 报告速览（首屏）\n\n'
+    + '- 速览内容（Markdown 自带，不应与 Web 首屏重复展示）\n\n'
+    + '## 一、主行业定位（申万 2021 一级行业）\n\n- 正文内容\n';
+
+  function detailBody(withStructured: boolean) {
+    return {
+      data: {
+        markdown: MARKDOWN_WITH_FIRST_SCREEN,
+        stock_name: '中国平安',
+        analysis_json: withStructured
+          ? {
+              sector_l2_identity: {
+                status: 'confirmed', l2_name: '保险Ⅱ',
+                l2_index_code: '801194.SL', l1_parent_name: '非银金融',
+                directory_version: 'sw2021-l2-20261119',
+                observation_date: '2026-11-19', gaps: [],
+              },
+              sector_trend_windows: trendWindows(),
+            }
+          : null,
+      },
+    };
+  }
+
+  beforeEach(() => {
+    getMock.mockImplementation((url: string) => {
+      if (url === HISTORY_URL) {
+        return Promise.resolve({
+          data: {
+            success: true,
+            data: [
+              { id: 'sa_a', stock_code: '601318', stock_name: '贵州茅台', created_at: '2026-11-19T15:00:00', sector_score: null },
+              { id: 'sa_b', stock_code: '601318', stock_name: '中国平安', created_at: '2026-11-18T15:00:00', sector_score: null },
+            ],
+            total: 2,
+          },
+        });
+      }
+      if (url.endsWith('/reports/sa_a')) {
+        return Promise.resolve({ data: detailBody(true) });
+      }
+      if (url.endsWith('/reports/sa_b')) {
+        return Promise.resolve({ data: detailBody(true) });
+      }
+      return Promise.reject(axiosError(404, { error: 'not_found' }));
+    });
+  });
+
+  it('resets trend window state when switching between history reports', async () => {
+    render(<SectorAnalysisPage />);
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(HISTORY_URL));
+    // 打开报告 A：默认 20 日窗口
+    fireEvent.click(screen.getByText('贵州茅台'));
+    await waitFor(() => expect(screen.getByText('报告速览')).toBeTruthy());
+    expect(screen.getByRole('tab', { name: '20日' }).getAttribute('aria-selected')).toBe('true');
+    // A 上切到 60 日
+    fireEvent.click(screen.getByRole('tab', { name: '60日' }));
+    expect(screen.getByRole('tab', { name: '60日' }).getAttribute('aria-selected')).toBe('true');
+    // 切换到报告 B：窗口状态重置回默认 20 日（key=报告 ID，不复用 A 的局部状态）
+    fireEvent.click(screen.getByText('中国平安'));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(
+      `${HISTORY_URL}/sa_b`));
+    await waitFor(() => {
+      expect(screen.getByRole('tab', { name: '20日' }).getAttribute('aria-selected')).toBe('true');
+    });
+    expect(screen.getByRole('tab', { name: '60日' }).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('strips duplicated Markdown first-screen section when structured screen exists', async () => {
+    render(<SectorAnalysisPage />);
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(HISTORY_URL));
+    fireEvent.click(screen.getByText('贵州茅台'));
+    await waitFor(() => expect(screen.getByText('报告速览')).toBeTruthy());
+    const body = screen.getByTestId('report-markdown').textContent ?? '';
+    // 有结构化首屏：Markdown 自带速览节跳过（标题与正文保留）
+    expect(body).not.toContain('## 报告速览（首屏）');
+    expect(body).toContain('# 中国平安（601318）板块分析报告');
+    expect(body).toContain('## 一、主行业定位（申万 2021 一级行业）');
+  });
+
+  it('keeps legacy markdown intact when no structured first screen exists', async () => {
+    getMock.mockImplementation((url: string) => {
+      if (url === HISTORY_URL) {
+        return Promise.resolve({
+          data: {
+            success: true,
+            data: [{ id: 'sa_legacy', stock_code: '601318', stock_name: '贵州茅台', created_at: '2026-11-01T15:00:00', sector_score: 61.5 }],
+            total: 1,
+          },
+        });
+      }
+      if (url.endsWith('/reports/sa_legacy')) {
+        return Promise.resolve({ data: detailBody(false) });
+      }
+      return Promise.reject(axiosError(404, { error: 'not_found' }));
+    });
+    render(<SectorAnalysisPage />);
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(HISTORY_URL));
+    fireEvent.click(screen.getByText('贵州茅台'));
+    await waitFor(() => expect(getMock).toHaveBeenCalledWith(
+      `${HISTORY_URL}/sa_legacy`));
+    await waitFor(() => expect(screen.getByTestId('report-markdown')).toBeTruthy());
+    const body = screen.getByTestId('report-markdown').textContent ?? '';
+    // 旧存档（无结构化键）：Web 首屏不渲染，Markdown 原样保留速览节
+    expect(body).toContain('## 报告速览（首屏）');
+    expect(screen.queryByText('报告速览')).toBeNull();
+  });
 });

@@ -3645,6 +3645,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     providers = [p for p in svc._providers if p.is_available]
     if not providers:
         out["gaps"].append("行业催化：搜索入口未配置（套餐搜索不可用），本次未搜索")
+        out["first_screen"] = {"state": "search_unavailable",
+                              "headline_evidence_id": None}
         return out
 
     search_days = sector_research.CATALYST_WINDOW_DAYS
@@ -3729,6 +3731,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
             ok_providers) = bounded_call(_thread_search, budget=budget,)
     except BudgetExhausted:
         out["gaps"].append("行业催化：取数预算不足，行业新闻搜索未完成（已取得内容保留）")
+        out["first_screen"] = {"state": "budget_exhausted",
+                              "headline_evidence_id": None}
         return out
     # 供应商 raw 畸形行计数并入 invalid_field 总数（诚实总数 = 供应商侧
     # 拒绝 + 本地准入拒绝；两者作用对象不相交，无双重计数）
@@ -3746,16 +3750,23 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                 f"{failed_providers} 个检索失败（见上方分类诊断），"
                 "不冒充「窗口内无新闻」"
             )
+            out["first_screen"] = {"state": "partial_failed",
+                              "headline_evidence_id": None}
         elif failed_providers:
             out["gaps"].append(
                 "行业催化：全部检索失败（搜索供应商均返回失败，见上方分类诊断），"
                 "不冒充「窗口内无新闻」"
             )
-        elif not out["gaps"]:
-            out["gaps"].append(
-                "行业催化：未发现合格催化（检索成功但窗口内无可用新闻或供应商"
-                "覆盖限制，不补造）"
-            )
+            out["first_screen"] = {"state": "search_failed",
+                              "headline_evidence_id": None}
+        else:
+            if not out["gaps"]:
+                out["gaps"].append(
+                    "行业催化：未发现合格催化（检索成功但窗口内无可用新闻或供应商"
+                    "覆盖限制，不补造）"
+                )
+            out["first_screen"] = {"state": "none_found",
+                              "headline_evidence_id": None}
         out["gaps"] = _bound_gaps(out["gaps"], 14)
         return out
     out["provider"] = str(provider_name)
@@ -4106,34 +4117,11 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
 
     out["items"] = items
     out["background_items"] = background
-    if not items:
-        if failed_providers:
-            # 混合响应：有供应商已取得结果（否则上方已按全部失败返回）但经
-            # 统一准入无合格催化，且其他渠道失败——两者如实并陈（issue #101
-            # 验收 1），诊断不冒充「无新闻」也不把部分成功误报为全失败
-            out["gaps"].append(
-                "行业催化：部分检索成功但无合格结果（已取得结果供应商的候选经"
-                "统一准入均未证实为近期催化），且其他检索渠道失败（见上方分类"
-                "诊断）；不冒充「窗口内无新闻」"
-            )
-        elif undated_count[0] and not out["dropped_offwindow"]:
-            out["gaps"].append(
-                f"行业催化：未发现合格催化（搜索返回 {undated_count[0]} 条相关"
-                "结果均无可用发布日期，无法确证近期催化；URL 日期不单独作证据；"
-                "文章探查未能确证；无日期条目仅列示为背景线索，不作为已证实"
-                "近期催化）"
-            )
-        elif undated_count[0]:
-            out["gaps"].append(
-                "行业催化：未发现合格催化（窗口外或无日期结果均不构成已证实"
-                "近期催化，见上方计数）"
-            )
-        else:
-            out["gaps"].append(
-                "行业催化：未发现合格催化（去重与资格过滤后无已证实近期催化："
-                "真实无窗口内行业新闻或供应商覆盖限制，不补造）"
-            )
-    else:
+    if items:
+        # 首屏摘要：状态 + 首条引用 ID（标题/链接由呈现层从 items 渲染，
+        # 不在摘要里复制文案或数值）
+        out["first_screen"] = {"state": "found",
+                               "headline_evidence_id": items[0]["evidence_id"]}
         if upgraded:
             out["gaps"].append(
                 f"其中 {upgraded} 条经文章元数据日期确证"
@@ -4145,6 +4133,41 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                 f"另有 {len(background)} 条无日期或降级结果仅列示为背景线索"
                 "（bg-*，不作为已证实近期催化，不单独支撑重要结论）"
             )
+    else:
+        if failed_providers:
+            # 混合响应：有供应商已取得结果（否则上方已按全部失败返回）但经
+            # 统一准入无合格催化，且其他渠道失败——两者如实并陈（issue #101
+            # 验收 1），诊断不冒充「无新闻」也不把部分成功误报为全失败
+            out["gaps"].append(
+                "行业催化：部分检索成功但无合格结果（已取得结果供应商的候选经"
+                "统一准入均未证实为近期催化），且其他检索渠道失败（见上方分类"
+                "诊断）；不冒充「窗口内无新闻」"
+            )
+            out["first_screen"] = {"state": "partial_failed",
+                              "headline_evidence_id": None}
+        elif undated_count[0] and not out["dropped_offwindow"]:
+            out["gaps"].append(
+                f"行业催化：未发现合格催化（搜索返回 {undated_count[0]} 条相关"
+                "结果均无可用发布日期，无法确证近期催化；URL 日期不单独作证据；"
+                "文章探查未能确证；无日期条目仅列示为背景线索，不作为已证实"
+                "近期催化）"
+            )
+            out["first_screen"] = {"state": "none_found",
+                              "headline_evidence_id": None}
+        elif undated_count[0]:
+            out["gaps"].append(
+                "行业催化：未发现合格催化（窗口外或无日期结果均不构成已证实"
+                "近期催化，见上方计数）"
+            )
+            out["first_screen"] = {"state": "none_found",
+                              "headline_evidence_id": None}
+        else:
+            out["gaps"].append(
+                "行业催化：未发现合格催化（去重与资格过滤后无已证实近期催化："
+                "真实无窗口内行业新闻或供应商覆盖限制，不补造）"
+            )
+            out["first_screen"] = {"state": "none_found",
+                              "headline_evidence_id": None}
     out["gaps"] = _bound_gaps(out["gaps"], 14)
     return out
 
@@ -4772,6 +4795,226 @@ def _sw_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudget,
     return out
 
 
+_TREND_WINDOW_SPECS: Tuple[Tuple[int, int], ...] = ((5, 6), (20, 21), (60, 61))
+"""多窗口趋势窗口规格（issue #103）：(交易日数, 收盘点数)——N 日收益需要
+N+1 个连续合格收盘点；现有一级 20 点（19 间隔）趋势块保留原含义不变。"""
+
+_SW_WINDOWS_SOURCE = "iFinD 标准HTTP指数日线"
+
+
+def _publishable_float_close(d: Decimal) -> bool:
+    """收盘点的发布边界（issue #103 复审）：资格层接受的有限正 Decimal 仍
+    可能超出 float 可安全表示范围（如 ``1E-400`` 下溢为 ``0.0``、
+    ``1E+400`` 上溢为 ``inf``）——观测明细与 Web 曲线以 float 承载，转换
+    后为零或非有限的值不可发布。这是**表示边界**，不是金融业务上限
+    （极值点按缺失语义隔离，不发明替代值，真正的程序错误照常上抛）。"""
+    try:
+        f = float(d)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(f) and f > 0
+
+
+def _trend_window_series_invariants(out: Dict[str, Any]) -> bool:
+    """多窗口序列行跨字段不变式（issue #103 复审；icontract 出口校验）。
+
+    对每个窗口的每条序列（TrendWindowSeries 构建路径出口）校验：
+    - 合格日数与观察明细一致：``qualified_sessions == len(observations)``
+      （观察行是合格收盘点的唯一明细，不允许计数与明细脱节）；
+    - 已发布收益对应完整对齐窗口：``period_return_pct`` 非 None 时观察
+      明细必须覆盖全部期望交易日（``len(observations) == expected_sessions``，
+      间隔数 = 期望日数 − 1 从首个收盘日复合）——部分合格窗口发布收益即
+      违约（反例：expected=6/qualified=2/observations=[]/return=1）。
+
+    字段取值范围（Pydantic Field）不在此重复；空窗口（整链未取得）恒真。
+    """
+    for window in out.get("windows") or []:
+        for s in window.get("series") or []:
+            if s.get("qualified_sessions") != len(s.get("observations") or []):
+                return False
+            if (s.get("period_return_pct") is not None
+                    and len(s.get("observations") or [])
+                    != s.get("expected_sessions")):
+                return False
+    return True
+
+
+@ensure(
+    lambda result: _trend_window_series_invariants(result),
+    "every emitted trend-window series must agree qualified_sessions with "
+    "its observation rows, and a published period_return_pct must correspond "
+    "to a fully aligned window (observations == expected_sessions)",
+)
+def _sw_trend_windows_pillar(
+    l2_index_code: Optional[str], l2_name: Optional[str],
+    l1_index_code: str, l1_name: str, *,
+    budget: ReportBudget, refresh_token: str, timeout_seconds: float,
+    current_time: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """二级/一级/沪深 300 的 5/20/60 日多窗口趋势（issue #103；新增可选出站）。
+
+    顺序契约（spec 决定 6）：在既有核心事实、兜底判定与必需研究（催化/综合）
+    完成后由编排层调用，消费同一报告总预算的剩余取数时间；取数截止已过时
+    不出站（缺口如实，一级事实与完整性判定不受影响）。**单次**日线出站覆盖
+    最长窗口（61 个收盘点）的全部请求序列——图表窗口切换使用存档数据，
+    不重新取数。
+
+    期望窗口来自同一严格交易日历（``recent_completed_trading_sessions``），
+    以报告时点最近一个已完成交易日为共同终点（盘中未完成交易日不进入）；
+    每条序列独立判定合格性：窗口内全部期望交易日都有合格收盘点才有窗口
+    收益，仅长窗缺点时该序列长窗收益与曲线留空、短窗照常；序列数据行整体
+    缺席（响应无该代码）时该序列不进入各窗口，缺口只记一次。
+    输出 ``{"windows": [...], "gaps": [...]}``（窗口形状见
+    ``SectorTrendWindowBlock``；供应商失败降缺口，不向上传播）。
+    """
+    out: Dict[str, Any] = {"windows": [], "gaps": []}
+    if budget.fetch_expired():
+        out["gaps"].append(
+            "多窗口趋势：取数截止已过，5/20/60 日新增查询未发起"
+            "（新增可选出站不晚于截止发起，不影响一级事实与完整性判定）")
+        return out
+    from src.services.sector_sw_market import SwSectorFetchError, fetch_index_history
+
+    sessions_61 = recent_completed_trading_sessions("cn", 61,
+                                                    current_time=current_time)
+    if not sessions_61:
+        out["gaps"].append(
+            "多窗口趋势：严格交易日历不可用或已完成交易日不足，"
+            "无法确定 5/20/60 日窗口（不按自然日补齐），未查询")
+        return out
+    expected_full = sorted(sessions_61)[-61:]
+    # role/code/name 三元组；code 为 None 的序列（如二级映射缺口）不进请求
+    series_spec: List[Tuple[str, Optional[str], str]] = [
+        ("l2_industry", l2_index_code, l2_name or (l2_index_code or "")),
+        ("l1_industry", l1_index_code, l1_name),
+        ("benchmark", _SW_BENCHMARK_CODE, "沪深300"),
+    ]
+    requested: List[Tuple[str, str, str]] = [
+        (role, code, name) for role, code, name in series_spec if code]
+    codes = [code for _r, code, _n in requested]
+    try:
+        frames = fetch_index_history(
+            ",".join(codes), expected_full[0].isoformat(),
+            expected_full[-1].isoformat(),
+            refresh_token=refresh_token, timeout_seconds=timeout_seconds,
+            deadline=budget.fetch_deadline,
+            isolate_conflicting_dates=True,
+        )
+    except SwSectorFetchError as exc:
+        out["gaps"].append(
+            f"多窗口趋势：iFinD 指数日线查询失败（{exc}），5/20/60 日窗口未取得"
+            "（新增可选查询，只降本块，不影响一级事实与完整性判定）")
+        return out
+    # 每序列对 61 点全集资格判定一次（各窗口按尾部子集切片，不重复出站）；
+    # 全集资格缺口（如仅长窗外的缺失日）记块级一次，不复制进各短窗
+    qualified_by_role: Dict[str, Tuple[Optional[Dict[Any, Decimal]], List[str]]] = {}
+    for role, code, name in requested:
+        label = f"多窗口日线（{name} {code}·iFinD）"
+        df = frames.get(code)
+        if df is None:
+            # 序列数据行整体缺席：块级缺口只记一次，该序列不进入各窗口
+            out["gaps"].append(
+                f"多窗口趋势：iFinD 日线响应缺 {name} {code} 数据行，"
+                "该序列各窗口未取得")
+            qualified_by_role[role] = (None, [])
+            continue
+        obs, _qualified, full_gaps = _qualify_daily_closes(
+            df, "date", "close", expected_full, label)
+        # 发布边界（issue #103 复审）：无法安全表示为有限正 float 的合格
+        # Decimal 收盘点不可发布——按缺失语义隔离（不进观测、该窗收益随
+        # 窗口完整性缺口留空），其余合格观察保留；不取旧日凑数
+        unpublishable = sorted(d for d in obs
+                               if not _publishable_float_close(obs[d]))
+        if unpublishable:
+            shown = "、".join(d.isoformat() for d in unpublishable[:3])
+            more = (f" 等 {len(unpublishable)} 天"
+                    if len(unpublishable) > 3 else "")
+            out["gaps"].append(
+                f"多窗口趋势：{name} {code} {len(unpublishable)} 个交易日收盘"
+                f"值超出可安全表示范围（{shown}{more}，不以有限正值表示），"
+                "按缺失处理（资格判定共享语义不变，仅发布边界隔离）")
+            for d in unpublishable:
+                obs.pop(d, None)
+        qualified_by_role[role] = (obs, full_gaps)
+        if full_gaps and not obs:
+            out["gaps"].append(
+                f"多窗口趋势：{name} {code} 无合格收盘观测"
+                "（全部期望交易日缺失或无效），该序列各窗口未取得")
+    observed_at = datetime.now().isoformat(timespec="seconds")
+    for window_days, points in _TREND_WINDOW_SPECS:
+        window_sessions = expected_full[-points:]
+        window_gaps: List[str] = []
+        if len(window_sessions) < points:
+            window_gaps.append(
+                f"{window_days} 日窗口：严格交易日历仅"
+                f" {len(window_sessions)}/{points} 个已完成交易日，"
+                "窗口期望不足（不按自然日补齐），各序列本窗口收益留空")
+        series_rows: List[Dict[str, Any]] = []
+        for role, code, name in requested:
+            obs, _full_gaps = qualified_by_role[role]
+            if obs is None:
+                continue  # 序列整体缺席：缺口已在块级记录，不逐窗重复
+            present = [d for d in window_sessions if d in obs]
+            missing_dates = [d.isoformat() for d in window_sessions
+                             if d not in obs]
+            # 窗口缺口只描述**本窗口**内的缺失（全集缺口已记块级一次）：
+            # 完整窗口缺任一天 → 该序列本窗口收益留空；短窗完整时不受
+            # 长窗缺失影响（验收例：仅长窗缺点，短窗照常）
+            series_gaps: List[str] = [
+                f"{window_days} 日窗口缺合格收盘点（{shown}{more}），"
+                "该序列本窗口收益与曲线留空（不取旧日凑数）"
+                for shown, more in [(
+                    "、".join(missing_dates[:3]),
+                    f" 等 {len(missing_dates)} 天" if len(missing_dates) > 3 else "",
+                )] if missing_dates
+            ]
+            period_return: Optional[float] = None
+            if len(present) == points and len(window_sessions) == points:
+                closes = [obs[d] for d in window_sessions]
+                # 发布边界（issue #103 复审）：极值收盘组合的区间收益可能
+                # 超出可发布数值范围（Decimal round/quantize InvalidOperation
+                # 或 float 上溢）——该窗口收益与曲线留空并注明原因；只捕
+                # Decimal/float 数值边界（ArithmeticError），程序错误照常
+                # 上抛，不设金融业务上限
+                try:
+                    pct = float(round(_period_return_pct(closes), 4))
+                except ArithmeticError:
+                    pct = None
+                if pct is not None and math.isfinite(pct):
+                    period_return = pct
+                else:
+                    series_gaps.append(
+                        f"{window_days} 日窗口区间收益超出可安全表示范围"
+                        "（首尾收盘极值组合，收益无法以有限数值发布），"
+                        "该序列本窗口收益与曲线留空（合格观察保留）")
+
+            series_rows.append({
+                "role": role,
+                "name": name,
+                "index_code": code,
+                "source": _SW_WINDOWS_SOURCE,
+                "expected_sessions": len(window_sessions),
+                "qualified_sessions": len(present),
+                "observations": _observation_rows(
+                    {d: obs[d] for d in present}),
+                "period_return_pct": period_return,
+                "gaps": _bound_gaps(series_gaps, 10),
+            })
+        out["windows"].append({
+            "window_days": window_days,
+            "point_count": points,
+            "start_date": (window_sessions[0].isoformat()
+                           if window_sessions else None),
+            "end_date": (window_sessions[-1].isoformat()
+                         if window_sessions else None),
+            "expected_dates": [d.isoformat() for d in window_sessions],
+            "series": series_rows,
+            "observed_at": observed_at,
+            "gaps": _bound_gaps(window_gaps, 10),
+        })
+    return out
+
+
 _MEMBER_QUOTE_BATCH_SIZE = 150
 """成分成员行情单批代码数上限（2026-11-18 实测成员行情按 ~150 分批）。"""
 
@@ -5011,6 +5254,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         "trend_ok": False,
         "gaps": [],
         "session": None,
+        "reference_now": None,
     }
     cfg = sw_http_config()
     if cfg is None:
@@ -5019,7 +5263,14 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         out["gaps"].extend(out["identity"]["gaps"])
         return out
     token, timeout = cfg
-    session = _session_context(current_time)
+    # 报告参考钟（issue #103 review 修正）：链入口取一次并贯穿全链（会话
+    # 归属、参考口径分支、20 点趋势与 #103 多窗口）——必需研究可能耗数十
+    # 秒，多窗口支柱若在收盘边界后重新取钟会让同一报告的两类窗口跨会话
+    # （如 14:59 开始的报告终点漂到次日）。显式传入 None 时取当前钟一次，
+    # 语义与既有内部取钟一致（不改变旧资格判定）。
+    reference_now = (current_time if current_time is not None
+                     else get_market_now("cn").replace(tzinfo=None))
+    session = _session_context(reference_now)
     if session is None:
         out["identity"]["gaps"] = [
             "交易日历不可用，无法确定目标交易日，申万链路不出站（不按自然日猜测）"]
@@ -5084,7 +5335,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         intraday_target = (received_at is not None and session_close is not None
                            and received_at < session_close)
         ref_sessions = recent_completed_trading_sessions("cn", 3,
-                                                         current_time=current_time)
+                                                         current_time=reference_now)
         ref_date = next(
             (s for s in (ref_sessions or [])
              if s.isoformat() < session_date), None)
@@ -5116,7 +5367,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
     out["trend"] = _sw_trend_pillar(index_code, index_name, budget=budget,
                                     refresh_token=token,
                                     timeout_seconds=timeout,
-                                    current_time=current_time)
+                                    current_time=reference_now)
     out["trend_ok"] = bool(out["trend"].get("eligible")
                            and out["trend"].get("period_return_pct") is not None)
     # 成分/同业出站**不在此处**发起：兜底门槛只看主行业与两项核心行情，
@@ -5124,6 +5375,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
     # 出站（issue #100 amend）；保留申万时由 compose_report 预算允许内
     # 富化一次（session 随链返回供富化复用）
     out["session"] = session
+    out["reference_now"] = reference_now
     return out
 
 
@@ -5792,6 +6044,67 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     # 缺口随身份块一并进入载荷，不在装配后再改写已组装事实。
     _enrich_sw_reference_levels(code, sw, budget=budget)
 
+    # ---- 二级指数身份与多窗口趋势（issue #103）：必需研究之后的剩余预算
+    # 可选出站（spec 决定 6）。二级归属（l2_name）经核定目录唯一映射到指数
+    # 代码才采纳；映射失败/查询失败只报缺口——不近似匹配、不影响一级事实、
+    # 完整性判定与兜底口径（二级缺口不单独触发东财兜底）。----
+    l2_name = ident_sw.get("l2_name")
+    l2_index_code: Optional[str] = None
+    l2_gaps: List[str] = []
+    if confirmed and l2_name:
+        from src.services.sector_sw_market import resolve_sw_l2_index
+
+        l2_index_code = resolve_sw_l2_index(index_name, l2_name)
+        if l2_index_code is None:
+            l2_gaps.append(
+                f"申万二级归属「{l2_name}」未能在核定二级目录中与父行业"
+                f"「{index_name}」唯一映射到指数代码（不按名称近似匹配），"
+                "二级对照未采纳")
+    elif confirmed and not l2_name:
+        l2_gaps.append(
+            "申万二级归属未取得（参考链未查询/失败或取数预算已耗尽），"
+            "二级对照未采纳")
+    elif not confirmed:
+        l2_gaps.append(
+            "申万主行业未确认，二级指数身份未查询（无主体）")
+    if confirmed and l2_index_code:
+        l2_identity_status = "confirmed"
+        l2_identity_gaps: List[str] = []
+    else:
+        l2_identity_status = "missing"
+        l2_identity_gaps = l2_gaps
+    from src.services.sector_sw_market import SW_L2_DIRECTORY_VERSION
+
+    l2_identity = {
+        "status": l2_identity_status,
+        "l2_name": l2_name if l2_identity_status == "confirmed" else None,
+        "l2_index_code": l2_index_code if l2_identity_status == "confirmed" else None,
+        "l1_parent_name": index_name if l2_identity_status == "confirmed" else None,
+        "directory_version": SW_L2_DIRECTORY_VERSION,
+        "observation_date": session_date or None,
+        "gaps": _bound_gaps(l2_identity_gaps, 10),
+    }
+    windows_block: Optional[Dict[str, Any]] = None
+    if confirmed:
+        from src.services.sector_sw_market import sw_http_config
+
+        cfg = sw_http_config()
+        if cfg is None:
+            windows_block = {"windows": [], "gaps": [
+                "多窗口趋势：iFinD 凭据未配置，5/20/60 日新增查询未发起"]}
+        else:
+            windows_block = _sw_trend_windows_pillar(
+                l2_index_code, l2_name, index_code, index_name,
+                budget=budget, refresh_token=cfg[0], timeout_seconds=cfg[1],
+                current_time=sw.get("reference_now"))
+    # 块级缺口无条件保留（issue #103 复审）：整链未取得（无窗口）时缺口随
+    # 首屏直出；取得部分窗口时（如仅二级序列整体缺席）块级缺口同样随首屏
+    # 趋势块直出一次——窗口级/序列级缺口已在各窗口块内，块级不逐窗重复
+    sector_trend_windows: Optional[List[Dict[str, Any]]] = (
+        (windows_block or {}).get("windows") or None)
+    sector_trend_windows_gaps: Optional[List[str]] = (
+        (windows_block or {}).get("gaps") or None)
+
     identity = {
         "industry_em": None, "industry_cninfo": None, "business_scope": None,
         "board_name": index_name or None, "board_code": index_code or None,
@@ -5900,6 +6213,9 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         gaps.extend(peer_block.get("gaps") or [])
     gaps.extend(catalysts.get("gaps") or [])
     gaps.extend(synthesis.get("gaps") or [])
+    gaps.extend(l2_identity.get("gaps") or [])
+    if windows_block is not None:
+        gaps.extend(windows_block.get("gaps") or [])
     for block in (policy, concepts):
         gaps.extend(block.get("gaps") or [])
     if base.get("is_default"):
@@ -5923,6 +6239,9 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         "sector_peers": peer_block,  # issue #100：成分边界 + 行业参考同业
         "sector_catalysts": catalysts,  # issue #101：选定口径后检索一次
         "sector_synthesis": synthesis,  # issue #101：登记表校验的综合
+        "sector_l2_identity": l2_identity,  # issue #103：二级目录唯一映射
+        "sector_trend_windows": sector_trend_windows,
+        "sector_trend_windows_gaps": sector_trend_windows_gaps,
         "assessment": {
             "status": status,
             "completeness": completeness,
