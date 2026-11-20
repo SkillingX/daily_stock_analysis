@@ -377,6 +377,12 @@
 - 目标股快照成交额缺失或无效，不参与成交额排名（成员保留，top5 资格无法判定，见缺口）
 {% endif %}
 {% endif %}
+{% if peers.target_amount_rank is not none %}
+- 目标股成交额名次：第 **{{ peers.target_amount_rank }}** / {{ peers.amount_rank_denominator }}（{{ '全成分正额范围' if peers.amount_rank_scope == 'full_constituents' else '有效正额样本范围' }}；按正额降序排列中的顺序位，同额按代码先后——不并列；涨跌幅名次才并列同名次）
+{% endif %}
+{% if peers.amount_rank_evidence %}
+- 全成分核验：{{ peers.amount_rank_evidence }}
+{% endif %}
 - ⚠️ 口径说明：「成交活跃代表」按**成交额**选取，是交易活跃度代表，**不是市值或基本面龙头**；
   相对位置基于快照当日涨跌幅（与趋势窗口不同口径），单日表现不构成同业强弱结论。
 {% else %}
@@ -389,6 +395,58 @@
 {% endif %}
 {% else %}
 - ⚠️ 同业比较未执行：主行业身份未确认（confirmed 前置不满足），不选取成交活跃代表、不给同业结论。
+{% endif %}
+{% endif %}
+
+{% set l2p = a.get('sector_l2_peers') %}
+{% set l2p_gaps = a.get('sector_l2_peers_gaps') %}
+{% set l2i = a.get('sector_l2_identity') %}
+{% if l2p or l2p_gaps %}
+### 二级同业对照（申万二级指数成分{% if l2i and l2i.status == 'confirmed' %}：{{ l2i.l2_name }} {{ l2i.l2_index_code }}{% endif %}）
+
+{% if l2p %}
+{% if l2p.industry_reference %}
+- ⚠️ **行业参考**：目标股未确认在二级指数成分内，以下为该二级指数成分的成交活跃代表，**不是与目标股同成分的可比样本**；目标股行情独立展示、不参与成分内比较与排名。
+{% endif %}
+{% if l2p.target_independent_quote %}
+{% set l2tiq = l2p.target_independent_quote %}
+- 目标股独立行情：{{ l2tiq.code }}（{{ l2tiq.name }}）｜ 当日涨跌幅：{{ l2tiq.change_pct if l2tiq.change_pct is not none else 'N/A' }}% ｜ 当日成交额：{{ l2tiq.amount if l2tiq.amount is not none else 'N/A' }} 元{% if l2tiq.as_of_date %} ｜ 行情日期：{{ l2tiq.as_of_date }}{% endif %}（独立事实，不进入成分比较）
+{% endif %}
+{% if l2p.valid_quote_rows is not none %}
+- 排名范围与覆盖：观察成分 {{ l2p.snapshot_rows }} 行、有效成交额报价 {{ l2p.valid_quote_rows }} 行（含已知零额 {{ l2p.valid_quote_rows - l2p.rankable_rows }}，正额可排名 {{ l2p.rankable_rows }} 行）、样本 {{ l2p.sample_size }} 家{% if l2p.change_pct_qualified_rows is not none %}、有效涨跌幅覆盖 {{ l2p.change_pct_qualified_rows }}/{{ l2p.sample_size }}{% endif %}；成分与报价均取报告目标交易日（行情时点 {{ l2p.quotes_as_of or '见缺口' }}）。行情覆盖（正额 + 已知零）与正额名次分母分开：分母只取正额可排名行。
+{% else %}
+- 排名范围与覆盖：观察成分 {{ l2p.snapshot_rows }} 行、有效成交额报价 {{ l2p.rankable_rows }} 行（正额口径；旧报告未采集已知零数，不假定）、样本 {{ l2p.sample_size }} 家{% if l2p.change_pct_qualified_rows is not none %}、有效涨跌幅覆盖 {{ l2p.change_pct_qualified_rows }}/{{ l2p.sample_size }}{% endif %}；成分与报价均取报告目标交易日（行情时点 {{ l2p.quotes_as_of or '见缺口' }}）。
+{% endif %}
+{% if l2p.verified_constituent_num is not none %}
+- 已验证成分数：{{ l2p.verified_constituent_num }}（iFinD 双接口核验一致；核验事实独立于全量名次是否发布，适用缺口见下方）。
+{% endif %}
+{% if l2p['items'] %}
+
+| 代码 | 名称 | 当日成交额（元） | 当日涨跌幅 | 目标股 |
+|------|------|-----------------|-----------|--------|
+{% for p in l2p['items'] %}
+| {{ p.code }} | {{ p.name }} | {{ p.amount if p.amount is not none else 'N/A' }} | {{ p.change_pct if p.change_pct is not none else 'N/A' }}% | {{ '✔' if p.is_target else '' }} |
+{% endfor %}
+
+{% endif %}
+{% if l2p.target_amount_rank is not none %}
+- 目标股成交额名次：第 **{{ l2p.target_amount_rank }}** / {{ l2p.amount_rank_denominator }}（{{ '全成分正额范围' if l2p.amount_rank_scope == 'full_constituents' else '有效正额样本范围（全成分门槛未满足）' }}；按正额降序排列中的顺序位，同额按代码先后——不并列；已知零额计入报价覆盖但不参与正额名次）。
+{% elif l2p['items'] | selectattr('is_target') | list %}
+- 目标股成交额名次：N/A（已知零额不参与正额名次，或目标成交额缺失/无效——见缺口）。
+{% endif %}
+{% if l2p.amount_rank_evidence %}
+- 全成分核验：{{ l2p.amount_rank_evidence }}
+{% endif %}
+{% if l2p.target_change_pct_rank is not none %}
+- 目标股涨跌幅相对位置：样本内第 **{{ l2p.target_change_pct_rank }}** / {{ l2p.sample_size }}（降序，并列同名次）。
+{% elif l2p['items'] | selectattr('is_target') | list %}
+- 目标股涨跌幅相对位置：N/A（样本内有同行缺同日合格涨跌幅或无可比同行，有效覆盖见缺口；已符合资格的全成分成交额名次不受影响）。
+{% endif %}
+{% for g in l2p.gaps %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% elif l2p_gaps %}
+- ⚠️ 二级同业未取得：{{ l2p_gaps[0] }}
 {% endif %}
 {% endif %}
 

@@ -1098,13 +1098,17 @@ def fetch_index_members(index_code: str, observation_date: str, *,
     ``rejected_identity_rows``（身份格式不合格被剔除的行数：非 6 位数字、缺
     后缀或后缀非沪/深/北；结构化计数，完整性证明的分母依据）、
     ``conflicting_code_members``（剥后缀后同 6 位码跨交易所矛盾被整组剔除的
-    成员数）、``gaps``。行级同日筛选：行日期 ≠ 观察日的行不进入成员集合
-    （异日成分不与目标日截面混用）；全部异日 = 未取得该日成分（非空成分，
-    如实缺口）。身份校验：入站成员代码必须是 ``6 位数字 + 有效交易所后缀``
-    （.SH/.SZ/.BJ），不合格行不采用且缺口**只含计数、不回显原始畸形标识**；
-    剥后缀后同 6 位码出现多个交易所后缀 = 身份矛盾，整组剔除（保守，不取
-    其一）。失败抛 :class:`SwSectorFetchError`，由调用方降缺口（成分查询
-    失败 ≠ 非成员）。
+    成员数）、``blank_date_rows``/``off_date_rows``（空日期/异日行的结构化
+    计数，issue #104——全量资格要求**原始行先校验后过滤**，过滤后数量吻合
+    但存在脏行时调用方依计数拒绝）、``identity_echo_conflict``（响应表回显
+    的指数身份与请求绑定指数冲突时 True——p03473 当前无表级回显，出现且
+    冲突即身份绑定不可信）、``gaps``。行级同日筛选：行日期 ≠ 观察日的行不
+    进入成员集合（异日成分不与目标日截面混用）；全部异日 = 未取得该日成分
+    （非空成分，如实缺口）。身份校验：入站成员代码必须是
+    ``6 位数字 + 有效交易所后缀``（.SH/.SZ/.BJ），不合格行不采用且缺口
+    **只含计数、不回显原始畸形标识**；剥后缀后同 6 位码出现多个交易所后缀
+    = 身份矛盾，整组剔除（保守，不取其一）。失败抛
+    :class:`SwSectorFetchError`，由调用方降缺口（成分查询失败 ≠ 非成员）。
     """
     body = {
         "reportname": "p03473",
@@ -1127,14 +1131,43 @@ def fetch_index_members(index_code: str, observation_date: str, *,
         dates_seen: List[str] = []
         off_dates: List[str] = []
         rejected_identity_rows = 0
+        blank_date_rows = 0
+        off_date_rows = 0
         stripped_seen: Dict[str, str] = {}
+        conflicting_names: set = set()
+        conflicting_name_rows = 0
         conflicting_stripped: set = set()
         conflicting_members = 0
         shape_gaps: List[str] = []
         rows_total = 0
+        echo_conflict = False
+        echoed_identities: List[str] = []
+        # 表级审计先于行处理（两阶段）：形状异常表显式计数（不静默忽略）；
+        # 回显与请求绑定指数冲突的表**整表不采用**——其行既不进成员集合、
+        # 也不能作为目标成员身份证据（原始行数保留在审计计数内）
+        usable_tables: List[Dict[str, Any]] = []
+        echo_conflicted_tables: List[Dict[str, Any]] = []
         for table in tables:
             if not isinstance(table, dict):
+                shape_gaps.append(
+                    "成分响应含非对象表项（表形状异常，该表不采用）")
                 continue
+            echo = str(table.get("thscode") or "").strip()
+            if echo and echo != index_code:
+                echo_conflict = True
+                echo_conflicted_tables.append(table)
+                continue
+            if echo and echo not in echoed_identities:
+                echoed_identities.append(echo)
+            usable_tables.append(table)
+        # 冲突回显表：原始行数计入审计计数（分母如实），行不进入成员集合
+        for table in echo_conflicted_tables:
+            cells = (table.get("table")
+                     if isinstance(table.get("table"), dict) else {})
+            row_codes = cells.get("p03473_f002")
+            if isinstance(row_codes, list):
+                rows_total += len(row_codes)
+        for table in usable_tables:
             raw_cells = table.get("table")
             cells = raw_cells if isinstance(raw_cells, dict) else {}
             row_dates = cells.get("p03473_f001")
@@ -1156,8 +1189,12 @@ def fetch_index_members(index_code: str, observation_date: str, *,
                 if date_text and date_text not in dates_seen:
                     dates_seen.append(date_text)
                 if date_text != observation_date:
-                    if date_text and date_text not in off_dates:
-                        off_dates.append(date_text)
+                    if date_text:
+                        off_date_rows += 1
+                        if date_text not in off_dates:
+                            off_dates.append(date_text)
+                    else:
+                        blank_date_rows += 1
                     continue
                 code_text = str(raw_code or "").strip()
                 if not _is_valid_a_share_secucode(code_text):
@@ -1173,10 +1210,29 @@ def fetch_index_members(index_code: str, observation_date: str, *,
                     conflicting_members += 1
                     continue
                 stripped_seen.setdefault(stripped, code_text)
+                # 同码重复行名称矛盾：审计基线 = **首个非空可信名**（即
+                # ``names`` 中已采纳的名称——空白首行不遮蔽后续矛盾）。
+                # 与基线不同的非空行 → 矛盾计数（全量资格拒绝依据），且
+                # 矛盾成员的名称置空——任意择一名都不诚实，不发布（按代码
+                # 显示）。一致重复正常去重；「首空白 + 单一非空」照常采纳
+                # （blank→one name，不误报矛盾）。
+                name_text = (raw_name.strip()
+                             if isinstance(raw_name, str) else "")
+                if name_text and code_text not in conflicting_names:
+                    prior_name = names.get(code_text)
+                    if prior_name and prior_name != name_text:
+                        conflicting_names.add(code_text)
+                        conflicting_name_rows += 1
+                        names[code_text] = ""
+                    elif not prior_name:
+                        names[code_text] = name_text
                 if code_text not in codes:
                     codes.append(code_text)
-                    if isinstance(raw_name, str) and raw_name.strip():
-                        names[code_text] = raw_name.strip()
+                    if name_text:
+                        names[code_text] = name_text
+                elif name_text and not names.get(code_text) \
+                        and code_text not in conflicting_names:
+                    names[code_text] = name_text
         # 冲突组整组回滚（先到成员先回退，保证分母如实）
         if conflicting_stripped:
             codes = [c for c in codes
@@ -1196,12 +1252,33 @@ def fetch_index_members(index_code: str, observation_date: str, *,
             gaps.append(
                 f"成分响应 {len(conflicting_stripped)} 组剥后缀后同码跨交易所"
                 f"矛盾（{shown}{more}），身份矛盾整组剔除（保守，不取其一）")
+        if blank_date_rows:
+            gaps.append(
+                f"成分响应 {blank_date_rows} 行空日期（原始行审计计数，"
+                "剔除不采用）")
+        if conflicting_name_rows:
+            shown_conflict = "、".join(
+                c.split(".", 1)[0] for c in sorted(conflicting_names)[:5])
+            gaps.append(
+                f"成分响应 {conflicting_name_rows} 行同码重复名称矛盾"
+                f"（{shown_conflict}，计数披露），矛盾事实不静默择名，"
+                "不授予全量资格")
         if off_dates:
             shown_dates = "、".join(sorted(off_dates)[:3])
             more = f" 等 {len(off_dates)} 个日期" if len(off_dates) > 3 else ""
             gaps.append(
                 f"成分响应存在非观察日 {observation_date} 的行"
                 f"（{shown_dates}{more}，异日成分不与目标日截面混用），已剔除并记录")
+        if echo_conflict:
+            # 不回显原始值：冲突回显身份是供应商返回的意外字符串（可能畸形
+            # 或超长），缺口只含数量与截断长度（每值 ≤16 字符）
+            shown_echo = "、".join(v[:16] for v in echoed_identities[:3])
+            more = (f" 等 {len(echoed_identities)} 个" if len(
+                echoed_identities) > 3 else "")
+            gaps.append(
+                f"成分响应表回显身份（{shown_echo}{more}，已截断）与请求"
+                f"绑定指数 {index_code} 冲突，冲突表整表不采用（行不进"
+                "成员集合、目标成员身份不可采信）")
         if rows_total and not codes and not rejected_identity_rows \
                 and not conflicting_stripped:
             gaps.append(
@@ -1235,8 +1312,175 @@ def fetch_index_members(index_code: str, observation_date: str, *,
         "completeness_evidence": None,
         "rejected_identity_rows": rejected_identity_rows,
         "conflicting_code_members": conflicting_members,
+        "blank_date_rows": blank_date_rows,
+        "off_date_rows": off_date_rows,
+        "conflicting_name_rows": conflicting_name_rows,
+        "identity_echo_conflict": echo_conflict,
+        "shape_gap_count": len(shape_gaps),
         "over_publish_limit": over_publish_limit,
         "gaps": gaps,
+    }
+
+
+def fetch_index_member_count(index_code: str, observation_date: str, *,
+                             refresh_token: str, timeout_seconds: float,
+                             deadline: Optional[float]) -> Dict[str, Any]:
+    """供应商同日成分计数 wire（``basic_data_service`` +
+    ``ths_constituent_num_index``，issue #104；父规格 #98 决策 4）。
+
+    与 p03473 成分名单做双接口交叉校验的计数侧证据。**单指数绑定**：
+    ``codes`` 只携带本请求指数（调用方为每次全量资格判定单独发起，请求
+    即身份绑定）；``indiparams`` **显式**传同一交易日 ``YYYYMMDD``（未传
+    日期时供应商回全 null 计数——2026-11-20 实测）。
+
+    校验（任一不成立抛 :class:`SwSectorFetchError`，由调用方降全量缺口）：
+    - 结果表 ``thscode`` 必须与请求指数**精确一致且恰好一个表**；响应出现
+      其他指数行（串批/越界）或同码多表 → 唯一性不可证，拒绝（不取其一）；
+    - 指标值列表必须恰好一个值，且为**唯一无冲突的正整数**（bool 永不作
+      数值；DT_INTEGER 语义下整值浮点按数值等价接受）。响应以
+      ``parse_float=Decimal`` **精确解码**（issue #104 复审）：JSON 字面
+      ``5.0000000000000001`` 在二进制浮点解码会损失为 ``5.0`` 并绕过整数
+      gate——精确值含小数即拒绝，解码后不可补救；超出可发布成员上界
+      （与成分 wire 同一 ``_MAX_PUBLISHABLE_MEMBER_ROWS``）拒绝；
+    - 供应商**输入参数回显**（``inputParams`` 中该指标的参数组）必须携带
+      ``FDATE`` 且值与请求交易日一致——日期不在结果表内，回显是「计数
+      属于该日」的唯一供应商证据，缺失或不符即拒绝。
+    返回 ``{"index_code", "observation_date", "count", "fdate_echo", "gaps"}``。
+    """
+    ymd = observation_date.replace("-", "")
+    body = {
+        "codes": index_code,
+        "indipara": [{
+            "indicator": "ths_constituent_num_index",
+            "indiparams": [ymd],
+        }],
+    }
+    payload = _sector_http_post(
+        _BASIC_DATA_ENDPOINT, body, label="sector_sw_member_count",
+        refresh_token=refresh_token, timeout_seconds=timeout_seconds,
+        deadline=deadline, parse_float=Decimal,
+    )
+
+    def _fail(reason: str) -> SwSectorFetchError:
+        return SwSectorFetchError(
+            f"成分计数核验失败（{index_code} {observation_date}）：{reason}")
+
+    try:
+        raw_tables = payload.get("tables")
+        tables = raw_tables if isinstance(raw_tables, list) else []
+        # 非对象表项不静默过滤——先拒绝再判定唯一表（malformed 即拒绝）
+        if any(not isinstance(t, dict) for t in tables):
+            raise _fail("结果表含非对象表项（形状异常，不过滤后判定）")
+        matched = [t for t in tables
+                   if str(t.get("thscode") or "").strip() == index_code]
+        if not matched:
+            raise _fail("结果表无请求指数行（计数缺失）")
+        if len(matched) > 1:
+            raise _fail(
+                f"结果表同码出现 {len(matched)} 个表（唯一性不可证，冲突拒绝）")
+        if len(matched) != len(tables):
+            raise _fail(
+                "单指数绑定请求的响应含非请求指数行（串批/越界形状异常）")
+        values = matched[0].get("table") if isinstance(
+            matched[0].get("table"), dict) else {}
+        raw_values = values.get("ths_constituent_num_index")
+        if not isinstance(raw_values, list) or len(raw_values) != 1:
+            raise _fail("计数列不是恰好一个值（形状异常）")
+        raw_value = raw_values[0]
+        # 唯一无冲突的正整数：bool 永不作数值；DT_INTEGER 语义下整值浮点
+        # 按数值等价接受（``parse_float=Decimal`` 精确解码后按 Decimal
+        # 整值判定——含小数的精确值如 5.0000000000000001 拒绝，不被二进制
+        # 浮点解码掩盖）；其他类型（字符串等）不 str() 合法化
+        if isinstance(raw_value, bool) or not isinstance(
+                raw_value, (int, float, Decimal)):
+            raise _fail("计数值不是整数（类型非法）")
+        # 有限、整值与区间都在**原值**上校验后才做 int()（issue #104 三轮）：
+        # 巨数指数字面（如 1e5000）的 int() 展开可能超预算/触发整数位数上限
+        # ValueError；拒绝消息只描述要求，不展开巨数、不回显供应商原始值
+        if isinstance(raw_value, Decimal):
+            if not raw_value.is_finite():
+                raise _fail("计数值不是整数（非有限）")
+            if raw_value != raw_value.to_integral_value():
+                raise _fail("计数值不是整数（精确值含小数）")
+            if raw_value <= 0:
+                raise _fail("计数值不是正整数")
+            if raw_value > _MAX_PUBLISHABLE_MEMBER_ROWS:
+                raise _fail(
+                    f"计数超出可发布成员上限 {_MAX_PUBLISHABLE_MEMBER_ROWS}")
+        elif isinstance(raw_value, float) and (
+                raw_value != int(raw_value) or raw_value != raw_value):
+            raise _fail("计数值不是整数（浮点含小数或非有限）")
+        count = int(raw_value)
+        if count <= 0:
+            raise _fail("计数值不是正整数")
+        if count > _MAX_PUBLISHABLE_MEMBER_ROWS:
+            raise _fail(
+                f"计数超出可发布成员上限 {_MAX_PUBLISHABLE_MEMBER_ROWS}")
+        # 供应商输入参数回显：日期不在结果表内，FDATE 回显是「计数属于
+        # 该日」的唯一供应商证据。匹配指标组内**每一个出现的 FDATE** 都
+        # 必须是非空有效值且全部一致：相同重复可去重；显式空白/null 是
+        # 无效源结果（与有效回显并存即拒绝，不能跳过空白后接受剩余值；
+        # 仅空白/null = 缺失）；矛盾回显（如 [错误, 正确] 的 last-wins
+        # 陷阱）与非字符串值（不 str() 合法化）一律拒绝。gap 文本不回显
+        # 供应商返回的任意字符串（只披露数量与事实）。
+        input_params = payload.get("inputParams")
+        echo_values: List[str] = []
+        blank_entries = 0
+        invalid_echo = False
+        if isinstance(input_params, dict):
+            param_groups = input_params.get("params")
+            groups = (param_groups if isinstance(param_groups, list)
+                      else [])
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                if str(group.get("function") or "") != \
+                        "ths_constituent_num_index":
+                    continue
+                group_params = group.get("params")
+                if not isinstance(group_params, list):
+                    continue
+                for p in group_params:
+                    if not isinstance(p, dict):
+                        continue
+                    if str(p.get("name") or "") == "FDATE":
+                        value = p.get("value")
+                        if value is None or (isinstance(value, str)
+                                             and not value.strip()):
+                            blank_entries += 1  # 显式空白 = 无效源结果
+                            continue
+                        if not isinstance(value, str):
+                            invalid_echo = True
+                            continue
+                        echo_values.append(value.strip())
+        if invalid_echo:
+            raise _fail("供应商输入参数回显含非字符串 FDATE 值（无效回显）")
+        unique_echoes = list(dict.fromkeys(echo_values))
+        if unique_echoes and blank_entries:
+            raise _fail(
+                f"供应商输入参数回显含 {blank_entries} 个空白/null FDATE "
+                "条目与有效值并存（无效源结果，不采纳）")
+        if not unique_echoes:
+            raise _fail("供应商输入参数回显缺 FDATE（日期证据缺失）")
+        if len(unique_echoes) > 1:
+            raise _fail(
+                f"供应商输入参数回显出现 {len(unique_echoes)} 个不同 FDATE "
+                "值（矛盾回显，不取其一，值不回显）")
+        fdate_echo = unique_echoes[0]
+        if fdate_echo != ymd:
+            raise _fail(
+                "供应商输入参数回显 FDATE 与请求交易日 "
+                f"{ymd} 不符（回显值不回显）")
+    except SwSectorFetchError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - wire 形状异常按源错误降级
+        raise _fail(f"响应形状异常（{type(exc).__name__}）") from None
+    return {
+        "index_code": index_code,
+        "observation_date": observation_date,
+        "count": count,
+        "fdate_echo": fdate_echo,
+        "gaps": [],
     }
 
 

@@ -3142,10 +3142,19 @@ def _peers_pillar(code: str, cons_snapshot: Optional[pd.DataFrame], *,
         "items": [],
         "target_in_amount_top5": None,
         "target_change_pct_rank": None,
+        "target_amount_rank": None,
+        "amount_rank_denominator": None,
+        "amount_rank_scope": None,
+        "amount_rank_evidence": None,
         "amount_unit": "元",
         "amount_provenance": amount_provenance or _AMOUNT_PROVENANCE,
         "snapshot_rows": 0,
         "rankable_rows": 0,
+        # 东财路径不采集（None=未采集；与 schema dump 键集一致保证
+        # 生成/详情读回 round-trip 全等，issue #104 复审追加兼容）
+        "valid_quote_rows": None,
+        "change_pct_qualified_rows": None,
+        "verified_constituent_num": None,
         "sample_size": 0,
         "snapshot_observed_at": snapshot_observed_at,
         "source": snapshot_source,
@@ -5529,9 +5538,12 @@ def _sw_public_amount(amount: Optional[Decimal],
                       reason: str) -> Tuple[Optional[Decimal], str]:
     """成员/独立行情共享的本地 amount 契约（既有公开边界复核）：
     Decimal 排序输入保留原始精度，但发布前按公开边界（PeerItem.amount 等
-    float 字段）复核有限性——不能以有限 float 表示的原始金额（超大整数
-    ``float()`` 溢出 ±inf）判 invalid（None + 缺口），JSON 与 Markdown
-    边界不出现 inf。ok/zero/missing 原样通过。"""
+    float 字段）复核有限性——不能以有限 float 表示的原始金额判 invalid
+    （None + 缺口）：超大整数 ``float()`` 溢出 ±inf；正 Decimal 下溢为
+    ``0.0``（如 wire 字面 ``1e-400``）同样不可发布——公开载荷会把「正额」
+    伪装成 0（issue #104 五轮）。真 0 是 reason=``zero`` 的已知零观测，
+    合格计覆盖、不参与正额排行，不受此条件影响。JSON 与 Markdown 边界
+    不出现 inf。ok/zero/missing 原样通过。"""
     if amount is None:
         return None, reason
     try:
@@ -5540,7 +5552,239 @@ def _sw_public_amount(amount: Optional[Decimal],
         return None, "invalid"
     if published != published or published in (float("inf"), float("-inf")):
         return None, "invalid"
+    if amount > 0 and published == 0:
+        return None, "invalid"
     return amount, reason
+
+
+_FULL_UNIVERSE_EVIDENCE_CAP = 200
+"""全量资格证据文本上界（与 SwMembershipDetail.completeness_evidence 一致）。"""
+
+
+def _verify_full_universe(index_code: str, session_date: str, *,
+                          constituents: Dict[str, Any],
+                          refresh_token: str, timeout_seconds: float,
+                          budget: ReportBudget) -> Dict[str, Any]:
+    """全成分资格双接口核验（issue #104；父规格 #98 决策 4）。
+
+    只有下列门槛**全部**成立才授予全成分成交额名次资格，任一失败即拒绝
+    （即使过滤后数量与供应商计数吻合）：
+
+    1. **原始行先校验后过滤**（p03473 审计计数，逐项为零）：身份格式不合格
+       行、空日期行、异日行、剥后缀同码冲突成员、表形状异常表；响应回显
+       身份与请求绑定指数冲突同样拒绝；超可发布上限的成员集合整体不发布；
+    2. **目标已确认纳入**（membership=included，带交易所精确匹配）——名次
+       是目标股的名次，目标不在名单无名次语境；
+    3. **供应商同日成分计数一致**：``ths_constituent_num_index`` 单指数
+       绑定请求 + 显式同一交易日，FDATE 回显一致，唯一无冲突正整数，且
+       **等于同日名单唯一成员数**（计数查询失败/缺失 → 拒绝，原因随缺口）；
+    4. **全体成员同日成交额状态可判定**：无批次缺口，每只成员都有行情行
+       且金额判定为 ok 或合法零（缺失/无效 → 拒绝；零额计入报价覆盖）。
+
+    通过时把证据文本写入 ``constituents["membership"]["completeness_evidence"]``
+    （单一写入点；:func:`_sw_peers_pillar` 据此解锁 full_constituents 名次
+    与前五资格）。返回 ``{"verified", "vendor_count", "evidence", "gaps",
+    "verified_member_count"}``，拒绝时 ``gaps`` 逐项写明缺少哪项证据（页面/
+    Markdown 如实透出）。``verified_member_count``（issue #104 复审）：名单/
+    计数核验通过（门槛 3）即携带——与全体报价状态（门槛 4）独立，行情失败
+    仍保留已核实的成分数事实，与才允许发布的全量名次分别表达。"""
+    members = constituents.get("members") or {}
+    membership = constituents.get("membership") or {}
+    member_codes = [str(c) for c in (members.get("member_codes") or [])]
+    quote_gaps = [str(g) for g in (constituents.get("member_quote_gaps") or [])]
+    gaps: List[str] = []
+
+    def _rejected(reasons: List[str],
+                  count: Optional[int] = None,
+                  verified_members: Optional[int] = None) -> Dict[str, Any]:
+        return {"verified": False, "vendor_count": count, "evidence": None,
+                "verified_member_count": verified_members, "gaps": reasons}
+
+    # ---- 门槛 1：原始行审计（过滤前校验，逐项结构化计数为零）----
+    audit_specs = (
+        ("rejected_identity_rows", "畸形", "行成员身份格式不合格"),
+        ("blank_date_rows", "空日期", "行日期为空"),
+        ("off_date_rows", "异日", "行非观察日"),
+        ("conflicting_code_members", "冲突", "个剥后缀同码跨交易所矛盾成员"),
+        ("conflicting_name_rows", "矛盾重复", "行同码重复名称矛盾"),
+    )
+    for key, label, phrase in audit_specs:
+        value = int(members.get(key) or 0)
+        if value:
+            gaps.append(
+                f"原始行审计：{value} {phrase}（{label}行计数非零），"
+                "拒绝全成分资格（表观计数吻合不豁免脏行）")
+    shape_gap_count = int(members.get("shape_gap_count") or 0)
+    if shape_gap_count:
+        gaps.append(
+            f"原始行审计：{shape_gap_count} 个响应表形状异常（该表不采用），"
+            "名单完整性不可证，拒绝全成分资格")
+    if members.get("identity_echo_conflict"):
+        gaps.append(
+            "原始行审计：成分响应回显身份与请求绑定指数冲突，绑定不可信，"
+            "拒绝全成分资格")
+    if members.get("over_publish_limit"):
+        gaps.append("原始行审计：成员响应超可发布上限，集合整体不发布，"
+                    "拒绝全成分资格")
+    if gaps:
+        return _rejected(gaps)
+    # ---- 门槛 2：目标已确认纳入 ----
+    if str(membership.get("status") or "unknown") != "included":
+        gaps.append(
+            f"目标股成分状态为 {membership.get('status') or 'unknown'}（未确认"
+            "纳入名单），无目标全成分名次语境，拒绝全成分资格")
+        return _rejected(gaps)
+    if not member_codes:
+        gaps.append("同日成员名单为空，拒绝全成分资格")
+        return _rejected(gaps)
+    # ---- 门槛 3：供应商同日成分计数一致 ----
+    from src.services.sector_sw_market import (
+        SwSectorFetchError,
+        fetch_index_member_count,
+    )
+
+    vendor_count: Optional[int] = None
+    fdate_echo: Optional[str] = None
+    try:
+        counted = fetch_index_member_count(
+            index_code, session_date, refresh_token=refresh_token,
+            timeout_seconds=timeout_seconds, deadline=budget.fetch_deadline,
+        )
+        vendor_count = int(counted.get("count"))
+        fdate_echo = str(counted.get("fdate_echo") or "")
+    except SwSectorFetchError as exc:
+        gaps.append(
+            f"供应商成分计数查询失败（{exc}），双接口核验缺计数证据，"
+            "拒绝全成分资格")
+        return _rejected(gaps)
+    unique_members = len(dict.fromkeys(member_codes))
+    if unique_members != vendor_count:
+        gaps.append(
+            f"计数不一致：供应商计数 {vendor_count} ≠ 同日名单唯一成员数 "
+            f"{unique_members}，拒绝全成分资格")
+        return _rejected(gaps, vendor_count)
+    verified_members = unique_members  # 门槛 3 过：名单/计数已核实（独立于门槛 4）
+    # ---- 门槛 4：全体成员同日成交额状态可判定 ----
+    member_quotes: Dict[str, Dict[str, Any]] = constituents.get(
+        "member_quotes") or {}
+    if quote_gaps:
+        gaps.append(
+            f"成员行情存在批次缺口（{len(quote_gaps)} 条），全体成交额状态"
+            "不可判定，拒绝全成分资格")
+        return _rejected(gaps, verified_members=verified_members)
+    undetermined: List[str] = []
+    for secucode in member_codes:
+        quote = member_quotes.get(secucode)
+        if quote is None:
+            undetermined.append(secucode)
+            continue
+        _, reason = _sw_public_amount(*_decimal_amount(quote.get("amount")))
+        if reason not in ("ok", "zero"):
+            undetermined.append(secucode)
+    if undetermined:
+        shown = "、".join(undetermined[:5])
+        more = f" 等 {len(undetermined)} 只" if len(undetermined) > 5 else ""
+        gaps.append(
+            f"{len(undetermined)} 只成员同日成交额状态不可判定（缺失或无效："
+            f"{shown}{more}），拒绝全成分资格")
+        return _rejected(gaps, verified_members=verified_members)
+    evidence = (
+        f"iFinD 双接口核验一致：p03473 同日名单 {unique_members} 只 = "
+        f"ths_constituent_num_index 计数 {vendor_count}（FDATE {fdate_echo}"
+        " 回显一致；原始行无空日期/异日/畸形/冲突）；全体成员同日成交额"
+        "状态可判定（含零额覆盖）")[:_FULL_UNIVERSE_EVIDENCE_CAP]
+    membership["completeness_evidence"] = evidence
+    return {"verified": True, "vendor_count": vendor_count,
+            "evidence": evidence, "gaps": gaps,
+            "verified_member_count": verified_members}
+
+
+def _sw_l2_peers_stage(code: str, name: str, sw_chain: Dict[str, Any],
+                       l2_index_code: str, *, budget: ReportBudget,
+                       ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """二级同业与全成分成交额名次阶段（issue #104；可选出站）。
+
+    必需研究（催化/综合）之后的剩余取数预算内运行（父规格 #98 决策 6）：
+    - 预算/凭据/会话/目标日门控不过 → ``(None, [缺口])``，零出站；
+    - 复用 :func:`_fetch_constituents`（L2 指数同日成分 + 目标独立行情 +
+      成员行情批次，失败隔离语义与一级成分链同一）；
+    - :func:`_verify_full_universe` 双接口核验（原始行审计 + 同日计数一致 +
+      报价全集），通过后解锁全成分名次；
+    - :func:`_sw_peers_pillar``（``amount_rank_enabled=True``）产出同业块。
+
+    失败隔离：成分/行情/核验失败只进块缺口与阶段缺口——不触发东财兜底、
+    不影响一级事实、完整性判定与必需研究。返回 ``(块 or None, 阶段缺口)``。
+    """
+    if budget.fetch_expired():
+        return None, ["二级同业：取数预算已耗尽，二级成分与全量核验未发起"
+                      "（可选出站，不影响既有事实）"]
+    from src.services.sector_sw_market import sw_http_config
+
+    cfg = sw_http_config()
+    if cfg is None:
+        return None, ["二级同业：iFinD 凭据未配置，二级成分与全量核验未发起"]
+    session = sw_chain.get("session")
+    if session is None:
+        return None, ["二级同业：会话上下文缺失（降级/受控链），未发起"]
+    token, timeout = cfg
+    snapshot_date = (sw_chain.get("snapshot") or {}).get("session_date")
+    if not snapshot_date:
+        return None, ["二级同业：目标交易日未确定，未发起"]
+    constituents = _fetch_constituents(
+        code, l2_index_code, snapshot_date, session, name=name,
+        refresh_token=token, timeout_seconds=timeout, budget=budget)
+    verification = _verify_full_universe(
+        l2_index_code, snapshot_date, constituents=constituents,
+        refresh_token=token, timeout_seconds=timeout, budget=budget)
+    # 核验的精确失败缺口随块承载（反馈 3：不只合并进全局 gaps——块存在时
+    # 缺口在块内可查，且替代支柱的泛化资格缺口避免同一失败两套文案）
+    stage_gaps: List[str] = [
+        f"二级同业全量核验未通过：{g}" for g in verification["gaps"]]
+    block = _sw_peers_pillar(
+        code, constituents=constituents,
+        snapshot_observed_at=datetime.now().isoformat(timespec="seconds"),
+        budget=budget, amount_rank_enabled=True,
+        qualification_gaps=stage_gaps or None,
+        verified_constituent_num=verification.get("verified_member_count"))
+    return block, stage_gaps
+
+
+def _sw_amount_rank_invariants(out: Dict[str, Any]) -> bool:
+    """申万同业块成交额名次跨字段不变式（issue #104 复审；icontract 出口校验）。
+
+    只承载跨字段真约束，字段取值与基本整数范围（类型、ge=1）由 Pydantic
+    Field 承载、不在此重复（issue #104 三轮）：
+
+    - 名次发布（``target_amount_rank`` 非 None）⇒ 声明了范围且名次不越分母
+      （rank ≤ denominator；rank 的下界由 Field ge=1 承载）；
+    - 分母不越正额行数：denominator ≤ ``rankable_rows``（正额集合是全量
+      与样本两种范围的公共上界——样本分母 = 样本内正额数 ≤ 正额行数）；
+    - 口径与证据/分母一致性：``full_constituents``（才允许发布的全量名次）
+      ⇒ 携带双接口核验证据，且分母**等于**正额行数（全量正额分母 =
+      ``rankable_rows``，不是其子集）；
+    - 核验事实独立、不受名次发布约束：``verified_constituent_num`` 允许在
+      样本级块携带（成分数复核与才允许发的全量名次分别表达），不在此
+      禁止。
+    """
+    denominator = out.get("amount_rank_denominator")
+    # 缺键按 schema 语义默认 0 对齐（issue #104 四轮）：dict 缺
+    # rankable_rows 时 get(None) 曾让全量分母一致性检查被跳过
+    rankable = out.get("rankable_rows", 0) or 0
+    scope = out.get("amount_rank_scope")
+    if denominator is not None and denominator > rankable:
+        return False
+    rank = out.get("target_amount_rank")
+    if rank is not None:
+        if denominator is None or rank > denominator:
+            return False
+        if scope is None:
+            return False
+    if scope == "full_constituents":
+        if not out.get("amount_rank_evidence"):
+            return False
+        if denominator is None or denominator != rankable:
+            return False
+    return True
 
 
 @require(lambda code: isinstance(code, str) and len(code) == 6 and code.isdigit(),
@@ -5551,11 +5795,14 @@ def _sw_public_amount(amount: Optional[Decimal],
     lambda result: (not result.get("industry_reference")
                     or (result.get("target_change_pct_rank") is None
                         and result.get("target_in_amount_top5") is None
+                        and result.get("target_amount_rank") is None
+                        and result.get("amount_rank_denominator") is None
+                        and result.get("amount_rank_scope") is None
                         and not any(i.get("is_target")
                                     for i in (result.get("items") or [])))),
     "industry_reference=True (target not confirmed in constituents) must leave "
-    "in-constituents rank and top5 eligibility empty and must not list the "
-    "target inside the constituents sample items",
+    "in-constituents rank, top5 eligibility and amount rank fields empty and "
+    "must not list the target inside the constituents sample items",
 )
 @ensure(
     lambda result: (result.get("target_independent_quote") is None
@@ -5568,10 +5815,22 @@ def _sw_public_amount(amount: Optional[Decimal],
     "target quote is only an independent fact (a bare-code lookalike from "
     "another exchange in items stays a peer row, not target evidence)",
 )
+@ensure(
+    lambda result: _sw_amount_rank_invariants(result),
+    "amount rank cross-field invariants: a published rank needs a declared "
+    "scope and a denominator that bounds it (1 <= rank <= denominator); the "
+    "denominator is bounded by the positive-amount rows; a full_constituents "
+    "scope always carries the dual-interface verification evidence "
+    "(scope's literal membership is Pydantic's, not re-checked here)",
+)
 def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
                      snapshot_observed_at: Optional[str],
-                     budget: ReportBudget) -> Dict[str, Any]:
-    """申万口径同业比较支柱（issue #100；父规格 #98 决策 3/5）。
+                     budget: ReportBudget,
+                     amount_rank_enabled: bool = False,
+                     qualification_gaps: Optional[List[str]] = None,
+                     verified_constituent_num: Optional[int] = None,
+                     ) -> Dict[str, Any]:
+    """申万口径同业比较支柱（issue #100；成交额名次见 issue #104）。
 
     成分边界三态（:func:`sector_sw_market.classify_membership` 输出）下的选取：
     - ``included``（已纳入）：同一成分快照按成交额前五 + 目标股去重（既有
@@ -5588,6 +5847,22 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
     不补造），有效范围与批次缺口如实披露；零额成员是已知零观测（保留 0、
     不进活跃前五）；剥后缀后 6 位码冲突整组剔除（保守）。成员行情时点
     （``quotes_as_of``）来自供应商时间戳（非接收钟）。
+
+    成交额名次（issue #104，``amount_rank_enabled=True`` 时发布；一级既有
+    口径默认关闭、字段组恒 None）：名次是**顺序名次**——按正额降序、同额
+    代码升序的确定排序中的位置（不并列；涨跌幅名次才并列同名次）。
+    ``qualification_gaps``（issue #104 review）：全量核验的精确失败缺口，
+    提供时替代泛化资格缺口进入块（避免同一失败两套文案）。范围两态：
+    - ``full_constituents``：成分全集证据（:func:`_verify_full_universe`
+      双接口核验一致）与报价全集同时可证——全体正额成员均实际纳入比较，
+      名次/分母取全体正额集合，核验证据随 ``amount_rank_evidence`` 透出；
+    - ``qualified_sample``：门槛未满足时降级——比较集是**实际入选样本**
+      （成交额前五 + 确认纳入的目标股去重），名次/分母取该样本内的有效
+      正额成员（如实标注范围，不冒充全成分：28 只观测目标第 10 时样本
+      名次是 6/6，不是 10/28——前五之外的成员未入选比较，不给隐藏名次）。
+    已知零额目标不参与正额名次（字段组不发布，缺口承载）；目标缺有效正额
+    同样不发布。成交额名次与涨跌幅名次独立判定（缺涨跌幅同行只 withhold
+    涨跌幅名次，不阻断成交额名次）。
     """
     membership = constituents.get("membership") or {}
     members = constituents.get("members") or {}
@@ -5610,6 +5885,10 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
         "items": [],
         "target_in_amount_top5": None,
         "target_change_pct_rank": None,
+        "target_amount_rank": None,
+        "amount_rank_denominator": None,
+        "amount_rank_scope": None,
+        "amount_rank_evidence": None,
         "amount_unit": "元",
         "amount_provenance": _SW_MEMBERS_AMOUNT_PROVENANCE,
         # 超可发布上限的响应：成员集合整体不发布，观测行数不进有界字段
@@ -5617,6 +5896,9 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
         "snapshot_rows": (0 if members.get("over_publish_limit")
                           else int(members.get("rows_total") or 0)),
         "rankable_rows": 0,
+        "valid_quote_rows": None,
+        "change_pct_qualified_rows": None,
+        "verified_constituent_num": verified_constituent_num,
         "sample_size": 0,
         "snapshot_observed_at": snapshot_observed_at,
         "source": _SW_MEMBERS_SOURCE,
@@ -5703,6 +5985,9 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
         1 for m in members_data
         if m["amount"] is not None and m["amount"] > 0)
     zero_total = amount_reasons["zero"]
+    # 行情覆盖与正额排名分母分开（issue #104 复审）：有效报价 = 正额 +
+    # 已知零（零额计入报价覆盖但不进分母）；旧存档无此键（不假定零数）
+    out["valid_quote_rows"] = out["rankable_rows"] + zero_total
     invalid_total = amount_reasons["invalid"]
     missing_total = amount_reasons["missing"]
     if zero_total:
@@ -5722,7 +6007,7 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
 
     rankable = sorted(
         (m for m in members_data if m["amount"] is not None and m["amount"] > 0),
-        key=lambda m: (-m["amount"], m["code"]))
+        key=lambda m: (m["amount"].copy_negate(), m["code"]))
     ranked_codes = [m["code"] for m in rankable]
     member_by_code = {m["code"]: m for m in members_data}
     target_member = member_by_code.get(code)
@@ -5755,12 +6040,17 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
                 out["target_in_amount_top5"] = False
                 gaps.append(
                     f"同业比较：目标股 {code} 成交额为已知零，不属于正额活跃前五")
+            elif qualification_gaps:
+                # 全量核验的精确缺口已由调用方提供（替代泛化文案，不重复）
+                gaps.extend(str(g) for g in qualification_gaps)
             else:
                 gaps.append(
                     "同业比较：报价全集或成分完整性不可证（含被剔除成员行时"
                     "分母不完整），目标股前五资格不判定（样本内事实保留）")
         elif full_universe:
             out["target_in_amount_top5"] = code in ranked_codes[:5]
+        elif qualification_gaps:
+            gaps.extend(str(g) for g in qualification_gaps)
         else:
             missing_parts = []
             if not member_completeness:
@@ -5772,6 +6062,12 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
                 "同业比较：全成分成交额前五资格需要成分全集证据与报价全集"
                 f"同时可证（{'、'.join(missing_parts)}），资格不判定"
                 "（样本内事实保留）")
+        # 有效涨跌幅覆盖对入选样本一次统计（issue #104 复审二轮）：名次、
+        # 覆盖数与缺口共用同一计数，不在汇合点对同一样本重复计算
+        picked_change_ok = sum(
+            1 for c in picked
+            if member_by_code[c]["change_pct"] is not None)
+        out["change_pct_qualified_rows"] = picked_change_ok if picked else None
         # 样本内涨跌幅名次（picked 全覆盖才发；缺失同行 withhold）
         if target_member is None:
             pass
@@ -5783,21 +6079,64 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
             gaps.append(
                 "同业比较：样本内无可比同行（仅目标股自身），相对位置不输出")
         else:
-            valid_changes = [
-                m["change_pct"] for m in (member_by_code[c] for c in picked)
-                if m["change_pct"] is not None]
-            missing_changes = len(picked) - len(valid_changes)
+            missing_changes = len(picked) - picked_change_ok
             if missing_changes:
                 gaps.append(
                     f"同业比较：样本内 {missing_changes} 家当日涨跌幅缺失，"
-                    f"有效比较范围 {len(valid_changes)}/{len(picked)} 家，"
+                    f"有效比较范围 {picked_change_ok}/{len(picked)} 家，"
                     "不输出全样本名次（不伪完整排名）")
             else:
                 out["target_change_pct_rank"] = (
-                    1 + sum(1 for ch in valid_changes
+                    1 + sum(1 for ch in (member_by_code[c]["change_pct"]
+                                          for c in picked)
                             if ch > target_member["change_pct"]))
+        # 成交额名次（issue #104，amount_rank_enabled 时）：与涨跌幅名次
+        # 独立判定——缺涨跌幅同行只 withhold 涨跌幅名次，不阻断本名次。
+        # 目标有有效正额才发布（已知零额不参与正额名次、缺额无名次语境，
+        # 字段组不发布）。名次为**顺序名次**（排序契约：正额降序、同额
+        # 代码升序中的位置，不并列）。范围两态：
+        # - full_constituents：全量资格可证 → 全体正额成员均实际纳入比较，
+        #   名次/分母取全体正额集合；
+        # - qualified_sample：门槛未满足 → 比较集是实际入选样本（前五 +
+        #   确认纳入的目标去重），名次/分母取该样本内有效正额成员——
+        #   前五之外的成员未入选比较，不给隐藏名次（28 只观测目标第 10
+        #   时样本名次是 6/6，不是 10/28）。
+        if amount_rank_enabled and target_member is not None:
+            t_amount = target_member["amount"]
+            if t_amount is not None and t_amount > 0:
+                # 名次/分母直接复用已排序名单（copy_negate 精确降序、同额码
+                # 升序）中的位置——不再维护第二套比较器（issue #104 四轮）：
+                # 上下文精度的 -amount 取负曾把 38 位有效数字的金额差截断
+                if full_universe:
+                    out["target_amount_rank"] = ranked_codes.index(code) + 1
+                    out["amount_rank_denominator"] = len(rankable)
+                    out["amount_rank_scope"] = "full_constituents"
+                    out["amount_rank_evidence"] = evidence
+                else:
+                    picked_set = set(picked)
+                    picked_ranked = [
+                        m for m in rankable if m["code"] in picked_set]
+                    out["target_amount_rank"] = (
+                        next(i for i, m in enumerate(picked_ranked)
+                             if m["code"] == code) + 1)
+                    out["amount_rank_denominator"] = len(picked_ranked)
+                    out["amount_rank_scope"] = "qualified_sample"
+            elif t_amount == Decimal("0"):
+                gaps.append(
+                    f"目标股 {code} 成交额为已知零额，不参与正额成交额名次"
+                    "（计入报价覆盖）")
+            else:
+                gaps.append(
+                    f"目标股 {code} 成交额缺失或无效，不参与成交额名次"
+                    "（不按其他指标顶替）")
     else:
         picked = list(ranked_codes[:5])
+        # 行业参考样本同样发布有效涨跌幅覆盖（issue #104 复审：一次统计，
+        # 与 included 分支共用同一计数语义；名次字段保持留空）
+        out["change_pct_qualified_rows"] = (
+            sum(1 for c in picked
+                if member_by_code[c]["change_pct"] is not None)
+            if picked else None)
         # 目标独立行情：只进独立事实位（不进 items、不参与排名）
         if target_quote is not None:
             t_secucode = str(target_quote.get("thscode") or "")
@@ -5935,7 +6274,7 @@ def _enrich_sw_reference_levels(code: str, sw: Dict[str, Any], *,
 def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: ReportBudget,
                         em_fallback_note: Optional[str] = None) -> Dict[str, Any]:
     """申万口径载荷组合（issue #99；同业/成分接线见 issue #100；研究接线
-    见 issue #101）。
+    见 issue #101；二级同业与全成分成交额名次见 issue #104）。
 
     市场数据块（主行业/当日快照/趋势）按申万事实产出；成分边界三态回填
     identity.membership（``sw_index_members`` 口径 + ``sw_membership`` 明细）
@@ -6105,6 +6444,16 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     sector_trend_windows_gaps: Optional[List[str]] = (
         (windows_block or {}).get("gaps") or None)
 
+    # ---- 二级同业与全成分成交额名次（issue #104）：必需研究之后的剩余
+    # 预算可选出站（spec 决定 6）。二级身份确认才发起；身份缺失的缺口已随
+    # l2_identity.gaps 披露（二级同业依赖身份，不重复）；成分/行情/核验
+    # 失败只进块缺口与阶段缺口——不触发兜底、不降一级完整性。----
+    l2_peers_block: Optional[Dict[str, Any]] = None
+    l2_peers_stage_gaps: List[str] = []
+    if confirmed and l2_index_code:
+        l2_peers_block, l2_peers_stage_gaps = _sw_l2_peers_stage(
+            code, name, sw, l2_index_code, budget=budget)
+
     identity = {
         "industry_em": None, "industry_cninfo": None, "business_scope": None,
         "board_name": index_name or None, "board_code": index_code or None,
@@ -6216,6 +6565,9 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     gaps.extend(l2_identity.get("gaps") or [])
     if windows_block is not None:
         gaps.extend(windows_block.get("gaps") or [])
+    if l2_peers_block is not None:
+        gaps.extend(l2_peers_block.get("gaps") or [])
+    gaps.extend(l2_peers_stage_gaps)
     for block in (policy, concepts):
         gaps.extend(block.get("gaps") or [])
     if base.get("is_default"):
@@ -6242,6 +6594,11 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         "sector_l2_identity": l2_identity,  # issue #103：二级目录唯一映射
         "sector_trend_windows": sector_trend_windows,
         "sector_trend_windows_gaps": sector_trend_windows_gaps,
+        "sector_l2_peers": l2_peers_block,  # issue #104：二级同业 + 全量名次
+        # 整链缺口仅在块缺席时发布（块取得时缺口随块内 gaps 与顶层 gaps）
+        "sector_l2_peers_gaps": (
+            (l2_peers_stage_gaps or None)
+            if l2_peers_block is None else None),
         "assessment": {
             "status": status,
             "completeness": completeness,

@@ -817,3 +817,148 @@ class TestTrendWindowSeriesContracts:
         postconditions = getattr(
             svc._sw_trend_windows_pillar, "__postconditions__", [])
         assert postconditions, "_sw_trend_windows_pillar 应挂载 ensure 契约"
+
+
+# ========================================================================
+# 申万同业块成交额名次跨字段契约（issue #104 复审；icontract 出口校验）
+# ========================================================================
+
+
+class TestSwAmountRankInvariants:
+    """``_sw_peers_pillar`` 出口的成交额名次跨字段不变式：名次发布需要声明
+    范围且有界分母（1 ≤ rank ≤ denominator ≤ 正额行数）；full_constituents
+    范围必携带双接口核验证据；成分数复核（verified_constituent_num）独立于
+    名次发布——样本级块允许持有独立复核信息，不在契约中禁止。"""
+
+    @staticmethod
+    def _included_constituents(*, evidence: Any) -> Dict[str, Any]:
+        codes = ["601318.SH", "601319.SH", "601336.SH", "601601.SH",
+                 "601628.SH"]
+        quotes = {
+            "601318.SH": {"thscode": "601318.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.73,
+                          "amount": 2.81e9},
+            "601319.SH": {"thscode": "601319.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -1.39,
+                          "amount": 3.12e8},
+            "601336.SH": {"thscode": "601336.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -1.91,
+                          "amount": 4.32e8},
+            "601601.SH": {"thscode": "601601.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.06,
+                          "amount": 6.26e8},
+            "601628.SH": {"thscode": "601628.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.60,
+                          "amount": 0.0},
+        }
+        return {
+            "membership": {"status": "included",
+                           "target_secucode": "601318.SH",
+                           "observation_date": "2026-11-20",
+                           "member_count": 5,
+                           "completeness_evidence": evidence, "gaps": []},
+            "members": {"member_codes": codes,
+                        "member_names": {c: f"成员{c[:6]}" for c in codes},
+                        "dates_seen": ["2026-11-20"],
+                        "rows_total": len(codes),
+                        "completeness_evidence": None, "gaps": []},
+            "member_quotes": quotes, "member_quote_gaps": [],
+            "target_quote": None, "target_quote_gaps": [],
+            "target_name": "中国平安",
+        }
+
+    def test_real_paths_satisfy_invariants(self) -> None:
+        """真实业务路径正例：全量发布（含零额成员）、一级口径出口全部满足
+        不变式（每次调用自动校验）；样本范围形状经谓词正例覆盖。"""
+        evidence = ("iFinD 双接口核验一致：p03473 同日名单 5 只 = "
+                    "ths_constituent_num_index 计数 5（FDATE 20261120）")
+        full = svc._sw_peers_pillar(
+            "601318", constituents=self._included_constituents(evidence=evidence),
+            snapshot_observed_at="2026-11-20T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0),
+            amount_rank_enabled=True)
+        assert full["amount_rank_scope"] == "full_constituents"
+        assert full["amount_rank_evidence"] == evidence
+        assert svc._sw_amount_rank_invariants(full) is True
+        l1 = svc._sw_peers_pillar(
+            "601318", constituents=self._included_constituents(evidence=None),
+            snapshot_observed_at="2026-11-20T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0))
+        assert l1["amount_rank_scope"] is None
+        assert svc._sw_amount_rank_invariants(l1) is True
+        assert svc._sw_amount_rank_invariants(
+            {"target_amount_rank": 1, "amount_rank_denominator": 4,
+             "amount_rank_scope": "qualified_sample",
+             "rankable_rows": 4}) is True
+        assert svc._sw_amount_rank_invariants(
+            {"target_amount_rank": None, "amount_rank_denominator": None,
+             "amount_rank_scope": None, "rankable_rows": 4}) is True
+
+    def test_predicate_rejects_out_of_range_rank(self) -> None:
+        """反例：名次越过分母（5 > 4）必须判 False。"""
+        bad = {"target_amount_rank": 5, "amount_rank_denominator": 4,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_predicate_rejects_full_scope_without_evidence(self) -> None:
+        """反例：全成分范围名次不携带双接口核验证据必须判 False。"""
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 4,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": None, "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_predicate_rejects_denominator_beyond_rankable_rows(self) -> None:
+        """反例：分母越过正额行数（样本/全量范围的公共上界）必须判 False。"""
+        bad = {"target_amount_rank": None, "amount_rank_denominator": 10,
+               "amount_rank_scope": None, "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+        bad_rank = {"target_amount_rank": 3, "amount_rank_denominator": 10,
+                    "amount_rank_scope": "qualified_sample",
+                    "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad_rank) is False
+
+    def test_sample_scope_may_carry_independent_verification(self) -> None:
+        """样本级块持有独立复核信息不被禁止（成分数复核与全量名次分别
+        表达——复审问题 6 的契约面）。"""
+        ok = {"target_amount_rank": 2, "amount_rank_denominator": 4,
+              "amount_rank_scope": "qualified_sample",
+              "amount_rank_evidence": None, "rankable_rows": 4,
+              "verified_constituent_num": 28}
+        assert svc._sw_amount_rank_invariants(ok) is True
+
+    def test_full_scope_denominator_must_equal_rankable_rows(self) -> None:
+        """三轮：全成分正额分母必须**等于**正额行数（不是其子集）。"""
+        ok = {"target_amount_rank": 1, "amount_rank_denominator": 4,
+              "amount_rank_scope": "full_constituents",
+              "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(ok) is True
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_missing_rankable_rows_defaults_to_zero_not_skipped(self) -> None:
+        """四轮：缺 ``rankable_rows`` 键按 schema 语义默认 0——全量分母
+        一致性与上界检查不再被 get(None) 跳过（反例：缺键 + 全量 denom=3
+        曾被误接受）。"""
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e"}
+        assert svc._sw_amount_rank_invariants(bad) is False
+        ok = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+              "amount_rank_scope": "full_constituents",
+              "amount_rank_evidence": "e", "rankable_rows": 3}
+        assert svc._sw_amount_rank_invariants(ok) is True
+
+    def test_contracts_attached_to_sw_peers_pillar(self) -> None:
+        """跨字段不变式以 icontract 契约强制在构建出口（每次调用校验）。"""
+        postconditions = getattr(svc._sw_peers_pillar, "__postconditions__", [])
+        joined = " ".join(str(getattr(pc, "description", "")) for pc in
+                          postconditions)
+        assert "amount rank cross-field invariants" in joined

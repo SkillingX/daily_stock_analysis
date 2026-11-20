@@ -375,6 +375,133 @@ describe('SectorFirstScreen', () => {
   });
 });
 
+// issue #104：二级同业表（成交活跃代表 + 全成分成交额名次），数据来自存档。
+describe('SectorFirstScreen L2 peers', () => {
+  function l2PeersBlock() {
+    return {
+      eligible: true,
+      selection_rule: '同一成分快照按成交额前五 + 目标股去重',
+      items: [
+        { code: '601898', name: '中国神华', amount: 1.0e9, change_pct: 0.5, is_target: false, as_of_date: '2026-11-19' },
+        { code: '600188', name: '兖矿能源', amount: 9.0e8, change_pct: -0.87, is_target: true, as_of_date: '2026-11-19' },
+        { code: '601225', name: '陕西煤业', amount: 7.0e8, change_pct: 2.2, is_target: false, as_of_date: '2026-11-19' },
+      ],
+      target_in_amount_top5: true,
+      target_change_pct_rank: null,
+      target_amount_rank: 2,
+      amount_rank_denominator: 5,
+      amount_rank_scope: 'full_constituents',
+      amount_rank_evidence: 'iFinD 双接口核验一致：p03473 同日名单 5 只 = ths_constituent_num_index 计数 5（FDATE 20261119 回显一致）',
+      amount_unit: '元',
+      snapshot_rows: 5,
+      rankable_rows: 5,
+      valid_quote_rows: 5,
+      change_pct_qualified_rows: 3,
+      verified_constituent_num: 5,
+      sample_size: 3,
+      quotes_as_of: '2026-11-19 22:00:46',
+      industry_reference: false,
+      target_independent_quote: null,
+      gaps: [],
+    };
+  }
+
+  it('renders L2 peers table with amount rank, scope and verification', () => {
+    const analysis = confirmedAnalysis();
+    (analysis as Record<string, unknown>).sector_l2_peers = l2PeersBlock();
+    render(<SectorFirstScreen analysis={analysis} />);
+    // 表格：成员代码与目标标记
+    expect(screen.getByText('600188')).toBeTruthy();
+    expect(screen.getByText('兖矿能源')).toBeTruthy();
+    expect(screen.getByText('601898')).toBeTruthy();
+    // 名次行：范围 + 分母 + 核验证据
+    expect(screen.getByText(/第 2 \/ 5/)).toBeTruthy();
+    expect(screen.getAllByText(/全成分/).length).toBeGreaterThan(0);
+    // 双接口核验一致出现在核验证据行与已验证成分数行（各自独立表达）
+    expect(screen.getAllByText(/双接口核验一致/).length).toBe(2);
+    // 覆盖统计（issue #104 复审：行情覆盖含已知零，与正额名次分母分开）
+    expect(screen.getByText(/观察成分 5/)).toBeTruthy();
+    expect(screen.getByText(/有效报价 5 行（含已知零 0，正额可排名 5）/)).toBeTruthy();
+    expect(screen.getByText(/正额名次分母 5/)).toBeTruthy();
+    // 涨跌幅覆盖与已验证成分数（核验事实独立于名次发布）
+    expect(screen.getByText(/有效涨跌幅覆盖 3\/3/)).toBeTruthy();
+    expect(screen.getByText(/已验证成分数：5/)).toBeTruthy();
+  });
+
+  it('separates quote coverage from rank denominator with known zeros', () => {
+    // 复审样例：四正一已知零全覆盖——有效报价 5、正额可排名 4、分母 4
+    const analysis = confirmedAnalysis();
+    const block = l2PeersBlock();
+    (block as Record<string, unknown>).rankable_rows = 4;
+    (block as Record<string, unknown>).amount_rank_denominator = 4;
+    (analysis as Record<string, unknown>).sector_l2_peers = block;
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText(/有效报价 5 行（含已知零 1，正额可排名 4）/)).toBeTruthy();
+    expect(screen.getByText(/正额名次分母 4/)).toBeTruthy();
+  });
+
+  it('falls back to positive-only wording for legacy archives', () => {
+    // 旧存档无 valid_quote_rows：不假定未采集的已知零数
+    const analysis = confirmedAnalysis();
+    const block = l2PeersBlock();
+    (block as Record<string, unknown>).valid_quote_rows = null;
+    (block as Record<string, unknown>).change_pct_qualified_rows = null;
+    (block as Record<string, unknown>).verified_constituent_num = null;
+    (analysis as Record<string, unknown>).sector_l2_peers = block;
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText(/有效报价 5 行（正额口径，未采集已知零数）/)).toBeTruthy();
+    expect(screen.queryByText(/有效涨跌幅覆盖/)).toBeNull();
+    expect(screen.queryByText(/已验证成分数/)).toBeNull();
+  });
+
+  it('shows change-pct coverage when rank is withheld and quote date on independent quote', () => {
+    // 复审样例：五个入选、四个合格、目标缺幅——覆盖 4/5 可见；独立行情带日期
+    const analysis = confirmedAnalysis();
+    const block = l2PeersBlock();
+    (block as Record<string, unknown>).sample_size = 5;
+    (block as Record<string, unknown>).change_pct_qualified_rows = 4;
+    (block as Record<string, unknown>).target_independent_quote = {
+      code: '601318', name: '中国平安', amount: 2.81e9,
+      change_pct: null, is_target: true, as_of_date: '2026-11-18',
+    };
+    (analysis as Record<string, unknown>).sector_l2_peers = block;
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText(/有效涨跌幅覆盖 4\/5/)).toBeTruthy();
+    expect(screen.getByText(/行情日期 2026-11-18/)).toBeTruthy();
+  });
+
+  it('renders sample scope wording when full universe not granted', () => {
+    const analysis = confirmedAnalysis();
+    const block = l2PeersBlock();
+    (block as Record<string, unknown>).amount_rank_scope = 'qualified_sample';
+    (block as Record<string, unknown>).amount_rank_evidence = null;
+    (analysis as Record<string, unknown>).sector_l2_peers = block;
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText(/有效正额样本/)).toBeTruthy();
+    // 无全量核验证据行；已验证成分数（独立复核事实）照常展示
+    expect(screen.queryByText(/全成分核验/)).toBeNull();
+    expect(screen.getByText(/已验证成分数：5/)).toBeTruthy();
+  });
+
+  it('renders chain gap when L2 peers block absent', () => {
+    const analysis = confirmedAnalysis();
+    (analysis as Record<string, unknown>).sector_l2_peers = null;
+    (analysis as Record<string, unknown>).sector_l2_peers_gaps = [
+      '二级同业：取数预算已耗尽，二级成分与全量核验未发起（可选出站，不影响既有事实）',
+    ];
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText(/二级同业未取得/)).toBeTruthy();
+    expect(screen.getByText(/预算已耗尽/)).toBeTruthy();
+  });
+
+  it('does not render L2 peers section for legacy reports', () => {
+    const analysis = confirmedAnalysis();
+    render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.queryByText(/二级同业/)).toBeNull();
+    expect(screen.queryByText(/二级同业未取得/)).toBeNull();
+  });
+});
+
 // issue #103 三轮：归一化边界的可画判定只有一份（buildChartData 的
 // drawableRoles），Line/图例与画线缺口说明共用；目录版本随已确认身份带出。
 describe('SectorFirstScreen 复审三轮', () => {
@@ -532,5 +659,49 @@ describe('SectorFirstScreen 复审五轮', () => {
     render(<SectorFirstScreen analysis={analysis} />);
     expect(screen.queryByTestId('chart-line-l2_industry')).toBeNull();
     expect(screen.getAllByText(/曲线未绘制/).length).toBe(1);
+  });
+});
+
+// issue #104 六轮：正但不足 1 元的金额保留原值字面（String(v)），与真零 0
+// 有清楚区别——服务端仍按正额排行，页面不得把小正数显示成「0」。
+describe('SectorFirstScreen 复审六轮', () => {
+  it('distinguishes sub-1-yuan positive amounts from true zero', () => {
+    const analysis = confirmedAnalysis();
+    (analysis as Record<string, unknown>).sector_l2_peers = {
+      eligible: true,
+      selection_rule: '同一成分快照按成交额前五 + 目标股去重',
+      items: [
+        { code: '601898', name: '中国神华', amount: 0.1, change_pct: 0.5, is_target: false, as_of_date: '2026-11-19' },
+        { code: '600188', name: '兖矿能源', amount: 0, change_pct: 0.5, is_target: false, as_of_date: '2026-11-19' },
+        { code: '601225', name: '陕西煤业', amount: 7.0e8, change_pct: 2.2, is_target: false, as_of_date: '2026-11-19' },
+      ],
+      target_in_amount_top5: false,
+      target_change_pct_rank: null,
+      target_amount_rank: 3,
+      amount_rank_denominator: 3,
+      amount_rank_scope: 'full_constituents',
+      amount_rank_evidence: 'iFinD 双接口核验一致',
+      amount_unit: '元',
+      snapshot_rows: 3,
+      rankable_rows: 2,
+      valid_quote_rows: 3,
+      change_pct_qualified_rows: 3,
+      verified_constituent_num: 3,
+      sample_size: 3,
+      quotes_as_of: null,
+      industry_reference: false,
+      target_independent_quote: {
+        code: '601318', name: '中国平安', amount: 0.1,
+        change_pct: null, is_target: true, as_of_date: '2026-11-18',
+      },
+      gaps: [],
+    };
+    render(<SectorFirstScreen analysis={analysis} />);
+    // 小正数保留字面 0.1（表格与独立行情同一 formatter），真零显示 0
+    expect(screen.getAllByText('0.1').length).toBe(1);  // 表格单元格
+    expect(screen.getByText(/成交额 0\.1 元/)).toBeTruthy();  // 独立行情（同 formatter）
+    expect(screen.getByText('0')).toBeTruthy();          // 真零不受影响
+    // 可表示极小值同样保留字面（String(v)）
+    expect(screen.getByText(/成交额（元）/)).toBeTruthy();
   });
 });

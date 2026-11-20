@@ -48,6 +48,93 @@ interface TrendWindow {
   gaps: string[];
 }
 
+// issue #104：二级同业块（成交活跃代表 + 全成分成交额名次），来自存档载荷。
+interface L2PeerItem {
+  code: string;
+  name: string;
+  amount: number | null;
+  change_pct: number | null;
+  is_target: boolean;
+  as_of_date: string | null;
+}
+
+interface L2PeersBlock {
+  items: L2PeerItem[];
+  target_amount_rank: number | null;
+  amount_rank_denominator: number | null;
+  amount_rank_scope: string | null;
+  amount_rank_evidence: string | null;
+  target_change_pct_rank: number | null;
+  sample_size: number;
+  snapshot_rows: number;
+  rankable_rows: number;
+  // issue #104 复审追加（旧存档无键 → null，不假定未采集的已知零数）：
+  valid_quote_rows: number | null;
+  change_pct_qualified_rows: number | null;
+  verified_constituent_num: number | null;
+  quotes_as_of: string | null;
+  industry_reference: boolean;
+  target_independent_quote: L2PeerItem | null;
+  gaps: string[];
+}
+
+function parseL2PeerItem(v: unknown): L2PeerItem | null {
+  const rec = asRecord(v);
+  if (!rec) return null;
+  const code = asString(rec.code);
+  if (!code) return null;
+  return {
+    code,
+    name: asString(rec.name) ?? code,
+    amount: asNumber(rec.amount),
+    change_pct: asNumber(rec.change_pct),
+    is_target: rec.is_target === true,
+    as_of_date: asString(rec.as_of_date),
+  };
+}
+
+function parseL2Peers(v: unknown): L2PeersBlock | null {
+  const rec = asRecord(v);
+  if (!rec) return null;
+  const items: L2PeerItem[] = Array.isArray(rec.items)
+    ? rec.items.map(parseL2PeerItem).filter((i): i is L2PeerItem => i !== null)
+    : [];
+  const gaps = Array.isArray(rec.gaps)
+    ? rec.gaps.filter((g): g is string => typeof g === 'string')
+    : [];
+  const scope = asString(rec.amount_rank_scope);
+  return {
+    items,
+    target_amount_rank: asNumber(rec.target_amount_rank),
+    amount_rank_denominator: asNumber(rec.amount_rank_denominator),
+    amount_rank_scope:
+      scope === 'full_constituents' || scope === 'qualified_sample'
+        ? scope
+        : null,
+    amount_rank_evidence: asString(rec.amount_rank_evidence),
+    target_change_pct_rank: asNumber(rec.target_change_pct_rank),
+    sample_size: asNumber(rec.sample_size) ?? 0,
+    snapshot_rows: asNumber(rec.snapshot_rows) ?? 0,
+    rankable_rows: asNumber(rec.rankable_rows) ?? 0,
+    valid_quote_rows: asNumber(rec.valid_quote_rows),
+    change_pct_qualified_rows: asNumber(rec.change_pct_qualified_rows),
+    verified_constituent_num: asNumber(rec.verified_constituent_num),
+    quotes_as_of: asString(rec.quotes_as_of),
+    industry_reference: rec.industry_reference === true,
+    target_independent_quote: parseL2PeerItem(rec.target_independent_quote),
+    gaps,
+  };
+}
+
+function formatAmount(v: number): string {
+  if (v >= 1e8) return `${(v / 1e8).toFixed(2)} 亿`;
+  if (v >= 1e4) return `${(v / 1e4).toFixed(0)} 万`;
+  // 正但不足 1 元（含可表示的极小值）：保留原值字面，与真零 0 有清楚
+  // 区别——服务端仍按正额排行，页面不得把它显示成「0」（issue #104 六轮）
+  if (v > 0 && v < 1) return String(v);
+  return v.toFixed(0);
+}
+
 const ROLE_LABEL: Record<string, string> = {
   l2_industry: '二级',
   l1_industry: '一级',
@@ -216,6 +303,132 @@ function CatalystBar({ catalysts }: { catalysts: Record<string, unknown> | null 
     <p className="text-sm text-muted-text">
       近七天催化：{eligible ? '未发现合格催化' : '催化检索未执行（主行业身份未确认）'}
     </p>
+  );
+}
+
+// issue #104：二级同业表（同一存档载荷，生成/历史回看一致；旧存档无键不渲染）。
+// 名次行标注范围（全成分需 iFinD 双接口核验一致，否则样本范围）与分母；
+// 覆盖统计暴露观察成分数与有效报价数；缺口逐条透出。
+function L2PeersTable({ peers, chainGaps, l2Label }: {
+  peers: L2PeersBlock | null;
+  chainGaps: string[];
+  l2Label: string | null;
+}) {
+  if (!peers && chainGaps.length === 0) return null;
+  const hasTarget = peers?.items.some((i) => i.is_target) ?? false;
+  const scopeText = peers?.amount_rank_scope === 'full_constituents'
+    ? '全成分正额范围'
+    : peers?.amount_rank_scope === 'qualified_sample'
+      ? '有效正额样本范围（全成分门槛未满足）'
+      : null;
+  return (
+    <div className="space-y-1.5" aria-label="二级同业对照">
+      {peers ? (
+        <>
+          <p className="text-sm font-medium text-secondary-text">
+            二级同业{peers.industry_reference ? '（行业参考）' : ''}
+            {l2Label ? ` · ${l2Label} 成分口径` : ''}
+          </p>
+          {peers.industry_reference && (
+            <p className="text-xs text-amber-400/90">
+              ⚠ 目标股未确认在二级指数成分内，以下为行业参考、不构成与目标股同成分的可比样本
+            </p>
+          )}
+          {peers.target_independent_quote && (
+            <p className="text-sm text-secondary-text">
+              目标股独立行情：
+              {peers.target_independent_quote.code}（{peers.target_independent_quote.name}）
+              ｜ 涨跌幅 {peers.target_independent_quote.change_pct !== null
+                ? pct(peers.target_independent_quote.change_pct) : 'N/A'}
+              ｜ 成交额 {peers.target_independent_quote.amount !== null
+                ? `${formatAmount(peers.target_independent_quote.amount)} 元` : 'N/A'}
+              {peers.target_independent_quote.as_of_date
+                ? ` ｜ 行情日期 ${peers.target_independent_quote.as_of_date}` : ''}
+            </p>
+          )}
+          {peers.items.length > 0 && (
+            <table className="w-full text-left text-xs">
+              <thead className="text-muted-text">
+                <tr>
+                  <th className="py-1 pr-3 font-medium">代码</th>
+                  <th className="py-1 pr-3 font-medium">名称</th>
+                  <th className="py-1 pr-3 font-medium">成交额（元）</th>
+                  <th className="py-1 pr-3 font-medium">涨跌幅</th>
+                  <th className="py-1 font-medium">目标股</th>
+                </tr>
+              </thead>
+              <tbody>
+                {peers.items.map((p) => (
+                  <tr key={p.code} className="border-t border-white/5">
+                    <td className="py-1 pr-3">{p.code}</td>
+                    <td className="py-1 pr-3">{p.name}</td>
+                    <td className="py-1 pr-3">
+                      {p.amount !== null ? formatAmount(p.amount) : 'N/A'}
+                    </td>
+                    <td className="py-1 pr-3">
+                      {p.change_pct !== null ? (
+                        <span className={p.change_pct >= 0
+                          ? 'text-red-400' : 'text-emerald-400'}>
+                          {pct(p.change_pct)}
+                        </span>
+                      ) : 'N/A'}
+                    </td>
+                    <td className="py-1">{p.is_target ? '✔' : ''}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <p className="text-xs text-muted-text">
+            排名范围与覆盖：观察成分 {peers.snapshot_rows} 行
+            {/* issue #104 复审：行情覆盖（正额+已知零）与正额名次分母分开；
+                旧存档无 valid_quote_rows 时不假定未采集的已知零数 */}
+            {peers.valid_quote_rows !== null
+              ? ` · 有效报价 ${peers.valid_quote_rows} 行（含已知零 ${
+                  peers.valid_quote_rows - peers.rankable_rows}，正额可排名 ${peers.rankable_rows}）`
+              : ` · 有效报价 ${peers.rankable_rows} 行（正额口径，未采集已知零数）`}
+            {peers.amount_rank_denominator !== null
+              ? ` · 正额名次分母 ${peers.amount_rank_denominator}` : ''}
+            {' '}· 样本 {peers.sample_size} 家
+            {peers.change_pct_qualified_rows !== null
+              ? ` · 有效涨跌幅覆盖 ${peers.change_pct_qualified_rows}/${peers.sample_size}` : ''}
+            {peers.quotes_as_of ? ` · 行情时点 ${peers.quotes_as_of}` : ''}
+          </p>
+          {peers.verified_constituent_num !== null && (
+            <p className="text-xs text-muted-text">
+              已验证成分数：{peers.verified_constituent_num}
+              （iFinD 双接口核验一致；核验事实独立于全量名次是否发布，适用缺口见下方）
+            </p>
+          )}
+          {peers.target_amount_rank !== null && scopeText && (
+            <p className="text-sm text-secondary-text">
+              目标股成交额名次：第 {peers.target_amount_rank} /{' '}
+              {peers.amount_rank_denominator ?? '—'}（{scopeText}；降序顺序位，同额按代码先后）
+            </p>
+          )}
+          {peers.amount_rank_evidence && (
+            <p className="text-xs text-muted-text">
+              全成分核验：{peers.amount_rank_evidence}
+            </p>
+          )}
+          {peers.target_change_pct_rank !== null && hasTarget && (
+            <p className="text-sm text-secondary-text">
+              目标股涨跌幅相对位置：样本内第 {peers.target_change_pct_rank} /{' '}
+              {peers.sample_size}（并列同名次）
+            </p>
+          )}
+          {peers.gaps.map((g, i) => (
+            <p key={i} className="text-xs text-amber-400/90">⚠ {g}</p>
+          ))}
+        </>
+      ) : (
+        chainGaps.length > 0 && (
+          <p className="text-xs text-amber-400/90">
+            ⚠ 二级同业未取得：{chainGaps[0]}
+          </p>
+        )
+      )}
+    </div>
   );
 }
 
@@ -430,6 +643,14 @@ export default function SectorFirstScreen({
           ⚠ 5/20/60 日多窗口趋势未取得：{windowGaps[0]}
         </p>
       )}
+      <L2PeersTable peers={root ? parseL2Peers(root.sector_l2_peers) : null}
+        chainGaps={root && Array.isArray(root.sector_l2_peers_gaps)
+          ? (root.sector_l2_peers_gaps.filter(
+              (g) => typeof g === 'string') as string[])
+          : []}
+        l2Label={l2Identity?.status === 'confirmed'
+          ? `${asString(l2Identity.l2_name)}（${asString(l2Identity.l2_index_code)}）`
+          : null} />
       <CatalystBar catalysts={asRecord(root?.sector_catalysts)} />
     </section>
   );

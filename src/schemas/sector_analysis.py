@@ -514,6 +514,22 @@ class SectorPeersBlock(_StrictBase):
     target_in_amount_top5: Optional[bool] = None
     """目标股是否落在成交额前五内；成交额缺失/无效无法判定时 None（成员仍保留）。"""
     target_change_pct_rank: Optional[Annotated[int, Field(ge=1, le=6)]] = None
+    target_amount_rank: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """目标股当日成交额名次（issue #104 追加兼容字段；一级既有口径恒 None）。
+
+    名次为顺序名次：按正额降序、同额代码升序的确定排序中的位置
+    （不并列；涨跌幅名次才并列同名次）；范围由 ``amount_rank_scope``
+    标注。已知零额目标不参与正额名次（不发布），目标缺有效正额同样不发布。"""
+    amount_rank_denominator: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """成交额名次分母：有效正额成员数（零额计入报价覆盖但不进分母）。"""
+    amount_rank_scope: Optional[Literal["full_constituents",
+                                        "qualified_sample"]] = None
+    """名次范围：``full_constituents`` = iFinD 双接口核验一致 + 报价全集可证
+    （全成分正额名次）；``qualified_sample`` = 门槛未满足时降级为实际纳入
+    比较的有效正额样本名次（不冒充全成分）。"""
+    amount_rank_evidence: Optional[Annotated[str, Field(max_length=240)]] = None
+    """全成分范围的双接口核验证据说明（仅在 full_constituents 名次发布时
+    携带）；核验缺口见 gaps。"""
     amount_unit: Literal["元"] = "元"
     """快照成交额计量单位（判定依据见 ``amount_provenance``）。"""
     amount_provenance: Annotated[str, Field(max_length=240)] = (
@@ -526,6 +542,18 @@ class SectorPeersBlock(_StrictBase):
     """成分快照观测总行数（资格过滤前；与 rankable_rows 一起暴露实际范围）。"""
     rankable_rows: Annotated[int, Field(ge=0, le=10000)] = 0
     """成交额可排名行数（代码有效、无重复冲突且成交额有限正）；与观测总数分开。"""
+    valid_quote_rows: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
+    """有效成交额报价行数 = 正额可排名 + 已知零额（issue #104 复审追加兼容；
+    行情覆盖事实与正额排名分母分开——名次分母只取正额，覆盖含已知零）。
+    None = 旧存档未采集（不假定已知零数为 0，展示退化为正额口径）。"""
+    change_pct_qualified_rows: Optional[Annotated[int, Field(ge=0, le=6)]] = None
+    """入选样本内有合格同日涨跌幅的行数（issue #104 复审追加兼容；涨跌幅
+    覆盖事实对样本一次统计，名次未发布时同样可见，分母为 sample_size）。
+    None = 旧存档未采集或无样本（不假定覆盖数）。"""
+    verified_constituent_num: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """iFinD 双接口核验一致的成分数（issue #104 复审追加兼容；名单/计数
+    核验通过即发布，与全成分名次是否发布独立——核验事实与才允许发布的
+    全量名次分别表达；未通过核验时 None，缺口承载精确失败）。"""
     sample_size: Annotated[int, Field(ge=0, le=6)] = 0
     snapshot_observed_at: Optional[Annotated[str, Field(max_length=32)]] = None
     source: Optional[Annotated[str, Field(max_length=48)]] = None
@@ -878,6 +906,18 @@ class SectorReportPayload(_StrictBase):
     sector_trend_windows: Optional[List[SectorTrendWindowBlock]] = Field(
         default=None, max_length=3,
     )
+    sector_l2_peers: Optional["SectorPeersBlock"] = None
+    """二级同业对照块（issue #104 追加兼容字段；目标股申万二级指数成分的
+    成交活跃代表 + 全成分成交额名次，复用 #103 的二级指数身份）。None 仅是
+    追加兼容边界——二级身份未确认/取数预算耗尽/查询失败时整块缺席（缺口
+    随载荷 gaps 与 ``sector_l2_peers_gaps`` 透出），一级既有 ``sector_peers``
+    与完整性判定不受影响，存量旧记录读回不受影响。"""
+    sector_l2_peers_gaps: Optional[_GapList] = Field(
+        default=None, max_length=10,
+    )
+    """二级同业**整链**缺口（issue #104 追加兼容字段）：仅当
+    ``sector_l2_peers`` 为 None（二级身份未确认/取数预算耗尽/会话缺失等
+    整链未发起）且缺口非空时发布；块取得时为 None（块内 gaps 承载）。"""
     sector_trend_windows_gaps: Optional[_GapList] = Field(
         default=None, max_length=10,
     )
