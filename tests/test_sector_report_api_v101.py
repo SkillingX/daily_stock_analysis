@@ -269,7 +269,7 @@ class TestFullQualifyingReportLoop(SectorReportApiV101TestCase):
 
         # ---- 零东财出站（哨兵即时失败）+ 研究零新增 iFinD 出站 ----
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        self.assertEqual(len(rt_calls), 2)  # 31 快照 + 成员批次（无新增）
+        self.assertEqual(len(rt_calls), 3)  # 31 快照 + L1 成员批次 + #104 L2 批次
 
     def test_optional_concepts_failure_never_starves_required_research(self):
         """可选概念失败（入口关闭）不影响必需研究完整取得与完整状态。"""

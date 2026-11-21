@@ -490,10 +490,11 @@ class TestBjUnknownBoundary(SectorReportApiV100TestCase):
         gaps = " ".join(analysis["gaps"])
         self.assertIn("成分", gaps)
 
-        # 独立行情出站恰好一次（未确认成分时）；无东财出站（哨兵即时失败）
+        # 独立行情每条成分链恰好一次（L1 + #104 L2，目标均未确认成分）；
+        # 无东财出站（哨兵即时失败）
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
         independent = [p for p in rt_calls if p["codes"] == BJ_TARGET_SEC]
-        self.assertEqual(len(independent), 1)
+        self.assertEqual(len(independent), 2)
 
         # 存档一致：详情读回与下载
         rid = body["report_id"]
@@ -583,8 +584,8 @@ class TestShIncludedLoop(SectorReportApiV100TestCase):
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
         self.assertEqual(
             len([p for p in rt_calls if p["codes"] == SH_TARGET_SEC]), 0)
-        # 成员行情批次出站（6 只成员 < 150 → 1 批）
-        self.assertEqual(len(rt_calls), 2)
+        # 成员行情批次出站（6 只成员 < 150 → L1/L2 各 1 批，#104）
+        self.assertEqual(len(rt_calls), 3)
         # 存档一致
         rid = resp.json()["report_id"]
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
@@ -622,9 +623,10 @@ class TestConstituentFailureLoop(SectorReportApiV100TestCase):
         self.assertTrue(peers["industry_reference"])
         self.assertEqual(peers["items"], [])
         self.assertTrue(peers["gaps"])
-        # 成分失败 → 成员集空：无成员批次；目标未确认成分 → 独立行情仍尝试
+        # 成分失败 → 成员集空：无成员批次；目标未确认成分 → 独立行情仍尝试；
+        # #104 L2 成分链独立运行（stub 下正常取得）→ 其成员批次照常
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        self.assertEqual(len(rt_calls), 2)
+        self.assertEqual(len(rt_calls), 3)  # 31 快照 + L1 独立行情 + L2 批次
         self.assertEqual(rt_calls[1]["codes"], SH_TARGET_SEC)
         self.assertIsNotNone(peers["target_independent_quote"])
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
@@ -672,9 +674,10 @@ class TestAmountOnlyMemberKeepsSample(SectorReportApiV100TestCase):
         self.assertIsNone(peers["target_change_pct_rank"])
         gaps = " ".join(peers["gaps"])
         self.assertIn("有效比较范围", gaps)
-        # 成员行情批次真实出站（31 快照 + 1 批），存档与下载一致
+        # 成员行情批次真实出站（31 快照 + L1 一批 + #104 L2 一批），
+        # 存档与下载一致
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        self.assertEqual(len(rt_calls), 2)
+        self.assertEqual(len(rt_calls), 3)
         rid = resp.json()["report_id"]
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
         self.assertEqual(detail.status_code, 200)

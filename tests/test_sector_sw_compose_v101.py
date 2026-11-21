@@ -57,6 +57,10 @@ def _offline_reference_levels(monkeypatch):
         lambda secucode, *, observation_date, refresh_token,
         timeout_seconds, deadline: {
             "l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []})
+    # issue #103 多窗口趋势（新可选出站）受控替身：单元编排测试不真实出站
+    monkeypatch.setattr(
+        "src.services.sector_analysis_service._sw_trend_windows_pillar",
+        lambda *a, **k: {"windows": [], "gaps": []})
 
 
 def _budget(seconds: float = 120.0) -> ReportBudget:
