@@ -162,6 +162,31 @@ class TestCloseBoundaryTrendClock:
         assert payload["sector_l2_identity"]["observation_date"] == "2026-11-19"
         SectorReportPayload.model_validate(payload)
 
+    def test_empty_snapshot_first_screen_has_no_empty_change_label(
+            self, boundary: Dict[str, Any]):
+        """缺当日快照（快照响应空 → 渲染输入 ``row={}``）：真实 ``_render``
+        的速览不渲染空的「当日涨跌幅」标签——修复前 Jinja ``Undefined is
+        not none`` 恒 True，渲染出「 ｜ 当日涨跌幅 」空标签，与 Web 缺口
+        语义不一致（issue #105 复审）。合法 0、参考日/正常行与既有涨跌幅
+        排名、日期渲染不受影响（数字分支未改动，见 v103 首屏渲染用例）。"""
+        payload = compose_report("600188", "兖矿能源", budget=_budget())
+        # 空快照是本用例真实链事实：行情块 sector_found=false + row 空
+        intraday = payload["background"]["intraday"]
+        assert intraday["sector_found"] is False
+        assert intraday["row"] == {}
+        md = svc._render("兖矿能源", "600188",
+                         payload["generated_at"], "sr-close-0001", payload)
+        seg = md.split("## 报告速览（首屏）", 1)[1].split("\n##", 1)[0]
+        fs_line = next(l for l in seg.splitlines() if l.startswith("- 一级 "))
+        assert "涨跌幅" not in fs_line
+        # 同行保留身份事实回退（row 无名称时用身份板块名）与快照缺口
+        assert "**煤炭**" in fs_line
+        # 快照缺失不阻断同报告的二级身份与趋势事实
+        assert payload["sector_l2_identity"]["observation_date"] == "2026-11-19"
+        assert payload["sector_trend"]["qualified_sessions"] == 20
+        svc._compose_eastmoney_core.assert_not_called()
+        SectorReportPayload.model_validate(payload)
+
     def test_explicit_current_time_pins_trend_window(
             self, boundary: Dict[str, Any]):
         """显式 current_time 直传旧趋势（旧代码语义）：窗口钉在传入钟

@@ -5096,11 +5096,16 @@ def _quote_session_time_ok(row: Dict[str, Any], *, session_date: str,
     return qualified.get(str(row.get("thscode") or "")) is not None
 
 
-def _quote_row_has_usable_fact(row: Dict[str, Any]) -> bool:
+def _quote_row_has_usable_fact(row: Dict[str, Any], *,
+                               underflow_invalid: bool = False) -> bool:
     """行情行是否至少有一项可用事实（金额 ok/合法零，或有效涨跌幅）——
     整行替换门（issue #105 修复）：补查新行两字段均不可用时不替换旧行，
-    避免用全空行顶替已有事实；金额按既有公开边界判定（正额/真零合格）。"""
-    amount, reason = _sw_public_amount(*_decimal_amount(row.get("amount")))
+    避免用全空行顶替已有事实；金额按既有公开边界判定（正额/真零合格）。
+    ``underflow_invalid``（issue #105 复审）：二级复用/补查语境（``full_
+    constituent_audit``）显式启用正额下溢判 invalid；一级补查保持基线。"""
+    amount, reason = _sw_public_amount(
+        *_decimal_amount(row.get("amount")),
+        underflow_invalid=underflow_invalid)
     if reason in ("ok", "zero") and amount is not None:
         return True
     return _num(row.get("change_pct")) is not None
@@ -5245,12 +5250,15 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                     received_at=reuse_clock):
                 pending_codes.append(secucode)
                 continue
+            # 金额可用性按两级下溢口径（见 _sw_public_amount）
             amount, reason = _sw_public_amount(
-                *_decimal_amount(row.get("amount")))
+                *_decimal_amount(row.get("amount")),
+                underflow_invalid=full_constituent_audit)
             if reason in ("ok", "zero") and amount is not None:
                 reused[secucode] = row
                 continue
-            if _quote_row_has_usable_fact(row):
+            if _quote_row_has_usable_fact(
+                    row, underflow_invalid=full_constituent_audit):
                 quotes[secucode] = row  # 旧可用行先保留（缺成交额，待补查）
             pending_codes.append(secucode)
         total_batches = (len(pending_codes) + _MEMBER_QUOTE_BATCH_SIZE - 1) \
@@ -5308,7 +5316,9 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                 # 露，不丢失为「缺失」）；仅当该成员已有可用合格候选需要
                 # 保护时，才不以全空/无可用事实的新行替换它（不跨观测时点
                 # 拼接、不让全空行顶替已有事实）
-                if _quote_row_has_usable_fact(row) or code not in quotes:
+                if _quote_row_has_usable_fact(
+                        row, underflow_invalid=full_constituent_audit) \
+                        or code not in quotes:
                     quotes[code] = row
             if out_of_batch:
                 quote_gaps.append(
@@ -5703,15 +5713,22 @@ _SW_MEMBERS_AMOUNT_PROVENANCE = (
 
 
 def _sw_public_amount(amount: Optional[Decimal],
-                      reason: str) -> Tuple[Optional[Decimal], str]:
+                      reason: str, *,
+                      underflow_invalid: bool = False
+                      ) -> Tuple[Optional[Decimal], str]:
     """成员/独立行情共享的本地 amount 契约（既有公开边界复核）：
     Decimal 排序输入保留原始精度，但发布前按公开边界（PeerItem.amount 等
     float 字段）复核有限性——不能以有限 float 表示的原始金额判 invalid
-    （None + 缺口）：超大整数 ``float()`` 溢出 ±inf；正 Decimal 下溢为
-    ``0.0``（如 wire 字面 ``1e-400``）同样不可发布——公开载荷会把「正额」
-    伪装成 0（issue #104 五轮）。真 0 是 reason=``zero`` 的已知零观测，
-    合格计覆盖、不参与正额排行，不受此条件影响。JSON 与 Markdown 边界
-    不出现 inf。ok/zero/missing 原样通过。"""
+    （None + 缺口）：超大整数 ``float()`` 溢出 ±inf 一律 invalid（两级
+    照常）。``underflow_invalid``（issue #105 复审：非默认开关）控制正
+    Decimal 下溢为 ``0.0``（如 wire 字面 ``1e-400``）的语义——
+    - ``False``（默认）：**一级既有口径**，原始 Decimal 保留（rankable
+      按正额参与选样，公开 float 发布 0.0），与规格 §6/基线一致；
+    - ``True``：**issue #104 二级名次/全量资格/二级复用语境**启用——
+      公开载荷会把「正额」伪装成 0，不可发布（None + 缺口）。
+    真 0 是 reason=``zero`` 的已知零观测，合格计覆盖、不参与正额排行，
+    不受此条件影响。JSON 与 Markdown 边界不出现 inf。ok/zero/missing
+    原样通过。"""
     if amount is None:
         return None, reason
     try:
@@ -5720,7 +5737,7 @@ def _sw_public_amount(amount: Optional[Decimal],
         return None, "invalid"
     if published != published or published in (float("inf"), float("-inf")):
         return None, "invalid"
-    if amount > 0 and published == 0:
+    if underflow_invalid and amount > 0 and published == 0:
         return None, "invalid"
     return amount, reason
 
@@ -5746,8 +5763,11 @@ def _verify_full_universe(index_code: str, session_date: str, *,
     3. **供应商同日成分计数一致**：``ths_constituent_num_index`` 单指数
        绑定请求 + 显式同一交易日，FDATE 回显一致，唯一无冲突正整数，且
        **等于同日名单唯一成员数**（计数查询失败/缺失 → 拒绝，原因随缺口）；
-    4. **全体成员同日成交额状态可判定**：无批次缺口，每只成员都有行情行
-       且金额判定为 ok 或合法零（缺失/无效 → 拒绝；零额计入报价覆盖）。
+    4. **全体成员同日成交额状态可判定**：每只成员都有行情行且金额判定
+       为 ok 或合法零（缺失/无效 → 拒绝；零额计入报价覆盖）。资格按
+       **名单内合格金额的实际全集**判定（issue #105 复审 P2）：名单外
+       干扰行已被既有资格过滤隔离、批次诊断不按字符串提前拒绝（诊断
+       仍随 ``member_quote_gaps`` 透出），实际缺行/无效金额仍逐成员拒绝。
 
     通过时把证据文本写入 ``constituents["membership"]["completeness_evidence"]``
     （单一写入点；:func:`_sw_peers_pillar` 据此解锁 full_constituents 名次
@@ -5759,7 +5779,6 @@ def _verify_full_universe(index_code: str, session_date: str, *,
     members = constituents.get("members") or {}
     membership = constituents.get("membership") or {}
     member_codes = [str(c) for c in (members.get("member_codes") or [])]
-    quote_gaps = [str(g) for g in (constituents.get("member_quote_gaps") or [])]
     gaps: List[str] = []
 
     def _rejected(reasons: List[str],
@@ -5833,20 +5852,20 @@ def _verify_full_universe(index_code: str, session_date: str, *,
         return _rejected(gaps, vendor_count)
     verified_members = unique_members  # 门槛 3 过：名单/计数已核实（独立于门槛 4）
     # ---- 门槛 4：全体成员同日成交额状态可判定 ----
+    # 资格按名单内合格金额的**实际全集**判定（issue #105 复审 P2）：
+    # 名单外干扰行已被既有资格过滤隔离（不在 member_quotes/名单），批次
+    # 诊断字符串不在此提前拒绝——避免供应商多带的非合格行误伤全量；
+    # 实际缺行/无效金额（含时间资格剔除后的缺行）仍逐成员拒绝。
     member_quotes: Dict[str, Dict[str, Any]] = constituents.get(
         "member_quotes") or {}
-    if quote_gaps:
-        gaps.append(
-            f"成员行情存在批次缺口（{len(quote_gaps)} 条），全体成交额状态"
-            "不可判定，拒绝全成分资格")
-        return _rejected(gaps, verified_members=verified_members)
     undetermined: List[str] = []
     for secucode in member_codes:
         quote = member_quotes.get(secucode)
         if quote is None:
             undetermined.append(secucode)
             continue
-        _, reason = _sw_public_amount(*_decimal_amount(quote.get("amount")))
+        _, reason = _sw_public_amount(*_decimal_amount(quote.get("amount")),
+                                      underflow_invalid=True)
         if reason not in ("ok", "zero"):
             undetermined.append(secucode)
     if undetermined:
@@ -6134,8 +6153,10 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
         amount: Optional[Decimal] = None
         change: Optional[float] = None
         if quote is not None:
+            # 下溢护栏按两级口径（见 _sw_public_amount）
             amount, reason = _sw_public_amount(
-                *_decimal_amount(quote.get("amount")))
+                *_decimal_amount(quote.get("amount")),
+                underflow_invalid=amount_rank_enabled)
             if reason == "zero":
                 amount_reasons["zero"] += 1
             elif reason != "ok":
@@ -6192,7 +6213,8 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
     # 按基线截断为同值、并列按代码升序，基线一级行为不变）；二级
     # （amount_rank_enabled，全成分名次语境）继续 ``copy_negate`` 精确
     # 降序（38 位有效数字的金额差不截断，名次/分母精确）。两级有限金额
-    # 与正额下溢发布护栏（_sw_public_amount）共用不变
+    # 护栏（_sw_public_amount）共用不变；正额下溢判 invalid 仅二级
+    # 名次语境启用（一级基线：原始 Decimal 保留，公开 float 发布 0.0）
     sort_negate = ((lambda m: (m["amount"].copy_negate(), m["code"]))
                    if amount_rank_enabled
                    else (lambda m: (-m["amount"], m["code"])))
@@ -6203,12 +6225,15 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
     member_by_code = {m["code"]: m for m in members_data}
     target_member = member_by_code.get(code)
 
-    # 报价全集：批次无缺口、无被剔除成员行（身份不合格/剥后缀矛盾——完整性
-    # 证明不得基于被静默缩小的分母）、全部成员行金额已知（正/零），且成分
-    # 观测集非空
+    # 报价全集：无被剔除成员行（身份不合格/剥后缀矛盾——完整性证明不得
+    # 基于被静默缩小的分母）、全部成员行金额已知（正/零），且成分观测集
+    # 非空。批次诊断字符串只在一级作为门槛（issue #105 复审 P2：二级按
+    # 名单内实际全集判定——干扰行已被资格过滤隔离，不误伤全量；一级旧
+    # 门槛保留）
     identity_rejected = int(members.get("rejected_identity_rows") or 0)
     conflicting_members = int(members.get("conflicting_code_members") or 0)
-    quotes_full = (not quote_gaps and bool(member_codes)
+    quotes_full = ((not quote_gaps or amount_rank_enabled)
+                   and bool(member_codes)
                    and missing_total == 0 and invalid_total == 0
                    and identity_rejected == 0 and conflicting_members == 0)
     member_completeness = bool(evidence) and bool(member_codes)
@@ -6341,9 +6366,10 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
                 constituents.get("target_name"), t_code)
             # 独立行情金额经同一 Decimal 判定 + 公开边界复核：负/非有限/
             # 超大不可表示 = 无效观测（None + 缺口），不发布负额/inf 事实；
-            # 已知零额保留 0
+            # 已知零额保留 0；下溢护栏按两级口径（见 _sw_public_amount）
             t_amount, t_amount_reason = _sw_public_amount(
-                *_decimal_amount(target_quote.get("amount")))
+                *_decimal_amount(target_quote.get("amount")),
+                underflow_invalid=amount_rank_enabled)
             t_change = _num(target_quote.get("change_pct"))
             t_as_of = str(target_quote.get("trade_date") or "") or None
             if t_amount_reason not in ("ok", "zero") and t_change is not None:

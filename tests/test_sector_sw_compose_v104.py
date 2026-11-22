@@ -128,7 +128,8 @@ class _Sw104Stub:
                  l2_count_raw: Optional[bytes] = None,
                  l2_quote_literal: Optional[Tuple[str, str]] = None,
                  l2_quote_changes: Optional[Dict[str, Optional[float]]] = None,
-                 l2_quote_drop: Optional[List[str]] = None) -> None:
+                 l2_quote_drop: Optional[List[str]] = None,
+                 l2_quote_extra_codes: Optional[List[str]] = None) -> None:
         self.l2_members_payload = l2_members_payload
         self.l2_members_error = l2_members_error
         self.l2_count = l2_count
@@ -141,6 +142,9 @@ class _Sw104Stub:
         self.l2_quote_literal = l2_quote_literal
         self.l2_quote_changes = l2_quote_changes or {}
         self.l2_quote_drop = l2_quote_drop or []
+        # 名单外干扰行（issue #105 复审 P2 闭环）：供应商响应多带的非本批
+        # 请求身份行（资格过滤后隔离，不采用）
+        self.l2_quote_extra_codes = l2_quote_extra_codes or []
         self.l2_data_pool_calls = 0
         self.l2_count_calls = 0
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -191,6 +195,8 @@ class _Sw104Stub:
                        else L2_AMOUNTS.get(c, 5.0e8))
                 rows.append(_quote_row(
                     c, self.l2_quote_changes.get(c, 1.0), amt))
+            rows.extend(_quote_row(c, 0.4, 6.0e8)
+                        for c in self.l2_quote_extra_codes)
             body = {"errorcode": 0, "errmsg": "", "tables": rows}
             if self.l2_quote_literal:
                 text = json.dumps(body).replace(
@@ -495,6 +501,23 @@ class TestL2PeersMarkdownRendering:
         assert "全成分核验" in md and "双接口" in md
         # 成员行情时点（供应商时间戳口径）
         assert "2026-11-18" in md
+
+    def test_full_universe_survives_out_of_batch_noise_row(
+            self, transport) -> None:
+        """全额 + 供应商多带 1 行名单外身份（issue #105 复审 P2）：行被
+        资格过滤隔离、不采用，全量资格不因干扰行降级——双接口证据照发，
+        隔离诊断随缺口可见。"""
+        stub = transport(_Sw104Stub(l2_quote_extra_codes=["999999.SZ"]))
+        payload = _compose_sw_payload(TARGET, "兖矿能源", _confirmed_chain(),
+                                      budget=_budget())
+        l2 = payload["sector_l2_peers"]
+        assert l2 is not None
+        assert l2["amount_rank_scope"] == "full_constituents"
+        assert l2["amount_rank_evidence"] is not None
+        assert l2["target_amount_rank"] is not None
+        assert any("非本批请求身份" in g for g in l2["gaps"])
+        SectorReportPayload.model_validate(payload)
+        assert stub.l2_data_pool_calls >= 1
 
     def test_verified_constituent_num_survives_quote_gate_failure(
             self, transport) -> None:

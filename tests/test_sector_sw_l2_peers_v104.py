@@ -496,15 +496,30 @@ class TestVerifyFullUniverse:
         assert out["vendor_count"] == 4
         assert any("4" in g and "5" in g for g in out["gaps"])
 
-    def test_quote_gap_rejected(self, count_stub) -> None:
-        """批次报价缺口：全体成交额状态不可判定，拒绝。"""
+    def test_quote_gap_missing_rows_rejected(self, count_stub) -> None:
+        """批次报价失败的实质是成员缺行（issue #105 复审 P2：资格按名单
+        内实际全集判定，不再按缺口字符串提前拒绝）——整批缺失即全体
+        成交额状态不可判定，拒绝。"""
         count_stub(self._count_ok(5))
         constituents = _ins_constituents(
+            quotes=_ins_quotes(drop=INS_CODES),
             quote_gaps=["成员行情第 1/1 批查询失败（HTTP 超时），该批 5 只"
                         "成员行情缺失"])
         out = _verify(constituents)
         assert out["verified"] is False
         assert any("成交额" in g for g in out["gaps"])
+
+    def test_out_of_batch_noise_gap_keeps_full_universe(
+            self, count_stub) -> None:
+        """名单外干扰行（已被资格过滤隔离）：诊断随 quote_gaps 透出，
+        名单内全体成员金额到手可判定 → 全量资格不因干扰行拒绝
+        （issue #105 复审 P2）。"""
+        count_stub(self._count_ok(5))
+        constituents = _ins_constituents(
+            quote_gaps=["成员行情第 1/1 批响应含 1 个非本批请求身份的行，"
+                        "不采用、不覆盖先批已采用行（原始值不回显）"])
+        out = _verify(constituents)
+        assert out["verified"] is True
 
     def test_missing_member_quote_rejected(self, count_stub) -> None:
         """一只成员无行情行：全体状态不可判定，拒绝（零额豁免不适用缺失）。"""
