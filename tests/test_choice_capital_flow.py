@@ -1,4 +1,5 @@
 """Native transport and LLM fixtures preserve real flow mapping and consumption."""
+from datetime import date
 from types import SimpleNamespace
 
 import pandas as pd
@@ -27,6 +28,8 @@ def native_flow(monkeypatch):
         assert method == "csd" and args[1] == "NETINFLOW"
         return {"codes": [args[0]], "indicators": ["NETINFLOW"], "dates": dates, "data": {args[0]: [[float(i-2) for i in range(len(dates))]]}}
     monkeypatch.setattr(ChoiceAdapter, "_native_request", staticmethod(request))
+    # 固定查询时点，使滚动窗口与静态样本的交易日匹配。
+    monkeypatch.setattr(ChoiceAdapter, "completed_day", staticmethod(lambda: date.fromisoformat(DATES[0])))
     manager = DataFetcherManager()
     def sector_transport(candidates):
         assert all("individual" not in name and "main_fund" not in name for name, _ in candidates)

@@ -29,7 +29,7 @@ import time
 from datetime import date, datetime
 from decimal import Decimal, DecimalException
 from fractions import Fraction
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 from icontract import ensure
@@ -154,6 +154,380 @@ SW_L1_DIRECTORY: Tuple[Tuple[str, str], ...] = (
 """
 
 _DIRECTORY_BY_NAME: Dict[str, str] = {name: code for code, name in SW_L1_DIRECTORY}
+
+
+# ---------------------------------------------------------------------------
+# 申万 2021 二级目录（核定配置数据，issue #103 工单 01）
+# ---------------------------------------------------------------------------
+
+SW_L2_OFFICIAL_DIRECTORY_VERSION = "sw2021-l2-official-20261120"
+"""官方发布目录快照版本：申万研究所发布的申万 2021 二级行业指数目录，
+2026-11-20 采集。"""
+
+SW_L2_OFFICIAL_DIRECTORY_SOURCE = (
+    "申万 2021 二级行业指数官方发布目录快照：申万研究所发布的二级行业指数"
+    "全集（行业代码/行业名称/上级行业三列；2026-11-20 经项目既有 AkShare "
+    "兼容接口 sw_index_second_info 采集，131 项），作为分类与指数发布目录的"
+    "主证据；父行业均为核定的 31 个申万一级行业名称，二级名称无重复。"
+    "采集可复现：同一接口在目录变更时会返回新版本，采集时点随版本号记录"
+)
+
+SW_L2_OFFICIAL_DIRECTORY: Tuple[Tuple[str, str, str], ...] = (
+    ("801011", "林业Ⅱ", "农林牧渔"),
+    ("801012", "农产品加工", "农林牧渔"),
+    ("801014", "饲料", "农林牧渔"),
+    ("801015", "渔业", "农林牧渔"),
+    ("801016", "种植业", "农林牧渔"),
+    ("801017", "养殖业", "农林牧渔"),
+    ("801018", "动物保健Ⅱ", "农林牧渔"),
+    ("801019", "农业综合Ⅱ", "农林牧渔"),
+    ("801032", "化学纤维", "基础化工"),
+    ("801033", "化学原料", "基础化工"),
+    ("801034", "化学制品", "基础化工"),
+    ("801036", "塑料", "基础化工"),
+    ("801037", "橡胶", "基础化工"),
+    ("801038", "农化制品", "基础化工"),
+    ("801039", "非金属材料Ⅱ", "基础化工"),
+    ("801043", "冶钢原料", "钢铁"),
+    ("801044", "普钢", "钢铁"),
+    ("801045", "特钢Ⅱ", "钢铁"),
+    ("801051", "金属新材料", "有色金属"),
+    ("801053", "贵金属", "有色金属"),
+    ("801054", "小金属", "有色金属"),
+    ("801055", "工业金属", "有色金属"),
+    ("801056", "能源金属", "有色金属"),
+    ("801072", "通用设备", "机械设备"),
+    ("801074", "专用设备", "机械设备"),
+    ("801076", "轨交设备Ⅱ", "机械设备"),
+    ("801077", "工程机械", "机械设备"),
+    ("801078", "自动化设备", "机械设备"),
+    ("801081", "半导体", "电子"),
+    ("801082", "其他电子Ⅱ", "电子"),
+    ("801083", "元件", "电子"),
+    ("801084", "光学光电子", "电子"),
+    ("801085", "消费电子", "电子"),
+    ("801086", "电子化学品Ⅱ", "电子"),
+    ("801092", "汽车服务", "汽车"),
+    ("801093", "汽车零部件", "汽车"),
+    ("801095", "乘用车", "汽车"),
+    ("801096", "商用车", "汽车"),
+    ("801101", "计算机设备", "计算机"),
+    ("801102", "通信设备", "通信"),
+    ("801103", "IT服务Ⅱ", "计算机"),
+    ("801104", "软件开发", "计算机"),
+    ("801111", "白色家电", "家用电器"),
+    ("801112", "黑色家电", "家用电器"),
+    ("801113", "小家电", "家用电器"),
+    ("801114", "厨卫电器", "家用电器"),
+    ("801115", "照明设备Ⅱ", "家用电器"),
+    ("801116", "家电零部件Ⅱ", "家用电器"),
+    ("801117", "其他家电Ⅱ", "家用电器"),
+    ("801124", "食品加工", "食品饮料"),
+    ("801125", "白酒Ⅱ", "食品饮料"),
+    ("801126", "非白酒", "食品饮料"),
+    ("801127", "饮料乳品", "食品饮料"),
+    ("801128", "休闲食品", "食品饮料"),
+    ("801129", "调味发酵品Ⅱ", "食品饮料"),
+    ("801131", "纺织制造", "纺织服饰"),
+    ("801132", "服装家纺", "纺织服饰"),
+    ("801133", "饰品", "纺织服饰"),
+    ("801141", "包装印刷", "轻工制造"),
+    ("801142", "家居用品", "轻工制造"),
+    ("801143", "造纸", "轻工制造"),
+    ("801145", "文娱用品", "轻工制造"),
+    ("801151", "化学制药", "医药生物"),
+    ("801152", "生物制品", "医药生物"),
+    ("801153", "医疗器械", "医药生物"),
+    ("801154", "医药商业", "医药生物"),
+    ("801155", "中药Ⅱ", "医药生物"),
+    ("801156", "医疗服务", "医药生物"),
+    ("801161", "电力", "公用事业"),
+    ("801163", "燃气Ⅱ", "公用事业"),
+    ("801178", "物流", "交通运输"),
+    ("801179", "铁路公路", "交通运输"),
+    ("801181", "房地产开发", "房地产"),
+    ("801183", "房地产服务", "房地产"),
+    ("801191", "多元金融", "非银金融"),
+    ("801193", "证券Ⅱ", "非银金融"),
+    ("801194", "保险Ⅱ", "非银金融"),
+    ("801202", "贸易Ⅱ", "商贸零售"),
+    ("801203", "一般零售", "商贸零售"),
+    ("801204", "专业连锁Ⅱ", "商贸零售"),
+    ("801206", "互联网电商", "商贸零售"),
+    ("801207", "旅游零售Ⅱ", "商贸零售"),
+    ("801216", "体育Ⅱ", "社会服务"),
+    ("801218", "专业服务", "社会服务"),
+    ("801219", "酒店餐饮", "社会服务"),
+    ("801223", "通信服务", "通信"),
+    ("801231", "综合Ⅱ", "综合"),
+    ("801711", "水泥", "建筑材料"),
+    ("801712", "玻璃玻纤", "建筑材料"),
+    ("801713", "装修建材", "建筑材料"),
+    ("801721", "房屋建设Ⅱ", "建筑装饰"),
+    ("801722", "装修装饰Ⅱ", "建筑装饰"),
+    ("801723", "基础建设", "建筑装饰"),
+    ("801724", "专业工程", "建筑装饰"),
+    ("801726", "工程咨询服务Ⅱ", "建筑装饰"),
+    ("801731", "电机Ⅱ", "电力设备"),
+    ("801733", "其他电源设备Ⅱ", "电力设备"),
+    ("801735", "光伏设备", "电力设备"),
+    ("801736", "风电设备", "电力设备"),
+    ("801737", "电池", "电力设备"),
+    ("801738", "电网设备", "电力设备"),
+    ("801741", "航天装备Ⅱ", "国防军工"),
+    ("801742", "航空装备Ⅱ", "国防军工"),
+    ("801743", "地面兵装Ⅱ", "国防军工"),
+    ("801744", "航海装备Ⅱ", "国防军工"),
+    ("801745", "军工电子Ⅱ", "国防军工"),
+    ("801764", "游戏Ⅱ", "传媒"),
+    ("801765", "广告营销", "传媒"),
+    ("801766", "影视院线", "传媒"),
+    ("801767", "数字媒体", "传媒"),
+    ("801769", "出版", "传媒"),
+    ("801782", "国有大型银行Ⅱ", "银行"),
+    ("801783", "股份制银行Ⅱ", "银行"),
+    ("801784", "城商行Ⅱ", "银行"),
+    ("801785", "农商行Ⅱ", "银行"),
+    ("801881", "摩托车及其他", "汽车"),
+    ("801951", "煤炭开采", "煤炭"),
+    ("801952", "焦炭Ⅱ", "煤炭"),
+    ("801961", "油气开采Ⅱ", "石油石化"),
+    ("801962", "油服工程", "石油石化"),
+    ("801963", "炼化及贸易", "石油石化"),
+    ("801971", "环境治理", "环保"),
+    ("801972", "环保设备Ⅱ", "环保"),
+    ("801981", "个护用品", "美容护理"),
+    ("801982", "化妆品", "美容护理"),
+    ("801983", "医疗美容", "美容护理"),
+    ("801991", "航空机场", "交通运输"),
+    ("801992", "航运港口", "交通运输"),
+    ("801993", "旅游及景区", "社会服务"),
+    ("801994", "教育", "社会服务"),
+    ("801995", "电视广播Ⅱ", "传媒"),
+)
+
+# 对账事实（2026-11-20）：官方 131 项中，名称与父行业与下方 iFinD 核验子集
+# 完全一致的 124 项；下列 7 项官方分类存在但 iFinD 侧未核验（iFinD 代码区间
+# 扫描 + 成分归属反推均未确认，多为当前无成分/低覆盖分类）——不产生 iFinD
+# 指数代码映射，目标股归属落在这些分类时按二级缺口如实披露。
+SW_L2_UNVERIFIED_BY_IFIND: Tuple[Tuple[str, str, str], ...] = (
+    ("801011", "林业Ⅱ", "农林牧渔"),
+    ("801019", "农业综合Ⅱ", "农林牧渔"),
+    ("801117", "其他家电Ⅱ", "家用电器"),
+    ("801207", "旅游零售Ⅱ", "商贸零售"),
+    ("801216", "体育Ⅱ", "社会服务"),
+    ("801961", "油气开采Ⅱ", "石油石化"),
+    ("801983", "医疗美容", "美容护理"),
+)
+
+SW_L2_DIRECTORY_VERSION = "sw2021-l2-20261120"
+"""核定目录版本：申万 2021 二级行业指数目录（官方发布目录 + iFinD 身份
+核验），2026-11-20 核定。"""
+
+SW_L2_DIRECTORY_SOURCE = (
+    "申万 2021 二级行业指数目录：以官方发布目录快照为分类主证据"
+    f"（{SW_L2_OFFICIAL_DIRECTORY_VERSION}，131 项，"
+    "见 SW_L2_OFFICIAL_DIRECTORY_SOURCE），逐一 join iFinD 侧核验——"
+    "801001-801999 指数代码区间扫描（2026-11-19，basic_data_service "
+    "ths_index_short_name_index 简称回显，31 个一级目录双重比对）+ 同日成分"
+    "（p03473）成员 L1/L2 正式归属多数票反推（2026-11-19），124 项与官方"
+    "目录的二级正式名称与父行业**逐项完全一致**（无名称/父行业矛盾），"
+    "另 7 项官方分类存在但 iFinD 侧未核验（SW_L2_UNVERIFIED_BY_IFIND，"
+    "不产生指数代码映射、如实缺口）。父行业与二级正式名称必须能在本目录"
+    "唯一映射到已核验的 iFinD 指数代码才采纳，缺失或歧义按缺口处理"
+    "（不按名称近似匹配、不用样例白名单替代目录）。验收样本："
+    "中国平安→保险Ⅱ（801194.SL）、三一重工→工程机械（801077.SL，"
+    "2026-11-19 实测归属；官方目录同项核对一致）"
+)
+
+SW_L2_DIRECTORY: Tuple[Tuple[str, str, str], ...] = (
+    ("801178.SL", "物流", "交通运输"),
+    ("801179.SL", "铁路公路", "交通运输"),
+    ("801991.SL", "航空机场", "交通运输"),
+    ("801992.SL", "航运港口", "交通运输"),
+    ("801764.SL", "游戏Ⅱ", "传媒"),
+    ("801765.SL", "广告营销", "传媒"),
+    ("801766.SL", "影视院线", "传媒"),
+    ("801767.SL", "数字媒体", "传媒"),
+    ("801769.SL", "出版", "传媒"),
+    ("801995.SL", "电视广播Ⅱ", "传媒"),
+    ("801161.SL", "电力", "公用事业"),
+    ("801163.SL", "燃气Ⅱ", "公用事业"),
+    ("801012.SL", "农产品加工", "农林牧渔"),
+    ("801014.SL", "饲料", "农林牧渔"),
+    ("801015.SL", "渔业", "农林牧渔"),
+    ("801016.SL", "种植业", "农林牧渔"),
+    ("801017.SL", "养殖业", "农林牧渔"),
+    ("801018.SL", "动物保健Ⅱ", "农林牧渔"),
+    ("801151.SL", "化学制药", "医药生物"),
+    ("801152.SL", "生物制品", "医药生物"),
+    ("801153.SL", "医疗器械", "医药生物"),
+    ("801154.SL", "医药商业", "医药生物"),
+    ("801155.SL", "中药Ⅱ", "医药生物"),
+    ("801156.SL", "医疗服务", "医药生物"),
+    ("801202.SL", "贸易Ⅱ", "商贸零售"),
+    ("801203.SL", "一般零售", "商贸零售"),
+    ("801204.SL", "专业连锁Ⅱ", "商贸零售"),
+    ("801206.SL", "互联网电商", "商贸零售"),
+    ("801741.SL", "航天装备Ⅱ", "国防军工"),
+    ("801742.SL", "航空装备Ⅱ", "国防军工"),
+    ("801743.SL", "地面兵装Ⅱ", "国防军工"),
+    ("801744.SL", "航海装备Ⅱ", "国防军工"),
+    ("801745.SL", "军工电子Ⅱ", "国防军工"),
+    ("801032.SL", "化学纤维", "基础化工"),
+    ("801033.SL", "化学原料", "基础化工"),
+    ("801034.SL", "化学制品", "基础化工"),
+    ("801036.SL", "塑料", "基础化工"),
+    ("801037.SL", "橡胶", "基础化工"),
+    ("801038.SL", "农化制品", "基础化工"),
+    ("801039.SL", "非金属材料Ⅱ", "基础化工"),
+    ("801111.SL", "白色家电", "家用电器"),
+    ("801112.SL", "黑色家电", "家用电器"),
+    ("801113.SL", "小家电", "家用电器"),
+    ("801114.SL", "厨卫电器", "家用电器"),
+    ("801115.SL", "照明设备Ⅱ", "家用电器"),
+    ("801116.SL", "家电零部件Ⅱ", "家用电器"),
+    ("801711.SL", "水泥", "建筑材料"),
+    ("801712.SL", "玻璃玻纤", "建筑材料"),
+    ("801713.SL", "装修建材", "建筑材料"),
+    ("801721.SL", "房屋建设Ⅱ", "建筑装饰"),
+    ("801722.SL", "装修装饰Ⅱ", "建筑装饰"),
+    ("801723.SL", "基础建设", "建筑装饰"),
+    ("801724.SL", "专业工程", "建筑装饰"),
+    ("801726.SL", "工程咨询服务Ⅱ", "建筑装饰"),
+    ("801181.SL", "房地产开发", "房地产"),
+    ("801183.SL", "房地产服务", "房地产"),
+    ("801051.SL", "金属新材料", "有色金属"),
+    ("801053.SL", "贵金属", "有色金属"),
+    ("801054.SL", "小金属", "有色金属"),
+    ("801055.SL", "工业金属", "有色金属"),
+    ("801056.SL", "能源金属", "有色金属"),
+    ("801072.SL", "通用设备", "机械设备"),
+    ("801074.SL", "专用设备", "机械设备"),
+    ("801076.SL", "轨交设备Ⅱ", "机械设备"),
+    ("801077.SL", "工程机械", "机械设备"),
+    ("801078.SL", "自动化设备", "机械设备"),
+    ("801092.SL", "汽车服务", "汽车"),
+    ("801093.SL", "汽车零部件", "汽车"),
+    ("801095.SL", "乘用车", "汽车"),
+    ("801096.SL", "商用车", "汽车"),
+    ("801881.SL", "摩托车及其他", "汽车"),
+    ("801951.SL", "煤炭开采", "煤炭"),
+    ("801952.SL", "焦炭Ⅱ", "煤炭"),
+    ("801971.SL", "环境治理", "环保"),
+    ("801972.SL", "环保设备Ⅱ", "环保"),
+    ("801731.SL", "电机Ⅱ", "电力设备"),
+    ("801733.SL", "其他电源设备Ⅱ", "电力设备"),
+    ("801735.SL", "光伏设备", "电力设备"),
+    ("801736.SL", "风电设备", "电力设备"),
+    ("801737.SL", "电池", "电力设备"),
+    ("801738.SL", "电网设备", "电力设备"),
+    ("801081.SL", "半导体", "电子"),
+    ("801082.SL", "其他电子Ⅱ", "电子"),
+    ("801083.SL", "元件", "电子"),
+    ("801084.SL", "光学光电子", "电子"),
+    ("801085.SL", "消费电子", "电子"),
+    ("801086.SL", "电子化学品Ⅱ", "电子"),
+    ("801962.SL", "油服工程", "石油石化"),
+    ("801963.SL", "炼化及贸易", "石油石化"),
+    ("801218.SL", "专业服务", "社会服务"),
+    ("801219.SL", "酒店餐饮", "社会服务"),
+    ("801993.SL", "旅游及景区", "社会服务"),
+    ("801994.SL", "教育", "社会服务"),
+    ("801131.SL", "纺织制造", "纺织服饰"),
+    ("801132.SL", "服装家纺", "纺织服饰"),
+    ("801133.SL", "饰品", "纺织服饰"),
+    ("801231.SL", "综合Ⅱ", "综合"),
+    ("801981.SL", "个护用品", "美容护理"),
+    ("801982.SL", "化妆品", "美容护理"),
+    ("801101.SL", "计算机设备", "计算机"),
+    ("801103.SL", "IT服务Ⅱ", "计算机"),
+    ("801104.SL", "软件开发", "计算机"),
+    ("801141.SL", "包装印刷", "轻工制造"),
+    ("801142.SL", "家居用品", "轻工制造"),
+    ("801143.SL", "造纸", "轻工制造"),
+    ("801145.SL", "文娱用品", "轻工制造"),
+    ("801102.SL", "通信设备", "通信"),
+    ("801223.SL", "通信服务", "通信"),
+    ("801043.SL", "冶钢原料", "钢铁"),
+    ("801044.SL", "普钢", "钢铁"),
+    ("801045.SL", "特钢Ⅱ", "钢铁"),
+    ("801782.SL", "国有大型银行Ⅱ", "银行"),
+    ("801783.SL", "股份制银行Ⅱ", "银行"),
+    ("801784.SL", "城商行Ⅱ", "银行"),
+    ("801785.SL", "农商行Ⅱ", "银行"),
+    ("801191.SL", "多元金融", "非银金融"),
+    ("801193.SL", "证券Ⅱ", "非银金融"),
+    ("801194.SL", "保险Ⅱ", "非银金融"),
+    ("801124.SL", "食品加工", "食品饮料"),
+    ("801125.SL", "白酒Ⅱ", "食品饮料"),
+    ("801126.SL", "非白酒", "食品饮料"),
+    ("801127.SL", "饮料乳品", "食品饮料"),
+    ("801128.SL", "休闲食品", "食品饮料"),
+    ("801129.SL", "调味发酵品Ⅱ", "食品饮料"),
+)
+"""申万 2021 二级行业指数目录（iFinD 指数代码 → (二级正式名称, 父一级名称)，
+124 项——官方发布目录 131 项中已经 iFinD 侧核验的子集）。
+
+依据见 ``SW_L2_DIRECTORY_SOURCE``（官方目录主证据 + iFinD 精确身份核验，
+对账事实 2026-11-20）；目录变更须重核官方目录、iFinD 身份与对账结果并
+更新版本号。
+"""
+
+
+def _build_l2_parent_name_index(
+        entries: Tuple[Tuple[str, str, str], ...],
+) -> Tuple[Dict[Tuple[str, str], str], Tuple[Tuple[str, str], ...]]:
+    """(父一级, 二级名称) → iFinD 指数代码 + 歧义键集（构建期标记，issue #105 修复）。
+
+    同一 (父行业, 名称) 键出现两个代码即目录数据错误：歧义按契约必须映射
+    为 None（缺口），静默覆盖会让 resolve 返回其中之一冒充唯一命中。构建
+    期把歧义键**标记为不可解析**（从唯一映射中移除、单独收集），不抛错、
+    不阻断模块加载与其他键解析（issue #105 修复：受控歧义只降相应二级
+    身份，一级报告与目录其余条目继续可用）；正式目录的发布前数据错误由
+    目录唯一性/覆盖测试负责发现（当前核定目录无歧义键）。
+    """
+    index: Dict[Tuple[str, str], str] = {}
+    ambiguous: set = set()
+    for code, name, parent in entries:
+        key = (parent, name)
+        if key in index or key in ambiguous:
+            ambiguous.add(key)
+            index.pop(key, None)  # 歧义键不可解析（映射 None 语义）
+            continue
+        index[key] = code
+    return index, tuple(sorted(ambiguous))
+
+
+_L2_BY_PARENT_AND_NAME, _L2_AMBIGUOUS_KEYS = (
+    _build_l2_parent_name_index(SW_L2_DIRECTORY))
+
+
+def sw_l2_key_ambiguous(l1_name: str, l2_name: str) -> bool:
+    """(父一级, 二级名称) 是否为核定目录构建期标记的歧义键（issue #105 修复）。
+
+    歧义键在目录构建期已从唯一映射移除（:func:`_build_l2_parent_name_index`），
+    :func:`resolve_sw_l2_index` 对其恒返回 None；本函数供调用方在二级身份
+    缺口处区分「歧义不可解析」与「未核验/未知名称」，只降相应二级身份、
+    不泛化目录系统。
+    """
+    if not l1_name or not l2_name:
+        return False
+    return (l1_name.strip(), l2_name.strip()) in set(_L2_AMBIGUOUS_KEYS)
+
+
+def resolve_sw_l2_index(l1_name: str, l2_name: str) -> Optional[str]:
+    """父一级 + 二级名称 → 已核验的 iFinD 二级指数代码（唯一映射；issue #103）。
+
+    仅当 (父一级名称, 二级名称) 能在核定目录中**唯一**命中且该条目已有
+    iFinD 侧核验身份时返回代码；父行业不符、名称未知、歧义（构建期标记
+    为不可解析，见 ``sw_l2_key_ambiguous``）或仅官方分类存在但 iFinD 未
+    核验（见 ``SW_L2_UNVERIFIED_BY_IFIND``）一律返回 None（调用方按二级
+    缺口处理，不按名称近似匹配）。
+    """
+    if not l1_name or not l2_name:
+        return None
+    return _L2_BY_PARENT_AND_NAME.get((l1_name.strip(), l2_name.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -730,8 +1104,21 @@ def _is_valid_a_share_secucode(code_text: str) -> bool:
 
 def fetch_index_members(index_code: str, observation_date: str, *,
                         refresh_token: str, timeout_seconds: float,
-                        deadline: Optional[float]) -> Dict[str, Any]:
+                        deadline: Optional[float],
+                        full_constituent_audit: bool = False,
+                        ) -> Dict[str, Any]:
     """申万指数成分 wire 解析（专题报表 p03473，``iv_date`` + ``iv_zsdm``）。
+
+    ``full_constituent_audit``（issue #105 修复）：**二级**全量资格链显式
+    启用的发布前审计——表级回显身份绑定核验、同码重复名称矛盾置空、
+    非对象表项形状审计计数。**一级**消费语义（默认 ``False``）与基线
+    （issue #100 时期）行为等价：不核验表级回显（p03473 本无表级回显，
+    出现异常回显表不改变一级既有消费）、同码重复行保留首个非空可信名
+    （不置空、不审计拒绝）、非对象表项按既有语义跳过（不计形状缺口）。
+    一级旧键契约（``member_codes``/``member_names``/``gaps`` 语义）不变；
+    两级共用的既有防护不受开关影响：六位码跨交易所矛盾整组剔除、异日/
+    空日期行剔除、身份格式不合格剔除、超可发布上限整体不发布（安全可
+    发布金额与正额下溢防护在行情/支柱层，与本开关无关）。
 
     返回：``member_codes``（与观察日**同日**的成员代码，保留供应商带回的
     **交易所后缀**——带交易所证券身份匹配的依据）、``member_names``、
@@ -741,13 +1128,18 @@ def fetch_index_members(index_code: str, observation_date: str, *,
     ``rejected_identity_rows``（身份格式不合格被剔除的行数：非 6 位数字、缺
     后缀或后缀非沪/深/北；结构化计数，完整性证明的分母依据）、
     ``conflicting_code_members``（剥后缀后同 6 位码跨交易所矛盾被整组剔除的
-    成员数）、``gaps``。行级同日筛选：行日期 ≠ 观察日的行不进入成员集合
-    （异日成分不与目标日截面混用）；全部异日 = 未取得该日成分（非空成分，
-    如实缺口）。身份校验：入站成员代码必须是 ``6 位数字 + 有效交易所后缀``
-    （.SH/.SZ/.BJ），不合格行不采用且缺口**只含计数、不回显原始畸形标识**；
-    剥后缀后同 6 位码出现多个交易所后缀 = 身份矛盾，整组剔除（保守，不取
-    其一）。失败抛 :class:`SwSectorFetchError`，由调用方降缺口（成分查询
-    失败 ≠ 非成员）。
+    成员数）、``blank_date_rows``/``off_date_rows``（空日期/异日行的结构化
+    计数，issue #104——全量资格要求**原始行先校验后过滤**，过滤后数量吻合
+    但存在脏行时调用方依计数拒绝）、``identity_echo_conflict``（仅审计模式
+    核验：响应表回显的指数身份与请求绑定指数冲突时 True——p03473 当前无
+    表级回显，出现且冲突即身份绑定不可信）、``shape_gap_count``（仅审计
+    模式计非对象表项；缺列/不对齐形状缺口两级照记）、``gaps``。行级同日
+    筛选：行日期 ≠ 观察日的行不进入成员集合（异日成分不与目标日截面混
+    用）；全部异日 = 未取得该日成分（非空成分，如实缺口）。身份校验：
+    入站成员代码必须是 ``6 位数字 + 有效交易所后缀``（.SH/.SZ/.BJ），不合格
+    行不采用且缺口**只含计数、不回显原始畸形标识**；剥后缀后同 6 位码出现
+    多个交易所后缀 = 身份矛盾，整组剔除（保守，不取其一）。失败抛
+    :class:`SwSectorFetchError`，由调用方降缺口（成分查询失败 ≠ 非成员）。
     """
     body = {
         "reportname": "p03473",
@@ -770,14 +1162,48 @@ def fetch_index_members(index_code: str, observation_date: str, *,
         dates_seen: List[str] = []
         off_dates: List[str] = []
         rejected_identity_rows = 0
+        blank_date_rows = 0
+        off_date_rows = 0
         stripped_seen: Dict[str, str] = {}
+        conflicting_names: set = set()
+        conflicting_name_rows = 0
         conflicting_stripped: set = set()
         conflicting_members = 0
         shape_gaps: List[str] = []
         rows_total = 0
+        echo_conflict = False
+        echoed_identities: List[str] = []
+        # 表级审计先于行处理（两阶段）：审计模式（二级全量资格链）下形状
+        # 异常表显式计数（不静默忽略），回显与请求绑定指数冲突的表**整表
+        # 不采用**——其行既不进成员集合、也不能作为目标成员身份证据（原始
+        # 行数保留在审计计数内）；一级消费模式（基线语义）非对象表项按既有
+        # 语义跳过、不核验回显（p03473 本无表级回显，异常回显表不改变一级
+        # 既有消费），缺列/不对齐形状缺口两级照记（基线即有）
+        usable_tables: List[Dict[str, Any]] = []
+        echo_conflicted_tables: List[Dict[str, Any]] = []
         for table in tables:
             if not isinstance(table, dict):
+                if full_constituent_audit:
+                    shape_gaps.append(
+                        "成分响应含非对象表项（表形状异常，该表不采用）")
                 continue
+            if full_constituent_audit:
+                echo = str(table.get("thscode") or "").strip()
+                if echo and echo != index_code:
+                    echo_conflict = True
+                    echo_conflicted_tables.append(table)
+                    continue
+                if echo and echo not in echoed_identities:
+                    echoed_identities.append(echo)
+            usable_tables.append(table)
+        # 冲突回显表：原始行数计入审计计数（分母如实），行不进入成员集合
+        for table in echo_conflicted_tables:
+            cells = (table.get("table")
+                     if isinstance(table.get("table"), dict) else {})
+            row_codes = cells.get("p03473_f002")
+            if isinstance(row_codes, list):
+                rows_total += len(row_codes)
+        for table in usable_tables:
             raw_cells = table.get("table")
             cells = raw_cells if isinstance(raw_cells, dict) else {}
             row_dates = cells.get("p03473_f001")
@@ -799,8 +1225,12 @@ def fetch_index_members(index_code: str, observation_date: str, *,
                 if date_text and date_text not in dates_seen:
                     dates_seen.append(date_text)
                 if date_text != observation_date:
-                    if date_text and date_text not in off_dates:
-                        off_dates.append(date_text)
+                    if date_text:
+                        off_date_rows += 1
+                        if date_text not in off_dates:
+                            off_dates.append(date_text)
+                    else:
+                        blank_date_rows += 1
                     continue
                 code_text = str(raw_code or "").strip()
                 if not _is_valid_a_share_secucode(code_text):
@@ -816,10 +1246,35 @@ def fetch_index_members(index_code: str, observation_date: str, *,
                     conflicting_members += 1
                     continue
                 stripped_seen.setdefault(stripped, code_text)
+                # 同码重复行名称（issue #105 修复二轮）：审计模式（二级）以
+                # **首个非空可信名**为审计基线——与基线不同的非空行 → 矛盾
+                # 计数（全量资格拒绝依据），且矛盾成员的名称置空——任意择一
+                # 名都不诚实，不发布（按代码显示）；一致重复正常去重；「首
+                # 空白 + 单一非空」照常采纳（blank→one name，不误报矛盾）。
+                # 一级消费模式恢复基线语义：名称只在**首次出现**时采纳
+                # （首行空白 → 该成员名称保持缺失，不回填后续行的名称；
+                # 名称展示事实，非成员资格依据，矛盾不做审计）。
+                name_text = (raw_name.strip()
+                             if isinstance(raw_name, str) else "")
+                if full_constituent_audit:
+                    if name_text and code_text not in conflicting_names:
+                        prior_name = names.get(code_text)
+                        if prior_name and prior_name != name_text:
+                            conflicting_names.add(code_text)
+                            conflicting_name_rows += 1
+                            names[code_text] = ""
+                        elif not prior_name:
+                            names[code_text] = name_text
                 if code_text not in codes:
                     codes.append(code_text)
-                    if isinstance(raw_name, str) and raw_name.strip():
-                        names[code_text] = raw_name.strip()
+                    if name_text:
+                        names[code_text] = name_text
+                elif full_constituent_audit and name_text \
+                        and not names.get(code_text) \
+                        and code_text not in conflicting_names:
+                    # 「首空白 + 单一非空」补名仅审计模式（blank→one name）；
+                    # 一级保持基线：不补名（names 缺失 → 支柱按代码显示）
+                    names[code_text] = name_text
         # 冲突组整组回滚（先到成员先回退，保证分母如实）
         if conflicting_stripped:
             codes = [c for c in codes
@@ -839,12 +1294,34 @@ def fetch_index_members(index_code: str, observation_date: str, *,
             gaps.append(
                 f"成分响应 {len(conflicting_stripped)} 组剥后缀后同码跨交易所"
                 f"矛盾（{shown}{more}），身份矛盾整组剔除（保守，不取其一）")
+        if blank_date_rows and full_constituent_audit:
+            # 审计计数 gap 仅二级全量资格链发布（一级缺口文本与基线逐字一致）
+            gaps.append(
+                f"成分响应 {blank_date_rows} 行空日期（原始行审计计数，"
+                "剔除不采用）")
+        if conflicting_name_rows:
+            shown_conflict = "、".join(
+                c.split(".", 1)[0] for c in sorted(conflicting_names)[:5])
+            gaps.append(
+                f"成分响应 {conflicting_name_rows} 行同码重复名称矛盾"
+                f"（{shown_conflict}，计数披露），矛盾事实不静默择名，"
+                "不授予全量资格")
         if off_dates:
             shown_dates = "、".join(sorted(off_dates)[:3])
             more = f" 等 {len(off_dates)} 个日期" if len(off_dates) > 3 else ""
             gaps.append(
                 f"成分响应存在非观察日 {observation_date} 的行"
                 f"（{shown_dates}{more}，异日成分不与目标日截面混用），已剔除并记录")
+        if echo_conflict:
+            # 不回显原始值：冲突回显身份是供应商返回的意外字符串（可能畸形
+            # 或超长），缺口只含数量与截断长度（每值 ≤16 字符）
+            shown_echo = "、".join(v[:16] for v in echoed_identities[:3])
+            more = (f" 等 {len(echoed_identities)} 个" if len(
+                echoed_identities) > 3 else "")
+            gaps.append(
+                f"成分响应表回显身份（{shown_echo}{more}，已截断）与请求"
+                f"绑定指数 {index_code} 冲突，冲突表整表不采用（行不进"
+                "成员集合、目标成员身份不可采信）")
         if rows_total and not codes and not rejected_identity_rows \
                 and not conflicting_stripped:
             gaps.append(
@@ -878,8 +1355,175 @@ def fetch_index_members(index_code: str, observation_date: str, *,
         "completeness_evidence": None,
         "rejected_identity_rows": rejected_identity_rows,
         "conflicting_code_members": conflicting_members,
+        "blank_date_rows": blank_date_rows,
+        "off_date_rows": off_date_rows,
+        "conflicting_name_rows": conflicting_name_rows,
+        "identity_echo_conflict": echo_conflict,
+        "shape_gap_count": len(shape_gaps),
         "over_publish_limit": over_publish_limit,
         "gaps": gaps,
+    }
+
+
+def fetch_index_member_count(index_code: str, observation_date: str, *,
+                             refresh_token: str, timeout_seconds: float,
+                             deadline: Optional[float]) -> Dict[str, Any]:
+    """供应商同日成分计数 wire（``basic_data_service`` +
+    ``ths_constituent_num_index``，issue #104；父规格 #98 决策 4）。
+
+    与 p03473 成分名单做双接口交叉校验的计数侧证据。**单指数绑定**：
+    ``codes`` 只携带本请求指数（调用方为每次全量资格判定单独发起，请求
+    即身份绑定）；``indiparams`` **显式**传同一交易日 ``YYYYMMDD``（未传
+    日期时供应商回全 null 计数——2026-11-20 实测）。
+
+    校验（任一不成立抛 :class:`SwSectorFetchError`，由调用方降全量缺口）：
+    - 结果表 ``thscode`` 必须与请求指数**精确一致且恰好一个表**；响应出现
+      其他指数行（串批/越界）或同码多表 → 唯一性不可证，拒绝（不取其一）；
+    - 指标值列表必须恰好一个值，且为**唯一无冲突的正整数**（bool 永不作
+      数值；DT_INTEGER 语义下整值浮点按数值等价接受）。响应以
+      ``parse_float=Decimal`` **精确解码**（issue #104 复审）：JSON 字面
+      ``5.0000000000000001`` 在二进制浮点解码会损失为 ``5.0`` 并绕过整数
+      gate——精确值含小数即拒绝，解码后不可补救；超出可发布成员上界
+      （与成分 wire 同一 ``_MAX_PUBLISHABLE_MEMBER_ROWS``）拒绝；
+    - 供应商**输入参数回显**（``inputParams`` 中该指标的参数组）必须携带
+      ``FDATE`` 且值与请求交易日一致——日期不在结果表内，回显是「计数
+      属于该日」的唯一供应商证据，缺失或不符即拒绝。
+    返回 ``{"index_code", "observation_date", "count", "fdate_echo", "gaps"}``。
+    """
+    ymd = observation_date.replace("-", "")
+    body = {
+        "codes": index_code,
+        "indipara": [{
+            "indicator": "ths_constituent_num_index",
+            "indiparams": [ymd],
+        }],
+    }
+    payload = _sector_http_post(
+        _BASIC_DATA_ENDPOINT, body, label="sector_sw_member_count",
+        refresh_token=refresh_token, timeout_seconds=timeout_seconds,
+        deadline=deadline, parse_float=Decimal,
+    )
+
+    def _fail(reason: str) -> SwSectorFetchError:
+        return SwSectorFetchError(
+            f"成分计数核验失败（{index_code} {observation_date}）：{reason}")
+
+    try:
+        raw_tables = payload.get("tables")
+        tables = raw_tables if isinstance(raw_tables, list) else []
+        # 非对象表项不静默过滤——先拒绝再判定唯一表（malformed 即拒绝）
+        if any(not isinstance(t, dict) for t in tables):
+            raise _fail("结果表含非对象表项（形状异常，不过滤后判定）")
+        matched = [t for t in tables
+                   if str(t.get("thscode") or "").strip() == index_code]
+        if not matched:
+            raise _fail("结果表无请求指数行（计数缺失）")
+        if len(matched) > 1:
+            raise _fail(
+                f"结果表同码出现 {len(matched)} 个表（唯一性不可证，冲突拒绝）")
+        if len(matched) != len(tables):
+            raise _fail(
+                "单指数绑定请求的响应含非请求指数行（串批/越界形状异常）")
+        values = matched[0].get("table") if isinstance(
+            matched[0].get("table"), dict) else {}
+        raw_values = values.get("ths_constituent_num_index")
+        if not isinstance(raw_values, list) or len(raw_values) != 1:
+            raise _fail("计数列不是恰好一个值（形状异常）")
+        raw_value = raw_values[0]
+        # 唯一无冲突的正整数：bool 永不作数值；DT_INTEGER 语义下整值浮点
+        # 按数值等价接受（``parse_float=Decimal`` 精确解码后按 Decimal
+        # 整值判定——含小数的精确值如 5.0000000000000001 拒绝，不被二进制
+        # 浮点解码掩盖）；其他类型（字符串等）不 str() 合法化
+        if isinstance(raw_value, bool) or not isinstance(
+                raw_value, (int, float, Decimal)):
+            raise _fail("计数值不是整数（类型非法）")
+        # 有限、整值与区间都在**原值**上校验后才做 int()（issue #104 三轮）：
+        # 巨数指数字面（如 1e5000）的 int() 展开可能超预算/触发整数位数上限
+        # ValueError；拒绝消息只描述要求，不展开巨数、不回显供应商原始值
+        if isinstance(raw_value, Decimal):
+            if not raw_value.is_finite():
+                raise _fail("计数值不是整数（非有限）")
+            if raw_value != raw_value.to_integral_value():
+                raise _fail("计数值不是整数（精确值含小数）")
+            if raw_value <= 0:
+                raise _fail("计数值不是正整数")
+            if raw_value > _MAX_PUBLISHABLE_MEMBER_ROWS:
+                raise _fail(
+                    f"计数超出可发布成员上限 {_MAX_PUBLISHABLE_MEMBER_ROWS}")
+        elif isinstance(raw_value, float) and (
+                raw_value != int(raw_value) or raw_value != raw_value):
+            raise _fail("计数值不是整数（浮点含小数或非有限）")
+        count = int(raw_value)
+        if count <= 0:
+            raise _fail("计数值不是正整数")
+        if count > _MAX_PUBLISHABLE_MEMBER_ROWS:
+            raise _fail(
+                f"计数超出可发布成员上限 {_MAX_PUBLISHABLE_MEMBER_ROWS}")
+        # 供应商输入参数回显：日期不在结果表内，FDATE 回显是「计数属于
+        # 该日」的唯一供应商证据。匹配指标组内**每一个出现的 FDATE** 都
+        # 必须是非空有效值且全部一致：相同重复可去重；显式空白/null 是
+        # 无效源结果（与有效回显并存即拒绝，不能跳过空白后接受剩余值；
+        # 仅空白/null = 缺失）；矛盾回显（如 [错误, 正确] 的 last-wins
+        # 陷阱）与非字符串值（不 str() 合法化）一律拒绝。gap 文本不回显
+        # 供应商返回的任意字符串（只披露数量与事实）。
+        input_params = payload.get("inputParams")
+        echo_values: List[str] = []
+        blank_entries = 0
+        invalid_echo = False
+        if isinstance(input_params, dict):
+            param_groups = input_params.get("params")
+            groups = (param_groups if isinstance(param_groups, list)
+                      else [])
+            for group in groups:
+                if not isinstance(group, dict):
+                    continue
+                if str(group.get("function") or "") != \
+                        "ths_constituent_num_index":
+                    continue
+                group_params = group.get("params")
+                if not isinstance(group_params, list):
+                    continue
+                for p in group_params:
+                    if not isinstance(p, dict):
+                        continue
+                    if str(p.get("name") or "") == "FDATE":
+                        value = p.get("value")
+                        if value is None or (isinstance(value, str)
+                                             and not value.strip()):
+                            blank_entries += 1  # 显式空白 = 无效源结果
+                            continue
+                        if not isinstance(value, str):
+                            invalid_echo = True
+                            continue
+                        echo_values.append(value.strip())
+        if invalid_echo:
+            raise _fail("供应商输入参数回显含非字符串 FDATE 值（无效回显）")
+        unique_echoes = list(dict.fromkeys(echo_values))
+        if unique_echoes and blank_entries:
+            raise _fail(
+                f"供应商输入参数回显含 {blank_entries} 个空白/null FDATE "
+                "条目与有效值并存（无效源结果，不采纳）")
+        if not unique_echoes:
+            raise _fail("供应商输入参数回显缺 FDATE（日期证据缺失）")
+        if len(unique_echoes) > 1:
+            raise _fail(
+                f"供应商输入参数回显出现 {len(unique_echoes)} 个不同 FDATE "
+                "值（矛盾回显，不取其一，值不回显）")
+        fdate_echo = unique_echoes[0]
+        if fdate_echo != ymd:
+            raise _fail(
+                "供应商输入参数回显 FDATE 与请求交易日 "
+                f"{ymd} 不符（回显值不回显）")
+    except SwSectorFetchError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - wire 形状异常按源错误降级
+        raise _fail(f"响应形状异常（{type(exc).__name__}）") from None
+    return {
+        "index_code": index_code,
+        "observation_date": observation_date,
+        "count": count,
+        "fdate_echo": fdate_echo,
+        "gaps": [],
     }
 
 
@@ -948,7 +1592,9 @@ def _history_close_key(value: Any) -> Tuple[str, Any]:
 
 def fetch_index_history(codes: str, start_date: str, end_date: str, *,
                         refresh_token: str, timeout_seconds: float,
-                        deadline: Optional[float]) -> Dict[str, pd.DataFrame]:
+                        deadline: Optional[float],
+                        isolate_conflicting_dates: bool = False
+                        ) -> Dict[str, pd.DataFrame]:
     """指数日线收盘 wire 解析：``{thscode: DataFrame(date, close)}``。
 
     请求固定 ``Interval=D / CPS=1（不复权，指数口径）/ Fill=Omit（无交易
@@ -962,9 +1608,15 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
     - **请求窗口过滤**：归一日期在 ``[start_date, end_date]`` 之外的行为
       窗口外行，与资格层语义一致忽略——窗口外矛盾不淘汰窗口内有效行；
     - **收盘等价**：按有限正 Decimal 数值比较（``10`` ≡ ``"10.00"``；
-      布尔/非数/非正同类缺值）。同日等值去重保留一行，同日不等价 → 该
-      代码整体保守拒绝（不取其一；不影响其他代码的有效行——调用方按缺行
-      降缺口）。
+      布尔/非数/非正同类缺值）。同日等值去重保留一行，同日不等价按
+      ``isolate_conflicting_dates`` 分级：
+      - ``False``（默认，旧入口 20 点趋势等）：该代码整体保守拒绝（不取
+        其一；不影响其他代码的有效行——调用方按缺行降缺口）；
+      - ``True``（多窗口路径，issue #103 复审）：只隔离该无效日期——该日
+        从该代码序列剔除（两行一并放弃，不取其一），其余日期照常保留。
+        单次 61 点查询承载 5/20/60 三个窗口，某日冲突不应放大为整条序列
+        全窗口丢失；冲突日缺失由调用方资格层按缺合格收盘点降缺口（仅影响
+        含该日的窗口）。
     不可解析日期行原样透传（资格层忽略并计数，行级诊断不丢）。"""
     body = {
         "codes": codes,
@@ -992,7 +1644,10 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
             window = None
         rows_by_code: Dict[str, Dict[date, Tuple[Tuple[str, Any], Any]]] = {}
         passthrough_by_code: Dict[str, List[Tuple[str, Any]]] = {}
-        conflicting: set = set()
+        conflicting: Set[str] = set()
+        # isolate 模式下的按码冲突日期集：该日两行一并放弃（不取其一），
+        # 后续重复行同样忽略；其余日期照常合并
+        isolated_dates: Dict[str, Set[date]] = {}
         for table in tables:
             if not isinstance(table, dict):
                 continue
@@ -1011,6 +1666,7 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
             parsed = pd.to_datetime(dates, errors="coerce", format="mixed")
             merged = rows_by_code.setdefault(thscode, {})
             passthrough = passthrough_by_code.setdefault(thscode, [])
+            isolated = isolated_dates.setdefault(thscode, set())
             for d_ts, raw_date, c_raw in zip(parsed, dates, closes):
                 if pd.isna(d_ts):
                     # 不可解析日期行：原样透传（资格层忽略并注明，诊断不丢）
@@ -1019,12 +1675,19 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
                 d = d_ts.date()
                 if window is not None and not (window[0] <= d <= window[1]):
                     continue  # 窗口外行：资格层忽略，不参与冲突判定
+                if d in isolated:
+                    continue  # 已隔离日期：后续重复行一并忽略（不取其一）
                 key = _history_close_key(c_raw)
                 prior = merged.get(d)
                 if prior is not None and prior[0] != key:
                     # 同码同日收盘矛盾（数值不等或有效性不同类）：供应商对
-                    # 同一身份给出冲突事实，该代码整体不采用（保守，不取
-                    # 其一；已合并观测一并放弃）
+                    # 同一身份给出冲突事实。isolate 模式只隔离该无效日期
+                    #（两行一并放弃，不取其一；已合并观测一并放弃，该日
+                    # 由资格层降缺口）；默认模式整码保守拒绝。
+                    if isolate_conflicting_dates:
+                        isolated.add(d)
+                        merged.pop(d, None)
+                        continue
                     conflicting.add(thscode)
                     rows_by_code.pop(thscode, None)
                     passthrough_by_code.pop(thscode, None)

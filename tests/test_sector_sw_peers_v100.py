@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -510,3 +511,36 @@ class TestSharedDiscipline:
         assert out["amount_unit"] == "元"
         assert "iFinD" in out["amount_provenance"]
         assert out["snapshot_observed_at"] == OBSERVED_AT
+
+
+class TestUnderflowTwoLevelSemantics:
+    """issue #105 复审：同一 wire 输入（6 条同日行情 amount=Decimal('1e-400')、
+    合格涨跌幅）两级行为对照——一级恢复基线（正额参与选样，公开 float
+    发布 0.0），二级名次语境判 invalid（不冒充正额）。有限/上溢护栏两级
+    共用不变。"""
+
+    def _underflow_constituents(self):
+        amounts = {c: Decimal("1e-400") for c in (
+            "000552.SZ", "000723.SZ", "600188.SH", "601225.SH",
+            "601898.SH", "002128.SZ")}
+        return _constituents(
+            membership=_membership("included", COAL_TARGET_SEC),
+            members=_coal_members(), member_quotes=_coal_quotes(amounts=amounts))
+
+    def test_l1_keeps_legacy_sample_semantics(self):
+        out = _pillar(COAL_TARGET, self._underflow_constituents())
+        assert out["rankable_rows"] == 6
+        assert out["sample_size"] == 5
+        assert all(i["amount"] == 0.0 for i in out["items"])
+        assert not any("不可排名" in g for g in out["gaps"])
+
+    def test_l2_rank_context_treats_underflow_invalid(self):
+        out = _sw_peers_pillar(
+            COAL_TARGET, constituents=self._underflow_constituents(),
+            snapshot_observed_at=OBSERVED_AT, budget=_budget(),
+            amount_rank_enabled=True)
+        assert out["rankable_rows"] == 0
+        assert out["sample_size"] == 1
+        target = next(i for i in out["items"] if i["is_target"])
+        assert target["amount"] is None
+        assert any("不可排名" in g and "无效" in g for g in out["gaps"])

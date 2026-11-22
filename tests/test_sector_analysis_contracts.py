@@ -704,3 +704,393 @@ def _dt_factory(*args: int) -> Any:
     from datetime import datetime as _dt
 
     return _dt(*args)
+
+
+# ========================================================================
+# 多窗口序列行契约（issue #103 复审；icontract 出口校验）
+# ========================================================================
+
+
+class TestTrendWindowSeriesContracts:
+    """多窗口序列行跨字段不变式（挂在实际构建路径 ``_sw_trend_windows_pillar``
+    出口）：合格日数与观察明细一致（``qualified_sessions == len(observations)``）、
+    已发布收益对应完整对齐窗口（收益非 None ⇒ 明细覆盖全部期望交易日）。
+    schema 反例（expected=6/qualified=2/observations=[]/return=1）必须被拒。
+    """
+
+    @staticmethod
+    def _full_frames(sessions):
+        import pandas as pd
+
+        def _frame(code):
+            return pd.DataFrame({
+                "date": [d.isoformat() for d in sessions],
+                "close": [100.0 + i for i in range(len(sessions))],
+            })
+
+        return {code: _frame(code) for code in
+                ("801194.SL", "801790.SL", "000300.SH")}
+
+    def _run_pillar(self, monkeypatch, sessions, frames):
+        from src.services import sector_sw_market as sw_mod
+
+        monkeypatch.setattr(svc, "recent_completed_trading_sessions",
+                            lambda market, n, current_time=None: sessions[:n])
+        monkeypatch.setattr(sw_mod, "fetch_index_history",
+                            lambda *a, **k: frames)
+        return svc._sw_trend_windows_pillar(
+            "801194.SL", "保险Ⅱ", "801790.SL", "非银金融",
+            budget=ReportBudget(60.0, finish_margin=5.0),
+            refresh_token="t", timeout_seconds=5.0)
+
+    def test_valid_output_satisfies_contracts(self, monkeypatch):
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        out = self._run_pillar(monkeypatch, sessions,
+                               self._full_frames(sessions))
+        assert svc._trend_window_series_invariants(out)
+        w5 = out["windows"][0]
+        for s in w5["series"]:
+            assert s["qualified_sessions"] == len(s["observations"]) == 6
+            assert s["period_return_pct"] is not None
+
+    def test_observations_missing_violates_contract(self, monkeypatch):
+        """缝反例 A：合格日数与观察明细脱节（明细被清空）→ ViolationError。"""
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        orig = svc._observation_rows
+        monkeypatch.setattr(svc, "_observation_rows", lambda obs: [])
+        with pytest.raises(ViolationError):
+            self._run_pillar(monkeypatch, sessions,
+                             self._full_frames(sessions))
+        monkeypatch.setattr(svc, "_observation_rows", orig)
+
+    def test_published_return_requires_full_window_rows(self, monkeypatch):
+        """缝反例 B：收益已发布但观察明细不完整（截断为一行）→
+        ViolationError（收益只许伴随完整对齐窗口发布）。"""
+        from datetime import date, timedelta
+
+        sessions = []
+        d = date(2026, 8, 3)
+        while len(sessions) < 61:
+            if d.weekday() < 5:
+                sessions.append(d)
+            d += timedelta(days=1)
+        orig = svc._observation_rows
+        monkeypatch.setattr(
+            svc, "_observation_rows",
+            lambda obs: orig(dict(list(obs.items())[:1])))
+        with pytest.raises(ViolationError):
+            self._run_pillar(monkeypatch, sessions,
+                             self._full_frames(sessions))
+        monkeypatch.setattr(svc, "_observation_rows", orig)
+
+    def test_predicate_rejects_schema_counterexample_shape(self):
+        """谓词反例（schema 可接受而契约拒绝的形状）：expected=6、
+        qualified=2、observations=[]、period_return_pct=1 必须判 False。"""
+        bad = {"windows": [{"series": [{
+            "expected_sessions": 6, "qualified_sessions": 2,
+            "observations": [], "period_return_pct": 1.0}]}]}
+        assert svc._trend_window_series_invariants(bad) is False
+        # 部分合格且收益留空的合法形状不误伤
+        partial = {"windows": [{
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-13", "close": 100.0},
+                                 {"date": "2026-11-17", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(partial) is True
+
+    def test_published_return_rejects_equal_count_repeated_dates(self):
+        """issue #105 修复反例 A（当前 PR 版本可接受、修复后拒绝）：5 日窗
+        同一交易日重复六次且携带收益——数量与点数对齐但观测日期未按序
+        等于本窗完整预期日期，收益发布必须拒绝。"""
+        bad = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-18", "close": 100.0},
+                                 {"date": "2026-11-18", "close": 101.0},
+                                 {"date": "2026-11-18", "close": 102.0},
+                                 {"date": "2026-11-18", "close": 103.0},
+                                 {"date": "2026-11-18", "close": 104.0},
+                                 {"date": "2026-11-18", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(bad) is False
+
+    def test_both_sides_repeating_same_date_rejected_at_window_level(self):
+        """issue #105 修复二轮反例：预期日期与观察**双方**重复同一日期——
+        旧的逐位相等比较会放行（两份列表逐字相同），新契约在窗口级先拒
+        绝（预期日期必须时间有序且唯一），无论是否携带收益。"""
+        repeated = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-18"] * 6,
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-18", "close": 100.0 + i}
+                                 for i in range(6)],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(repeated) is False
+        repeated["windows"][0]["series"][0]["period_return_pct"] = None
+        assert svc._trend_window_series_invariants(repeated) is False
+
+    def test_out_of_window_partial_observations_rejected_without_return(self):
+        """issue #105 修复二轮反例：无收益的部分观测含窗外日期（旧版契约
+        只在有收益时查对齐，窗外观察曾可发布）——观察必须是预期日期的
+        有序子集，收益留空同样拒绝。"""
+        out_of_window = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-12", "close": 100.0},
+                                 {"date": "2026-11-13", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(out_of_window) is False
+
+    def test_legal_partial_and_calendar_shortfall_allowed(self):
+        """issue #105 修复二轮正例：真正合规的部分观测（观察 = 预期日期的
+        有序子集、无收益）与日历不足（expected 少于规定点数）都允许。"""
+        partial = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-16", "close": 100.0},
+                                 {"date": "2026-11-19", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(partial) is True
+        # 日历不足：窗口期望仅 3/6 个交易日（严格日历已完成交易日不够），
+        # 部分观测仍是其有序子集
+        shortfall = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 3, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-18", "close": 100.0},
+                                 {"date": "2026-11-20", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(shortfall) is True
+
+    def test_published_return_rejects_equal_count_wrong_dates(self):
+        """issue #105 修复反例 B：点数相同但日期错位（旧日凑数/偏移一日）
+        且携带收益——同样拒绝；窗外首日（2026-11-12）在无收益时同样拒绝
+        （观察须为预期日期的有序子集）。"""
+        wrong_dates = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-12", "close": 100.0},
+                                 {"date": "2026-11-13", "close": 101.0},
+                                 {"date": "2026-11-16", "close": 102.0},
+                                 {"date": "2026-11-17", "close": 103.0},
+                                 {"date": "2026-11-18", "close": 104.0},
+                                 {"date": "2026-11-19", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(wrong_dates) is False
+        # 窗外观察（首日 2026-11-12 不在预期窗口内）无收益时同样拒绝
+        wrong_dates["windows"][0]["series"][0]["period_return_pct"] = None
+        assert svc._trend_window_series_invariants(wrong_dates) is False
+
+    def test_published_return_rejects_wrong_point_count(self):
+        """issue #105 修复反例 C：收益发布但点数不等于该窗口规定点数
+        （expected_sessions ≠ point_count）→ 拒绝；完整同日对齐的正例
+        通过。"""
+        wrong_count = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-16", "2026-11-17", "2026-11-18",
+                               "2026-11-19", "2026-11-20", "2026-11-21"],
+            "series": [{
+                "expected_sessions": 5, "qualified_sessions": 5,
+                "observations": [{"date": "2026-11-16", "close": 100.0},
+                                 {"date": "2026-11-17", "close": 101.0},
+                                 {"date": "2026-11-18", "close": 102.0},
+                                 {"date": "2026-11-19", "close": 103.0},
+                                 {"date": "2026-11-20", "close": 104.0}],
+                "period_return_pct": 4.0}]}]}
+        assert svc._trend_window_series_invariants(wrong_count) is False
+        aligned = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-13", "close": 100.0},
+                                 {"date": "2026-11-16", "close": 101.0},
+                                 {"date": "2026-11-17", "close": 102.0},
+                                 {"date": "2026-11-18", "close": 103.0},
+                                 {"date": "2026-11-19", "close": 104.0},
+                                 {"date": "2026-11-20", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(aligned) is True
+
+    def test_contracts_attached_to_construction_path(self):
+        """出口不变式以 icontract 契约强制在实际构建路径（每次调用校验）。"""
+        postconditions = getattr(
+            svc._sw_trend_windows_pillar, "__postconditions__", [])
+        assert postconditions, "_sw_trend_windows_pillar 应挂载 ensure 契约"
+
+
+# ========================================================================
+# 申万同业块成交额名次跨字段契约（issue #104 复审；icontract 出口校验）
+# ========================================================================
+
+
+class TestSwAmountRankInvariants:
+    """``_sw_peers_pillar`` 出口的成交额名次跨字段不变式：名次发布需要声明
+    范围且有界分母（1 ≤ rank ≤ denominator ≤ 正额行数）；full_constituents
+    范围必携带双接口核验证据；成分数复核（verified_constituent_num）独立于
+    名次发布——样本级块允许持有独立复核信息，不在契约中禁止。"""
+
+    @staticmethod
+    def _included_constituents(*, evidence: Any) -> Dict[str, Any]:
+        codes = ["601318.SH", "601319.SH", "601336.SH", "601601.SH",
+                 "601628.SH"]
+        quotes = {
+            "601318.SH": {"thscode": "601318.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.73,
+                          "amount": 2.81e9},
+            "601319.SH": {"thscode": "601319.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -1.39,
+                          "amount": 3.12e8},
+            "601336.SH": {"thscode": "601336.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -1.91,
+                          "amount": 4.32e8},
+            "601601.SH": {"thscode": "601601.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.06,
+                          "amount": 6.26e8},
+            "601628.SH": {"thscode": "601628.SH",
+                          "trade_date": "2026-11-20",
+                          "trade_time": "22:00:46", "change_pct": -0.60,
+                          "amount": 0.0},
+        }
+        return {
+            "membership": {"status": "included",
+                           "target_secucode": "601318.SH",
+                           "observation_date": "2026-11-20",
+                           "member_count": 5,
+                           "completeness_evidence": evidence, "gaps": []},
+            "members": {"member_codes": codes,
+                        "member_names": {c: f"成员{c[:6]}" for c in codes},
+                        "dates_seen": ["2026-11-20"],
+                        "rows_total": len(codes),
+                        "completeness_evidence": None, "gaps": []},
+            "member_quotes": quotes, "member_quote_gaps": [],
+            "target_quote": None, "target_quote_gaps": [],
+            "target_name": "中国平安",
+        }
+
+    def test_real_paths_satisfy_invariants(self) -> None:
+        """真实业务路径正例：全量发布（含零额成员）、一级口径出口全部满足
+        不变式（每次调用自动校验）；样本范围形状经谓词正例覆盖。"""
+        evidence = ("iFinD 双接口核验一致：p03473 同日名单 5 只 = "
+                    "ths_constituent_num_index 计数 5（FDATE 20261120）")
+        full = svc._sw_peers_pillar(
+            "601318", constituents=self._included_constituents(evidence=evidence),
+            snapshot_observed_at="2026-11-20T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0),
+            amount_rank_enabled=True)
+        assert full["amount_rank_scope"] == "full_constituents"
+        assert full["amount_rank_evidence"] == evidence
+        assert svc._sw_amount_rank_invariants(full) is True
+        l1 = svc._sw_peers_pillar(
+            "601318", constituents=self._included_constituents(evidence=None),
+            snapshot_observed_at="2026-11-20T23:00:00",
+            budget=ReportBudget(60.0, finish_margin=5.0))
+        assert l1["amount_rank_scope"] is None
+        assert svc._sw_amount_rank_invariants(l1) is True
+        assert svc._sw_amount_rank_invariants(
+            {"target_amount_rank": 1, "amount_rank_denominator": 4,
+             "amount_rank_scope": "qualified_sample",
+             "rankable_rows": 4}) is True
+        assert svc._sw_amount_rank_invariants(
+            {"target_amount_rank": None, "amount_rank_denominator": None,
+             "amount_rank_scope": None, "rankable_rows": 4}) is True
+
+    def test_predicate_rejects_out_of_range_rank(self) -> None:
+        """反例：名次越过分母（5 > 4）必须判 False。"""
+        bad = {"target_amount_rank": 5, "amount_rank_denominator": 4,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_predicate_rejects_full_scope_without_evidence(self) -> None:
+        """反例：全成分范围名次不携带双接口核验证据必须判 False。"""
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 4,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": None, "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_predicate_rejects_denominator_beyond_rankable_rows(self) -> None:
+        """反例：分母越过正额行数（样本/全量范围的公共上界）必须判 False。"""
+        bad = {"target_amount_rank": None, "amount_rank_denominator": 10,
+               "amount_rank_scope": None, "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+        bad_rank = {"target_amount_rank": 3, "amount_rank_denominator": 10,
+                    "amount_rank_scope": "qualified_sample",
+                    "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad_rank) is False
+
+    def test_sample_scope_may_carry_independent_verification(self) -> None:
+        """样本级块持有独立复核信息不被禁止（成分数复核与全量名次分别
+        表达——复审问题 6 的契约面）。"""
+        ok = {"target_amount_rank": 2, "amount_rank_denominator": 4,
+              "amount_rank_scope": "qualified_sample",
+              "amount_rank_evidence": None, "rankable_rows": 4,
+              "verified_constituent_num": 28}
+        assert svc._sw_amount_rank_invariants(ok) is True
+
+    def test_full_scope_denominator_must_equal_rankable_rows(self) -> None:
+        """三轮：全成分正额分母必须**等于**正额行数（不是其子集）。"""
+        ok = {"target_amount_rank": 1, "amount_rank_denominator": 4,
+              "amount_rank_scope": "full_constituents",
+              "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(ok) is True
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e", "rankable_rows": 4}
+        assert svc._sw_amount_rank_invariants(bad) is False
+
+    def test_missing_rankable_rows_defaults_to_zero_not_skipped(self) -> None:
+        """四轮：缺 ``rankable_rows`` 键按 schema 语义默认 0——全量分母
+        一致性与上界检查不再被 get(None) 跳过（反例：缺键 + 全量 denom=3
+        曾被误接受）。"""
+        bad = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+               "amount_rank_scope": "full_constituents",
+               "amount_rank_evidence": "e"}
+        assert svc._sw_amount_rank_invariants(bad) is False
+        ok = {"target_amount_rank": 1, "amount_rank_denominator": 3,
+              "amount_rank_scope": "full_constituents",
+              "amount_rank_evidence": "e", "rankable_rows": 3}
+        assert svc._sw_amount_rank_invariants(ok) is True
+
+    def test_contracts_attached_to_sw_peers_pillar(self) -> None:
+        """跨字段不变式以 icontract 契约强制在构建出口（每次调用校验）。"""
+        postconditions = getattr(svc._sw_peers_pillar, "__postconditions__", [])
+        joined = " ".join(str(getattr(pc, "description", "")) for pc in
+                          postconditions)
+        assert "amount rank cross-field invariants" in joined

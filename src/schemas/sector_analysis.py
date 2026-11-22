@@ -99,6 +99,17 @@ PayloadVersion = Literal[2, 3]
 """板块报告载荷版本。3 = 申万口径报告（issue #99 起；#101 起研究块随载荷
 透出，完整性按实际取得的合格证据判定）。"""
 
+SwL2IdentityStatus = Literal["confirmed", "missing"]
+"""申万二级行业指数身份状态（issue #103；目录唯一映射语义）：
+- confirmed：目标股报告目标交易日的正式二级归属能在核定目录中以
+  (父一级, 二级名称) 唯一映射到指数代码
+- missing：二级归属未取得、未命中目录或父行业不符——只报缺口，
+  不按名称近似匹配
+"""
+
+TrendSeriesRole = Literal["l2_industry", "l1_industry", "benchmark"]
+"""多窗口趋势序列角色（issue #103）：目标二级 / 一级（主行业）/ 沪深 300。"""
+
 
 _GapList = List[Annotated[str, Field(min_length=1, max_length=200)]]
 
@@ -382,6 +393,90 @@ class SectorTrendBlock(_StrictBase):
     gaps: _GapList = Field(default_factory=list, max_length=10)
 
 
+class SwL2IdentityBlock(_StrictBase):
+    """目标股申万二级行业指数身份（issue #103；核定目录唯一映射产物）。
+
+    ``status=confirmed`` 时 ``l2_name``/``l2_index_code``/``l1_parent_name``
+    必须同时非空（(父一级, 二级名称) 唯一映射到指数代码）；``missing``
+    时三者保持 None、原因随 gaps 透出（不近似匹配、不用样例白名单顶替
+    目录）。目录来源与版本随载荷固化（``directory_version``），采集/核定
+    日期在版本号与来源常量中可追溯。二级缺口不影响一级事实与完整性判定，
+    也不触发东财兜底。
+    """
+
+    status: SwL2IdentityStatus
+    l2_name: Optional[Annotated[str, Field(max_length=64)]] = None
+    l2_index_code: Optional[Annotated[str, Field(max_length=16)]] = None
+    l1_parent_name: Optional[Annotated[str, Field(max_length=64)]] = None
+    directory_version: Annotated[str, Field(min_length=1, max_length=32)]
+    observation_date: Optional[Annotated[str, Field(min_length=8, max_length=10)]] = None
+    gaps: _GapList = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_confirmed_identity(self) -> "SwL2IdentityBlock":
+        if self.status == "confirmed" and not (
+                self.l2_name and self.l2_index_code and self.l1_parent_name):
+            raise ValueError(
+                "confirmed L2 identity requires l2_name, l2_index_code and "
+                "l1_parent_name together")
+        return self
+
+
+class TrendWindowSeries(_StrictBase):
+    """多窗口趋势中的单条序列（issue #103）：实际合格收盘点，无发明值。
+
+    ``observations`` 是该窗口内实际合格收盘点（升序）；窗口内全部期望
+    交易日都取得合格收盘点时 ``period_return_pct`` 才非 None（间隔数 =
+    ``expected_sessions - 1``，从窗口首个收盘日复合）；仅部分合格时收益
+    留空、已取得观测保留、缺口注明缺失（不取旧日凑数、不按自然日补齐）。
+    归一化（同窗首个收盘日 = 100）是展示语义，存档保留原始收盘点位。
+    """
+
+    role: TrendSeriesRole
+    name: Annotated[str, Field(min_length=1, max_length=64)]
+    index_code: Annotated[str, Field(min_length=1, max_length=16)]
+    source: Annotated[str, Field(min_length=1, max_length=48)]
+    expected_sessions: Annotated[int, Field(ge=1, le=61)]
+    qualified_sessions: Annotated[int, Field(ge=0, le=61)]
+    observations: List[TrendObservation] = Field(default_factory=list, max_length=61)
+    # 新增趋势收益 I/O 字段禁用非有限值（issue #105 修复：inf/nan 不可发布；
+    # 旧一级 20 点块 SectorTrendBlock.period_return_pct 保持既有规则不变）
+    period_return_pct: Optional[Annotated[float, Field(allow_inf_nan=False)]] = None
+    gaps: _GapList = Field(default_factory=list, max_length=10)
+
+
+class SectorTrendWindowBlock(_StrictBase):
+    """申万二级/一级/沪深 300 多窗口趋势块（issue #103；追加兼容）。
+
+    每个块是一个窗口（5/20/60 个交易日 → 6/21/61 个连续合格收盘点），
+    三条序列共用同一严格交易日历期望窗口，以报告时点最近一个已完成
+    交易日为共同终点（盘中未完成交易日不进入期望窗口）。``series`` 中
+    每条序列独立判定合格性：某序列该窗口缺观测时该条收益与曲线留空，
+    其他序列照常展示。存档一次包含全部窗口的数据，图表窗口切换不重新
+    取数。新增查询失败/无预算时本块为 None + 缺口（原一级事实与完整性
+    判定不受影响）。
+    """
+
+    window_days: Literal[5, 20, 60]
+    point_count: Literal[6, 21, 61]
+    start_date: Optional[Annotated[str, Field(max_length=10)]] = None
+    end_date: Optional[Annotated[str, Field(max_length=10)]] = None
+    expected_dates: List[Annotated[str, Field(min_length=10, max_length=10)]] = Field(
+        default_factory=list, max_length=61,
+    )
+    series: List[TrendWindowSeries] = Field(default_factory=list, max_length=3)
+    observed_at: Optional[Annotated[str, Field(max_length=32)]] = None
+    gaps: _GapList = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def validate_window_shape(self) -> "SectorTrendWindowBlock":
+        expected_points = {5: 6, 20: 21, 60: 61}
+        if expected_points[self.window_days] != self.point_count:
+            raise ValueError(
+                "point_count must be window_days + 1 (5→6, 20→21, 60→61)")
+        return self
+
+
 class PeerItem(_StrictBase):
     """同业样本条目（同一成分快照内的成交活跃代表，非市值/基本面龙头）。"""
 
@@ -421,6 +516,22 @@ class SectorPeersBlock(_StrictBase):
     target_in_amount_top5: Optional[bool] = None
     """目标股是否落在成交额前五内；成交额缺失/无效无法判定时 None（成员仍保留）。"""
     target_change_pct_rank: Optional[Annotated[int, Field(ge=1, le=6)]] = None
+    target_amount_rank: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """目标股当日成交额名次（issue #104 追加兼容字段；一级既有口径恒 None）。
+
+    名次为顺序名次：按正额降序、同额代码升序的确定排序中的位置
+    （不并列；涨跌幅名次才并列同名次）；范围由 ``amount_rank_scope``
+    标注。已知零额目标不参与正额名次（不发布），目标缺有效正额同样不发布。"""
+    amount_rank_denominator: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """成交额名次分母：有效正额成员数（零额计入报价覆盖但不进分母）。"""
+    amount_rank_scope: Optional[Literal["full_constituents",
+                                        "qualified_sample"]] = None
+    """名次范围：``full_constituents`` = iFinD 双接口核验一致 + 报价全集可证
+    （全成分正额名次）；``qualified_sample`` = 门槛未满足时降级为实际纳入
+    比较的有效正额样本名次（不冒充全成分）。"""
+    amount_rank_evidence: Optional[Annotated[str, Field(max_length=240)]] = None
+    """全成分范围的双接口核验证据说明（仅在 full_constituents 名次发布时
+    携带）；核验缺口见 gaps。"""
     amount_unit: Literal["元"] = "元"
     """快照成交额计量单位（判定依据见 ``amount_provenance``）。"""
     amount_provenance: Annotated[str, Field(max_length=240)] = (
@@ -433,6 +544,18 @@ class SectorPeersBlock(_StrictBase):
     """成分快照观测总行数（资格过滤前；与 rankable_rows 一起暴露实际范围）。"""
     rankable_rows: Annotated[int, Field(ge=0, le=10000)] = 0
     """成交额可排名行数（代码有效、无重复冲突且成交额有限正）；与观测总数分开。"""
+    valid_quote_rows: Optional[Annotated[int, Field(ge=0, le=10000)]] = None
+    """有效成交额报价行数 = 正额可排名 + 已知零额（issue #104 复审追加兼容；
+    行情覆盖事实与正额排名分母分开——名次分母只取正额，覆盖含已知零）。
+    None = 旧存档未采集（不假定已知零数为 0，展示退化为正额口径）。"""
+    change_pct_qualified_rows: Optional[Annotated[int, Field(ge=0, le=6)]] = None
+    """入选样本内有合格同日涨跌幅的行数（issue #104 复审追加兼容；涨跌幅
+    覆盖事实对样本一次统计，名次未发布时同样可见，分母为 sample_size）。
+    None = 旧存档未采集或无样本（不假定覆盖数）。"""
+    verified_constituent_num: Optional[Annotated[int, Field(ge=1, le=10000)]] = None
+    """iFinD 双接口核验一致的成分数（issue #104 复审追加兼容；名单/计数
+    核验通过即发布，与全成分名次是否发布独立——核验事实与才允许发布的
+    全量名次分别表达；未通过核验时 None，缺口承载精确失败）。"""
     sample_size: Annotated[int, Field(ge=0, le=6)] = 0
     snapshot_observed_at: Optional[Annotated[str, Field(max_length=32)]] = None
     source: Optional[Annotated[str, Field(max_length=48)]] = None
@@ -556,7 +679,45 @@ class SectorCatalystsBlock(_StrictBase):
     不相交（供应商侧拒绝的行不会进入本地准入），无双重计数。追加兼容字段
     （默认 0）。"""
     source: Optional[Annotated[str, Field(max_length=48)]] = None
+    first_screen: Optional["CatalystFirstScreenSummary"] = None
+    """首屏催化摘要（issue #103 review 修正；追加兼容字段，默认 None 兼容
+    旧存档）。在既有检索/准入分支处从结构化信号派生（state + 首条引用 ID），
+    不解析 gap 文案——Web 与 Markdown 两个呈现面共用，避免 worker 诊断
+    先于聚合诊断落位时把「未发现」误读为「全失败」。"""
     gaps: _GapList = Field(default_factory=list, max_length=14)
+
+
+CatalystFirstScreenState = Literal[
+    "found", "none_found", "search_failed", "partial_failed",
+    "search_unavailable", "budget_exhausted",
+]
+"""首屏催化状态（与既有诊断语义一一对应，不在呈现层重复数值）：
+- found：已取得合格催化（headline_evidence_id 指向首条）
+- none_found：检索成功、经统一准入无合格催化
+- search_failed：全部检索渠道失败
+- partial_failed：部分渠道检索成功但无合格结果且其他渠道失败
+- search_unavailable：搜索入口未配置
+- budget_exhausted：取数预算不足，搜索未完成
+"""
+
+
+class CatalystFirstScreenSummary(_StrictBase):
+    """首屏催化结构化摘要（issue #103 review 修正）。
+
+    ``state`` 由 :func:`_catalysts_pillar` 在既有分支处直接发布；
+    ``headline_evidence_id`` 仅 ``state="found"`` 时非 None，指向
+    ``items[0].evidence_id``（标题/链接由呈现层从 items 渲染，不在
+    摘要里复制数值或文案）。
+    ``partial_search_failures``（issue #105 修复，追加兼容字段，默认 None
+    兼容旧存档）：``state="found"`` 且存在检索渠道失败时的结构化失败数
+    （复用检索既有计数；已找到催化时两端并列标注部分检索失败，不改变
+    ``state``）。未取得催化的既有诊断状态不携带本字段。
+    """
+
+    state: CatalystFirstScreenState
+    headline_evidence_id: Optional[Annotated[str, Field(min_length=1,
+                                                        max_length=16)]] = None
+    partial_search_failures: Optional[Annotated[int, Field(ge=0, le=50)]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +907,34 @@ class SectorReportPayload(_StrictBase):
     # 边界；已验收 #81/#82 形状 payload（无此键）仍通过严格校验 ----
     sector_catalysts: Optional[SectorCatalystsBlock] = None
     sector_synthesis: Optional[SectorSynthesisBlock] = None
+    # ---- v3.x 追加（issue #103）：二级指数身份与多窗口趋势。同上追加兼容
+    # 边界；已验收 #81-#101 形状 payload（无此键）仍通过严格校验 ----
+    sector_l2_identity: Optional[SwL2IdentityBlock] = None
+    sector_trend_windows: Optional[List[SectorTrendWindowBlock]] = Field(
+        default=None, max_length=3,
+    )
+    sector_l2_peers: Optional["SectorPeersBlock"] = None
+    """二级同业对照块（issue #104 追加兼容字段；目标股申万二级指数成分的
+    成交活跃代表 + 全成分成交额名次，复用 #103 的二级指数身份）。None 仅是
+    追加兼容边界——二级身份未确认/取数预算耗尽/查询失败时整块缺席（缺口
+    随载荷 gaps 与 ``sector_l2_peers_gaps`` 透出），一级既有 ``sector_peers``
+    与完整性判定不受影响，存量旧记录读回不受影响。"""
+    sector_l2_peers_gaps: Optional[_GapList] = Field(
+        default=None, max_length=10,
+    )
+    """二级同业**整链**缺口（issue #104 追加兼容字段）：仅当
+    ``sector_l2_peers`` 为 None（二级身份未确认/取数预算耗尽/会话缺失等
+    整链未发起）且缺口非空时发布；块取得时为 None（块内 gaps 承载）。"""
+    sector_trend_windows_gaps: Optional[_GapList] = Field(
+        default=None, max_length=10,
+    )
+    """多窗口趋势**块级**缺口（issue #103 review 修正 + 复审修正；追加兼容
+    字段）。
+
+    整链未取得（交易日历不可用/取数截止/查询失败等，``sector_trend_windows``
+    为 None）或取得部分窗口但存在块级缺口（如仅二级序列整体缺席）时发布，
+    随首屏速览趋势块直出**一次**（不逐窗口重复，窗口级/序列级缺口在各窗口
+    块内）；链路完全成功时为 None。"""
     # ---- v1 兼容投影（事实路径）----
     identification: LegacyIdentification
     policy: LegacyPolicy

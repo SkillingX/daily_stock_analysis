@@ -194,6 +194,10 @@ def _offline_reference_levels(monkeypatch):
         lambda secucode, *, observation_date, refresh_token,
         timeout_seconds, deadline: {
             "l2_name": "煤炭开采", "l3_name": "动力煤", "gaps": []})
+    # issue #103 多窗口趋势（新可选出站）受控替身：单元编排测试不真实出站
+    monkeypatch.setattr(
+        "src.services.sector_analysis_service._sw_trend_windows_pillar",
+        lambda *a, **k: {"windows": [], "gaps": []})
 
 
 @pytest.fixture()
@@ -655,8 +659,10 @@ class TestOrchestrationConstituentOrder:
         core_calls: List[str] = []
 
         def _recorder(code, index_code, session_date, session, *, name,
-                      refresh_token, timeout_seconds, budget):
-            enrich_calls.append(code)
+                      refresh_token, timeout_seconds, budget,
+                      full_constituent_audit=False,
+                      reuse_member_quotes=None):
+            enrich_calls.append((code, index_code))
             return {"membership": None, "members": {}, "member_quotes": {},
                     "member_quote_gaps": [], "target_quote": None,
                     "target_quote_gaps": [], "target_name": name}
@@ -708,12 +714,18 @@ class TestOrchestrationConstituentOrder:
         assert recorder.calls == []
 
     def test_sw_kept_enriches_constituents_exactly_once(self, monkeypatch):
-        """双失败保留申万：成分/同业富化恰好一次（预算允许）。"""
+        """双失败保留申万：成分/同业富化按指数恰好一次（预算允许）。
+
+        #100 原语义（一级成分链不出站两次）保留；#104 追加二级同业阶段
+        对**二级指数**的成分链调用恰好一次（不同指数、独立预算门控）。"""
         payload, recorder = self._run(
             monkeypatch, _em_core_stub(subject_status="missing",
                                        quote_change=None))
         assert payload["research_outcome"] == "kept_sw_stage"
-        assert len(recorder.calls) == 1
+        l1_calls = [c for c in recorder.calls if c[1] == "801950.SL"]
+        l2_calls = [c for c in recorder.calls if c[1] == "801951.SL"]
+        assert len(l1_calls) == 1
+        assert len(l2_calls) == 1
 
     def test_fetch_expired_keeps_sw_without_constituent_outbound(
             self, monkeypatch):

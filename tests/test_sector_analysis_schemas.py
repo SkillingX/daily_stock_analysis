@@ -505,6 +505,48 @@ class TestSectorTrendAndPeers:
         with pytest.raises(ValidationError):
             SectorTrendBlock.model_validate(bad)
 
+    def test_trend_window_series_rejects_non_finite_return(self):
+        """issue #105 修复：新增趋势收益 I/O 字段禁用非有限值（inf/nan）。
+        旧一级 20 点块（SectorTrendBlock.period_return_pct）保持既有规则
+        不在此列。"""
+        from src.schemas.sector_analysis import TrendWindowSeries
+
+        base = {
+            "role": "l2_industry", "name": "煤炭开采", "index_code": "801951.SL",
+            "source": "iFinD 标准HTTP指数日线", "expected_sessions": 6,
+            "qualified_sessions": 6,
+            "observations": [{"date": "2026-11-13", "close": 100.0},
+                             {"date": "2026-11-16", "close": 101.0},
+                             {"date": "2026-11-17", "close": 102.0},
+                             {"date": "2026-11-18", "close": 103.0},
+                             {"date": "2026-11-19", "close": 104.0},
+                             {"date": "2026-11-20", "close": 105.0}],
+        }
+        for bad_return in (float("inf"), float("-inf"), float("nan")):
+            with pytest.raises(ValidationError):
+                TrendWindowSeries.model_validate(
+                    base | {"period_return_pct": bad_return})
+        ok = TrendWindowSeries.model_validate(
+            base | {"period_return_pct": 5.0})
+        assert ok.period_return_pct == 5.0
+
+    def test_catalyst_first_screen_partial_failures_compat(self):
+        """issue #105 修复：``partial_search_failures`` 为追加兼容字段——
+        旧存档摘要（无该键）默认 None；新摘要携带非负计数；负值拒绝。"""
+        from src.schemas.sector_analysis import CatalystFirstScreenSummary
+
+        legacy = CatalystFirstScreenSummary.model_validate({
+            "state": "found", "headline_evidence_id": "cat-001"})
+        assert legacy.partial_search_failures is None
+        fresh = CatalystFirstScreenSummary.model_validate({
+            "state": "found", "headline_evidence_id": "cat-001",
+            "partial_search_failures": 1})
+        assert fresh.partial_search_failures == 1
+        with pytest.raises(ValidationError):
+            CatalystFirstScreenSummary.model_validate({
+                "state": "found", "headline_evidence_id": "cat-001",
+                "partial_search_failures": -1})
+
     def test_trend_eligible_false_default_block(self):
         """unconfirmed 资格块：eligible=False + benchmark None 合法。"""
         from src.schemas.sector_analysis import SectorTrendBlock

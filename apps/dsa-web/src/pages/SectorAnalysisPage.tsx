@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Download, FileText, History, LayoutGrid, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { ReportMarkdownBody } from '../components/report/ReportMarkdownBody';
+import SectorFirstScreen from '../components/sector/SectorFirstScreen';
 import { StockAutocomplete } from '../components/StockAutocomplete/StockAutocomplete';
 import apiClient from '../api';
 import { parseApiError, type ParsedApiError } from '../api/error';
@@ -26,6 +27,30 @@ interface DeleteResult {
   deleted: string;
   file_cleanup?: 'ok' | 'failed';
   message?: string | null;
+}
+
+// 页面是否渲染结构化首屏（与 SectorFirstScreen 的渲染条件同源：旧存档
+// 无新增键 → 组件不渲染 → Markdown 原样保留）。
+function hasStructuredFirstScreen(analysis: Record<string, unknown> | null | undefined): boolean {
+  if (!analysis) return false;
+  if (analysis.sector_l2_identity != null) return true;
+  if (Array.isArray(analysis.sector_trend_windows) && analysis.sector_trend_windows.length > 0) return true;
+  if (Array.isArray(analysis.sector_trend_windows_gaps) && analysis.sector_trend_windows_gaps.length > 0) return true;
+  return false;
+}
+
+// 有结构化首屏时，正文本跳过 Markdown 自带的「报告速览（首屏）」节
+// （issue #103 复审：页面同时渲染 Web 首屏与整篇 Markdown 会重复展示速览
+// 与块级趋势缺口）。最小页面层处理：只移除该节（从节标题到下一个二级
+// 标题/文末），报告标题、其余正文、旧存档（无结构化键不裁剪）、「查看
+// 原文件/下载」的原始 Markdown 不受影响。
+function stripFirstScreenSection(markdown: string): string {
+  const marker = '## 报告速览（首屏）';
+  const start = markdown.indexOf(marker);
+  if (start === -1) return markdown;
+  const nextHeading = markdown.slice(start).indexOf('\n## ');
+  const end = nextHeading === -1 ? markdown.length : start + nextHeading + 1;
+  return markdown.slice(0, start) + markdown.slice(end);
 }
 
 /** 生成请求等待上限：后端报告总预算 300s + 收尾/传输余量（issue #79 实施默认）。 */
@@ -90,7 +115,13 @@ export default function SectorAnalysisPage() {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<{ code: string; name?: string } | null>(null);
   const [history, setHistory] = useState<SectorItem[]>([]);
-  const [detail, setDetail] = useState<{ id: string; markdown: string; stock_name?: string } | null>(null);
+  const [detail, setDetail] = useState<{
+    id: string;
+    markdown: string;
+    stock_name?: string;
+    /** 报告存档载荷（issue #103 首屏数据源；旧存档无新键时首屏组件不渲染）。 */
+    analysis?: Record<string, unknown> | null;
+  } | null>(null);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
@@ -117,7 +148,7 @@ export default function SectorAnalysisPage() {
         { timeout: GENERATE_WAIT_TIMEOUT_MS },
       );
       if (res.data.report_id) {
-        setDetail({ id: res.data.report_id, markdown: res.data.markdown, stock_name: res.data.stock_name || undefined });
+        setDetail({ id: res.data.report_id, markdown: res.data.markdown, stock_name: res.data.stock_name || undefined, analysis: res.data.analysis ?? null });
         await loadHistory();
       } else {
         setError('生成反馈异常：未返回报告 id，请勿视为已保存，可重试');
@@ -132,10 +163,10 @@ export default function SectorAnalysisPage() {
   const handleSelect = useCallback(async (id: string) => {
     setError(null);
     try {
-      const res = await apiClient.get<{ data: { markdown: string; stock_name?: string } }>(
+      const res = await apiClient.get<{ data: { markdown: string; stock_name?: string; analysis_json?: Record<string, unknown> | null } }>(
         `/api/v1/sector-analysis/reports/${id}`,
       );
-      setDetail({ id, markdown: res.data.data.markdown, stock_name: res.data.data.stock_name });
+      setDetail({ id, markdown: res.data.data.markdown, stock_name: res.data.data.stock_name, analysis: res.data.data.analysis_json ?? null });
     } catch (e: unknown) {
       setError(describeError(e, '报告详情打开失败'));
     }
@@ -298,7 +329,15 @@ export default function SectorAnalysisPage() {
                   <FileText className="h-4 w-4" /> 查看原文件
                 </button>
               </div>
-              <ReportMarkdownBody content={detail.markdown} className="deep-research-prose" />
+              {/* 报告 ID 作 key：切换历史报告时重建首屏组件，窗口选择等
+                  局部状态不复用上个报告（复审：A 选 60 日切 B 仍 60 日） */}
+              <SectorFirstScreen key={detail.id} analysis={detail.analysis} />
+              <ReportMarkdownBody
+                content={hasStructuredFirstScreen(detail.analysis)
+                  ? stripFirstScreenSection(detail.markdown)
+                  : detail.markdown}
+                className="deep-research-prose"
+              />
             </div>
           )}
         </div>

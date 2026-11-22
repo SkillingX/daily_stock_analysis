@@ -410,15 +410,24 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
         self.assertIn("行业催化未取得", reasons)
         self.assertNotIn("同业比较与指数成分验证", reasons)
         self.assertEqual(analysis["assessment"]["completeness"], "partial")
-        # 归属请求按层级单独查询（3 次）；快照+成员批次行情；成分 1 次
+        # 归属请求按层级单独查询（3 次）；#104 计数核验经同一端点单独出站
         basic_calls = [p for u, p in stub.calls if "basic_data_service" in u]
-        self.assertEqual(len(basic_calls), 3)
+        self.assertEqual(len(basic_calls), 4)
+        count_calls = [p for p in basic_calls
+                       if p["indipara"][0]["indicator"]
+                       == "ths_constituent_num_index"]
+        self.assertEqual(len(count_calls), 1)  # 单指数绑定，恰好一次
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        self.assertEqual(len(rt_calls), 2)  # 31 指数快照 + 成员批次（included 无独立行情）
+        # 31 指数快照 + L1 成员批次（included 链均无独立行情）；L2 成员批次
+        # 为 0——issue #105 修复：二级名单与一级同名单时成员行情全复用
+        # （带交易所完整代码、同报告目标交易日），零二级行情批次出站
+        self.assertEqual(len(rt_calls), 2)
         self.assertEqual(len([1 for u, p in stub.calls
-                              if "data_pool" in u]), 1)
+                              if "data_pool" in u]), 2)  # L1 + L2 成分各一次
+        # issue #103：原一级 20 点趋势出站 + 必需研究后的多窗口（5/20/60 日）
+        # 出站各一次；多窗口为新增可选出站，不替代原 20 点请求
         self.assertEqual(len([1 for u, p in stub.calls
-                              if "cmd_history_quotation" in u]), 1)
+                              if "cmd_history_quotation" in u]), 2)
 
         # 存档：详情读回与下载与生成一致（同一载荷/同一 Markdown）
         rows, total = self.db.list_sector_analysis_reports()
