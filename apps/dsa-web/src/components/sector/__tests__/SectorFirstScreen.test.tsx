@@ -225,6 +225,64 @@ describe('SectorFirstScreen', () => {
     }
   });
 
+  it('marks partial search failure beside a found catalyst', () => {
+    // issue #105 修复：已找到催化时并列标注部分检索失败（原文与日期照常）
+    const analysis = confirmedAnalysis();
+    (analysis as Record<string, unknown>).sector_catalysts = {
+      eligible: true,
+      items: [
+        {
+          evidence_id: 'cat-1',
+          title: '保险行业监管新规发布',
+          url: 'https://example.com/news/1',
+          source_domain: 'example.com',
+          published_date: '2026-11-18',
+        },
+      ],
+      first_screen: {
+        state: 'found',
+        headline_evidence_id: 'cat-1',
+        partial_search_failures: 1,
+      },
+      gaps: [],
+    };
+    const { unmount } = render(<SectorFirstScreen analysis={analysis} />);
+    expect(screen.getByText('保险行业监管新规发布')).toBeTruthy();
+    expect(screen.getByText(/2026-11-18 发布/)).toBeTruthy();
+    expect(screen.getByText(/部分检索渠道失败 1 个/)).toBeTruthy();
+    unmount();
+    // 旧存档（无该键）不标注
+    const legacy = confirmedAnalysis();
+    (legacy as Record<string, unknown>).sector_catalysts = {
+      eligible: true,
+      items: [
+        {
+          evidence_id: 'cat-1',
+          title: '保险行业监管新规发布',
+          url: 'https://example.com/news/1',
+          source_domain: 'example.com',
+          published_date: '2026-11-18',
+        },
+      ],
+      gaps: [],
+    };
+    const { unmount: unmountLegacy } = render(
+      <SectorFirstScreen analysis={legacy} />);
+    expect(screen.getByText('保险行业监管新规发布')).toBeTruthy();
+    expect(screen.queryByText(/部分检索渠道失败/)).toBeNull();
+    unmountLegacy();
+  });
+
+  it('renders first-screen title with theme foreground token', () => {
+    // issue #105 修复：标题与二级身份文字用主题前景色（深色主题可读）
+    render(<SectorFirstScreen analysis={confirmedAnalysis()} />);
+    const heading = screen.getByRole('heading', { name: '报告速览' });
+    expect(heading.className).toContain('text-foreground');
+    expect(heading.className).not.toContain('text-primary-text');
+    const l2Span = screen.getByText(/保险Ⅱ（801194.SL）/);
+    expect(l2Span.className).toContain('text-foreground');
+  });
+
   it('renders nothing for legacy reports without new keys', () => {
     const { container } = render(<SectorFirstScreen analysis={{ payload_version: 3 }} />);
     expect(container).toBeEmptyDOMElement();

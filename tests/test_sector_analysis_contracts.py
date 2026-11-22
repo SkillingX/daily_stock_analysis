@@ -805,12 +805,144 @@ class TestTrendWindowSeriesContracts:
             "observations": [], "period_return_pct": 1.0}]}]}
         assert svc._trend_window_series_invariants(bad) is False
         # 部分合格且收益留空的合法形状不误伤
-        partial = {"windows": [{"series": [{
-            "expected_sessions": 6, "qualified_sessions": 2,
-            "observations": [{"date": "2026-11-18", "close": 100.0},
-                             {"date": "2026-11-19", "close": 101.0}],
-            "period_return_pct": None}]}]}
+        partial = {"windows": [{
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-13", "close": 100.0},
+                                 {"date": "2026-11-17", "close": 101.0}],
+                "period_return_pct": None}]}]}
         assert svc._trend_window_series_invariants(partial) is True
+
+    def test_published_return_rejects_equal_count_repeated_dates(self):
+        """issue #105 修复反例 A（当前 PR 版本可接受、修复后拒绝）：5 日窗
+        同一交易日重复六次且携带收益——数量与点数对齐但观测日期未按序
+        等于本窗完整预期日期，收益发布必须拒绝。"""
+        bad = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-18", "close": 100.0},
+                                 {"date": "2026-11-18", "close": 101.0},
+                                 {"date": "2026-11-18", "close": 102.0},
+                                 {"date": "2026-11-18", "close": 103.0},
+                                 {"date": "2026-11-18", "close": 104.0},
+                                 {"date": "2026-11-18", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(bad) is False
+
+    def test_both_sides_repeating_same_date_rejected_at_window_level(self):
+        """issue #105 修复二轮反例：预期日期与观察**双方**重复同一日期——
+        旧的逐位相等比较会放行（两份列表逐字相同），新契约在窗口级先拒
+        绝（预期日期必须时间有序且唯一），无论是否携带收益。"""
+        repeated = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-18"] * 6,
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-18", "close": 100.0 + i}
+                                 for i in range(6)],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(repeated) is False
+        repeated["windows"][0]["series"][0]["period_return_pct"] = None
+        assert svc._trend_window_series_invariants(repeated) is False
+
+    def test_out_of_window_partial_observations_rejected_without_return(self):
+        """issue #105 修复二轮反例：无收益的部分观测含窗外日期（旧版契约
+        只在有收益时查对齐，窗外观察曾可发布）——观察必须是预期日期的
+        有序子集，收益留空同样拒绝。"""
+        out_of_window = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-12", "close": 100.0},
+                                 {"date": "2026-11-13", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(out_of_window) is False
+
+    def test_legal_partial_and_calendar_shortfall_allowed(self):
+        """issue #105 修复二轮正例：真正合规的部分观测（观察 = 预期日期的
+        有序子集、无收益）与日历不足（expected 少于规定点数）都允许。"""
+        partial = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-16", "close": 100.0},
+                                 {"date": "2026-11-19", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(partial) is True
+        # 日历不足：窗口期望仅 3/6 个交易日（严格日历已完成交易日不够），
+        # 部分观测仍是其有序子集
+        shortfall = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 3, "qualified_sessions": 2,
+                "observations": [{"date": "2026-11-18", "close": 100.0},
+                                 {"date": "2026-11-20", "close": 101.0}],
+                "period_return_pct": None}]}]}
+        assert svc._trend_window_series_invariants(shortfall) is True
+
+    def test_published_return_rejects_equal_count_wrong_dates(self):
+        """issue #105 修复反例 B：点数相同但日期错位（旧日凑数/偏移一日）
+        且携带收益——同样拒绝；窗外首日（2026-11-12）在无收益时同样拒绝
+        （观察须为预期日期的有序子集）。"""
+        wrong_dates = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-12", "close": 100.0},
+                                 {"date": "2026-11-13", "close": 101.0},
+                                 {"date": "2026-11-16", "close": 102.0},
+                                 {"date": "2026-11-17", "close": 103.0},
+                                 {"date": "2026-11-18", "close": 104.0},
+                                 {"date": "2026-11-19", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(wrong_dates) is False
+        # 窗外观察（首日 2026-11-12 不在预期窗口内）无收益时同样拒绝
+        wrong_dates["windows"][0]["series"][0]["period_return_pct"] = None
+        assert svc._trend_window_series_invariants(wrong_dates) is False
+
+    def test_published_return_rejects_wrong_point_count(self):
+        """issue #105 修复反例 C：收益发布但点数不等于该窗口规定点数
+        （expected_sessions ≠ point_count）→ 拒绝；完整同日对齐的正例
+        通过。"""
+        wrong_count = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-16", "2026-11-17", "2026-11-18",
+                               "2026-11-19", "2026-11-20", "2026-11-21"],
+            "series": [{
+                "expected_sessions": 5, "qualified_sessions": 5,
+                "observations": [{"date": "2026-11-16", "close": 100.0},
+                                 {"date": "2026-11-17", "close": 101.0},
+                                 {"date": "2026-11-18", "close": 102.0},
+                                 {"date": "2026-11-19", "close": 103.0},
+                                 {"date": "2026-11-20", "close": 104.0}],
+                "period_return_pct": 4.0}]}]}
+        assert svc._trend_window_series_invariants(wrong_count) is False
+        aligned = {"windows": [{
+            "point_count": 6,
+            "expected_dates": ["2026-11-13", "2026-11-16", "2026-11-17",
+                               "2026-11-18", "2026-11-19", "2026-11-20"],
+            "series": [{
+                "expected_sessions": 6, "qualified_sessions": 6,
+                "observations": [{"date": "2026-11-13", "close": 100.0},
+                                 {"date": "2026-11-16", "close": 101.0},
+                                 {"date": "2026-11-17", "close": 102.0},
+                                 {"date": "2026-11-18", "close": 103.0},
+                                 {"date": "2026-11-19", "close": 104.0},
+                                 {"date": "2026-11-20", "close": 105.0}],
+                "period_return_pct": 5.0}]}]}
+        assert svc._trend_window_series_invariants(aligned) is True
 
     def test_contracts_attached_to_construction_path(self):
         """出口不变式以 icontract 契约强制在实际构建路径（每次调用校验）。"""

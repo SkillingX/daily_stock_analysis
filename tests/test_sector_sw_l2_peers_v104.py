@@ -640,15 +640,20 @@ class TestReviewCoverageFields:
         assert out["verified_constituent_num"] == 5
 
     def test_l1_scope_keeps_rank_and_verification_fields_none(self) -> None:
-        """一级既有口径不变：不启用名次时不传核验数——名次组与
-        verified_constituent_num 恒 None（覆盖字段为结构化事实照常）。"""
+        """一级既有口径不变（issue #105 修复）：不启用名次时不传核验数——
+        名次组、verified_constituent_num 与 #104 覆盖统计
+        （valid_quote_rows/change_pct_qualified_rows）恒 None——一级不发布
+        #104 的统计结果，旧键契约 schema 兼容默认 None。"""
         out = _sw_peers_pillar(
             INS_TARGET, constituents=_ins_constituents(evidence=EVIDENCE_5),
             snapshot_observed_at=OBSERVED_AT, budget=_budget())
         assert out["target_amount_rank"] is None
         assert out["amount_rank_scope"] is None
         assert out["verified_constituent_num"] is None
-        assert out["valid_quote_rows"] == 5
+        assert out["valid_quote_rows"] is None
+        assert out["change_pct_qualified_rows"] is None
+        # 旧键（基线一级既有）照常发布
+        assert out["rankable_rows"] == 5
 
     @staticmethod
     def _count_ok(count: int = 5) -> Dict[str, Any]:

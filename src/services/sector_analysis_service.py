@@ -3655,7 +3655,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     if not providers:
         out["gaps"].append("行业催化：搜索入口未配置（套餐搜索不可用），本次未搜索")
         out["first_screen"] = {"state": "search_unavailable",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         return out
 
     search_days = sector_research.CATALYST_WINDOW_DAYS
@@ -3741,7 +3742,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     except BudgetExhausted:
         out["gaps"].append("行业催化：取数预算不足，行业新闻搜索未完成（已取得内容保留）")
         out["first_screen"] = {"state": "budget_exhausted",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         return out
     # 供应商 raw 畸形行计数并入 invalid_field 总数（诚实总数 = 供应商侧
     # 拒绝 + 本地准入拒绝；两者作用对象不相交，无双重计数）
@@ -3760,14 +3762,16 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                 "不冒充「窗口内无新闻」"
             )
             out["first_screen"] = {"state": "partial_failed",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         elif failed_providers:
             out["gaps"].append(
                 "行业催化：全部检索失败（搜索供应商均返回失败，见上方分类诊断），"
                 "不冒充「窗口内无新闻」"
             )
             out["first_screen"] = {"state": "search_failed",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         else:
             if not out["gaps"]:
                 out["gaps"].append(
@@ -3775,7 +3779,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                     "覆盖限制，不补造）"
                 )
             out["first_screen"] = {"state": "none_found",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         out["gaps"] = _bound_gaps(out["gaps"], 14)
         return out
     out["provider"] = str(provider_name)
@@ -4128,9 +4133,22 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
     out["background_items"] = background
     if items:
         # 首屏摘要：状态 + 首条引用 ID（标题/链接由呈现层从 items 渲染，
-        # 不在摘要里复制文案或数值）
+        # 不在摘要里复制文案或数值）；存在检索渠道失败时复用既有结构化
+        # 失败数并列标注（issue #105 修复：已找到催化不遮住部分检索失败
+        # ——state 保持 found、原文与日期照常展示，两端按该字段并列标注；
+        # 未取得催化的三类既有诊断状态不变）。各分支统一显式携带
+        # ``partial_search_failures`` 键（无失败为 None）：compose dict 与
+        # Pydantic 规范化（生成响应）形状一致，存档读回逐键相等。
         out["first_screen"] = {"state": "found",
-                               "headline_evidence_id": items[0]["evidence_id"]}
+                               "headline_evidence_id":
+                                   items[0]["evidence_id"],
+                               "partial_search_failures": None}
+        if failed_providers:
+            out["first_screen"]["partial_search_failures"] = failed_providers
+            out["gaps"].append(
+                f"行业催化：{failed_providers} 个检索渠道失败（另一渠道已取得"
+                "合格催化，首条照常展示；部分检索失败随首屏并列标注，分类"
+                "诊断见上方）")
         if upgraded:
             out["gaps"].append(
                 f"其中 {upgraded} 条经文章元数据日期确证"
@@ -4153,7 +4171,8 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                 "诊断）；不冒充「窗口内无新闻」"
             )
             out["first_screen"] = {"state": "partial_failed",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         elif undated_count[0] and not out["dropped_offwindow"]:
             out["gaps"].append(
                 f"行业催化：未发现合格催化（搜索返回 {undated_count[0]} 条相关"
@@ -4162,21 +4181,24 @@ def _catalysts_pillar(board_name: str, *, budget: ReportBudget,
                 "近期催化）"
             )
             out["first_screen"] = {"state": "none_found",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         elif undated_count[0]:
             out["gaps"].append(
                 "行业催化：未发现合格催化（窗口外或无日期结果均不构成已证实"
                 "近期催化，见上方计数）"
             )
             out["first_screen"] = {"state": "none_found",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
         else:
             out["gaps"].append(
                 "行业催化：未发现合格催化（去重与资格过滤后无已证实近期催化："
                 "真实无窗口内行业新闻或供应商覆盖限制，不补造）"
             )
             out["first_screen"] = {"state": "none_found",
-                              "headline_evidence_id": None}
+                              "headline_evidence_id": None,
+                              "partial_search_failures": None}
     out["gaps"] = _bound_gaps(out["gaps"], 14)
     return out
 
@@ -4825,34 +4847,59 @@ def _publishable_float_close(d: Decimal) -> bool:
 
 
 def _trend_window_series_invariants(out: Dict[str, Any]) -> bool:
-    """多窗口序列行跨字段不变式（issue #103 复审；icontract 出口校验）。
+    """多窗口序列行跨字段不变式（issue #103 复审；icontract 出口校验；
+    issue #105 修复二轮强化对齐维度）。
 
-    对每个窗口的每条序列（TrendWindowSeries 构建路径出口）校验：
+    对每个窗口先校验**预期日期本身**：必须按时间严格递增（有序且唯一——
+    ISO 日期字符串的字典序即时间序；观察与预期双方重复同一日期的「对齐」
+    不构成对齐）。对每条序列（TrendWindowSeries 构建路径出口）校验：
     - 合格日数与观察明细一致：``qualified_sessions == len(observations)``
       （观察行是合格收盘点的唯一明细，不允许计数与明细脱节）；
+    - 合格观察是预期日期的**有序子集**：观察日期必须按序出现在本窗
+      ``expected_dates`` 中——无收益的部分观测同样不得含窗外日期或乱序
+      （issue #105 修复二轮：无收益时窗外观察曾可发布）；真正合规的部分
+      观测与日历不足（expected 少于规定点数）允许；
     - 已发布收益对应完整对齐窗口：``period_return_pct`` 非 None 时观察
-      明细必须覆盖全部期望交易日（``len(observations) == expected_sessions``，
-      间隔数 = 期望日数 − 1 从首个收盘日复合）——部分合格窗口发布收益即
-      违约（反例：expected=6/qualified=2/observations=[]/return=1）。
+      明细必须覆盖全部期望交易日（``len(observations) == expected_sessions``），
+      点数等于该窗口规定点数（``expected_sessions == point_count``），且
+      观测日期**按序完全等于**本窗预期日期——仅数量相等不构成对齐。
 
     字段取值范围（Pydantic Field）不在此重复；空窗口（整链未取得）恒真。
     """
     for window in out.get("windows") or []:
+        expected_dates = [str(d) for d in (window.get("expected_dates") or [])]
+        if any(a >= b for a, b in zip(expected_dates, expected_dates[1:])):
+            return False  # 预期日期须时间有序且唯一（重复/乱序即违约）
+        point_count = window.get("point_count")
         for s in window.get("series") or []:
             if s.get("qualified_sessions") != len(s.get("observations") or []):
                 return False
-            if (s.get("period_return_pct") is not None
-                    and len(s.get("observations") or [])
-                    != s.get("expected_sessions")):
+            obs_dates = [str(o.get("date"))
+                         for o in (s.get("observations") or [])]
+            # 有序子集判定（窗外/乱序观察一律违约，无论是否发布收益）
+            cursor = iter(expected_dates)
+            if not all(d in cursor for d in obs_dates):
                 return False
+            if s.get("period_return_pct") is not None:
+                if len(obs_dates) != s.get("expected_sessions"):
+                    return False
+                if point_count is None \
+                        or s.get("expected_sessions") != point_count:
+                    return False
+                if obs_dates != expected_dates:
+                    return False
     return True
 
 
 @ensure(
     lambda result: _trend_window_series_invariants(result),
     "every emitted trend-window series must agree qualified_sessions with "
-    "its observation rows, and a published period_return_pct must correspond "
-    "to a fully aligned window (observations == expected_sessions)",
+    "its observation rows; expected_dates must be strictly increasing and "
+    "unique; qualified observations must be an ordered subset of the "
+    "window's expected_dates (no out-of-window dates even without a return); "
+    "a published period_return_pct must correspond to a fully aligned window "
+    "(observation dates sequence-equal expected_dates and the point count "
+    "equals the window's prescribed point_count)",
 )
 def _sw_trend_windows_pillar(
     l2_index_code: Optional[str], l2_name: Optional[str],
@@ -5031,13 +5078,59 @@ _MEMBER_QUOTE_INDICATORS = "changeRatio,amount,tradeTime,latest,preClose"
 """成分成员行情指标子集（与 2026-11-18 实测口径一致；同业只用成交额与涨跌幅）。"""
 
 
+def _quote_session_time_ok(row: Dict[str, Any], *, session_date: str,
+                           session: "SessionContext",
+                           received_at: datetime) -> bool:
+    """复用候选的会话时间资格复核（issue #105 修复）：**直接复用**
+    :func:`qualify_quote_rows`（同一日/身份/时间/容差谓词，不复制实现）
+    ——以本次接收钟对候选单行重新走完整资格，非 None 即仍合格（同日截面
+    内字段值不变，重新判定结果只受时间纪律影响）。"""
+    from src.services.sector_sw_market import qualify_quote_rows
+
+    qualified, _notes = qualify_quote_rows(
+        [row], session_date=session_date, received_at=received_at,
+        session_open=session.session_open,
+        session_close=session.session_close,
+        require_change=False,
+    )
+    return qualified.get(str(row.get("thscode") or "")) is not None
+
+
+def _quote_row_has_usable_fact(row: Dict[str, Any]) -> bool:
+    """行情行是否至少有一项可用事实（金额 ok/合法零，或有效涨跌幅）——
+    整行替换门（issue #105 修复）：补查新行两字段均不可用时不替换旧行，
+    避免用全空行顶替已有事实；金额按既有公开边界判定（正额/真零合格）。"""
+    amount, reason = _sw_public_amount(*_decimal_amount(row.get("amount")))
+    if reason in ("ok", "zero") and amount is not None:
+        return True
+    return _num(row.get("change_pct")) is not None
+
+
 def _fetch_constituents(code: str, index_code: str, session_date: str,
                         session: "SessionContext", *, name: Optional[str],
                         refresh_token: str, timeout_seconds: float,
                         budget: ReportBudget,
+                        full_constituent_audit: bool = False,
+                        reuse_member_quotes: Optional[Dict[str, Dict[str, Any]]] = None,
                         ) -> Dict[str, Any]:
     """指数成分边界与成员行情链（issue #100；#98 决策 3/5；amend 后仅在
     编排层决定**保留申万**时由预算允许内调用一次）。
+
+    ``full_constituent_audit``（issue #105 修复）：仅**二级**全量资格链
+    置 True，透传给 :func:`sector_sw_market.fetch_index_members` 启用绑定
+    身份/重复名称/形状审计；一级默认 False，消费语义与基线等价。
+
+    ``reuse_member_quotes``（issue #105 修复）：同一报告上下文中一级已
+    合格的成员行情（带交易所完整代码 → 行）。仅作用于本次名单内的成员：
+    候选按**本次接收钟**复核会话时间资格（跨收盘边界后盘中旧报价不再
+    冒充收盘后合格报价），通过者直接采用、不重复出站（全复用时零行情
+    批次）；行仅涨跌幅可用/仅金额可用均按整行采用（不拼接不同观测时点
+    的字段）。需补查的成员按既有分批/时限/隔离规则查询：补查新行至少
+    有一项可用事实才**整行替换**（有金额无涨跌幅的新行不拼接旧涨跌幅），
+    否则保留仍满足本次会话时间资格的旧可用行；补查失败/无该码/资格拒绝
+    同样保留旧行。名单外、异日、异交易所一律不复用；目标独立行情不复用
+    （保留既有独立查询顺序）；调用方的批次诊断不继承（二级缺口只含本次
+    阶段自己的诊断）。一级路径不传（默认 None），取数过程不需要了解二级。
 
     顺序与失败隔离（各自独立降缺口，不影响核心行情/趋势资格与兜底门槛）：
     1. 同日成分查询（p03473）→ 三态判定（带交易所身份精确匹配）；
@@ -5080,6 +5173,7 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
         members = fetch_index_members(
             index_code, session_date, refresh_token=refresh_token,
             timeout_seconds=timeout_seconds, deadline=budget.fetch_deadline,
+            full_constituent_audit=full_constituent_audit,
         )
     except SwSectorFetchError as exc:
         # 成分查询失败：membership 保守未知，目标独立行情仍独立尝试
@@ -5130,10 +5224,39 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
     if member_codes:
         quotes: Dict[str, Dict[str, Any]] = {}
         quote_gaps: List[str] = []
-        total_batches = (len(member_codes) + _MEMBER_QUOTE_BATCH_SIZE - 1) \
+        # 复用候选复核钟（issue #105 修复二轮）：仅在检查复用候选时取一次
+        # 当前钟——每个新批次响应用自己的接收钟（见下方），互不混用
+        reuse_clock = _received_at_now()
+        # 同报告上下文行情复用（issue #105 修复）：仅作用于本次名单成员——
+        # 带交易所完整代码命中 + 以**原资格谓词**（qualify_quote_rows 同一
+        # 日/身份/时间/容差实现，不复制）按本次接收钟复核通过。金额合格
+        # （正额/合法零）的候选按整行采用、不重复出站（正额缺涨跌幅仍是
+        # 可复用报价，覆盖与名次依原条件判定；全复用时零行情批次）；仅
+        # 涨跌幅可用（金额缺失/无效）的旧行先按整行保留，同时**纳入缺项
+        # 发起同日补查**；两字段均不可用的候选不占用（成员照常补查）。
+        # 复用候选诊断不进缺口（一级临时失败的批次诊断不继承到二级，
+        # 二级缺口只含本次阶段自己的诊断）。
+        reused: Dict[str, Dict[str, Any]] = {}
+        pending_codes: List[str] = []
+        for secucode in member_codes:
+            row = (reuse_member_quotes or {}).get(secucode)
+            if row is None or not _quote_session_time_ok(
+                    row, session_date=session_date, session=session,
+                    received_at=reuse_clock):
+                pending_codes.append(secucode)
+                continue
+            amount, reason = _sw_public_amount(
+                *_decimal_amount(row.get("amount")))
+            if reason in ("ok", "zero") and amount is not None:
+                reused[secucode] = row
+                continue
+            if _quote_row_has_usable_fact(row):
+                quotes[secucode] = row  # 旧可用行先保留（缺成交额，待补查）
+            pending_codes.append(secucode)
+        total_batches = (len(pending_codes) + _MEMBER_QUOTE_BATCH_SIZE - 1) \
             // _MEMBER_QUOTE_BATCH_SIZE
-        for offset in range(0, len(member_codes), _MEMBER_QUOTE_BATCH_SIZE):
-            batch = member_codes[offset:offset + _MEMBER_QUOTE_BATCH_SIZE]
+        for offset in range(0, len(pending_codes), _MEMBER_QUOTE_BATCH_SIZE):
+            batch = pending_codes[offset:offset + _MEMBER_QUOTE_BATCH_SIZE]
             batch_no = offset // _MEMBER_QUOTE_BATCH_SIZE + 1
             try:
                 rows = fetch_index_quotes(
@@ -5144,14 +5267,25 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                     raw_amount=True,
                 )
             except SwSectorFetchError as exc:
-                quote_gaps.append(
-                    f"成员行情第 {batch_no}/{total_batches} 批查询失败"
-                    f"（{exc}），该批 {len(batch)} 只成员行情缺失")
+                # 失败文案（issue #105 修复二轮）：无新的可用报价是事实，
+                # 但已保留的同日合格事实不因此消失——该批存在已保留行时
+                # 如实注明，不声称整批从未有行情
+                kept = sum(1 for c in batch if c in quotes)
+                message = (f"成员行情第 {batch_no}/{total_batches} 批查询失败"
+                           f"（{exc}），该批 {len(batch)} 只成员行情缺失")
+                if kept:
+                    message += (f"（其中 {kept} 只已有同日合格报价保留，"
+                                "无新的可用报价）")
+                quote_gaps.append(message)
                 continue
+            # 接收钟（基线语义恢复）：每个新响应后取 _received_at_now——
+            # 请求前/上一批的钟不能充当本批响应的接收时刻（供应商时间戳
+            # 晚于请求时刻但早于响应到达的行是合法观测，不是未来行情）
             received_at = _received_at_now()
-            # 成员行情口径：身份/会话/时间戳资格照常；涨跌幅缺失不剔除
-            # 整行——amount-only 成员保留有效金额参与选样（不递补第六名），
-            # 涨跌幅名次由同业支柱对缺失同行 withhold 并给覆盖说明
+            # 成员行情口径：身份/会话/时间戳资格照常（本批接收钟）；涨跌幅
+            # 缺失不剔除整行——amount-only 成员保留有效金额参与选样（不递
+            # 补第六名），涨跌幅名次由同业支柱对缺失同行 withhold 并给覆盖
+            # 说明
             qualified, notes = qualify_quote_rows(
                 rows, session_date=session_date, received_at=received_at,
                 session_open=session.session_open,
@@ -5168,12 +5302,44 @@ def _fetch_constituents(code: str, index_code: str, session_date: str,
                 if code not in batch_identity:
                     out_of_batch += 1
                     continue
-                quotes[code] = row
+                # 整行替换门（issue #105 修复二轮）：资格接纳的新行默认按
+                # 基线保留（无可用字段的行也保留观测事实——归属日随行进入
+                # as_of_date/quotes_as_of，无效金额由支柱按「无效」计数披
+                # 露，不丢失为「缺失」）；仅当该成员已有可用合格候选需要
+                # 保护时，才不以全空/无可用事实的新行替换它（不跨观测时点
+                # 拼接、不让全空行顶替已有事实）
+                if _quote_row_has_usable_fact(row) or code not in quotes:
+                    quotes[code] = row
             if out_of_batch:
                 quote_gaps.append(
                     f"成员行情第 {batch_no}/{total_batches} 批响应含 "
                     f"{out_of_batch} 个非本批请求身份的行，不采用、不覆盖"
                     "先批已采用行（原始值不回显）")
+        quotes.update(reused)
+        if full_constituent_audit and quotes:
+            # L2 相位钉定（issue #105 修复二轮）：二级输出固定在可验证的
+            # 同一相位——补查期间（含查询失败）壁钟跨过收盘时，用**原资格
+            # 谓词**（qualify_quote_rows）以最终钟复核全部行，剔除不再合格
+            # 的旧盘中行并如实说明缺口，保留合格收盘行；稳定会话内此复核
+            # 为本地无出站空操作（零补查/只查缺项语义不变）
+            final_clock = _received_at_now()
+            requalified, _notes = qualify_quote_rows(
+                list(quotes.values()), session_date=session_date,
+                received_at=final_clock,
+                session_open=session.session_open,
+                session_close=session.session_close,
+                require_change=False,
+            )
+            stale = [c for c in quotes if c not in requalified]
+            for c in stale:
+                del quotes[c]
+            if stale:
+                shown = "、".join(c.split(".", 1)[0] for c in sorted(stale)[:5])
+                more = f" 等 {len(stale)} 只" if len(stale) > 5 else ""
+                quote_gaps.append(
+                    f"成员行情：补查期间会话已跨收盘，{len(stale)} 只盘中"
+                    f"旧报价（{shown}{more}，时间戳早于收盘）不再满足收盘后"
+                    "资格，已剔除；收盘后合格报价保留")
         out["member_quotes"] = quotes
         out["member_quote_gaps"] = quote_gaps
     return out
@@ -5707,13 +5873,18 @@ def _sw_l2_peers_stage(code: str, name: str, sw_chain: Dict[str, Any],
     必需研究（催化/综合）之后的剩余取数预算内运行（父规格 #98 决策 6）：
     - 预算/凭据/会话/目标日门控不过 → ``(None, [缺口])``，零出站；
     - 复用 :func:`_fetch_constituents`（L2 指数同日成分 + 目标独立行情 +
-      成员行情批次，失败隔离语义与一级成分链同一）；
+      成员行情批次，失败隔离语义与一级成分链同一）——**启用二级全量资格
+      审计**（``full_constituent_audit=True``，绑定身份/重复名称/形状审计
+      仅二级路径生效），并传入同报告上下文中一级已合格的成员行情按会话
+      时间资格复核复用（issue #105 修复：仅查缺项，不重查全部二级成员）；
     - :func:`_verify_full_universe` 双接口核验（原始行审计 + 同日计数一致 +
       报价全集），通过后解锁全成分名次；
     - :func:`_sw_peers_pillar``（``amount_rank_enabled=True``）产出同业块。
 
     失败隔离：成分/行情/核验失败只进块缺口与阶段缺口——不触发东财兜底、
-    不影响一级事实、完整性判定与必需研究。返回 ``(块 or None, 阶段缺口)``。
+    不影响一级事实、完整性判定与必需研究；一级成分临时失败的批次诊断不
+    整体继承到二级（复用仅取一级已合格的行情行本身）。返回
+    ``(块 or None, 阶段缺口)``。
     """
     if budget.fetch_expired():
         return None, ["二级同业：取数预算已耗尽，二级成分与全量核验未发起"
@@ -5730,9 +5901,15 @@ def _sw_l2_peers_stage(code: str, name: str, sw_chain: Dict[str, Any],
     snapshot_date = (sw_chain.get("snapshot") or {}).get("session_date")
     if not snapshot_date:
         return None, ["二级同业：目标交易日未确定，未发起"]
+    # 一级已合格成员行情（同报告上下文复用源）：带交易所完整代码 → 行；
+    # 一级成分未取得/失败时为空 dict，二级照常独立查询
+    l1_quotes: Dict[str, Dict[str, Any]] = dict(
+        (sw_chain.get("constituents") or {}).get("member_quotes") or {})
     constituents = _fetch_constituents(
         code, l2_index_code, snapshot_date, session, name=name,
-        refresh_token=token, timeout_seconds=timeout, budget=budget)
+        refresh_token=token, timeout_seconds=timeout, budget=budget,
+        full_constituent_audit=True,
+        reuse_member_quotes=l1_quotes or None)
     verification = _verify_full_universe(
         l2_index_code, snapshot_date, constituents=constituents,
         refresh_token=token, timeout_seconds=timeout, budget=budget)
@@ -5986,8 +6163,11 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
         if m["amount"] is not None and m["amount"] > 0)
     zero_total = amount_reasons["zero"]
     # 行情覆盖与正额排名分母分开（issue #104 复审）：有效报价 = 正额 +
-    # 已知零（零额计入报价覆盖但不进分母）；旧存档无此键（不假定零数）
-    out["valid_quote_rows"] = out["rankable_rows"] + zero_total
+    # 已知零（零额计入报价覆盖但不进分母）；旧存档无此键（不假定零数）。
+    # 该覆盖统计随全量资格链仅在二级入口发布（issue #105 修复：一级不
+    # 发布 #104 的统计结果，一级旧键契约保持 None）
+    if amount_rank_enabled:
+        out["valid_quote_rows"] = out["rankable_rows"] + zero_total
     invalid_total = amount_reasons["invalid"]
     missing_total = amount_reasons["missing"]
     if zero_total:
@@ -6005,9 +6185,18 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
             f"（{'、'.join(parts)}，未知语义；成员资格保留，缺失金额不参与"
             "成交额排名，不冒充全体分布）")
 
+    # 排序键按两级口径区分（issue #105 修复二轮）：一级保持基线
+    # ``-amount`` 降序键（上下文取负——超出 Decimal 上下文精度的金额差
+    # 按基线截断为同值、并列按代码升序，基线一级行为不变）；二级
+    # （amount_rank_enabled，全成分名次语境）继续 ``copy_negate`` 精确
+    # 降序（38 位有效数字的金额差不截断，名次/分母精确）。两级有限金额
+    # 与正额下溢发布护栏（_sw_public_amount）共用不变
+    sort_negate = ((lambda m: (m["amount"].copy_negate(), m["code"]))
+                   if amount_rank_enabled
+                   else (lambda m: (-m["amount"], m["code"])))
     rankable = sorted(
         (m for m in members_data if m["amount"] is not None and m["amount"] > 0),
-        key=lambda m: (m["amount"].copy_negate(), m["code"]))
+        key=sort_negate)
     ranked_codes = [m["code"] for m in rankable]
     member_by_code = {m["code"]: m for m in members_data}
     target_member = member_by_code.get(code)
@@ -6063,11 +6252,14 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
                 f"同时可证（{'、'.join(missing_parts)}），资格不判定"
                 "（样本内事实保留）")
         # 有效涨跌幅覆盖对入选样本一次统计（issue #104 复审二轮）：名次、
-        # 覆盖数与缺口共用同一计数，不在汇合点对同一样本重复计算
+        # 覆盖数与缺口共用同一计数，不在汇合点对同一样本重复计算；仅二级
+        # 入口发布（issue #105 修复：一级不发布 #104 的统计结果）
         picked_change_ok = sum(
             1 for c in picked
             if member_by_code[c]["change_pct"] is not None)
-        out["change_pct_qualified_rows"] = picked_change_ok if picked else None
+        if amount_rank_enabled:
+            out["change_pct_qualified_rows"] = (
+                picked_change_ok if picked else None)
         # 样本内涨跌幅名次（picked 全覆盖才发；缺失同行 withhold）
         if target_member is None:
             pass
@@ -6132,11 +6324,13 @@ def _sw_peers_pillar(code: str, *, constituents: Dict[str, Any],
     else:
         picked = list(ranked_codes[:5])
         # 行业参考样本同样发布有效涨跌幅覆盖（issue #104 复审：一次统计，
-        # 与 included 分支共用同一计数语义；名次字段保持留空）
-        out["change_pct_qualified_rows"] = (
-            sum(1 for c in picked
-                if member_by_code[c]["change_pct"] is not None)
-            if picked else None)
+        # 与 included 分支共用同一计数语义；名次字段保持留空）；仅二级
+        # 入口发布（issue #105 修复）
+        if amount_rank_enabled:
+            out["change_pct_qualified_rows"] = (
+                sum(1 for c in picked
+                    if member_by_code[c]["change_pct"] is not None)
+                if picked else None)
         # 目标独立行情：只进独立事实位（不进 items、不参与排名）
         if target_quote is not None:
             t_secucode = str(target_quote.get("thscode") or "")
@@ -6391,14 +6585,26 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
     l2_index_code: Optional[str] = None
     l2_gaps: List[str] = []
     if confirmed and l2_name:
-        from src.services.sector_sw_market import resolve_sw_l2_index
+        from src.services.sector_sw_market import (
+            resolve_sw_l2_index,
+            sw_l2_key_ambiguous,
+        )
 
         l2_index_code = resolve_sw_l2_index(index_name, l2_name)
         if l2_index_code is None:
-            l2_gaps.append(
-                f"申万二级归属「{l2_name}」未能在核定二级目录中与父行业"
-                f"「{index_name}」唯一映射到指数代码（不按名称近似匹配），"
-                "二级对照未采纳")
+            if sw_l2_key_ambiguous(index_name, l2_name):
+                # 目录构建期标记的歧义键：只降本二级身份（issue #105 修复
+                # ——运行时隔离，不阻断一级报告与其他键；正式目录数据错误
+                # 由目录唯一性测试在发布前发现）
+                l2_gaps.append(
+                    f"申万二级目录 (父行业「{index_name}」, 二级名称"
+                    f"「{l2_name}」) 键在构建期标记为歧义（多个指数代码），"
+                    "该键不可解析，二级对照未采纳（不影响其他键与一级报告）")
+            else:
+                l2_gaps.append(
+                    f"申万二级归属「{l2_name}」未能在核定二级目录中与父行业"
+                    f"「{index_name}」唯一映射到指数代码（不按名称近似匹配），"
+                    "二级对照未采纳")
     elif confirmed and not l2_name:
         l2_gaps.append(
             "申万二级归属未取得（参考链未查询/失败或取数预算已耗尽），"

@@ -311,7 +311,11 @@ class TestFetchIndexMemberCount:
 
 
 class TestFetchIndexMembersRowAudit:
-    """成分 wire 原始行审计计数（issue #104：过滤前校验的结构化分母）。"""
+    """成分 wire 原始行审计计数（issue #104：过滤前校验的结构化分母）。
+
+    审计仅二级全量资格链显式启用（issue #105 修复：
+    ``full_constituent_audit=True``）；一级消费语义（默认 False）见
+    :class:`TestFetchIndexMembersL1Compat`。"""
 
     def _fetch(self, rec: _TransportRecorder,
               index_code: str = "801194.SL",
@@ -319,7 +323,7 @@ class TestFetchIndexMembersRowAudit:
         return sw.fetch_index_members(
             index_code, observation_date,
             refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
-            deadline=None,
+            deadline=None, full_constituent_audit=True,
         )
 
     def test_clean_sample_zero_audit_counters(self, recorder) -> None:
@@ -562,6 +566,165 @@ class TestFetchIndexMembersRowAudit:
         rec = recorder({"data_pool": payload})
         out = self._fetch(rec)
         assert out["identity_echo_conflict"] is False
+
+
+class TestFetchIndexMembersL1Compat:
+    """一级消费语义与基线等价（issue #105 修复回归）：审计仅二级显式启用，
+    一级默认 False 恢复基线可接受的旧选样与资格——同一原始响应在一级路径
+    上不因 #104 的绑定身份/重复名称/形状审计改变结果。六位码跨交易所冲突、
+    异日/空日期剔除、超上限防护等两级共用既有防护不受开关影响。"""
+
+    def test_l1_echo_conflict_table_still_consumed(self, recorder) -> None:
+        """审查反例 1（复现基线）：请求一级 801780.SL、响应表回显
+        801790.SL、含有效同日 601318.SH——一级（默认）照常采用该表，
+        目标命中 → classify_membership 为 included；审计模式（二级）才
+        整表拒绝。"""
+        from src.services.sector_sw_market import classify_membership
+
+        payload = {
+            "errorcode": 0, "errmsg": "",
+            "tables": [{"thscode": "801790.SL", "table": {
+                "p03473_f001": ["2026-11-20"],
+                "p03473_f002": ["601318.SH"],
+                "p03473_f003": ["中国平安"],
+            }}],
+        }
+        rec = recorder({"data_pool": payload})
+        out = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=False)
+        assert out["member_codes"] == ["601318.SH"]
+        assert out["identity_echo_conflict"] is False
+        assert not any("回显" in g for g in out["gaps"])
+        membership = classify_membership(
+            "601318.SH", out, observation_date="2026-11-20")
+        assert membership["status"] == "included"
+        # 同一响应在审计模式（二级路径）下整表拒绝 → unknown
+        out_audit = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=True)
+        assert out_audit["member_codes"] == []
+        assert out_audit["identity_echo_conflict"] is True
+        assert any("回显" in g for g in out_audit["gaps"])
+        membership_audit = classify_membership(
+            "601318.SH", out_audit, observation_date="2026-11-20")
+        assert membership_audit["status"] == "unknown"
+
+    def test_l1_duplicate_names_keep_first(self, recorder) -> None:
+        """审查反例 2：同码重复行名称矛盾（平安A/平安B）——一级保留首个
+        名称（基线语义），不置空、不审计拒绝；审计模式置空 + 计数。"""
+        codes = ["601318.SH", "601318.SH"]
+        payload = {
+            "errorcode": 0, "errmsg": "",
+            "tables": [{"table": {
+                "p03473_f001": ["2026-11-20"] * 2,
+                "p03473_f002": codes,
+                "p03473_f003": ["平安A", "平安B"],
+            }}],
+        }
+        rec = recorder({"data_pool": payload})
+        out = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=False)
+        assert len(out["member_codes"]) == 1
+        assert out["conflicting_name_rows"] == 0
+        assert out["member_names"].get("601318.SH") == "平安A"
+        assert not any("名称矛盾" in g for g in out["gaps"])
+        out_audit = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=True)
+        assert out_audit["conflicting_name_rows"] == 1
+        assert out_audit["member_names"].get("601318.SH") == ""
+
+    def test_l1_blank_then_name_not_backfilled(self, recorder) -> None:
+        """issue #105 修复二轮：同码首行无名称、后续行名称「中国平安」——
+        一级保持基线（名称缺失，不回填后续行名称；支柱按代码显示）；补名
+        仅审计模式（二级「首空后名」）生效。"""
+        codes = ["601318.SH", "601318.SH"]
+        payload = {
+            "errorcode": 0, "errmsg": "",
+            "tables": [{"table": {
+                "p03473_f001": ["2026-11-20"] * 2,
+                "p03473_f002": codes,
+                "p03473_f003": ["", "中国平安"],
+            }}],
+        }
+        rec = recorder({"data_pool": payload})
+        out = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=False)
+        assert len(out["member_codes"]) == 1
+        # 基线：首行空白 → 该成员名称保持缺失（{}），不采用后续名称
+        assert "601318.SH" not in out["member_names"]
+        assert out["conflicting_name_rows"] == 0
+        # 补名（blank→one name）仅二级审计模式
+        out_audit = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=True)
+        assert out_audit["member_names"].get("601318.SH") == "中国平安"
+        assert out_audit["conflicting_name_rows"] == 0
+
+    def test_l1_non_object_table_silently_skipped(self, recorder) -> None:
+        """非对象表项：一级按基线语义跳过（无形状审计缺口），不改变同日
+        合格行；审计模式记形状缺口计数。"""
+        payload = {
+            "errorcode": 0, "errmsg": "",
+            "tables": [
+                "not-a-table",
+                {"table": {
+                    "p03473_f001": ["2026-11-20"],
+                    "p03473_f002": ["601318.SH"],
+                    "p03473_f003": ["中国平安"],
+                }},
+            ],
+        }
+        rec = recorder({"data_pool": payload})
+        out = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=False)
+        assert out["member_codes"] == ["601318.SH"]
+        assert out["shape_gap_count"] == 0
+        assert not any("非对象表项" in g for g in out["gaps"])
+        out_audit = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=True)
+        assert out_audit["shape_gap_count"] == 1
+        assert any("非对象表项" in g for g in out_audit["gaps"])
+
+    def test_l1_shared_guards_unchanged(self, recorder) -> None:
+        """两级共用既有防护不受开关影响：六位码跨交易所矛盾整组剔除、
+        异日行剔除（含既有 off-date 缺口文本）、身份格式不合格剔除。"""
+        payload = {
+            "errorcode": 0, "errmsg": "",
+            "tables": [{"table": {
+                "p03473_f001": ["2026-11-20", "2026-11-20", "2026-11-19",
+                                "2026-11-20"],
+                "p03473_f002": ["601318.SH", "601318.SZ", "600000.SH",
+                                "bad-code"],
+                "p03473_f003": ["平安A", "平安SZ", "异日成员", "畸形"],
+            }}],
+        }
+        rec = recorder({"data_pool": payload})
+        out = sw.fetch_index_members(
+            "801780.SL", "2026-11-20",
+            refresh_token="sector-test-refresh-token", timeout_seconds=10.0,
+            deadline=None, full_constituent_audit=False)
+        assert out["member_codes"] == []  # 601318 跨交易所矛盾整组剔除
+        # 计数口径 = 先到成员回滚 1 + 矛盾行 1（既有语义，两级一致）
+        assert out["conflicting_code_members"] == 2
+        assert out["off_date_rows"] == 1
+        assert out["rejected_identity_rows"] == 1
+        assert any("跨交易所" in g for g in out["gaps"])
+        assert any("非观察日" in g for g in out["gaps"])
+        assert any("身份格式不合格" in g for g in out["gaps"])
 
 
 class TestCountExactFloatDecode:

@@ -418,8 +418,10 @@ class TestSwRouteClosedLoop(SectorReportApiV99TestCase):
                        == "ths_constituent_num_index"]
         self.assertEqual(len(count_calls), 1)  # 单指数绑定，恰好一次
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        # 31 指数快照 + L1 成员批次 + L2 成员批次（included 链均无独立行情）
-        self.assertEqual(len(rt_calls), 3)
+        # 31 指数快照 + L1 成员批次（included 链均无独立行情）；L2 成员批次
+        # 为 0——issue #105 修复：二级名单与一级同名单时成员行情全复用
+        # （带交易所完整代码、同报告目标交易日），零二级行情批次出站
+        self.assertEqual(len(rt_calls), 2)
         self.assertEqual(len([1 for u, p in stub.calls
                               if "data_pool" in u]), 2)  # L1 + L2 成分各一次
         # issue #103：原一级 20 点趋势出站 + 必需研究后的多窗口（5/20/60 日）

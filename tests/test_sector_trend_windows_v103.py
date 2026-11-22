@@ -962,6 +962,110 @@ class TestFirstScreenMarkdown:
         # 既有章节不受影响
         assert "主行业定位" in md
 
+    # ---- 二级同业位置速览（issue #105 修复）：趋势与催化之间 ----
+
+    @staticmethod
+    def _l2_peers_block(**overrides: Any) -> Dict[str, Any]:
+        block = {
+            "eligible": True,
+            "selection_rule": "同一成分快照按成交额前五 + 目标股去重",
+            "items": [
+                {"code": "601318", "name": "中国平安", "amount": 9.0e8,
+                 "change_pct": 1.2, "is_target": True},
+                {"code": "601601", "name": "中国太保", "amount": 5.0e8,
+                 "change_pct": 0.8, "is_target": False},
+            ],
+            "target_in_amount_top5": True, "target_change_pct_rank": 1,
+            "target_amount_rank": 1, "amount_rank_denominator": 2,
+            "amount_rank_scope": "full_constituents",
+            "amount_rank_evidence": "iFinD 双接口核验一致（受控证据）",
+            "amount_unit": "元", "rankable_rows": 2, "valid_quote_rows": 2,
+            "change_pct_qualified_rows": 2, "verified_constituent_num": 2,
+            "sample_size": 2, "snapshot_observed_at": "2026-11-19T15:29:00",
+            "source": "iFinD 申万指数成分（p03473）+ 成员行情",
+            "quotes_as_of": "2026-11-19 22:00:46",
+            "industry_reference": False,
+            "target_independent_quote": None, "gaps": [],
+        }
+        block.update(overrides)
+        return block
+
+    def test_l2_peers_summary_between_trend_and_catalyst(self):
+        """有同业：速览在趋势之后、催化之前给出二级同业位置（口径、分母、
+        名次与涨跌幅相对位置）；小节以三级标题承载（不破坏网页以二级标题
+        为边界的裁剪）。"""
+        payload = _v3_payload_for_render(with_new_blocks=True)
+        payload["sector_l2_peers"] = self._l2_peers_block()
+        md = self._render(payload)
+        assert "二级同业位置" in md
+        assert "成交额名次第 **1** / 2" in md
+        assert "全成分正额范围" in md
+        assert "涨跌幅相对位置第 **1** / 2" in md
+        assert "正额可排名 2 行" in md
+        assert "成交活跃代表" in md
+        # 顺序：速览节内 同业位置 在趋势之后、催化之前
+        i_summary = md.index("二级同业位置")
+        i_trend = md.index("最近 60 个交易日")
+        i_cat = md.index("近七天催化")
+        assert i_trend < i_summary < i_cat
+        # 三级标题：仍在「报告速览」二级标题节内（网页裁剪语义保持）
+        first_screen_section = md.split("## 报告速览", 1)[1].split("\n## ", 1)[0]
+        assert "二级同业位置" in first_screen_section
+        assert "近七天催化" in first_screen_section
+
+    def test_l2_peers_summary_industry_reference_no_comparable(self):
+        """无可比资格（行业参考）：位置行如实标注不适用，不给成分内名次。"""
+        payload = _v3_payload_for_render(with_new_blocks=True)
+        payload["sector_l2_peers"] = self._l2_peers_block(
+            industry_reference=True, target_amount_rank=None,
+            amount_rank_denominator=None, amount_rank_scope=None,
+            target_change_pct_rank=None)
+        md = self._render(payload)
+        assert "二级同业位置" in md
+        assert "行业参考" in md
+        assert "不适用（行业参考" in md
+
+    def test_l2_peers_chain_gap_renders_in_first_screen(self):
+        """二级同业整链未取得：速览给出缺口提示（首条），详细诊断留正文。"""
+        payload = _v3_payload_for_render(with_new_blocks=True)
+        payload["sector_l2_peers"] = None
+        payload["sector_l2_peers_gaps"] = [
+            "二级同业：取数预算已耗尽，二级成分与全量核验未发起"]
+        md = self._render(payload)
+        i_summary = md.index("二级同业未取得")
+        i_cat = md.index("近七天催化")
+        assert i_summary < i_cat
+        assert "取数预算已耗尽" in md
+
+    def test_legacy_payload_without_l2_peers_key_no_summary(self):
+        """旧存档路径：无 sector_l2_peers 键（且无链缺口）→ 速览无二级
+        同业小节，其余速览内容不变。"""
+        payload = _v3_payload_for_render(with_new_blocks=True)
+        assert payload.get("sector_l2_peers") is None
+        md = self._render(payload)
+        assert "二级同业位置" not in md
+        assert "报告速览" in md
+        assert "近七天催化" in md
+
+    def test_catalyst_found_with_partial_search_failure_marked(self):
+        """issue #105 修复：已找到催化时部分检索失败并列标注（state 保持
+        found、原文与日期照常展示）。"""
+        payload = _v3_payload_for_render(with_new_blocks=True)
+        payload["sector_catalysts"]["first_screen"] = {
+            "state": "found", "headline_evidence_id": "cat-1",
+            "partial_search_failures": 1}
+        md = self._render(payload)
+        assert "保险行业监管新规发布" in md  # 原文与日期照常
+        assert "2026-11-18" in md
+        assert "部分检索渠道失败 1 个" in md
+        # 旧存档（无该字段）不标注
+        payload2 = _v3_payload_for_render(with_new_blocks=True)
+        payload2["sector_catalysts"]["first_screen"] = {
+            "state": "found", "headline_evidence_id": "cat-1"}
+        md2 = self._render(payload2)
+        assert "部分检索渠道失败" not in md2
+        assert "保险行业监管新规发布" in md2
+
 
 class TestCatalystFirstScreenSummary:
     """首屏催化结构化摘要（review 修正）：state 在既有检索分支处发布，

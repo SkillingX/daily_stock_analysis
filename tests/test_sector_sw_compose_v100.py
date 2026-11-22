@@ -659,7 +659,9 @@ class TestOrchestrationConstituentOrder:
         core_calls: List[str] = []
 
         def _recorder(code, index_code, session_date, session, *, name,
-                      refresh_token, timeout_seconds, budget):
+                      refresh_token, timeout_seconds, budget,
+                      full_constituent_audit=False,
+                      reuse_member_quotes=None):
             enrich_calls.append((code, index_code))
             return {"membership": None, "members": {}, "member_quotes": {},
                     "member_quote_gaps": [], "target_quote": None,

@@ -439,7 +439,9 @@ class TrendWindowSeries(_StrictBase):
     expected_sessions: Annotated[int, Field(ge=1, le=61)]
     qualified_sessions: Annotated[int, Field(ge=0, le=61)]
     observations: List[TrendObservation] = Field(default_factory=list, max_length=61)
-    period_return_pct: Optional[float] = None
+    # 新增趋势收益 I/O 字段禁用非有限值（issue #105 修复：inf/nan 不可发布；
+    # 旧一级 20 点块 SectorTrendBlock.period_return_pct 保持既有规则不变）
+    period_return_pct: Optional[Annotated[float, Field(allow_inf_nan=False)]] = None
     gaps: _GapList = Field(default_factory=list, max_length=10)
 
 
@@ -706,11 +708,16 @@ class CatalystFirstScreenSummary(_StrictBase):
     ``headline_evidence_id`` 仅 ``state="found"`` 时非 None，指向
     ``items[0].evidence_id``（标题/链接由呈现层从 items 渲染，不在
     摘要里复制数值或文案）。
+    ``partial_search_failures``（issue #105 修复，追加兼容字段，默认 None
+    兼容旧存档）：``state="found"`` 且存在检索渠道失败时的结构化失败数
+    （复用检索既有计数；已找到催化时两端并列标注部分检索失败，不改变
+    ``state``）。未取得催化的既有诊断状态不携带本字段。
     """
 
     state: CatalystFirstScreenState
     headline_evidence_id: Optional[Annotated[str, Field(min_length=1,
                                                         max_length=16)]] = None
+    partial_search_failures: Optional[Annotated[int, Field(ge=0, le=50)]] = None
 
 
 # ---------------------------------------------------------------------------

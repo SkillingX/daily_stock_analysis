@@ -261,6 +261,14 @@ function pct(v: number): string {
 function CatalystBar({ catalysts }: { catalysts: Record<string, unknown> | null }) {
   const items = catalysts && Array.isArray(catalysts.items) ? catalysts.items : [];
   const first = asRecord(items[0]);
+  // 部分检索失败数由后端结构化摘要发布（issue #105 修复：已找到催化时
+  // 并列标注部分检索渠道失败，不遮住失败事实；旧存档无该键则不标注）。
+  const summary = catalysts ? asRecord(catalysts.first_screen) : null;
+  const partialFailures = summary && typeof summary.partial_search_failures === 'number'
+    && Number.isFinite(summary.partial_search_failures)
+    && summary.partial_search_failures > 0
+    ? summary.partial_search_failures
+    : null;
   if (first) {
     const title = asString(first.title) ?? '';
     const url = asString(first.url) ?? '#';
@@ -281,12 +289,19 @@ function CatalystBar({ catalysts }: { catalysts: Record<string, unknown> | null 
           {' '}
           （{date} 发布{domain ? `，${domain}` : ''}）
         </span>
+        {partialFailures !== null && (
+          // 两主题可读警示（issue #105 修复二轮）：amber-400 在浅色背景
+          // 对比度不足；按项目内 dark: 变体惯例取浅色 amber-700（浅底
+          // 4.69:1，过 WCAG AA）/深色 amber-300（深底 13.29:1）
+          <span className="text-xs text-amber-700 dark:text-amber-300">
+            {' '}⚠ 部分检索渠道失败 {partialFailures} 个（已取得催化照常展示，诊断见行业催化节）
+          </span>
+        )}
       </p>
     );
   }
   // 三态由后端结构化摘要发布（不解析 gap 文案：worker 诊断与聚合诊断的
   // gaps 顺序不代表检索结论），首条缺失时按旧存档回退到资格文案。
-  const summary = catalysts ? asRecord(catalysts.first_screen) : null;
   const state = summary ? asString(summary.state) : null;
   const STATE_TEXT: Record<string, string> = {
     none_found: '未发现合格催化（检索成功、经统一准入无近期催化）',
@@ -480,7 +495,10 @@ export default function SectorFirstScreen({
       className="mb-4 space-y-3 rounded-2xl border border-white/10 bg-white/[0.03] p-4"
     >
       <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
-        <h2 className="text-base font-semibold text-primary-text">报告速览</h2>
+        {/* 主题前景色（issue #105 修复）：text-primary-text 未在 Tailwind
+            主题中定义，深色主题下继承近黑前景导致对比度约 1.13:1；改用
+            主题前景令牌，两种主题可读 */}
+        <h2 className="text-base font-semibold text-foreground">报告速览</h2>
         <span className="text-sm text-secondary-text">
           {l1Name}
           {l1Code ? `（${l1Code}）` : ''}
@@ -506,7 +524,7 @@ export default function SectorFirstScreen({
         <p className="text-sm text-secondary-text">
           {l2Identity.status === 'confirmed' ? (
             <>
-              二级对照：<span className="text-primary-text">{asString(l2Identity.l2_name)}（{asString(l2Identity.l2_index_code)}）</span>
+              二级对照：<span className="text-foreground">{asString(l2Identity.l2_name)}（{asString(l2Identity.l2_index_code)}）</span>
               {' '}· 父行业：{asString(l2Identity.l1_parent_name)}
               {l2Identity.observation_date ? ` · 归属观察日 ${asString(l2Identity.observation_date)}` : ''}
               {/* 目录版本与核验口径随已确认身份带出（issue #103 三轮：

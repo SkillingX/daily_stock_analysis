@@ -105,23 +105,60 @@ class TestSwL2OfficialDirectory:
         assert "SW_L2_UNVERIFIED_BY_IFIND" in sw.SW_L2_DIRECTORY_SOURCE
 
 
-class TestL2IndexBuildFailsClosed:
-    def test_duplicate_parent_name_key_raises(self):
-        with pytest.raises(ValueError, match="键重复"):
-            sw._build_l2_parent_name_index(
-                (("801001.SL", "同名Ⅱ", "父行业"), ("801002.SL", "同名Ⅱ", "父行业")))
+class TestL2IndexAmbiguousRuntimeIsolation:
+    """目录歧义键运行时隔离（issue #105 修复）：构建期把歧义键标记为不可
+    解析（映射 None 语义）并单独收集，不抛错、不阻断模块加载与其他键；
+    正式目录的发布前数据错误由本文件上方目录唯一性/覆盖测试负责发现。"""
 
-    def test_current_directory_builds_without_error(self):
-        index = sw._build_l2_parent_name_index(sw.SW_L2_DIRECTORY)
+    def test_duplicate_parent_name_key_isolated_not_raised(self):
+        """受控歧义映射：重复键不抛错、不映射到任一代码（运行时隔离）。"""
+        index, ambiguous = sw._build_l2_parent_name_index(
+            (("801001.SL", "同名Ⅱ", "父行业"), ("801002.SL", "同名Ⅱ", "父行业")))
+        # 歧义键不可解析：不在唯一映射中（resolve 语义返回 None），
+        # 且被单独标记为歧义（调用方据此输出专门缺口）
+        assert ("父行业", "同名Ⅱ") not in index
+        assert ("父行业", "同名Ⅱ") in ambiguous
+        assert len(ambiguous) == 1
+
+    def test_other_keys_survive_ambiguity(self):
+        """歧义键只降该键：同一受控目录中健康键照常唯一解析。"""
+        entries = (
+            ("801001.SL", "同名Ⅱ", "父行业"),
+            ("801002.SL", "同名Ⅱ", "父行业"),
+            ("801003.SL", "健康Ⅱ", "健康行业"),
+        )
+        index, ambiguous = sw._build_l2_parent_name_index(entries)
+        assert index == {("健康行业", "健康Ⅱ"): "801003.SL"}
+        assert ambiguous == (("父行业", "同名Ⅱ"),)
+
+    def test_triple_duplicate_key_isolated_once(self):
+        """同一键三次出现：全部标记歧义、不取任何一个代码。"""
+        index, ambiguous = sw._build_l2_parent_name_index(
+            (("801001.SL", "同名Ⅱ", "父行业"),
+             ("801002.SL", "同名Ⅱ", "父行业"),
+             ("801003.SL", "同名Ⅱ", "父行业")))
+        assert ("父行业", "同名Ⅱ") not in index
+        assert ambiguous == (("父行业", "同名Ⅱ"),)
+
+    def test_current_directory_builds_without_ambiguity(self):
+        """现行核定目录（124 项）无歧义键，唯一映射完整。"""
+        index, ambiguous = sw._build_l2_parent_name_index(sw.SW_L2_DIRECTORY)
         assert len(index) == 124
+        assert ambiguous == ()
 
     def test_ambiguous_key_resolution_is_none(self):
-        """构建期拒绝重复键后，运行期对任何输入不会产生歧义命中。"""
+        """构建期标记歧义后，运行期对歧义键不产生任一代码命中。"""
         broken = (("801001.SL", "同名Ⅱ", "父行业"), ("801002.SL", "同名Ⅱ", "父行业"))
-        with pytest.raises(ValueError):
-            sw._build_l2_parent_name_index(broken)
+        index, ambiguous = sw._build_l2_parent_name_index(broken)
+        assert index.get(("父行业", "同名Ⅱ")) is None
         # 现行目录（无重复键）语义：唯一命中才返回
         assert sw.resolve_sw_l2_index("非银金融", "保险Ⅱ") == "801194.SL"
+
+    def test_sw_l2_key_ambiguous_on_current_directory(self):
+        """现行目录无歧义键：sw_l2_key_ambiguous 对任何现行输入为 False。"""
+        assert not sw.sw_l2_key_ambiguous("非银金融", "保险Ⅱ")
+        assert not sw.sw_l2_key_ambiguous("非银金融", "不存在的二级")
+        assert not sw.sw_l2_key_ambiguous("", "")
 
 
 class TestResolveSwL2Index:

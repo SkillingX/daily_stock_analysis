@@ -477,36 +477,53 @@ SW_L2_DIRECTORY: Tuple[Tuple[str, str, str], ...] = (
 
 def _build_l2_parent_name_index(
         entries: Tuple[Tuple[str, str, str], ...],
-) -> Dict[Tuple[str, str], str]:
-    """(父一级, 二级名称) → iFinD 指数代码（构建期 fail-closed）。
+) -> Tuple[Dict[Tuple[str, str], str], Tuple[Tuple[str, str], ...]]:
+    """(父一级, 二级名称) → iFinD 指数代码 + 歧义键集（构建期标记，issue #105 修复）。
 
     同一 (父行业, 名称) 键出现两个代码即目录数据错误：歧义按契约必须映射
-    为 None（缺口），静默覆盖会让 resolve 返回其中之一冒充唯一命中——
-    构建期直接抛错拒绝启动（核定配置数据错误在本模块导入时暴露）。
+    为 None（缺口），静默覆盖会让 resolve 返回其中之一冒充唯一命中。构建
+    期把歧义键**标记为不可解析**（从唯一映射中移除、单独收集），不抛错、
+    不阻断模块加载与其他键解析（issue #105 修复：受控歧义只降相应二级
+    身份，一级报告与目录其余条目继续可用）；正式目录的发布前数据错误由
+    目录唯一性/覆盖测试负责发现（当前核定目录无歧义键）。
     """
     index: Dict[Tuple[str, str], str] = {}
+    ambiguous: set = set()
     for code, name, parent in entries:
         key = (parent, name)
-        if key in index:
-            raise ValueError(
-                "申万二级目录 (父行业, 二级名称) 键重复："
-                f"{key} -> {index[key]} 与 {code}；歧义映射必须 fail closed")
+        if key in index or key in ambiguous:
+            ambiguous.add(key)
+            index.pop(key, None)  # 歧义键不可解析（映射 None 语义）
+            continue
         index[key] = code
-    return index
+    return index, tuple(sorted(ambiguous))
 
 
-_L2_BY_PARENT_AND_NAME: Dict[Tuple[str, str], str] = (
+_L2_BY_PARENT_AND_NAME, _L2_AMBIGUOUS_KEYS = (
     _build_l2_parent_name_index(SW_L2_DIRECTORY))
+
+
+def sw_l2_key_ambiguous(l1_name: str, l2_name: str) -> bool:
+    """(父一级, 二级名称) 是否为核定目录构建期标记的歧义键（issue #105 修复）。
+
+    歧义键在目录构建期已从唯一映射移除（:func:`_build_l2_parent_name_index`），
+    :func:`resolve_sw_l2_index` 对其恒返回 None；本函数供调用方在二级身份
+    缺口处区分「歧义不可解析」与「未核验/未知名称」，只降相应二级身份、
+    不泛化目录系统。
+    """
+    if not l1_name or not l2_name:
+        return False
+    return (l1_name.strip(), l2_name.strip()) in set(_L2_AMBIGUOUS_KEYS)
 
 
 def resolve_sw_l2_index(l1_name: str, l2_name: str) -> Optional[str]:
     """父一级 + 二级名称 → 已核验的 iFinD 二级指数代码（唯一映射；issue #103）。
 
     仅当 (父一级名称, 二级名称) 能在核定目录中**唯一**命中且该条目已有
-    iFinD 侧核验身份时返回代码；父行业不符、名称未知、歧义或仅官方分类
-    存在但 iFinD 未核验（见 ``SW_L2_UNVERIFIED_BY_IFIND``）一律返回 None
-    （调用方按二级缺口处理，不按名称近似匹配）。目录构建期对重复键
-    fail-closed（:func:`_build_l2_parent_name_index`），运行期不产生歧义。
+    iFinD 侧核验身份时返回代码；父行业不符、名称未知、歧义（构建期标记
+    为不可解析，见 ``sw_l2_key_ambiguous``）或仅官方分类存在但 iFinD 未
+    核验（见 ``SW_L2_UNVERIFIED_BY_IFIND``）一律返回 None（调用方按二级
+    缺口处理，不按名称近似匹配）。
     """
     if not l1_name or not l2_name:
         return None
@@ -1087,8 +1104,21 @@ def _is_valid_a_share_secucode(code_text: str) -> bool:
 
 def fetch_index_members(index_code: str, observation_date: str, *,
                         refresh_token: str, timeout_seconds: float,
-                        deadline: Optional[float]) -> Dict[str, Any]:
+                        deadline: Optional[float],
+                        full_constituent_audit: bool = False,
+                        ) -> Dict[str, Any]:
     """申万指数成分 wire 解析（专题报表 p03473，``iv_date`` + ``iv_zsdm``）。
+
+    ``full_constituent_audit``（issue #105 修复）：**二级**全量资格链显式
+    启用的发布前审计——表级回显身份绑定核验、同码重复名称矛盾置空、
+    非对象表项形状审计计数。**一级**消费语义（默认 ``False``）与基线
+    （issue #100 时期）行为等价：不核验表级回显（p03473 本无表级回显，
+    出现异常回显表不改变一级既有消费）、同码重复行保留首个非空可信名
+    （不置空、不审计拒绝）、非对象表项按既有语义跳过（不计形状缺口）。
+    一级旧键契约（``member_codes``/``member_names``/``gaps`` 语义）不变；
+    两级共用的既有防护不受开关影响：六位码跨交易所矛盾整组剔除、异日/
+    空日期行剔除、身份格式不合格剔除、超可发布上限整体不发布（安全可
+    发布金额与正额下溢防护在行情/支柱层，与本开关无关）。
 
     返回：``member_codes``（与观察日**同日**的成员代码，保留供应商带回的
     **交易所后缀**——带交易所证券身份匹配的依据）、``member_names``、
@@ -1100,14 +1130,15 @@ def fetch_index_members(index_code: str, observation_date: str, *,
     ``conflicting_code_members``（剥后缀后同 6 位码跨交易所矛盾被整组剔除的
     成员数）、``blank_date_rows``/``off_date_rows``（空日期/异日行的结构化
     计数，issue #104——全量资格要求**原始行先校验后过滤**，过滤后数量吻合
-    但存在脏行时调用方依计数拒绝）、``identity_echo_conflict``（响应表回显
-    的指数身份与请求绑定指数冲突时 True——p03473 当前无表级回显，出现且
-    冲突即身份绑定不可信）、``gaps``。行级同日筛选：行日期 ≠ 观察日的行不
-    进入成员集合（异日成分不与目标日截面混用）；全部异日 = 未取得该日成分
-    （非空成分，如实缺口）。身份校验：入站成员代码必须是
-    ``6 位数字 + 有效交易所后缀``（.SH/.SZ/.BJ），不合格行不采用且缺口
-    **只含计数、不回显原始畸形标识**；剥后缀后同 6 位码出现多个交易所后缀
-    = 身份矛盾，整组剔除（保守，不取其一）。失败抛
+    但存在脏行时调用方依计数拒绝）、``identity_echo_conflict``（仅审计模式
+    核验：响应表回显的指数身份与请求绑定指数冲突时 True——p03473 当前无
+    表级回显，出现且冲突即身份绑定不可信）、``shape_gap_count``（仅审计
+    模式计非对象表项；缺列/不对齐形状缺口两级照记）、``gaps``。行级同日
+    筛选：行日期 ≠ 观察日的行不进入成员集合（异日成分不与目标日截面混
+    用）；全部异日 = 未取得该日成分（非空成分，如实缺口）。身份校验：
+    入站成员代码必须是 ``6 位数字 + 有效交易所后缀``（.SH/.SZ/.BJ），不合格
+    行不采用且缺口**只含计数、不回显原始畸形标识**；剥后缀后同 6 位码出现
+    多个交易所后缀 = 身份矛盾，整组剔除（保守，不取其一）。失败抛
     :class:`SwSectorFetchError`，由调用方降缺口（成分查询失败 ≠ 非成员）。
     """
     body = {
@@ -1142,23 +1173,28 @@ def fetch_index_members(index_code: str, observation_date: str, *,
         rows_total = 0
         echo_conflict = False
         echoed_identities: List[str] = []
-        # 表级审计先于行处理（两阶段）：形状异常表显式计数（不静默忽略）；
-        # 回显与请求绑定指数冲突的表**整表不采用**——其行既不进成员集合、
-        # 也不能作为目标成员身份证据（原始行数保留在审计计数内）
+        # 表级审计先于行处理（两阶段）：审计模式（二级全量资格链）下形状
+        # 异常表显式计数（不静默忽略），回显与请求绑定指数冲突的表**整表
+        # 不采用**——其行既不进成员集合、也不能作为目标成员身份证据（原始
+        # 行数保留在审计计数内）；一级消费模式（基线语义）非对象表项按既有
+        # 语义跳过、不核验回显（p03473 本无表级回显，异常回显表不改变一级
+        # 既有消费），缺列/不对齐形状缺口两级照记（基线即有）
         usable_tables: List[Dict[str, Any]] = []
         echo_conflicted_tables: List[Dict[str, Any]] = []
         for table in tables:
             if not isinstance(table, dict):
-                shape_gaps.append(
-                    "成分响应含非对象表项（表形状异常，该表不采用）")
+                if full_constituent_audit:
+                    shape_gaps.append(
+                        "成分响应含非对象表项（表形状异常，该表不采用）")
                 continue
-            echo = str(table.get("thscode") or "").strip()
-            if echo and echo != index_code:
-                echo_conflict = True
-                echo_conflicted_tables.append(table)
-                continue
-            if echo and echo not in echoed_identities:
-                echoed_identities.append(echo)
+            if full_constituent_audit:
+                echo = str(table.get("thscode") or "").strip()
+                if echo and echo != index_code:
+                    echo_conflict = True
+                    echo_conflicted_tables.append(table)
+                    continue
+                if echo and echo not in echoed_identities:
+                    echoed_identities.append(echo)
             usable_tables.append(table)
         # 冲突回显表：原始行数计入审计计数（分母如实），行不进入成员集合
         for table in echo_conflicted_tables:
@@ -1210,28 +1246,34 @@ def fetch_index_members(index_code: str, observation_date: str, *,
                     conflicting_members += 1
                     continue
                 stripped_seen.setdefault(stripped, code_text)
-                # 同码重复行名称矛盾：审计基线 = **首个非空可信名**（即
-                # ``names`` 中已采纳的名称——空白首行不遮蔽后续矛盾）。
-                # 与基线不同的非空行 → 矛盾计数（全量资格拒绝依据），且
-                # 矛盾成员的名称置空——任意择一名都不诚实，不发布（按代码
-                # 显示）。一致重复正常去重；「首空白 + 单一非空」照常采纳
-                # （blank→one name，不误报矛盾）。
+                # 同码重复行名称（issue #105 修复二轮）：审计模式（二级）以
+                # **首个非空可信名**为审计基线——与基线不同的非空行 → 矛盾
+                # 计数（全量资格拒绝依据），且矛盾成员的名称置空——任意择一
+                # 名都不诚实，不发布（按代码显示）；一致重复正常去重；「首
+                # 空白 + 单一非空」照常采纳（blank→one name，不误报矛盾）。
+                # 一级消费模式恢复基线语义：名称只在**首次出现**时采纳
+                # （首行空白 → 该成员名称保持缺失，不回填后续行的名称；
+                # 名称展示事实，非成员资格依据，矛盾不做审计）。
                 name_text = (raw_name.strip()
                              if isinstance(raw_name, str) else "")
-                if name_text and code_text not in conflicting_names:
-                    prior_name = names.get(code_text)
-                    if prior_name and prior_name != name_text:
-                        conflicting_names.add(code_text)
-                        conflicting_name_rows += 1
-                        names[code_text] = ""
-                    elif not prior_name:
-                        names[code_text] = name_text
+                if full_constituent_audit:
+                    if name_text and code_text not in conflicting_names:
+                        prior_name = names.get(code_text)
+                        if prior_name and prior_name != name_text:
+                            conflicting_names.add(code_text)
+                            conflicting_name_rows += 1
+                            names[code_text] = ""
+                        elif not prior_name:
+                            names[code_text] = name_text
                 if code_text not in codes:
                     codes.append(code_text)
                     if name_text:
                         names[code_text] = name_text
-                elif name_text and not names.get(code_text) \
+                elif full_constituent_audit and name_text \
+                        and not names.get(code_text) \
                         and code_text not in conflicting_names:
+                    # 「首空白 + 单一非空」补名仅审计模式（blank→one name）；
+                    # 一级保持基线：不补名（names 缺失 → 支柱按代码显示）
                     names[code_text] = name_text
         # 冲突组整组回滚（先到成员先回退，保证分母如实）
         if conflicting_stripped:
@@ -1252,7 +1294,8 @@ def fetch_index_members(index_code: str, observation_date: str, *,
             gaps.append(
                 f"成分响应 {len(conflicting_stripped)} 组剥后缀后同码跨交易所"
                 f"矛盾（{shown}{more}），身份矛盾整组剔除（保守，不取其一）")
-        if blank_date_rows:
+        if blank_date_rows and full_constituent_audit:
+            # 审计计数 gap 仅二级全量资格链发布（一级缺口文本与基线逐字一致）
             gaps.append(
                 f"成分响应 {blank_date_rows} 行空日期（原始行审计计数，"
                 "剔除不采用）")

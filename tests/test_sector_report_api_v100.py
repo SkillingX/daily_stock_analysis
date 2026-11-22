@@ -584,8 +584,9 @@ class TestShIncludedLoop(SectorReportApiV100TestCase):
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
         self.assertEqual(
             len([p for p in rt_calls if p["codes"] == SH_TARGET_SEC]), 0)
-        # 成员行情批次出站（6 只成员 < 150 → L1/L2 各 1 批，#104）
-        self.assertEqual(len(rt_calls), 3)
+        # 成员行情批次出站（6 只成员 < 150 → L1 1 批；#104 L2 批次为 0——
+        # issue #105 修复：二级名单与一级同名单时成员行情全复用）
+        self.assertEqual(len(rt_calls), 2)
         # 存档一致
         rid = resp.json()["report_id"]
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
@@ -674,10 +675,10 @@ class TestAmountOnlyMemberKeepsSample(SectorReportApiV100TestCase):
         self.assertIsNone(peers["target_change_pct_rank"])
         gaps = " ".join(peers["gaps"])
         self.assertIn("有效比较范围", gaps)
-        # 成员行情批次真实出站（31 快照 + L1 一批 + #104 L2 一批），
-        # 存档与下载一致
+        # 成员行情批次真实出站（31 快照 + L1 一批；#104 L2 批次为 0——
+        # issue #105 修复：二级成员行情全复用一级已合格报价），存档与下载一致
         rt_calls = [p for u, p in stub.calls if "real_time_quotation" in u]
-        self.assertEqual(len(rt_calls), 3)
+        self.assertEqual(len(rt_calls), 2)
         rid = resp.json()["report_id"]
         detail = self.client.get(f"/api/v1/sector-analysis/reports/{rid}")
         self.assertEqual(detail.status_code, 200)

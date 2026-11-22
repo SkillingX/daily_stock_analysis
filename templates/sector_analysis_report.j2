@@ -115,12 +115,36 @@
 {% elif a.get('sector_trend_windows_gaps') %}
 - ⚠️ 5/20/60 日多窗口趋势未取得{% for g in a.get('sector_trend_windows_gaps') %}：{{ g }}{% endfor %}
 {% endif %}
+{% set l2p_fs = a.get('sector_l2_peers') %}
+{% set l2p_fs_gaps = a.get('sector_l2_peers_gaps') %}
+{% if l2id and l2id.status == 'confirmed' and (l2p_fs or l2p_fs_gaps) %}
+### 二级同业位置（{{ l2id.l2_name }} {{ l2id.l2_index_code }} 成分口径）
+
+{% if l2p_fs %}
+- 口径：目标股同日**二级指数成分**内按成交额选取活跃代表（前五 + 目标股去重；交易活跃度代表，非市值/基本面龙头），独立于一级同业{% if l2p_fs.industry_reference %}；**目标股未确认在该成分内，以下为行业参考、不构成与目标股同成分的可比样本**{% endif %}。
+- 分母：正额可排名 {{ l2p_fs.rankable_rows }} 行{% if l2p_fs.valid_quote_rows is not none %}（有效报价 {{ l2p_fs.valid_quote_rows }} 行，含已知零 {{ l2p_fs.valid_quote_rows - l2p_fs.rankable_rows }} 行）{% endif %}，样本 {{ l2p_fs.sample_size }} 家{% if l2p_fs.quotes_as_of %}，行情时点 {{ l2p_fs.quotes_as_of }}{% endif %}。
+- 目标位置：{% if l2p_fs.industry_reference %}不适用（行业参考，目标股独立展示、不参与成分内名次）{% elif l2p_fs.target_amount_rank is not none %}成交额名次第 **{{ l2p_fs.target_amount_rank }}** / {{ l2p_fs.amount_rank_denominator }}（{{ '全成分正额范围' if l2p_fs.amount_rank_scope == 'full_constituents' else '有效正额样本范围' }}）{% else %}成交额名次 N/A（目标零额/缺额不参与正额名次，见缺口）{% endif %}{% if l2p_fs.target_change_pct_rank is not none %}；涨跌幅相对位置第 **{{ l2p_fs.target_change_pct_rank }}** / {{ l2p_fs.sample_size }}（样本内降序，并列同名次）{% endif %}。
+{% if l2p_fs.gaps %}
+{% for g in l2p_fs.gaps[:3] %}
+- ⚠️ {{ g }}
+{% endfor %}
+{% if l2p_fs.gaps | length > 3 %}
+- ⚠️ 另有 {{ l2p_fs.gaps | length - 3 }} 条缺口详见「同业比较」节。
+{% endif %}
+{% endif %}
+{% else %}
+- ⚠️ 二级同业未取得：{{ l2p_fs_gaps[0] }}
+{% endif %}
+{% endif %}
 {% set cat = a.get('sector_catalysts') %}
 {% set cat_fs = cat.get('first_screen') if cat else none %}
 {% set cat_items = (cat or {}).get('items') or [] %}
+{% if cat_fs or cat_items %}
+### 近七天催化
+
 {% if cat_fs and cat_fs.state == 'found' and cat_items %}
 {% set c0 = cat_items[0] %}
-- 近七天催化（首条，共 {{ cat_items | length }} 条已证实）：[{{ c0.title | md_link_text }}]({{ c0.url }})（{{ c0.published_date }} 发布，{{ c0.source_domain }}；全文见「行业催化」节）
+- 近七天催化（首条，共 {{ cat_items | length }} 条已证实）：[{{ c0.title | md_link_text }}]({{ c0.url }})（{{ c0.published_date }} 发布，{{ c0.source_domain }}；全文见「行业催化」节）{% if cat_fs.partial_search_failures %}（⚠ 部分检索渠道失败 {{ cat_fs.partial_search_failures }} 个，已取得催化照常展示；分类诊断见「行业催化」节）{% endif %}
 {% elif cat_fs and cat_fs.state == 'none_found' %}
 - 近七天催化：未发现合格催化（检索成功、经统一准入无近期催化；诊断见「行业催化」节）
 {% elif cat_fs and cat_fs.state == 'search_failed' %}
@@ -134,6 +158,7 @@
 {% elif cat_items %}
 {% set c0 = cat_items[0] %}
 - 近七天催化（首条，共 {{ cat_items | length }} 条已证实）：[{{ c0.title | md_link_text }}]({{ c0.url }})（{{ c0.published_date }} 发布，{{ c0.source_domain }}；全文见「行业催化」节）
+{% endif %}
 {% endif %}
 {% endif %}
 

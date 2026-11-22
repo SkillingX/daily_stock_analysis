@@ -1115,6 +1115,76 @@ class TestProviderFailureSemantics:
         assert out["dropped_invalid_source"] == 1
 
 
+class TestPartialFailureWithFoundCatalyst:
+    """部分检索失败被已找到催化并列标注（issue #105 修复）：
+
+    首渠道失败、次渠道成功并取得合格催化 → ``first_screen.state`` 保持
+    ``found``（原文与日期照常），摘要携带结构化 ``partial_search_failures``
+    （复用检索既有失败计数，无新增检索调用）；全部失败/无合格催化的既有
+    三态诊断不携带该字段；旧存档摘要无该键（schema 默认 None 兼容）。"""
+
+    @staticmethod
+    def _two_providers(monkeypatch: pytest.MonkeyPatch,
+                       first: _FakeProvider, second: _FakeProvider) -> None:
+        from src.search_service import get_search_service
+
+        svc_instance = get_search_service()
+        monkeypatch.setattr(svc_instance, "_providers", [first, second])
+
+    def test_first_fails_second_finds_catalyst_marks_partial(
+            self, monkeypatch):
+        today = _today().isoformat()
+        failing = _FakeProvider([], success=False, error_message="HTTP 403")
+        ok = _FakeProvider([
+            _result("白酒行业新政策发布", "https://example.com/news/1",
+                    snippet="新规落地", published=today),
+        ])
+        self._two_providers(monkeypatch, failing, ok)
+        out = svc._catalysts_pillar(
+            "白酒Ⅱ", budget=_budget(), subject_confirmed=True,
+            stock_name="贵州茅台")
+        # 已找到催化：state 保持 found，首条照常
+        fs = out["first_screen"]
+        assert fs["state"] == "found"
+        assert fs["headline_evidence_id"] == out["items"][0]["evidence_id"]
+        # 部分检索失败并列标注（结构化失败数复用既有计数）
+        assert fs["partial_search_failures"] == 1
+        assert len(out["items"]) == 1
+        # 聚合缺口注明部分失败（分类诊断已在 worker_gaps）
+        assert any("个检索渠道失败" in g for g in out["gaps"])
+        # 无新增检索调用：恰好 2 次（每个 provider 一次，fallback 语义）
+        assert len(failing.calls) == 1
+        assert len(ok.calls) == 1
+
+    def test_all_failures_keep_original_state(self, monkeypatch):
+        failing_a = _FakeProvider([], success=False, error_message="HTTP 500")
+        failing_b = _FakeProvider([], success=False, error_message="timeout")
+        self._two_providers(monkeypatch, failing_a, failing_b)
+        out = svc._catalysts_pillar(
+            "白酒Ⅱ", budget=_budget(), subject_confirmed=True,
+            stock_name="贵州茅台")
+        fs = out["first_screen"]
+        assert fs["state"] == "search_failed"
+        # 未取得催化的既有诊断不携带失败计数（统一键形，值恒 None）
+        assert fs["partial_search_failures"] is None
+        assert len(failing_a.calls) == 1
+        assert len(failing_b.calls) == 1
+
+    def test_success_without_qualified_keeps_none_found(self, monkeypatch):
+        ok_a = _FakeProvider([], success=True)  # 检索成功零结果
+        ok_b = _FakeProvider([
+            _result("白酒企业贵州茅台员工运动会", "https://example.com/s",
+                    published=_today().isoformat()),
+        ])
+        self._two_providers(monkeypatch, ok_a, ok_b)
+        out = svc._catalysts_pillar(
+            "白酒Ⅱ", budget=_budget(), subject_confirmed=True,
+            stock_name="贵州茅台")
+        fs = out["first_screen"]
+        assert fs["state"] == "none_found"
+        assert fs["partial_search_failures"] is None
+
+
 class TestEligibilityAndSharedFilters:
     """资格前置与共享过滤不变。"""
 
