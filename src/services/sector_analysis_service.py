@@ -5438,11 +5438,13 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         out["gaps"].extend(out["identity"]["gaps"])
         return out
     token, timeout = cfg
-    # 报告参考钟（issue #103 review 修正）：链入口取一次并贯穿全链（会话
-    # 归属、参考口径分支、20 点趋势与 #103 多窗口）——必需研究可能耗数十
-    # 秒，多窗口支柱若在收盘边界后重新取钟会让同一报告的两类窗口跨会话
-    # （如 14:59 开始的报告终点漂到次日）。显式传入 None 时取当前钟一次，
-    # 语义与既有内部取钟一致（不改变旧资格判定）。
+    # 报告参考钟（issue #103 review 修正）：链入口取一次并贯穿**会话归属
+    # 与 #103 多窗口终点**——必需研究可能耗数十秒，多窗口支柱若在收盘边
+    # 界后重新取钟会让同一报告的两类窗口跨会话（如 14:59 开始的报告终点
+    # 漂到次日）。显式传入 None 时取当前钟一次。旧参考口径分支与一级
+    # 20 点趋势维持原有取时（PR #105 复审恢复）：显式 current_time 直传、
+    # 未传入时内部实时取钟——趋势在快照后查询，收盘边界后实时钟可把当日
+    # 纳入 20 点窗口；钉在入口钟会把有效窗口掐成 19/20、误触发东财兜底。
     reference_now = (current_time if current_time is not None
                      else get_market_now("cn").replace(tzinfo=None))
     session = _session_context(reference_now)
@@ -5510,7 +5512,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         intraday_target = (received_at is not None and session_close is not None
                            and received_at < session_close)
         ref_sessions = recent_completed_trading_sessions("cn", 3,
-                                                         current_time=reference_now)
+                                                         current_time=current_time)
         ref_date = next(
             (s for s in (ref_sessions or [])
              if s.isoformat() < session_date), None)
@@ -5542,7 +5544,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
     out["trend"] = _sw_trend_pillar(index_code, index_name, budget=budget,
                                     refresh_token=token,
                                     timeout_seconds=timeout,
-                                    current_time=reference_now)
+                                    current_time=current_time)
     out["trend_ok"] = bool(out["trend"].get("eligible")
                            and out["trend"].get("period_return_pct") is not None)
     # 成分/同业出站**不在此处**发起：兜底门槛只看主行业与两项核心行情，
