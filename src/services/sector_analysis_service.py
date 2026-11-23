@@ -5415,6 +5415,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         SW_L1_DIRECTORY,
         SwSectorFetchError,
         fetch_index_quotes,
+        fetch_sw_l1_close_quotes,
         qualify_quote_rows,
         resolve_sw_main_industry,
         sw_http_config,
@@ -5505,22 +5506,25 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         )
         out["snapshot"]["gaps"].extend(dup_notes)
     except SwSectorFetchError as exc:
+        received_at = _received_at_now()
         out["snapshot"]["gaps"].append(
-            f"申万一级指数快照查询失败（{exc}），当日行业行情未取得")
+            f"申万一级指数实时快照查询失败（{exc}）")
     target_row = qualified.get(index_code)
     out["snapshot"]["rows"] = qualified
     out["snapshot"]["target_date_valid"] = len(qualified)
     out["snapshot"]["dates_seen"] = sorted(
         {str(r.get("trade_date")) for r in rows if r.get("trade_date")})
     out["quote_target_ok"] = bool(target_row and target_row.get("change_pct") is not None)
-    if not out["quote_target_ok"] and rows:
+    session_completed = (received_at is not None and session_close is not None
+                         and received_at >= session_close)
+    intraday_target = (received_at is not None and session_close is not None
+                       and received_at < session_close)
+    if not out["quote_target_ok"] and rows and intraday_target:
         # 目标指数目标日合格行缺失时的参考口径（issue #99 amend 四收紧）：
         # 仅当目标会话为**盘中**（接收时刻 < 该会话收盘）且**立即上一已完成
         # 交易日**的合格 cohort 含目标指数行时才激活——盘后/休市目标不前向
         # 参考上一交易日；上一交易日无目标行则不给无主体参考。模式与理由
         # 一律从实际选用的数据推导（不按 reference_date 的存在性猜测）。
-        intraday_target = (received_at is not None and session_close is not None
-                           and received_at < session_close)
         ref_sessions = recent_completed_trading_sessions("cn", 3,
                                                          current_time=current_time)
         ref_date = next(
@@ -5539,14 +5543,9 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
                 out["snapshot"]["gaps"].extend(ref_notes)
             except SwSectorFetchError:
                 ref_rows = {}
-        if intraday_target and ref_rows.get(index_code):
+        if ref_date is not None and index_code in ref_rows:
             out["snapshot"]["reference_date"] = ref_date.isoformat()
             out["snapshot"]["reference_rows"] = ref_rows
-        elif not intraday_target:
-            out["snapshot"]["gaps"].append(
-                f"目标交易日 {session_date} 为已完成会话（盘后/休市目标）："
-                "参考口径仅适用于盘中目标会话，上一已完成交易日行情不作为当日参考"
-                "（目标日合格行情未取得，如实缺口）")
         else:
             out["snapshot"]["gaps"].append(
                 "目标交易日为盘中会话，但立即上一已完成交易日无目标指数合格行情，"
@@ -5557,6 +5556,31 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
                                     current_time=current_time)
     out["trend_ok"] = bool(out["trend"].get("eligible")
                            and out["trend"].get("period_return_pct") is not None)
+    if not out["quote_target_ok"] and session_completed:
+        snapshot = out["snapshot"]
+        if budget.fetch_expired():
+            snapshot["gaps"].append("取数预算已耗尽，未补查申万一级收盘行情")
+        else:
+            try:
+                close_rows, close_notes = fetch_sw_l1_close_quotes(
+                    session_date, refresh_token=token, timeout_seconds=timeout,
+                    deadline=budget.fetch_deadline,
+                )
+            except SwSectorFetchError as exc:
+                snapshot["gaps"].append(f"申万一级收盘行情查询失败（{exc}）")
+            else:
+                snapshot["gaps"].extend(close_notes)
+                if budget.fetch_expired():
+                    snapshot["gaps"].append("收盘行情超过取数截止，未采纳")
+                elif index_code in close_rows:
+                    snapshot.update(rows=close_rows, target_date_valid=len(close_rows),
+                                    dates_seen=[session_date], uses_close_history=True)
+                    out["quote_target_ok"] = True
+                else:
+                    snapshot["gaps"].append("申万一级收盘行情未取得目标指数的同日合格行")
+        if not out["quote_target_ok"] and rows:
+            snapshot["gaps"].append(
+                f"目标交易日 {session_date} 为已完成会话，参考口径仅适用于盘中目标会话")
     # 成分/同业出站**不在此处**发起：兜底门槛只看主行业与两项核心行情，
     # 编排层先判定保留申万还是切换东财——切换成功则零被弃的成分/成员行情
     # 出站（issue #100 amend）；保留申万时由 compose_report 预算允许内
@@ -5688,9 +5712,14 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
               "（参考口径，报告为部分；当日缺口如实）")
         pillar["gaps"] = list(pillar.get("gaps") or []) + [target_note]
     else:
-        pillar["snapshot_source"] = (
-            f"iFinD 标准 HTTP 申万一级行业指数快照（real_time_quotation，"
-            f"行情日期 {snapshot_date}{f' {trade_time}' if trade_time else ''}）")
+        if sw_snapshot.get("uses_close_history"):
+            pillar["snapshot_source"] = (
+                "iFinD 标准 HTTP 申万一级行业指数收盘行情（cmd_history_quotation，"
+                f"交易日 {snapshot_date}）")
+        else:
+            pillar["snapshot_source"] = (
+                f"iFinD 标准 HTTP 申万一级行业指数快照（real_time_quotation，"
+                f"行情日期 {snapshot_date}{f' {trade_time}' if trade_time else ''}）")
         missing = 31 - target_day_valid
         if missing > 0:
             dates_seen = sw_snapshot.get("dates_seen") or []
