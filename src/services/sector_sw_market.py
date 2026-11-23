@@ -33,12 +33,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 from icontract import ensure
+from pydantic import ValidationError
 
 from data_provider.ifind_http_daily_adapter import (
     _http_api_curl_post,
     _redact_token,
     _resolve_access_token,
 )
+from src.schemas.sector_vendor import SwIndexCloseTable
 
 _HTTP_ROOT = "https://quantapi.51ifind.com/api/v1"
 _BASIC_DATA_ENDPOINT = f"{_HTTP_ROOT}/basic_data_service"
@@ -1571,6 +1573,58 @@ def classify_membership(target_secucode: str, members: Dict[str, Any], *,
 # ---------------------------------------------------------------------------
 # 指数日线（cmd_history_quotation）
 # ---------------------------------------------------------------------------
+
+
+def fetch_sw_l1_close_quotes(session_date: str, *, refresh_token: str,
+                             timeout_seconds: float, deadline: Optional[float],
+                             ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """查已收盘交易日的申万一级截面，按日线日期资格采纳，不生成报价时刻。"""
+    codes = [code for code, _ in SW_L1_DIRECTORY]
+    directory = set(codes)
+    body = {
+        "codes": ",".join(codes),
+        "indicators": "close,preClose,changeRatio,amount,turnoverRatio",
+        "startdate": session_date,
+        "enddate": session_date,
+        "functionpara": {"Interval": "D", "CPS": "1", "Fill": "Omit"},
+    }
+    payload = _sector_http_post(
+        _HISTORY_ENDPOINT, body, label="sector_sw_close_quotes",
+        refresh_token=refresh_token, timeout_seconds=timeout_seconds,
+        deadline=deadline, parse_float=_parse_quote_number,
+    )
+    tables = payload.get("tables")
+    if not isinstance(tables, list):
+        raise SwSectorFetchError("收盘行情响应形状异常（tables 非列表）")
+
+    rows: List[Dict[str, Any]] = []
+    for raw_table in tables:
+        try:
+            table = SwIndexCloseTable.model_validate(raw_table)
+        except ValidationError:
+            continue
+        if table.thscode not in directory:
+            continue
+        columns = table.table if isinstance(table.table, dict) else {}
+        for index, day in enumerate(table.time):
+            if day not in (session_date, f"{session_date} 00:00:00"):
+                continue
+            # 错位列按缺值处理。保留同日无效行参与同码冲突裁决。
+            cells = {name: column[index:index + 1] for name, column in columns.items()
+                     if isinstance(column, list) and len(column) == len(table.time)}
+            close = _first_finite_raw(cells.get("close"))
+            pre_close = _first_finite_raw(cells.get("preClose"))
+            prices_qualified = (close is not None and close > 0
+                                and pre_close is not None and pre_close > 0)
+            rows.append({
+                "thscode": table.thscode, "trade_date": session_date,
+                "change_pct": (_first_finite_raw(cells.get("changeRatio"))
+                               if prices_qualified else None),
+                "latest": close, "pre_close": pre_close,
+                "amount": _first_finite(cells.get("amount")),
+                "turnover": _first_finite(cells.get("turnoverRatio")),
+            })
+    return qualify_quote_rows(rows, session_date=session_date)
 
 
 def _history_close_key(value: Any) -> Tuple[str, Any]:

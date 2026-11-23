@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 from unittest.mock import Mock
@@ -39,6 +40,7 @@ from src.services.sector_sw_market import SwSectorFetchError
 from tests.test_sector_sw_compose_v99 import (
     _budget,
     _catalysts_stub_payload,
+    _peers_stub_payload,
     _synthesis_stub_payload,
 )
 
@@ -119,6 +121,7 @@ def boundary(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
                         _confirmed_identity(observation_date))
     monkeypatch.setattr(sw, "fetch_index_quotes", fake_quotes)
     monkeypatch.setattr(sw, "fetch_index_history", fake_history)
+    monkeypatch.setattr(sw, "_sector_http_post", Mock(return_value={"tables": []}))
     monkeypatch.setattr(sw, "resolve_sw_reference_levels",
                         _empty_reference_levels)
     # 可选/研究替身（v99 桩形状）：不在本反例关注面，零真实出站
@@ -138,6 +141,140 @@ def boundary(monkeypatch: pytest.MonkeyPatch) -> Dict[str, Any]:
         svc, "_compose_eastmoney_core",
         Mock(side_effect=AssertionError("不应触发东财兜底")))
     return h
+
+
+def _close_table(code: str, day: str, *, price: float = 101.0) -> Dict[str, Any]:
+    return {"thscode": code, "time": [day], "table": {
+        "close": [price], "preClose": [100.0], "changeRatio": [price - 100.0],
+        "amount": [34388980000], "turnoverRatio": [0.7],
+    }}
+
+
+def test_weekend_report_recovers_target_close(
+        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    day = "2026-11-20"
+    boundary["clock"].now = datetime(2026, 11, 23, 2, 53, 54)
+    boundary["trend_dates"] = _window20(at=boundary["clock"].now)
+    monkeypatch.setattr(sw, "fetch_index_quotes", Mock(return_value=[{
+        "thscode": _COAL, "trade_date": day, "change_pct": 2.0,
+        "stamp": datetime(2026, 11, 20, 14, 59, 59),
+    }]))
+    sw._sector_http_post.return_value = {"tables": [
+        _close_table(code, day) for code, _ in sw.SW_L1_DIRECTORY
+    ]}
+    monkeypatch.setattr(svc, "_fetch_constituents", lambda *a, **k: {
+        "membership": {"status": "included", "member_count": 2},
+    })
+    monkeypatch.setattr(svc, "_sw_peers_pillar", Mock(return_value=_peers_stub_payload()))
+    payload = compose_report("600188", "兖矿能源", budget=_budget())
+    SectorReportPayload.model_validate(payload)
+    intraday = payload["background"]["intraday"]
+    assert intraday["snapshot_date"] == day
+    assert intraday["snapshot_mode"] == "target"
+    assert intraday["row"]["change_pct"] == 1
+    assert intraday["rank_of"] == 1 and intraday["total_boards"] == 31
+    assert intraday["row"]["up_count"] is None and intraday["breadth"] is None
+    assert payload["assessment"]["completeness"] == "complete"
+    assert "当日合格行情未取得" not in " ".join(intraday["gaps"])
+    assert "收盘行情（cmd_history_quotation" in intraday["snapshot_source"]
+    md = svc._render("兖矿能源", "600188", payload["generated_at"],
+                     "sr-close-0002", payload)
+    assert intraday["snapshot_source"] in md
+    sw._sector_http_post.assert_called_once()
+    endpoint, body = sw._sector_http_post.call_args.args
+    assert endpoint == sw._HISTORY_ENDPOINT
+    assert body == {
+        "codes": ",".join(code for code, _ in sw.SW_L1_DIRECTORY),
+        "indicators": "close,preClose,changeRatio,amount,turnoverRatio",
+        "startdate": day, "enddate": day,
+        "functionpara": {"Interval": "D", "CPS": "1", "Fill": "Omit"},
+    }
+    svc._compose_eastmoney_core.assert_not_called()
+
+
+@pytest.mark.parametrize("now,snapshot_day,expected_mode", [
+    (ENTRY, "2026-11-18", "reference"),
+    (AFTER_CLOSE, "2026-11-19", "target"),
+])
+def test_intraday_reference_and_qualified_live_keep_original_source(
+        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+        now: datetime, snapshot_day: str, expected_mode: str) -> None:
+    boundary["clock"].now = now
+    monkeypatch.setattr(sw, "fetch_index_quotes", Mock(return_value=[{
+        "thscode": _COAL, "trade_date": snapshot_day, "change_pct": 2,
+        "stamp": datetime.fromisoformat(f"{snapshot_day}T15:00:00"),
+    }]))
+    budget = _budget()
+    chain = _sw_market_chain("600188", budget=budget)
+    pillar = svc._sw_snapshot_pillar(chain["snapshot"], "煤炭", _COAL, budget=budget)
+    assert pillar["snapshot_mode"] == expected_mode
+    assert "real_time_quotation" in pillar["snapshot_source"]
+    sw._sector_http_post.assert_not_called()
+
+
+def test_close_batch_cannot_borrow_missing_code_from_realtime(
+        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    boundary["clock"].now = AFTER_CLOSE
+    day = "2026-11-19"
+    other = "801790.SL"
+    monkeypatch.setattr(sw, "fetch_index_quotes", Mock(return_value=[{
+        "thscode": other, "trade_date": day, "change_pct": 4,
+        "stamp": datetime(2026, 11, 19, 15, 0),
+    }]))
+    malformed_duplicate = {"thscode": other, "time": [day], "table": []}
+    sw._sector_http_post.return_value = {"tables": [
+        *(_close_table(code, day) for code, _ in sw.SW_L1_DIRECTORY),
+        _close_table(_COAL, "2026-11-18", price=105.0),  # ignore other dates
+        _close_table("899999.SL", day),  # ignore non-directory indices
+        malformed_duplicate,  # a conflicting same-day row rejects this code
+    ]}
+    budget = _budget()
+    chain = _sw_market_chain("600188", budget=budget)
+    pillar = svc._sw_snapshot_pillar(chain["snapshot"], "煤炭", _COAL, budget=budget)
+    assert chain["quote_target_ok"]
+    assert set(chain["snapshot"]["rows"]) == {code for code, _ in sw.SW_L1_DIRECTORY} - {other}
+    assert pillar["rank_of"] is None
+    assert any("同码重复行冲突" in gap for gap in pillar["gaps"])
+
+
+@pytest.mark.parametrize("failure", ["target_missing", "transport", "budget", "late"])
+def test_failed_close_query_keeps_existing_trend_and_gap(
+        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    budget = svc.ReportBudget(120.0, finish_margin=5.0)
+
+    def end_fetch_budget() -> None:
+        budget.deadline = time.monotonic() + 4
+
+    if failure == "budget":
+        original = sw.fetch_index_history
+
+        def exhaust_after_trend(*args: Any, **kwargs: Any) -> Any:
+            history = original(*args, **kwargs)
+            end_fetch_budget()
+            return history
+
+        monkeypatch.setattr(sw, "fetch_index_history", exhaust_after_trend)
+
+    def close_response(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        assert boundary["windows"]  # the existing trend came first
+        assert kwargs["deadline"] == budget.fetch_deadline
+        if failure == "transport":
+            raise SwSectorFetchError("受控超时")
+        table = _close_table(_COAL, "2026-11-19")
+        if failure == "late":
+            end_fetch_budget()
+        else:
+            table["table"]["preClose"] = [0]  # prices cannot validate the change
+        return {"tables": [table]}
+
+    sw._sector_http_post.side_effect = close_response
+    chain = _sw_market_chain("600188", budget=budget)
+    assert not chain["quote_target_ok"] and chain["trend_ok"]
+    assert svc._sw_fallback_reason(chain) is None
+    assert chain["snapshot"]["rows"] == {}
+    assert any("收盘行情" in gap for gap in chain["snapshot"]["gaps"])
+    assert not budget.expired()
+    assert sw._sector_http_post.call_count == (0 if failure == "budget" else 1)
 
 
 class TestCloseBoundaryTrendClock:

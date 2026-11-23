@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""板块适配东财供应商响应 I/O 边界（Type-Contract-Data Defense Layer 3）。
+"""板块适配供应商响应 I/O 边界（Type-Contract-Data Defense Layer 3）。
 
 与载荷 schema（sector_analysis.py）分离：本文件只描述供应商 wire 形状。
 契约原则（2026-11-07 收敛轮，root 反例驱动）：
@@ -41,6 +41,14 @@ class _VendorWireBase(BaseModel):
         validate_assignment=True,
         extra="allow",
     )
+
+
+class SwIndexCloseTable(_VendorWireBase):
+    """iFinD 指数日线分表，数值列与交易日按位置对齐。"""
+
+    thscode: str
+    time: List[object]
+    table: object = None
 
 
 _Secucode = Annotated[str, Field(pattern=r"^\d{6}\.(SH|SZ|BJ)$")]
