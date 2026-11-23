@@ -1577,14 +1577,21 @@ def classify_membership(target_secucode: str, members: Dict[str, Any], *,
 
 def fetch_sw_l1_close_quotes(session_date: str, *, refresh_token: str,
                              timeout_seconds: float, deadline: Optional[float],
+                             previous_date: Optional[str] = None,
+                             target_index: Optional[str] = None,
                              ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
-    """查已收盘交易日的申万一级截面，按日线日期资格采纳，不生成报价时刻。"""
+    """批量查收盘截面。目标指数当日缺失时可使用前一交易日的独立截面。"""
     codes = [code for code, _ in SW_L1_DIRECTORY]
     directory = set(codes)
+    rows_by_date: Dict[str, List[Dict[str, Any]]] = {session_date: []}
+    if previous_date is not None:
+        rows_by_date[previous_date] = []
+    wire_dates = {wire: day for day in rows_by_date
+                  for wire in (day, f"{day} 00:00:00", f"{day}T00:00:00")}
     body = {
         "codes": ",".join(codes),
         "indicators": "close,preClose,changeRatio,amount,turnoverRatio",
-        "startdate": session_date,
+        "startdate": previous_date or session_date,
         "enddate": session_date,
         "functionpara": {"Interval": "D", "CPS": "1", "Fill": "Omit"},
     }
@@ -1597,8 +1604,13 @@ def fetch_sw_l1_close_quotes(session_date: str, *, refresh_token: str,
     if not isinstance(tables, list):
         raise SwSectorFetchError("收盘行情响应形状异常（tables 非列表）")
 
-    rows: List[Dict[str, Any]] = []
+    target_day_returned = False
     for raw_table in tables:
+        if isinstance(raw_table, dict) and raw_table.get("thscode") == target_index:
+            raw_time = raw_table.get("time")
+            dates = raw_time if isinstance(raw_time, list) else [raw_time]
+            target_day_returned |= any(isinstance(day, str) and day[:10] == session_date
+                                       for day in dates)
         try:
             table = SwIndexCloseTable.model_validate(raw_table)
         except ValidationError:
@@ -1606,8 +1618,9 @@ def fetch_sw_l1_close_quotes(session_date: str, *, refresh_token: str,
         if table.thscode not in directory:
             continue
         columns = table.table if isinstance(table.table, dict) else {}
-        for index, day in enumerate(table.time):
-            if day not in (session_date, f"{session_date} 00:00:00"):
+        for index, wire_day in enumerate(table.time):
+            day = wire_dates.get(wire_day) if isinstance(wire_day, str) else None
+            if day is None:
                 continue
             # 错位列按缺值处理。保留同日无效行参与同码冲突裁决。
             cells = {name: column[index:index + 1] for name, column in columns.items()
@@ -1616,15 +1629,26 @@ def fetch_sw_l1_close_quotes(session_date: str, *, refresh_token: str,
             pre_close = _first_finite_raw(cells.get("preClose"))
             prices_qualified = (close is not None and close > 0
                                 and pre_close is not None and pre_close > 0)
-            rows.append({
-                "thscode": table.thscode, "trade_date": session_date,
+            rows_by_date[day].append({
+                "thscode": table.thscode, "trade_date": day,
                 "change_pct": (_first_finite_raw(cells.get("changeRatio"))
                                if prices_qualified else None),
                 "latest": close, "pre_close": pre_close,
                 "amount": _first_finite(cells.get("amount")),
                 "turnover": _first_finite(cells.get("turnoverRatio")),
             })
-    return qualify_quote_rows(rows, session_date=session_date)
+    rows, notes = qualify_quote_rows(rows_by_date[session_date], session_date=session_date)
+    if not target_index or target_index in rows:
+        return rows, notes
+    if target_day_returned:
+        notes.append(f"目标交易日 {session_date} 的收盘行情已返回，但目标指数收盘数据无效或冲突")
+    elif previous_date is not None:
+        previous_rows, previous_notes = qualify_quote_rows(
+            rows_by_date[previous_date], session_date=previous_date)
+        notes.extend(previous_notes)
+        if target_index in previous_rows:
+            return previous_rows, notes
+    return rows, notes
 
 
 def _history_close_key(value: Any) -> Tuple[str, Any]:
@@ -1664,14 +1688,15 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
     - **收盘等价**：按有限正 Decimal 数值比较（``10`` ≡ ``"10.00"``；
       布尔/非数/非正同类缺值）。同日等值去重保留一行，同日不等价按
       ``isolate_conflicting_dates`` 分级：
-      - ``False``（默认，旧入口 20 点趋势等）：该代码整体保守拒绝（不取
+      - ``False``（默认）：该代码整体保守拒绝（不取
         其一；不影响其他代码的有效行——调用方按缺行降缺口）；
-      - ``True``（多窗口路径，issue #103 复审）：只隔离该无效日期——该日
+      - ``True``（申万趋势）：只隔离该无效日期——该日
         从该代码序列剔除（两行一并放弃，不取其一），其余日期照常保留。
         单次 61 点查询承载 5/20/60 三个窗口，某日冲突不应放大为整条序列
         全窗口丢失；冲突日缺失由调用方资格层按缺合格收盘点降缺口（仅影响
         含该日的窗口）。
-    不可解析日期行原样透传（资格层忽略并计数，行级诊断不丢）。"""
+    隔离模式保留供应商实际返回的日期（含无效或冲突行），供调用方判断最新日
+    是否尚未返回。不可解析日期行原样透传，由资格层注明。"""
     body = {
         "codes": codes,
         "indicators": "close",
@@ -1702,6 +1727,7 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
         # isolate 模式下的按码冲突日期集：该日两行一并放弃（不取其一），
         # 后续重复行同样忽略；其余日期照常合并
         isolated_dates: Dict[str, Set[date]] = {}
+        returned_dates: Dict[str, Set[str]] = {}
         for table in tables:
             if not isinstance(table, dict):
                 continue
@@ -1713,11 +1739,14 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
             cells = raw_cells if isinstance(raw_cells, dict) else {}
             raw_closes = cells.get("close")
             closes = raw_closes if isinstance(raw_closes, list) else []
-            if not thscode or not dates or not closes:
-                continue
-            if thscode in conflicting:
+            if not thscode or not dates or thscode in conflicting:
                 continue
             parsed = pd.to_datetime(dates, errors="coerce", format="mixed")
+            if isolate_conflicting_dates:
+                returned_dates.setdefault(thscode, set()).update(
+                    d_ts.date().isoformat() for d_ts in parsed if not pd.isna(d_ts))
+            if not closes:
+                continue
             merged = rows_by_code.setdefault(thscode, {})
             passthrough = passthrough_by_code.setdefault(thscode, [])
             isolated = isolated_dates.setdefault(thscode, set())
@@ -1756,6 +1785,8 @@ def fetch_index_history(codes: str, start_date: str, end_date: str, *,
                 {"date": [r[0] for r in rows],
                  "close": [r[1] for r in rows]},
             )
+            if isolate_conflicting_dates:
+                frames[thscode].attrs["returned_dates"] = returned_dates[thscode]
     except SwSectorFetchError:
         raise
     except Exception as exc:  # noqa: BLE001 - wire 形状异常按源错误降级，不逃出边界

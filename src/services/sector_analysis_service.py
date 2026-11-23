@@ -4277,7 +4277,7 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
         if snapshot_mode:
             intraday_material["snapshot_mode"] = snapshot_mode
             intraday_material["snapshot_date"] = snapshot_date
-        if snapshot_mode == "reference":
+        if snapshot_mode in ("reference", "previous_close"):
             # #98 复审：参考口径是**前一交易日**行情——报告与服务端事实
             # 摘要保留（带真实参考日），但**不可引用**（detached）：不进
             # 模型 wire、引用校验按未知 ID 拒绝——引用它加当日同业/目标
@@ -4285,7 +4285,9 @@ def _build_evidence_registry(stock_name: str, code: str, ident: Dict[str, Any],
             # prompt）。东财路径无 reference 口径，不受影响。
             registry.register_detached(sector_research.EvidenceEntry.build(
                 "intraday", "fact",
-                f"参考交易日（{snapshot_date}）板块行情（参考口径，单期观测）",
+                (f"前一交易日（{snapshot_date}）板块收盘行情"
+                 if snapshot_mode == "previous_close"
+                 else f"参考交易日（{snapshot_date}）板块行情（参考口径，单期观测）"),
                 intraday_material,
             ))
         else:
@@ -4748,7 +4750,8 @@ def _sw_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudget,
     }
     from src.services.sector_sw_market import SwSectorFetchError, fetch_index_history
 
-    sessions = recent_completed_trading_sessions("cn", 20, current_time=current_time)
+    sessions = (recent_completed_trading_sessions("cn", 21, current_time=current_time)
+                or recent_completed_trading_sessions("cn", 20, current_time=current_time))
     if not sessions:
         out["eligible"] = False
         out["gaps"].append(
@@ -4756,16 +4759,18 @@ def _sw_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudget,
             "本次不查询行业/基准日线（不按自然日补齐）"
         )
         return out
-    expected = sorted(sessions)
+    sessions = sorted(sessions)
+    expected = sessions[-20:]
     out["expected_dates"] = [d.isoformat() for d in expected]
     out["start_date"] = expected[0].isoformat()
     out["end_date"] = expected[-1].isoformat()
     try:
         frames = fetch_index_history(
             f"{board_code},{_SW_BENCHMARK_CODE}",
-            expected[0].isoformat(), expected[-1].isoformat(),
+            sessions[0].isoformat(), expected[-1].isoformat(),
             refresh_token=refresh_token, timeout_seconds=timeout_seconds,
             deadline=budget.fetch_deadline,
+            isolate_conflicting_dates=True,
         )
     except SwSectorFetchError as exc:
         out["gaps"].append(
@@ -4780,6 +4785,23 @@ def _sw_trend_pillar(board_code: str, board_name: str, *, budget: ReportBudget,
             board_df, "date", "close", expected,
             f"行业日线（{board_name} {board_code}·iFinD）",
         )
+        if len(sessions) == 21 and len(board_obs) == 19 and expected[-1] not in board_obs:
+            latest = expected[-1].isoformat()
+            if (latest in board_df.attrs.get("returned_dates", ())
+                    or board_df["date"].eq(latest).any()):
+                board_gaps.insert(0, f"最新交易日 {latest} 日线已返回，但收盘值无效或冲突")
+            else:
+                previous = sessions[:-1]
+                earlier_obs, earlier_qualified, earlier_gaps = _qualify_daily_closes(
+                    board_df, "date", "close", previous,
+                    f"行业日线（{board_name} {board_code}·iFinD）",
+                )
+                if earlier_qualified:
+                    out["latest_session_omitted"] = latest
+                    expected = previous
+                    out.update(expected_dates=[d.isoformat() for d in expected],
+                               start_date=expected[0].isoformat(), end_date=expected[-1].isoformat())
+                    board_obs, board_qualified, board_gaps = earlier_obs, True, earlier_gaps
         out["gaps"].extend(board_gaps)
     else:
         out["gaps"].append(
@@ -5400,7 +5422,7 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
       ``reference_date``=目标日未取得时的最近已完成交易日参考、
       ``dates_seen``、``target_date_valid``）
     - ``trend``：:func:`_sw_trend_pillar` 输出
-    - ``quote_target_ok``：目标行业在目标会话日有合格涨跌幅（兜底门槛输入）
+    - ``quote_target_ok``：目标行业有合格行情（目标日或前一交易日收盘）
     - ``trend_ok``：行业自身 20/20 合格且区间收益非空（兜底门槛输入）
     - ``constituents``（issue #100）：成分边界三态、成员同日合格行情、目标
       独立行情（未确认成分时）——由编排层在**决定保留申万**后经
@@ -5522,8 +5544,8 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
     if not out["quote_target_ok"] and rows and intraday_target:
         # 目标指数目标日合格行缺失时的参考口径（issue #99 amend 四收紧）：
         # 仅当目标会话为**盘中**（接收时刻 < 该会话收盘）且**立即上一已完成
-        # 交易日**的合格 cohort 含目标指数行时才激活——盘后/休市目标不前向
-        # 参考上一交易日；上一交易日无目标行则不给无主体参考。模式与理由
+        # 交易日**的合格 cohort 含目标指数行时才激活。盘后通过日线查收盘行情。
+        # 上一交易日无目标行则不给无主体参考。模式与理由
         # 一律从实际选用的数据推导（不按 reference_date 的存在性猜测）。
         ref_sessions = recent_completed_trading_sessions("cn", 3,
                                                          current_time=current_time)
@@ -5561,10 +5583,14 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
         if budget.fetch_expired():
             snapshot["gaps"].append("取数预算已耗尽，未补查申万一级收盘行情")
         else:
+            completed = recent_completed_trading_sessions("cn", 2, current_time=session_close)
+            previous = next((d.isoformat() for d in (completed or [])
+                             if d < session.session_date), None)
             try:
                 close_rows, close_notes = fetch_sw_l1_close_quotes(
                     session_date, refresh_token=token, timeout_seconds=timeout,
-                    deadline=budget.fetch_deadline,
+                    deadline=budget.fetch_deadline, previous_date=previous,
+                    target_index=index_code,
                 )
             except SwSectorFetchError as exc:
                 snapshot["gaps"].append(f"申万一级收盘行情查询失败（{exc}）")
@@ -5573,11 +5599,12 @@ def _sw_market_chain(code: str, *, budget: ReportBudget,
                 if budget.fetch_expired():
                     snapshot["gaps"].append("收盘行情超过取数截止，未采纳")
                 elif index_code in close_rows:
+                    close_date = close_rows[index_code]["trade_date"]
                     snapshot.update(rows=close_rows, target_date_valid=len(close_rows),
-                                    dates_seen=[session_date], uses_close_history=True)
+                                    dates_seen=[close_date], close_date=close_date)
                     out["quote_target_ok"] = True
                 else:
-                    snapshot["gaps"].append("申万一级收盘行情未取得目标指数的同日合格行")
+                    snapshot["gaps"].append("申万一级收盘行情未取得目标指数的合格行")
         if not out["quote_target_ok"] and rows:
             snapshot["gaps"].append(
                 f"目标交易日 {session_date} 为已完成会话，参考口径仅适用于盘中目标会话")
@@ -5596,6 +5623,7 @@ def _sw_fallback_reason(sw: Dict[str, Any]) -> Optional[str]:
     仅当申万主行业无法确认，或目标交易日行业涨跌幅与合格行业趋势**均**
     不可用时触发。行情可用指目标行业有合格的目标交易日涨跌幅；趋势可用
     指行业自身通过严格日历二十日窗口并得到区间收益（基准缺失不影响）。
+    收盘数据未齐时，前一交易日的合格收盘行情也可保留申万口径。
     """
     ident = sw.get("identity") or {}
     if ident.get("status") != "confirmed":
@@ -5645,9 +5673,11 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
     use_reference = (not target_in_rows
                      and bool(reference_rows.get(index_code)))
     qualified = reference_rows if use_reference else rows
-    snapshot_date = reference_date if use_reference else session_date
+    close_date = sw_snapshot.get("close_date")
+    previous_close = bool(close_date and close_date != session_date)
+    snapshot_date = reference_date if use_reference else close_date or session_date
     snapshot_mode = "reference" if use_reference else (
-        "target" if rows else None)
+        "previous_close" if previous_close else "target" if rows else None)
     fetch_gaps = list(sw_snapshot.get("gaps") or [])
     if unknown_identity_count:
         fetch_gaps.append(
@@ -5712,7 +5742,7 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
               "（参考口径，报告为部分；当日缺口如实）")
         pillar["gaps"] = list(pillar.get("gaps") or []) + [target_note]
     else:
-        if sw_snapshot.get("uses_close_history"):
+        if close_date:
             pillar["snapshot_source"] = (
                 "iFinD 标准 HTTP 申万一级行业指数收盘行情（cmd_history_quotation，"
                 f"交易日 {snapshot_date}）")
@@ -5723,14 +5753,18 @@ def _sw_snapshot_pillar(sw_snapshot: Dict[str, Any], index_name: str,
         missing = 31 - target_day_valid
         if missing > 0:
             dates_seen = sw_snapshot.get("dates_seen") or []
-            other = [d for d in dates_seen if d != session_date][:3]
+            other = [d for d in dates_seen if d != snapshot_date][:3]
             pillar["gaps"] = list(pillar.get("gaps") or []) + [
-                f"31 个申万一级指数中 {missing} 个未取得 {session_date} 同日合格行情"
+                f"31 个申万一级指数中 {missing} 个未取得 {snapshot_date} 同日合格行情"
                 + (f"（快照中出现其他日期：{'、'.join(other)}）" if other else "")
                 + "，不显示全量名次（保留有效事实与覆盖范围）"]
     pillar["snapshot_date"] = snapshot_date
     pillar["snapshot_mode"] = snapshot_mode
-    pillar["gaps"] = _bound_gaps(fetch_gaps + list(pillar.get("gaps") or []), 10)
+    metric_gaps = list(pillar.get("gaps") or [])
+    if previous_close:
+        metric_gaps = [g.replace("当日行情-", f"{snapshot_date} 收盘行情-", 1)
+                       for g in metric_gaps]
+    pillar["gaps"] = _bound_gaps(fetch_gaps + metric_gaps, 10)
     return pillar
 
 
@@ -6607,6 +6641,7 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             "gaps": ["申万主行业不可确认，当日行业行情未查询"],
         }
     trend = dict(sw.get("trend") or {})
+    omitted = trend.pop("latest_session_omitted", None)
     if not confirmed:
         trend["gaps"] = _bound_gaps(
             list(trend.get("gaps") or [])
@@ -6695,10 +6730,11 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             windows_block = {"windows": [], "gaps": [
                 "多窗口趋势：iFinD 凭据未配置，5/20/60 日新增查询未发起"]}
         else:
+            windows_as_of = datetime.fromisoformat(omitted) if omitted else sw.get("reference_now")
             windows_block = _sw_trend_windows_pillar(
                 l2_index_code, l2_name, index_code, index_name,
                 budget=budget, refresh_token=cfg[0], timeout_seconds=cfg[1],
-                current_time=sw.get("reference_now"))
+                current_time=windows_as_of)
     # 块级缺口无条件保留（issue #103 复审）：整链未取得（无窗口）时缺口随
     # 首屏直出；取得部分窗口时（如仅二级序列整体缺席）块级缺口同样随首屏
     # 趋势块直出一次——窗口级/序列级缺口已在各窗口块内，块级不逐窗重复
@@ -6761,8 +6797,9 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             (g for g in intraday["gaps"] if "动量" in g),
             intraday["gaps"][0] if intraday.get("gaps") else "未知原因",
         )
-        reasons.append(_bounded_reason(
-            f"当日行情行存在但动态字段未取得：{reason}"))
+        quote_label = (f"{intraday['snapshot_date']} 收盘行情"
+                       if intraday.get("snapshot_mode") == "previous_close" else "当日行情")
+        reasons.append(_bounded_reason(f"{quote_label}行存在但动态字段未取得：{reason}"))
     if confirmed and intraday.get("snapshot_mode") == "reference":
         # 参考口径不是当日完整证据（#98 US8：盘中参考行情报告标为部分）
         completeness = "partial"
@@ -6956,7 +6993,7 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
             and result.get("background", {}).get("intraday", {}).get(
                 "momentum") is not None
             and result.get("background", {}).get("intraday", {}).get(
-                "snapshot_mode") == "target"
+                "snapshot_mode") in ("target", "previous_close")
             and result.get("sector_trend", {}).get("period_return_pct")
             is not None
             and bool((result.get("sector_peers") or {}).get("items"))
@@ -6966,7 +7003,7 @@ def _compose_sw_payload(code: str, name: str, sw: Dict[str, Any], *, budget: Rep
         )
     ),
     "sw completeness=complete must be backed by qualifying evidence: confirmed "
-    "verified membership, target-date intraday with momentum, qualified trend, "
+    "verified membership, target-date or previous-close quotes with momentum, qualified trend, "
     "peers sample, qualified catalysts and ok synthesis without rejected claims "
     "(reference-day intraday or unconfirmed membership keeps partial)",
 )

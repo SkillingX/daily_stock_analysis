@@ -288,22 +288,25 @@ describe('SectorFirstScreen', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('marks reference-mode rank and quote with reference wording', () => {
+  it.each([
+    ['reference', '参考日', '参考口径'],
+    ['previous_close', '收盘日', '收盘日期'],
+  ])('dates a %s quote and its rank', (mode, dayLabel, dateLabel) => {
     const analysis = confirmedAnalysis();
     (analysis as Record<string, unknown>).background = {
       intraday: {
         sector_found: true,
         snapshot_date: '2026-11-18',
-        snapshot_mode: 'reference',
+        snapshot_mode: mode,
         rank_of: 9,
         total_boards: 31,
         row: { board_name: '非银金融', change_pct: 1.2 },
       },
     };
     render(<SectorFirstScreen analysis={analysis} />);
-    expect(screen.getByText(/参考日排名 9 \/ 31/)).toBeTruthy();
-    expect(screen.getByText(/参考日涨跌幅/)).toBeTruthy();
-    expect(screen.getByText(/参考口径 2026-11-18/)).toBeTruthy();
+    expect(screen.getByText(new RegExp(`${dayLabel}排名 9 / 31`))).toBeTruthy();
+    expect(screen.getByText(new RegExp(`${dayLabel}涨跌幅`))).toBeTruthy();
+    expect(screen.getByText(new RegExp(`${dateLabel} 2026-11-18`))).toBeTruthy();
     expect(screen.queryByText(/当日排名/)).toBeNull();
   });
 

@@ -29,6 +29,7 @@ import pytest
 from src.core import trading_calendar
 from src.schemas.sector_analysis import SectorReportPayload
 from src.services import sector_analysis_service as svc
+from src.services import sector_research
 from src.services import sector_sw_market as sw
 from src.services.sector_analysis_service import (
     _sw_market_chain,
@@ -150,46 +151,141 @@ def _close_table(code: str, day: str, *, price: float = 101.0) -> Dict[str, Any]
     }}
 
 
-def test_weekend_report_recovers_target_close(
-        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("previous_close,previous_trend,limited_quotes", [
+    (False, False, False), (False, True, False), (True, True, False), (True, True, True),
+])
+def test_weekend_report_recovers_qualified_close(
+        boundary: Dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+        previous_close: bool, previous_trend: bool, limited_quotes: bool) -> None:
     day = "2026-11-20"
+    previous_day = "2026-11-19"
+    quote_day = previous_day if previous_close else day
+    trend_day = previous_day if previous_trend else day
     boundary["clock"].now = datetime(2026, 11, 23, 2, 53, 54)
-    boundary["trend_dates"] = _window20(at=boundary["clock"].now)
+    boundary["trend_dates"] = _window20(at=datetime.fromisoformat(f"{trend_day}T15:30:00"))
     monkeypatch.setattr(sw, "fetch_index_quotes", Mock(return_value=[{
         "thscode": _COAL, "trade_date": day, "change_pct": 2.0,
         "stamp": datetime(2026, 11, 20, 14, 59, 59),
     }]))
-    sw._sector_http_post.return_value = {"tables": [
-        _close_table(code, day) for code, _ in sw.SW_L1_DIRECTORY
-    ]}
+    tables = [_close_table(code, quote_day) for code, _ in sw.SW_L1_DIRECTORY
+              if not limited_quotes or code == _COAL]
+    if previous_close:
+        tables.append(_close_table("801790.SL", day, price=109.0))
+    else:
+        tables[0]["time"] = [f"{day}T00:00:00"]
+    sw._sector_http_post.return_value = {"tables": tables}
     monkeypatch.setattr(svc, "_fetch_constituents", lambda *a, **k: {
         "membership": {"status": "included", "member_count": 2},
     })
     monkeypatch.setattr(svc, "_sw_peers_pillar", Mock(return_value=_peers_stub_payload()))
+    windows = Mock(return_value={"windows": [], "gaps": []})
+    monkeypatch.setattr(svc, "_sw_trend_windows_pillar", windows)
     payload = compose_report("600188", "兖矿能源", budget=_budget())
     SectorReportPayload.model_validate(payload)
     intraday = payload["background"]["intraday"]
-    assert intraday["snapshot_date"] == day
-    assert intraday["snapshot_mode"] == "target"
+    assert intraday["snapshot_date"] == quote_day
+    assert intraday["snapshot_mode"] == ("previous_close" if previous_close else "target")
     assert intraday["row"]["change_pct"] == 1
-    assert intraday["rank_of"] == 1 and intraday["total_boards"] == 31
+    assessment = payload["assessment"]
+    if limited_quotes:
+        assert intraday["rank_of"] is None
+        assert assessment["completeness"] == "partial"
+        assert assessment["reasons"][0].startswith(f"{quote_day} 收盘行情")
+    else:
+        assert intraday["rank_of"] == 1 and intraday["total_boards"] == 31
+        assert assessment["completeness"] == "complete"
+        assert assessment["reasons"] == []
     assert intraday["row"]["up_count"] is None and intraday["breadth"] is None
-    assert payload["assessment"]["completeness"] == "complete"
+    trend = payload["sector_trend"]
+    assert trend["end_date"] == trend["benchmark"]["end_date"] == trend_day
+    assert trend["qualified_sessions"] == 20
+    assert windows.call_args.kwargs["current_time"] == (
+        datetime.fromisoformat(day) if previous_trend else boundary["clock"].now)
     assert "当日合格行情未取得" not in " ".join(intraday["gaps"])
     assert "收盘行情（cmd_history_quotation" in intraday["snapshot_source"]
     md = svc._render("兖矿能源", "600188", payload["generated_at"],
                      "sr-close-0002", payload)
     assert intraday["snapshot_source"] in md
+    if previous_close:
+        assert "收盘日涨跌幅" in md
+        assert f"采用 **{quote_day}** 的收盘数据" in md
+        assert not any(gap.startswith("当日行情-") for gap in intraday["gaps"])
+        registry = svc._build_evidence_registry("兖矿能源", "600188", payload["identity"],
+                                                intraday, trend, {}, {})
+        assert not registry.citable("intraday")
+        assert f"前一交易日（{quote_day}）收盘涨跌幅" in sector_research.program_fact_summary(registry)
+        assert f"前一交易日（{quote_day}）收盘快照" in (sector_research.program_fact_limitations(registry) or "")
     sw._sector_http_post.assert_called_once()
     endpoint, body = sw._sector_http_post.call_args.args
     assert endpoint == sw._HISTORY_ENDPOINT
     assert body == {
         "codes": ",".join(code for code, _ in sw.SW_L1_DIRECTORY),
         "indicators": "close,preClose,changeRatio,amount,turnoverRatio",
-        "startdate": day, "enddate": day,
+        "startdate": previous_day, "enddate": day,
         "functionpara": {"Interval": "D", "CPS": "1", "Fill": "Omit"},
     }
     svc._compose_eastmoney_core.assert_not_called()
+
+
+@pytest.mark.parametrize("latest_closes", [[0.0], [101.0, 102.0], []])
+def test_invalid_latest_close_cannot_shift_trend(
+        monkeypatch: pytest.MonkeyPatch, latest_closes: List[float]) -> None:
+    sessions = trading_calendar.recent_completed_trading_sessions(
+        "cn", 21, current_time=AFTER_CLOSE)
+    assert sessions is not None
+    latest, *previous = sessions
+    days = [d.isoformat() for d in reversed(previous)]
+    latest_dates = [latest.isoformat()] * max(1, len(latest_closes))
+    table = {"thscode": _COAL, "time": days + latest_dates,
+             "table": {"close": [100.0] * len(days) + latest_closes}}
+    monkeypatch.setattr(sw, "_sector_http_post", Mock(return_value={"tables": [table]}))
+    result = svc._sw_trend_pillar(
+        _COAL, "煤炭", budget=_budget(), refresh_token="test-token",
+        timeout_seconds=10, current_time=AFTER_CLOSE,
+    )
+    assert result["end_date"] == latest.isoformat()
+    assert result["period_return_pct"] is None
+    assert any("收盘值无效或冲突" in gap for gap in result["gaps"])
+
+
+@pytest.mark.parametrize("malformed_date_column", [False, True])
+def test_invalid_target_close_cannot_adopt_previous_snapshot(
+        monkeypatch: pytest.MonkeyPatch, malformed_date_column: bool) -> None:
+    day, previous = "2026-11-19", "2026-11-18"
+    invalid = _close_table(_COAL, day, price=101.0 if malformed_date_column else 0.0)
+    if malformed_date_column:
+        invalid["time"] = day
+    monkeypatch.setattr(sw, "_sector_http_post", Mock(return_value={"tables": [
+        invalid, _close_table(_COAL, previous),
+    ]}))
+    rows, notes = sw.fetch_sw_l1_close_quotes(
+        day, previous_date=previous, target_index=_COAL, refresh_token="test-token",
+        timeout_seconds=10, deadline=None,
+    )
+    assert _COAL not in rows
+    assert any("收盘数据无效或冲突" in note for note in notes)
+
+
+def test_trend_remains_eligible_with_only_twenty_calendar_sessions(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import exchange_calendars as xcals
+
+    day = xcals.get_calendar("XSHG").sessions[19].date()
+    now = datetime(day.year, day.month, day.day, 16)
+    assert trading_calendar.recent_completed_trading_sessions("cn", 21, current_time=now) is None
+    sessions = trading_calendar.recent_completed_trading_sessions("cn", 20, current_time=now)
+    assert sessions is not None
+    days = [d.isoformat() for d in reversed(sessions)]
+    fetch = Mock(return_value={_COAL: pd.DataFrame({"date": days, "close": [100.0] * 20})})
+    monkeypatch.setattr(sw, "fetch_index_history", fetch)
+    result = svc._sw_trend_pillar(
+        _COAL, "煤炭", budget=_budget(), refresh_token="test-token",
+        timeout_seconds=10, current_time=now,
+    )
+    fetch.assert_called_once()
+    assert result["qualified_sessions"] == 20
+    assert result["end_date"] == now.date().isoformat()
+    assert result["period_return_pct"] == 0
 
 
 @pytest.mark.parametrize("now,snapshot_day,expected_mode", [
@@ -284,9 +380,9 @@ class TestCloseBoundaryTrendClock:
             self, boundary: Dict[str, Any]):
         payload = compose_report("600188", "兖矿能源", budget=_budget())
 
-        # 趋势窗口按查询时实时钟（已收盘）：单次出站、含当日 20 点
+        # 趋势窗口按查询时实时钟（已收盘）：单次出站多取一日供截止日回退
         assert boundary["windows"] == [
-            (f"{_COAL},{_BENCH}", "2026-10-23", "2026-11-19")]
+            (f"{_COAL},{_BENCH}", "2026-10-22", "2026-11-19")]
         trend = payload["sector_trend"]
         assert trend["qualified_sessions"] == 20
         assert (trend["start_date"], trend["end_date"]) == (
@@ -333,7 +429,7 @@ class TestCloseBoundaryTrendClock:
                                  current_time=ENTRY)
 
         assert boundary["windows"] == [
-            (f"{_COAL},{_BENCH}", "2026-10-22", "2026-11-18")]
+            (f"{_COAL},{_BENCH}", "2026-10-21", "2026-11-18")]
         trend = chain["trend"]
         assert (trend["start_date"], trend["end_date"]) == (
             "2026-10-22", "2026-11-18")

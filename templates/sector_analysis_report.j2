@@ -69,7 +69,8 @@
 {% if is_sw and (l2id or trend_windows or a.get('sector_trend_windows_gaps')) %}
 {% set pr_fs = a.background.intraday %}
 {% set fs_ref = (pr_fs.get('snapshot_mode') == 'reference') %}
-{% set fs_day = '参考日' if fs_ref else '当日' %}
+{% set fs_prev = (pr_fs.get('snapshot_mode') == 'previous_close') %}
+{% set fs_day = '参考日' if fs_ref else '收盘日' if fs_prev else '当日' %}
 ## 报告速览（首屏）
 
 - 一级 {{ fs_day }}行情：**{{ pr_fs.row.board_name or a.identity.board_name or 'N/A' }}**{% if pr_fs.row.change_pct is number %} ｜ {{ fs_day }}涨跌幅 {{ pr_fs.row.change_pct | round(4) }}%{% elif pr_fs.row.get('change_pct') is not none %} ｜ {{ fs_day }}涨跌幅 {{ pr_fs.row.change_pct }}{% endif %}{% if pr_fs.rank_of is not none and pr_fs.total_boards is not none %} ｜ {{ fs_day }}排名 {{ pr_fs.rank_of }} / {{ pr_fs.total_boards }}（31 个申万一级行业，按{{ fs_day }}涨跌幅）{% endif %}{% if pr_fs.get('snapshot_date') %} ｜ {{ '参考口径 ' + pr_fs.snapshot_date if fs_ref else '行情日期 ' + pr_fs.snapshot_date }}{% if fs_ref %}（目标交易日合格行情未取得，展示最近已完成交易日）{% endif %}{% endif %}{{ '' }}
@@ -191,7 +192,8 @@
 {% endif %}
 {% endif %}
 {% set pr = a.background.intraday %}
-{% set day_label = '参考交易日' if pr.get('snapshot_mode') == 'reference' else '当日' %}
+{% set prior_close = pr.get('snapshot_mode') == 'previous_close' %}
+{% set day_label = '参考交易日' if pr.get('snapshot_mode') == 'reference' else '收盘日' if prior_close else '当日' %}
 ## 二、{{ day_label }}板块行情（价格强弱与活跃度）
 
 {% if pr.sector_found %}
@@ -223,7 +225,7 @@
 {% if trend %}
 {% if trend.eligible %}
 {% if trend.start_date %}
-- 窗口：**{{ trend.start_date }} → {{ trend.end_date }}**（严格交易日历最近 {{ trend.window_completed_sessions }} 个已完成交易日；盘中未收盘当日已剔除）
+- 窗口：**{{ trend.start_date }} → {{ trend.end_date }}**（{% if is_sw %}截至该日的最近 {{ trend.window_completed_sessions }} 个交易日{% else %}严格交易日历最近 {{ trend.window_completed_sessions }} 个已完成交易日；盘中未收盘当日已剔除{% endif %}）
 {% endif %}
 {% if trend.observations %}
 - 板块合格观测：{{ trend.qualified_sessions }}/{{ trend.window_completed_sessions }} 个交易日{% if trend.period_return_pct is not none %}；板块区间收益：**{{ trend.period_return_pct }}%**（{{ trend.interval_count }} 个交易日间隔复合；区间起止如上，不是「20日收益」口径）{% endif %}
@@ -590,6 +592,9 @@
 - 目标股未确认在指数成分内时（明确未纳入或成分状态未知，常见于北交所标的）：同业为**行业参考**口径，目标股独立展示，成分内名次留空；该成分差异本身不触发东财兜底。
 {% if a.background.intraday.get('snapshot_mode') == 'reference' %}
 - 本报告当日行情为**参考口径**：目标交易日合格行情未取得，展示参考交易日行情；参考交易日行情**不进入当日证据**，与当日截面不拼接，报告完整性如实为部分。
+
+{% elif prior_close %}
+- 目标交易日收盘行情尚未取得，一级行情采用 **{{ pr.snapshot_date }}** 的收盘数据。
 
 {% endif %}
 {% endif %}

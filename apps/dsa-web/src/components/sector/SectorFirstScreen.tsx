@@ -485,7 +485,8 @@ export default function SectorFirstScreen({
   const snapshotDate = intraday ? asString(intraday.snapshot_date) : null;
   const snapshotMode = asString(intraday?.snapshot_mode);
   const isReference = snapshotMode === 'reference';
-  const dayLabel = isReference ? '参考日' : '当日';
+  const isPreviousClose = snapshotMode === 'previous_close';
+  const dayLabel = isReference ? '参考日' : isPreviousClose ? '收盘日' : '当日';
   const dataSource = current?.series[0]?.source
     ?? 'iFinD 标准 HTTP 指数日线';
 
@@ -504,7 +505,7 @@ export default function SectorFirstScreen({
           {l1Code ? `（${l1Code}）` : ''}
           {changePct !== null && (
             <span className={changePct >= 0 ? 'text-red-400' : 'text-emerald-400'}>
-              {' '}{isReference ? '参考日涨跌幅' : '当日涨跌幅'} {pct(changePct)}
+              {' '}{dayLabel}涨跌幅 {pct(changePct)}
             </span>
           )}
         </span>
@@ -515,7 +516,7 @@ export default function SectorFirstScreen({
         )}
         {snapshotDate && (
           <span className="text-xs text-muted-text">
-            {isReference ? '参考口径' : '行情日期'} {snapshotDate}
+            {isReference ? '参考口径' : isPreviousClose ? '收盘日期' : '行情日期'} {snapshotDate}
             {isReference ? '（目标交易日合格行情未取得，展示最近已完成交易日）' : ''}
           </span>
         )}
