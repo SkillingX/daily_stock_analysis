@@ -1011,6 +1011,8 @@ def program_fact_summary(registry: EvidenceRegistry) -> str:
                           and m.get("snapshot_date"))
         day_label = (f"参考交易日（{m['snapshot_date']}）"
                      if reference_mode else "当日")
+        if m.get("snapshot_mode") == "previous_close" and m.get("snapshot_date"):
+            day_label = f"前一交易日（{m['snapshot_date']}）收盘"
         if chg is not None:
             seg.append(f"板块指数{day_label}涨跌幅 {chg}%（{_sign_word(chg)}）")
         rank_of, total = m.get("rank_of"), m.get("total_boards")
@@ -1107,6 +1109,9 @@ def program_fact_limitations(registry: EvidenceRegistry) -> Optional[str]:
             parts.append(f"板块行情为参考交易日（{m['snapshot_date']}）单期"
                          "快照（参考口径：目标交易日合格行情未取得），不外推"
                          "历史趋势，参考日行情不进入当日证据")
+        elif m.get("snapshot_mode") == "previous_close" and m.get("snapshot_date"):
+            parts.append(f"板块行情采用前一交易日（{m['snapshot_date']}）收盘快照，"
+                         "与目标交易日行情分开展示")
         else:
             parts.append("当日行情为单期快照，不外推历史趋势；涨跌幅分位仅为"
                          "横截面相对位置，不提供方向或历史动量证据")

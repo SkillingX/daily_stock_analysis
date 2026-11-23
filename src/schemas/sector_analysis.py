@@ -291,13 +291,13 @@ class IntradayPillar(_StrictBase):
     snapshot_date: Optional[Annotated[str, Field(min_length=10, max_length=10)]] = None
     """快照行情的实际交易日（YYYY-MM-DD；issue #99 追加兼容字段）。
 
-    目标交易日行情未取得而展示最近已完成交易日参考行情时，为参考日
-    （目标日缺口随 gaps/reasons 透出）；默认 None 仅兼容存量记录。"""
-    snapshot_mode: Optional[Literal["target", "reference"]] = None
+    采用参考行情或上一交易日收盘行情时，记录其实际交易日。默认 None 兼容
+    存量记录。"""
+    snapshot_mode: Optional[Literal["target", "reference", "previous_close"]] = None
     """快照实际采用口径的显式标注（issue #99 amend 追加；渲染按此字段而非
     日期对比判断参考口径——目标日盘中合格行情不是参考口径）。``target``=
-    目标交易日口径；``reference``=立即上一已完成交易日参考口径。默认 None
-    仅兼容存量记录。"""
+    目标交易日口径；``reference``=盘中参考；``previous_close``=目标日收盘行情
+    未取得时采用的前一交易日收盘行情。默认 None 仅兼容存量记录。"""
     snapshot_source: Optional[Annotated[str, Field(max_length=200)]] = None
     """当日行情快照来源/时点说明：东财行业板块全表路径为 None（口径见文档）；
     全表不可用时单标的快照来源如实标注（stock/get 原样映射或 trends2
